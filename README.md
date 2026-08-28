@@ -42,8 +42,7 @@ The tooling is used from `~/.agents/`; this directory is the versioned source.
 ```bash
 mkdir -p ~/.agents ~/.claude/skills
 cp -R .agents/bin .agents/rules .agents/skills ~/.agents/
-chmod +x ~/.agents/bin/velo-dispatch ~/.agents/bin/velo-status \
-         ~/.agents/bin/velo-openrouter-agent ~/.agents/bin/*.py
+chmod +x ~/.agents/bin/*        # every script, not a hand-listed subset
 
 # make the skills visible to Claude Code
 for s in velo-deepseek velo-glm velo-local; do
@@ -251,6 +250,10 @@ record against an older one.
 | run ends `exceeded 1800s` | raise `--prompt-timeout`; ensure the brief mandates incremental commits |
 | `leaked_tool_calls=N` | model emitted a tool call as text; it never ran. Report is untrustworthy — re-run, keep quoting simple |
 | runner says "no worktree changes" but work exists | fixed: the snapshot now includes `HEAD`, so a commit counts as a change |
+| reviewer returns a report but nothing appears on the PR | its sandbox could not reach api.github.com. Reviewers should RETURN the report; relay it with `velo-gate-post` |
+| `velo-merge` refuses with `CI is 'SKIPPED'` | fixed: it evaluates ALL checks now. Optional lanes report SKIPPED and used to mask a green required build |
+| `velo-merge` says STALE GATE | correct — commits landed after the review. Re-gate against the current head; do not `--force` |
+| `velo-status` names the wrong worker | fixed: a running worker is named from its live process, not from a log matched by mtime |
 | every worker shows `done` immediately | check the process is actually detached (`nohup … &`) |
 
 ## Editing this tooling
