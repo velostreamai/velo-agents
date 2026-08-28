@@ -1,0 +1,108 @@
+#!/bin/bash
+# velo-status — one-shot status of every dispatched Velostream worker.
+#
+# Usage:
+#   velo-status            summary table
+#   velo-status -v         also show each worker's last log line
+#   velo-status <issue>    detail for one issue
+#
+# Reports from GIT AND THE PROCESS TABLE, never from a worker's self-report —
+# a worker that commits looks "unchanged" to its own runner, and one that
+# leaks a tool call reports success while having executed nothing.
+
+set -uo pipefail
+
+REPO="velostreamai/velostream"
+ROOT="$HOME/RustroverProjects/velostream"
+WORKTREE_BASE="$HOME/RustroverProjects"
+
+VERBOSE=0; ONLY=""
+for a in "$@"; do
+  case "$a" in
+    -v|--verbose) VERBOSE=1 ;;
+    [0-9]*) ONLY="$a" ;;
+    *) echo "usage: velo-status [-v] [issue]" >&2; exit 1 ;;
+  esac
+done
+
+RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+
+# Map a running worker process -> the issue number in its --cwd.
+running_pid_for() {
+  local wt="$1"
+  pgrep -f "velo-(openrouter-agent-sdk|lmstudio-agent-sdk)\.py.*--cwd $wt( |$)" 2>/dev/null | head -1
+}
+
+printf '%-7s %-11s %-8s %-7s %-6s %s\n' ISSUE WORKER STATE COMMITS DIRTY BRANCH
+printf '%s\n' "────────────────────────────────────────────────────────────────────────"
+
+FOUND=0
+for WT in "$WORKTREE_BASE"/velostream-*; do
+  [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
+  ISSUE="${WT##*velostream-}"
+  [[ -n "$ONLY" && "$ISSUE" != "$ONLY" ]] && continue
+  FOUND=1
+
+  BRANCH=$(git -C "$WT" branch --show-current 2>/dev/null || echo "?")
+  COMMITS=$(git -C "$WT" log --oneline origin/master..HEAD 2>/dev/null | wc -l | tr -d ' ')
+  DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+  PID=$(running_pid_for "$WT")
+  LOG=$(ls -t /tmp/{deepseek,glm,velo-local}-"$ISSUE"*.log 2>/dev/null | head -1)
+  WORKER="-"
+  # Log names vary: deepseek-1898.log, glm-1895.log, velo-local-1899.log,
+  # deepseek-1877-stage1.log. The worker is whatever precedes "-<issue>".
+  if [[ -n "$LOG" ]]; then BN=$(basename "$LOG"); WORKER="${BN%%-$ISSUE*}"; fi
+
+  if [[ -n "$PID" ]]; then
+    STATE_W=running; STATE_C="$GRN"
+  elif [[ -n "$LOG" ]]; then
+    # Distinguish a clean finish from a crash/timeout, and flag leaked tool calls.
+    TAIL=$(tail -5 "$LOG" 2>/dev/null)
+    if grep -q "leaked_tool_calls=[1-9]" <<<"$TAIL"; then
+      STATE_W=LEAKED; STATE_C="$RED"
+    elif grep -qE "^ERROR:|exceeded [0-9]+s|Traceback" <<<"$TAIL"; then
+      STATE_W=failed; STATE_C="$RED"
+    else
+      STATE_W=done; STATE_C="$DIM"
+    fi
+  else
+    STATE_W=idle; STATE_C="$DIM"
+  fi
+  STATE=$(printf '%s%-8s%s' "$STATE_C" "$STATE_W" "$OFF")
+
+  # Colour the commit count: work present but unpushed is the state that
+  # silently loses everything if the worktree is reset.
+  PUSHED=$(git -C "$WT" log --oneline "origin/$BRANCH..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+  CFLAG_W="$COMMITS"; CFLAG_C=""
+  [[ "$COMMITS" != "0" && "$PUSHED" != "0" ]] && { CFLAG_W="${COMMITS}!"; CFLAG_C="$YEL"; }
+  printf '%-7s %-11s %s %s%-7s%s %-6s %s\n' \
+    "$ISSUE" "${WORKER:0:11}" "$STATE" "$CFLAG_C" "$CFLAG_W" "$OFF" "$DIRTY" "$BRANCH"
+
+  if [[ $VERBOSE -eq 1 && -n "$LOG" ]]; then
+    printf '        %s%s%s\n' "$DIM" "$(tail -1 "$LOG" | cut -c1-100)" "$OFF"
+  fi
+done
+
+[[ $FOUND -eq 1 ]] || { echo "no velostream-* worktrees found"; exit 0; }
+
+echo
+echo "${YEL}n!${OFF} = commits not yet pushed   ${RED}LEAKED${OFF} = tool calls emitted as text, never ran"
+
+# ---- open PRs ---------------------------------------------------------------
+echo
+echo "open PRs:"
+gh pr list --repo "$REPO" --state open --limit 10 \
+  --json number,title,mergeable,statusCheckRollup \
+  --jq '.[] | "  #\(.number) \(.mergeable // "?") \((.statusCheckRollup[0].conclusion) // "pending")  \(.title[0:66])"' \
+  2>/dev/null || echo "  (gh unavailable)"
+
+# ---- disk -------------------------------------------------------------------
+AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
+echo
+if [[ "$AVAIL" -lt 40 ]]; then
+  echo "${RED}disk: ${AVAIL}GB free${OFF} — under 40GB. Workers die with errors that look"
+  echo "  like compile bugs. Free space: rm -rf <merged-worktree>/target"
+else
+  echo "disk: ${AVAIL}GB free"
+fi

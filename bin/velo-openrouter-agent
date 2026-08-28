@@ -1,0 +1,14 @@
+#!/bin/zsh
+set -euo pipefail
+
+SDK_PY="/Users/neilavery/.venvs/velo-openrouter-agent/bin/python"
+SDK_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent-sdk.py"
+LEGACY_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent.py"
+
+if [[ "${VELO_AGENT_IMPL:-sdk}" == "legacy" ]]; then
+  echo "[velo-openrouter-agent] implementation=legacy" >&2
+  exec "$LEGACY_AGENT" "$@"
+else
+  echo "[velo-openrouter-agent] implementation=sdk" >&2
+  exec "$SDK_PY" "$SDK_AGENT" "$@"
+fi

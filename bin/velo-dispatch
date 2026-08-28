@@ -1,0 +1,285 @@
+#!/bin/bash
+# velo-dispatch — validate a ticket is dispatch-ready, prepare its worktree,
+# assign it, and launch the right worker.
+#
+# Usage:
+#   velo-dispatch <issue> <brief-file> [--branch <name>] [--dry-run] [--force]
+#
+# Exits non-zero with a specific message when the ticket is NOT ready, so a
+# caller never burns a worker run on an under-specified task.
+#
+# Worker selection comes from the issue's `worker:*` label:
+#   worker:local     -> qwen3-coder-next-mlx@6bit via LM Studio   (free)
+#   worker:deepseek  -> deepseek/deepseek-v4-flash-0731           (very cheap)
+#   worker:glm       -> z-ai/glm-5.3-flash                        (pricier)
+
+set -uo pipefail
+
+REPO="velostreamai/velostream"
+ROOT="$HOME/RustroverProjects/velostream"
+WORKTREE_BASE="$HOME/RustroverProjects"
+POLICY="$HOME/.agents/rules/velo-impl.md"
+ASSIGNEE="bluemonk3y"
+MIN_DISK_GB=40
+LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://192.168.1.193:1234/v1}"
+MAX_TURNS=250
+PROMPT_TIMEOUT=14400
+
+die()  { printf '\n\033[31mNOT READY:\033[0m %s\n\n' "$1" >&2; exit 1; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+
+ISSUE="${1:-}"; BRIEF="${2:-}"; shift 2 2>/dev/null || true
+BRANCH=""; DRY=0; FORCE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --branch) BRANCH="$2"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    --force) FORCE=1; shift ;;
+    *) die "unknown flag: $1" ;;
+  esac
+done
+
+[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force]"
+[[ "$ISSUE" =~ ^[0-9]+$ ]] || die "issue must be a number, got '$ISSUE'"
+[[ -f "$BRIEF" ]] || die "brief file not found: $BRIEF"
+[[ -s "$BRIEF" ]] || die "brief file is empty: $BRIEF"
+
+echo "── validating #$ISSUE ─────────────────────────────────"
+
+# ---- 1. issue exists and is open -------------------------------------------
+META=$(gh issue view "$ISSUE" --repo "$REPO" --json state,title,labels,assignees 2>/dev/null) \
+  || die "issue #$ISSUE not found in $REPO (or gh not authenticated)"
+
+STATE=$(jq -r .state <<<"$META")
+TITLE=$(jq -r .title <<<"$META")
+LABELS=$(jq -r '[.labels[].name] | join(",")' <<<"$META")
+
+[[ "$STATE" == "OPEN" ]] || die "issue #$ISSUE is $STATE — nothing to dispatch.
+  \"$TITLE\""
+ok "open: $TITLE"
+
+# ---- 2. blocking labels -----------------------------------------------------
+if [[ ",$LABELS," == *",needs-design,"* ]]; then
+  die "#$ISSUE is labelled 'needs-design'.
+  A worker must never choose between design options.
+  Either pin the design on the issue and remove the label, or dispatch a
+  READ-ONLY analysis brief that presents options and stops."
+fi
+if [[ ",$LABELS," == *",blocked,"* ]]; then
+  die "#$ISSUE is labelled 'blocked'.
+  Resolve or remove the dependency first — see the issue for what it waits on."
+fi
+if [[ ",$LABELS," == *",triage-needed,"* ]]; then
+  if [[ $FORCE -eq 0 ]]; then
+    die "#$ISSUE is labelled 'triage-needed' — its claims may not match master.
+  FOUR issues in one session turned out already-fixed. Verify the issue's
+  file:line anchors against current master, then remove the label.
+  Re-run with --force only if you have just verified it."
+  fi
+  warn "triage-needed present, proceeding under --force"
+fi
+ok "no blocking labels"
+
+# ---- 3. exactly one worker label -------------------------------------------
+WORKERS=$(tr ',' '\n' <<<"$LABELS" | grep '^worker:' || true)
+COUNT=$(grep -c . <<<"$WORKERS" || true)
+[[ "$COUNT" -ne 0 ]] || die "#$ISSUE has no 'worker:*' label — routing is undefined.
+  Add one of:
+    worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
+    worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
+    worker:glm       pricier. Multi-step reasoning / per-case judgement."
+[[ "$COUNT" -eq 1 ]] || die "#$ISSUE has $COUNT worker labels ($(tr '\n' ' ' <<<"$WORKERS"))— exactly one required."
+
+case "$WORKERS" in
+  worker:local)    NAME="velo-local"; LOGTAG="velo-local" ;;
+  worker:deepseek) NAME="velo-deepseek"; LOGTAG="deepseek" ;;
+  worker:glm)      NAME="velo-glm"; LOGTAG="glm" ;;
+  *) die "unrecognised worker label: $WORKERS" ;;
+esac
+ok "routed to $NAME"
+
+# ---- 3b. task spec sidecar (authoritative when present) ---------------------
+SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
+if [[ -f "$SPEC" ]]; then
+  y() { python3 -c "
+import json
+d=json.load(open('$SPEC'))
+for p in '$1'.split('.'):
+    d = d.get(p) if isinstance(d,dict) else None
+print('' if d is None else (json.dumps(d) if isinstance(d,(list,dict)) else d))
+" 2>/dev/null; }
+
+  [[ "$(y design)" == "pinned" ]] || die "spec: design is '$(y design)', must be 'pinned'.
+  A worker never chooses between design options. Pin it on the issue first."
+
+  EV=$(y evidence); AU=$(y audit)
+  if [[ -n "$EV" && "$EV" != "code" ]]; then
+    [[ "$AU" == done:* ]] || die "spec: evidence='$EV' (not a code read) and audit='$AU'.
+  Claims sourced from a spec or another agent's report must be audited against
+  code first — four issues in one session were stale for exactly this reason.
+  Set audit: done:<sha> after auditing."
+  fi
+
+  DEPS=$(y depends_on)
+  if [[ -n "$DEPS" && "$DEPS" != "null" ]]; then
+    for d in $(tr -d '[]," ' <<<"$DEPS" | tr ',' ' '); do
+      [[ -n "$d" ]] || continue
+      DS=$(gh issue view "$d" --repo "$REPO" --json state --jq .state 2>/dev/null)
+      [[ "$DS" == "CLOSED" ]] || die "spec: depends_on #$d is $DS — must be CLOSED before dispatch."
+    done
+    ok "dependencies closed"
+  fi
+
+  # Anchors: SYMBOLS re-verified against the tree. Line numbers rot; symbols do not.
+  ANCH=$(y anchors)
+  if [[ "$ANCH" != "[]" && -n "$ANCH" ]]; then
+    STALE=$(python3 - "$ROOT" "$SPEC" <<'PYA'
+import sys, json, pathlib
+root, spec = pathlib.Path(sys.argv[1]), sys.argv[2]
+bad=[]
+for a in (json.load(open(spec)) or {}).get("anchors") or []:
+    f, sym, exp = a.get("file"), a.get("symbol"), a.get("expect")
+    p = root / f
+    if not p.exists():
+        bad.append(f"{f}: FILE MISSING"); continue
+    n = p.read_text(errors="ignore").count(sym)
+    if n == 0:
+        bad.append(f"{f}: symbol '{sym}' NOT FOUND")
+    elif exp is not None and n != exp:
+        bad.append(f"{f}: '{sym}' found {n}x, spec says {exp}x")
+print("\n".join(bad))
+PYA
+)
+    [[ -z "$STALE" ]] || die "spec: ANCHORS ARE STALE — the issue describes code that has moved.
+$STALE
+  Re-verify against master, update .agents/tasks/${ISSUE}.json, then retry."
+    ok "anchors verified against tree"
+  fi
+
+  # Blast radius: COMPUTE it. An author's estimate produced '1 call site' for 66.
+  BRP=$(y blast_radius.pattern); BRR=$(y blast_radius.refs)
+  if [[ -n "$BRP" && -n "$BRR" ]]; then
+    ACT=$(grep -rn "$BRP" "$ROOT/src" "$ROOT/tests" "$ROOT/examples" 2>/dev/null | wc -l | tr -d ' ')
+    DELTA=$(( ACT > BRR ? ACT - BRR : BRR - ACT ))
+    LIM=$(( BRR / 10 + 2 ))
+    [[ "$DELTA" -le "$LIM" ]] || die "spec: BLAST RADIUS MISMATCH for '$BRP'.
+  declared $BRR refs, actually $ACT (searched src/ tests/ examples/).
+  A wrong estimate is how a worker burned its entire budget hand-editing 66
+  call sites it was told was one. Re-measure and update the spec."
+    ok "blast radius: $ACT refs (declared $BRR)"
+  fi
+
+  BEHIND=$(git -C "$ROOT" rev-list --count "$(y verified_against)..origin/master" 2>/dev/null || echo "?")
+  [[ "$BEHIND" == "0" || "$BEHIND" == "?" ]] && ok "spec verified at current master" \
+    || warn "spec verified $BEHIND commits behind master (anchors still check out)"
+else
+  warn "no task spec at .agents/tasks/${ISSUE}.json — validating brief only.
+       See .agents/tasks/SCHEMA.md; a spec enables anchor + blast-radius checks."
+fi
+
+# ---- 4. brief sanity — cheap checks against velo-brief-spec.md --------------
+MISSING=()
+grep -qi "worktree" "$BRIEF"                  || MISSING+=("no WORKTREE path (spec §1)")
+grep -qiE "do not.*cd|don't.*cd" "$BRIEF"     || MISSING+=("no 'do NOT cd' instruction (spec §1)")
+grep -qiE "STOP and report|STOP —|STOP if"    "$BRIEF" || MISSING+=("no STOP conditions (spec §5)")
+grep -qiE "commit incrementally|commit after each" "$BRIEF" || MISSING+=("no incremental-commit rule (spec §12) — a timeout will lose all work")
+grep -qiE "cargo (check|nextest)" "$BRIEF"    || MISSING+=("no validation commands (spec §7)")
+if grep -qiE "\.sql|SELECT .* FROM" "$BRIEF"; then
+  grep -q "SQL_GRAMMAR_RULES\|PARSER_GRAMMAR" "$BRIEF" \
+    || MISSING+=("brief writes SQL but cites no grammar reference (spec §6)")
+fi
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  printf '\n\033[31mBRIEF INCOMPLETE:\033[0m %s\n' "$BRIEF" >&2
+  printf '  - %s\n' "${MISSING[@]}" >&2
+  printf '\nSee %s\n\n' "$HOME/.agents/rules/velo-brief-spec.md" >&2
+  exit 1
+fi
+ok "brief satisfies the spec checklist"
+
+# ---- 5. disk ----------------------------------------------------------------
+AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
+[[ "$AVAIL" -ge "$MIN_DISK_GB" ]] || die "only ${AVAIL}GB free; each worktree target/ is ~20GB.
+  A full disk kills workers with errors that look like compile bugs.
+  Free space (rm -rf <merged-worktree>/target) then retry."
+ok "disk: ${AVAIL}GB free"
+
+# ---- 6. worktree ------------------------------------------------------------
+[[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
+WT="$WORKTREE_BASE/velostream-$ISSUE"
+
+git -C "$ROOT" fetch -q origin || die "git fetch failed"
+BASE=$(git -C "$ROOT" rev-parse --short origin/master)
+
+if [[ $DRY -eq 1 ]]; then
+  echo
+  echo "DRY RUN — would do:"
+  echo "  worktree : $WT  (branch $BRANCH off origin/master $BASE)"
+  echo "  assign   : #$ISSUE -> $ASSIGNEE"
+  echo "  worker   : $NAME"
+  echo "  brief    : $BRIEF"
+  echo "  log      : /tmp/${LOGTAG}-${ISSUE}.log"
+  exit 0
+fi
+
+if [[ -d "$WT" ]]; then
+  DIRTY=$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')
+  AHEAD=$(git -C "$WT" log --oneline origin/master..HEAD 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$DIRTY" != "0" || "$AHEAD" != "0" ]]; then
+    [[ $FORCE -eq 1 ]] || die "worktree $WT already has work ($DIRTY dirty, $AHEAD commits).
+  Inspect it before discarding. Re-run with --force to reset to origin/master."
+    git -C "$WT" reset --hard origin/master -q && git -C "$WT" clean -qfd
+    warn "reset existing worktree (--force)"
+  fi
+  ok "worktree exists, clean: $WT"
+else
+  git -C "$ROOT" worktree add "$WT" -b "$BRANCH" origin/master -q 2>/dev/null \
+    || git -C "$ROOT" worktree add "$WT" "$BRANCH" -q \
+    || die "could not create worktree $WT on branch $BRANCH"
+  ok "worktree created: $WT ($BRANCH off $BASE)"
+fi
+
+# ---- 7. assign (only now that work is actually starting) --------------------
+gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1 \
+  && ok "assigned to $ASSIGNEE" || warn "could not assign (non-fatal)"
+
+# ---- 8. launch --------------------------------------------------------------
+LOG="/tmp/${LOGTAG}-${ISSUE}.log"
+TASK=$(cat "$BRIEF")
+
+case "$NAME" in
+  velo-local)
+    nohup "$HOME/.venvs/velo-openrouter-agent/bin/python" \
+      "$HOME/.agents/bin/velo-lmstudio-agent-sdk.py" \
+      --model 'qwen3-coder-next-mlx@6bit' \
+      --base-url "$LMSTUDIO_URL" \
+      --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT" \
+      --cwd "$WT" --task "$TASK" > "$LOG" 2>&1 &
+    ;;
+  velo-deepseek)
+    nohup "$HOME/.agents/bin/velo-openrouter-agent" \
+      --model deepseek/deepseek-v4-flash-0731 \
+      --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT" \
+      --cwd "$WT" --task "$TASK" > "$LOG" 2>&1 &
+    ;;
+  velo-glm)
+    nohup "$HOME/.agents/bin/velo-openrouter-agent" \
+      --model z-ai/glm-5.3-flash \
+      --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT" \
+      --cwd "$WT" --task "$TASK" > "$LOG" 2>&1 &
+    ;;
+esac
+PID=$!
+
+echo
+echo "── dispatched ─────────────────────────────────────────"
+echo "  #$ISSUE  $TITLE"
+echo "  worker : $NAME   pid $PID"
+echo "  branch : $BRANCH  (off origin/master $BASE)"
+echo "  log    : $LOG"
+echo
+echo "  poll:   tail -3 $LOG"
+echo "  result: git -C $WT log --oneline origin/master..HEAD"
+echo
+echo "  Detached — no completion event. Verify from git and the tests,"
+echo "  never from the worker's self-report."

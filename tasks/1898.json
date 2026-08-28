@@ -1,0 +1,46 @@
+{
+  "issue": 1898,
+  "worker": "deepseek",
+  "design": "pinned",
+  "verified_against": "591c2d6b8",
+  "evidence": "code",
+  "audit": "done:591c2d6b8",
+  "depends_on": [],
+  "anchors": [
+    {
+      "file": "src/velostream/sql/ast.rs",
+      "symbol": "Uri(String)",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "StreamSource::Uri",
+      "expect": 4
+    }
+  ],
+  "blast_radius": {
+    "pattern": "StreamSource::Uri",
+    "files": 44,
+    "refs": 94
+  },
+  "tests": {
+    "fail_to_pass": [
+      "source_name_with_scheme_separator_folds_like_any_label"
+    ],
+    "pass_to_stay": [
+      "order_by_inside_within_group_does_not_produce_a_sort_node"
+    ],
+    "known_red": [
+      "benchmark_three_hop_processor_pipeline"
+    ]
+  },
+  "acceptance": [
+    "StreamSource::Uri deleted; the enum has three variants",
+    "the four contains(\"://\") branches collapse to StreamSource::Stream(from_stream)",
+    "a name containing :// resolves as a label and fails through the existing unknown-source path"
+  ],
+  "forbidden": [
+    "do not add a WITHIN GROUP or any new grammar production",
+    "do not hand-Edit 30+ files; ast-grep is required for the match-arm rewrite"
+  ]
+}

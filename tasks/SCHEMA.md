@@ -1,0 +1,84 @@
+# Task spec — `.agents/tasks/<issue>.json` (JSON: stdlib-parseable, no deps)
+
+One file per dispatchable issue. **The sidecar is the source of truth**; the
+GitHub issue carries human prose and a pointer to it.
+
+Why in-repo rather than in the issue body: this file is versioned WITH the code
+it references, so its anchors and SHAs are checkable at the same commit they
+live in. Metadata in an issue body cannot be validated against any tree — which
+is the exact failure class this exists to remove.
+
+`velo-dispatch` reads this file, re-verifies every mechanical claim, and
+REFUSES to launch a worker when a claim no longer holds.
+
+## Fields
+
+```yaml
+issue: 1898
+worker: deepseek            # local | deepseek | glm  -> routing
+design: pinned              # pinned | open. `open` => dispatch REFUSED.
+                            # A worker never chooses between design options.
+
+verified_against: 591c2d6b8 # master SHA when the anchors below were last checked
+evidence: code              # code | spec | report — provenance of the central claim.
+                            # Anything but `code` implies audit: required.
+                            # Four issues in one session were stale because they
+                            # cited a SPEC line describing superseded code.
+audit: done:591c2d6b8       # required | done:<sha> | n/a
+
+depends_on: [1897]          # must all be CLOSED. Dispatch refused otherwise.
+
+anchors:                    # SYMBOLS, never line numbers. Line numbers rot:
+  - file: src/velostream/sql/parser/select.rs      # `join.rs:130` had moved to
+    symbol: "StreamSource::Uri"                    # `:147` and a brief shipped
+    expect: 4                                      # the stale number.
+  - file: src/velostream/sql/ast.rs
+    symbol: "Uri(String)"
+    expect: 1
+
+blast_radius:               # DECLARED value. velo-dispatch COMPUTES the real
+  pattern: "StreamSource::Uri"   # one and refuses on mismatch. An author's
+  files: 44                      # estimate is what produced "1 call site"
+  refs: 94                       # against an actual 66.
+
+tests:                      # SWE-bench's FAIL_TO_PASS / PASS_TO_PASS
+  fail_to_pass:             # must FAIL before the change — proves the test
+    - uri_name_folds_like_any_label   # would have caught the bug
+  pass_to_stay:             # must stay green — proves nothing was lost
+    - output_alias_3_hop_cycle_rejected_nb001
+  known_red:                # pre-existing failures, not caused by this work
+    - benchmark_three_hop_processor_pipeline
+
+acceptance:                 # injected verbatim into the generated brief
+  - "StreamSource::Uri deleted; the enum has three variants"
+  - "a name containing :// resolves as a label via the existing unknown-source path"
+
+forbidden:                  # things a worker must NOT do, from prior review
+  - "do not change any function signature"
+  - "do not touch protobuf_codec.rs's mod fast_path"
+```
+
+## What `velo-dispatch` enforces
+
+| field | check | on failure |
+|---|---|---|
+| `design` | must be `pinned` | refuse |
+| `depends_on` | every issue CLOSED | refuse, naming the open one |
+| `anchors` | each symbol found in its file, count matches `expect` | refuse — **stale** |
+| `blast_radius` | computed refs/files vs declared | refuse on mismatch |
+| `evidence` | if not `code`, `audit` must be `done:<sha>` | refuse — needs audit |
+| `verified_against` | reported as commits-behind (informational) | warn only |
+
+`acceptance`, `forbidden`, `tests` and the resolved anchor line numbers are
+written into the generated brief, so nothing is hand-transcribed.
+
+## Gate comments
+
+Every gate (code-review, check-code, check-spec, adversarial) starts its PR
+comment with:
+
+    gate: <name> @ <sha>
+
+A gate result is only valid for the SHA it ran against — a PR's CI was once
+green against a commit that had already been replaced. Comparing that SHA to
+`headRefOid` is the whole staleness check; no extra tooling needed.
