@@ -1,0 +1,86 @@
+#!/bin/bash
+# velo-merge — merge a PR only if it has been gated against its CURRENT head.
+#
+#   velo-merge <pr> [--force]
+#
+# This is the enforcement point. Everything else records state; this refuses to
+# act on bad state. Three things must hold:
+#
+#   1. the PR carries `gate:passed`
+#   2. the recorded `gate: <name> @ <sha>` matches the current head
+#   3. CI is green against that same head
+#
+# (2) is the one that is easy to get wrong by hand: a PR once reported green
+# CI against a commit that had already been replaced, so "green and mergeable"
+# described code that was no longer there.
+#
+# Docs/tooling-only PRs (no src/ or tests/ changes) skip the gate requirement
+# but still require green CI.
+
+set -uo pipefail
+REPO="velostreamai/velostream"
+die()  { printf '\n\033[31mREFUSING TO MERGE:\033[0m %s\n\n' "$1" >&2; exit 1; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+
+PR="${1:-}"; FORCE=0
+[[ "${2:-}" == "--force" ]] && FORCE=1
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-merge <pr> [--force]"
+
+M=$(gh pr view "$PR" --repo "$REPO" \
+     --json headRefOid,labels,files,state,title,mergeable,statusCheckRollup 2>/dev/null) \
+  || die "PR #$PR not found"
+
+STATE=$(jq -r .state <<<"$M")
+[[ "$STATE" == "OPEN" ]] || die "PR #$PR is $STATE"
+TITLE=$(jq -r .title <<<"$M")
+HEAD=$(jq -r .headRefOid <<<"$M"); SHORT="${HEAD:0:9}"
+MERGEABLE=$(jq -r .mergeable <<<"$M")
+CI=$(jq -r '(.statusCheckRollup[0].conclusion)//"pending"' <<<"$M")
+LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$M")
+FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$M")
+CODE=$(( $(grep -c '^src/' <<<"$FILES" || true) + $(grep -c '^tests/' <<<"$FILES" || true) ))
+
+echo "── #$PR $TITLE"
+echo "   head $SHORT   ci=$CI   mergeable=$MERGEABLE"
+
+[[ "$MERGEABLE" == "MERGEABLE" ]] || die "mergeable=$MERGEABLE — resolve conflicts first."
+[[ "$CI" == "SUCCESS" ]] || die "CI is '$CI' against $SHORT, not SUCCESS."
+ok "CI green on current head"
+
+if [[ "$CODE" -eq 0 ]]; then
+  ok "docs/tooling only — gate not required"
+else
+  if [[ ",$LABELS," == *",gate:passed,"* ]]; then
+    ok "gate:passed"
+  else
+    CUR=$(tr ',' '\n' <<<"$LABELS" | grep '^gate:' | head -1); [[ -n "$CUR" ]] || CUR="gate:none"
+    [[ $FORCE -eq 1 ]] || die "#$PR touches $CODE code file(s) and is '$CUR', not gate:passed.
+  Run the gate, then: velo-gate $PR --pass
+  Verifying it yourself is not the gate — that is how an ungated PR gets
+  described as ready."
+  fi
+
+  # The stale-gate check: a gate result is only valid for the commit it ran on.
+  GSHA=$(gh pr view "$PR" --repo "$REPO" --json comments \
+          --jq '[.comments[].body | capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
+  [[ "$GSHA" == "null" ]] && GSHA=""
+  if [[ -z "$GSHA" ]]; then
+    [[ $FORCE -eq 1 ]] || die "no 'gate: <name> @ <sha>' comment on #$PR.
+  Gate comments must name the commit they ran against, else staleness is
+  unverifiable."
+  elif [[ "$HEAD" != "$GSHA"* ]]; then
+    [[ $FORCE -eq 1 ]] || die "STALE GATE — reviewed at $GSHA, head is now $SHORT.
+  Commits landed after the review. Re-gate against the current head:
+    velo-gate $PR --running   # then re-run the reviewers
+  This is the exact case where a PR looked green against code that had
+  already been replaced."
+  else
+    ok "gate ran against current head ($GSHA)"
+  fi
+fi
+
+[[ $FORCE -eq 1 ]] && printf '\033[33mwarn:\033[0m --force: overriding the checks above\n' >&2
+
+echo
+gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+  && ok "merged #$PR" || die "gh pr merge failed"

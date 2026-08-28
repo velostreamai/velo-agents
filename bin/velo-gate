@@ -1,0 +1,105 @@
+#!/bin/bash
+# velo-gate — record and enforce a PR's review-gate state.
+#
+#   velo-gate <pr>                 show gate state (and whether it is stale)
+#   velo-gate <pr> --plan          print which gates this PR needs, and why
+#   velo-gate <pr> --running       mark gates dispatched (sets gate:running)
+#   velo-gate <pr> --pass          record a clean gate  (sets gate:passed)
+#   velo-gate <pr> --block         record a blocked gate (sets gate:blocked)
+#
+# Gate state lives in a LABEL, not in someone's memory, so "not gated" is
+# visible rather than merely absent. A gate result is bound to the commit it
+# ran against: if the head moves, the label goes stale and `velo-merge`
+# refuses. That is the failure this exists to prevent — a PR once reported
+# green CI against a commit that had already been replaced.
+
+set -uo pipefail
+REPO="velostreamai/velostream"
+die()  { printf '\n\033[31m%s\033[0m %s\n\n' "ERROR:" "$1" >&2; exit 1; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+
+PR="${1:-}"; MODE="${2:---show}"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-gate <pr> [--plan|--running|--pass|--block]"
+
+META=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,labels,files,state,title,body 2>/dev/null) \
+  || die "PR #$PR not found"
+
+HEAD=$(jq -r .headRefOid <<<"$META")
+SHORT="${HEAD:0:9}"
+STATE=$(jq -r .state <<<"$META")
+TITLE=$(jq -r .title <<<"$META")
+LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$META")
+CUR=$(tr ',' '\n' <<<"$LABELS" | grep '^gate:' | head -1)
+[[ -n "$CUR" ]] || CUR="gate:none"
+
+# --- which gates does this PR need? ------------------------------------------
+FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$META")
+TOUCHES_SRC=$(grep -c '^src/' <<<"$FILES" || true)
+TOUCHES_TEST=$(grep -c '^tests/' <<<"$FILES" || true)
+NFILES=$(grep -c . <<<"$FILES" || true)
+# A linked issue with several acceptance bullets warrants check-spec.
+ISSUE=$(jq -r '.body' <<<"$META" | grep -oE '(Closes|Fixes) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+BARS=0
+if [[ -n "$ISSUE" ]]; then
+  BARS=$(gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body 2>/dev/null \
+         | sed -n '/^#* *Acceptance/,/^#* [A-Z]/p' | grep -cE '^\s*[-*] ' || true)
+fi
+
+NEED=()
+if [[ "$TOUCHES_SRC" -eq 0 && "$TOUCHES_TEST" -eq 0 ]]; then
+  NEED+=("none — docs/tooling only, no buildable code")
+else
+  NEED+=("code-review  (independent reviewer)")
+  [[ "$TOUCHES_SRC" -gt 0 ]] && NEED+=("check-code   (src/ touched: $TOUCHES_SRC files)")
+  [[ "$BARS" -ge 3 ]] && NEED+=("check-spec   (#$ISSUE has $BARS acceptance bars)")
+fi
+
+# --- the recorded gate SHA, from the gate comments ----------------------------
+GSHA=$(gh pr view "$PR" --repo "$REPO" --json comments \
+        --jq '[.comments[].body | capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
+[[ "$GSHA" == "null" ]] && GSHA=""
+
+case "$MODE" in
+  --plan)
+    echo "#$PR  $TITLE"
+    echo "  files: $NFILES (src=$TOUCHES_SRC tests=$TOUCHES_TEST)"
+    echo "  gates needed:"; printf '    - %s\n' "${NEED[@]}"
+    ;;
+  --running|--pass|--block)
+    NEW="gate:running"; [[ "$MODE" == "--pass" ]] && NEW="gate:passed"
+    [[ "$MODE" == "--block" ]] && NEW="gate:blocked"
+    if [[ "$MODE" == "--pass" && -n "$GSHA" && "$HEAD" != "$GSHA"* ]]; then
+      die "refusing to mark passed: the last gate comment names $GSHA but head is $SHORT.
+  Re-run the gate against the current head."
+    fi
+    for l in gate:none gate:running gate:passed gate:blocked; do
+      [[ "$l" == "$NEW" ]] || gh pr edit "$PR" --repo "$REPO" --remove-label "$l" >/dev/null 2>&1
+    done
+    gh pr edit "$PR" --repo "$REPO" --add-label "$NEW" >/dev/null 2>&1 \
+      && ok "#$PR -> $NEW (head $SHORT)" || die "could not set $NEW"
+    ;;
+  --show)
+    echo "#$PR  $TITLE"
+    echo "  head       : $SHORT"
+    echo "  gate label : $CUR"
+    if [[ -n "$GSHA" ]]; then
+      if [[ "$HEAD" == "$GSHA"* ]]; then
+        if [[ "$CUR" == "gate:passed" ]]; then
+          ok "gate comment matches the current head"
+        else
+          warn "a gate comment names the current head, but the label is '$CUR'.
+       A comment records that a gate RAN; only the label records its VERDICT.
+       Set it once the reviewers report: velo-gate $PR --pass | --block"
+        fi
+      else
+        warn "STALE — gate ran at $GSHA, head is now $SHORT. Re-gate before merging."
+      fi
+    else
+      warn "no 'gate: <name> @ <sha>' comment found — nothing has been recorded"
+    fi
+    echo "  gates needed:"; printf '    - %s\n' "${NEED[@]}"
+    [[ "$STATE" == "OPEN" ]] || warn "PR is $STATE"
+    ;;
+  *) die "unknown mode: $MODE" ;;
+esac
