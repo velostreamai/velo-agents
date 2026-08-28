@@ -1,0 +1,67 @@
+#!/bin/bash
+# velo-gate-post — post a reviewer's report to a PR on its behalf.
+#
+#   velo-gate-post <pr> <gate-name> <report-file> [--sha <sha>]
+#   <something producing a report> | velo-gate-post <pr> <gate-name> -
+#
+# Why this exists: a reviewer that cannot reach the GitHub API produces a
+# perfectly good report and then silently fails to deliver it. A gate whose
+# result never reaches the PR is indistinguishable from a gate that never ran —
+# so the orchestrator must own delivery, not the reviewer.
+#
+# It stamps the mandatory `gate: <name> @ <sha>` header (defaulting to the PR's
+# CURRENT head), so the result is bound to the commit it applies to and
+# `velo-merge` can detect staleness.
+
+set -uo pipefail
+REPO="velostreamai/velostream"
+die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+
+PR="${1:-}"; NAME="${2:-}"; FILE="${3:-}"; shift 3 2>/dev/null || true
+SHA=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sha) SHA="$2"; shift 2 ;;
+    *) die "unknown flag: $1" ;;
+  esac
+done
+
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-gate-post <pr> <gate-name> <report-file|-> [--sha <sha>]"
+[[ "$NAME" =~ ^[a-z0-9-]+$ ]] || die "gate name must be lowercase-kebab (e.g. codex-review), got '$NAME'"
+[[ -n "$FILE" ]] || die "report file required ('-' to read stdin)"
+
+if [[ "$FILE" == "-" ]]; then BODY=$(cat); else
+  [[ -f "$FILE" ]] || die "report file not found: $FILE"
+  BODY=$(cat "$FILE")
+fi
+[[ -n "${BODY// }" ]] || die "report is empty — refusing to post a gate result with no content"
+
+HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null) \
+  || die "PR #$PR not found"
+
+if [[ -z "$SHA" ]]; then
+  SHA="$HEAD"
+else
+  # An explicit --sha is how you record a review of an OLDER head honestly,
+  # rather than back-dating it onto the current one.
+  [[ "$HEAD" == "$SHA"* ]] || printf '\033[33mwarn:\033[0m recording against %s, but head is now %s — this will read as STALE, which is correct if the review predates the newer commits.\n' "$SHA" "${HEAD:0:9}" >&2
+fi
+
+HDR="gate: $NAME @ ${SHA:0:9}"
+# Do not double-stamp a report that already carries the header.
+if grep -qiE "^gate: *$NAME *@" <<<"$BODY"; then
+  FULL="$BODY"
+  ok "report already carries its gate header"
+else
+  FULL="$HDR"$'\n\n'"$BODY"
+fi
+
+URL=$(gh pr comment "$PR" --repo "$REPO" --body "$FULL" 2>&1 | tail -1) \
+  || die "could not post to #$PR: $URL"
+
+ok "posted '$NAME' to #$PR @ ${SHA:0:9}"
+echo "   $URL"
+echo
+echo "   Next: record the VERDICT — a comment says a gate RAN, the label says what it FOUND:"
+echo "     velo-gate $PR --pass    # or --block"

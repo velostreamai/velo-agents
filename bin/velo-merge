@@ -35,17 +35,29 @@ STATE=$(jq -r .state <<<"$M")
 TITLE=$(jq -r .title <<<"$M")
 HEAD=$(jq -r .headRefOid <<<"$M"); SHORT="${HEAD:0:9}"
 MERGEABLE=$(jq -r .mergeable <<<"$M")
-CI=$(jq -r '(.statusCheckRollup[0].conclusion)//"pending"' <<<"$M")
+# Evaluate ALL checks, not just the first. Optional lanes report SKIPPED and
+# can sort first, which would otherwise mask a green required build.
+FAILED=$(jq -r '[.statusCheckRollup[]?|select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT")|.name]|unique|join(", ")' <<<"$M")
+PASSED=$(jq -r '[.statusCheckRollup[]?|select(.conclusion=="SUCCESS")|.name]|unique|join(", ")' <<<"$M")
+PENDING=$(jq -r '[.statusCheckRollup[]?|select(.conclusion==null)|.name]|unique|join(", ")' <<<"$M")
+if   [[ -n "$FAILED"  ]]; then CI="FAILING"
+elif [[ -n "$PENDING" ]]; then CI="pending"
+elif [[ -n "$PASSED"  ]]; then CI="SUCCESS"
+else CI="none"; fi
 LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$M")
 FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$M")
 CODE=$(( $(grep -c '^src/' <<<"$FILES" || true) + $(grep -c '^tests/' <<<"$FILES" || true) ))
 
 echo "── #$PR $TITLE"
-echo "   head $SHORT   ci=$CI   mergeable=$MERGEABLE"
+echo "   head $SHORT   mergeable=$MERGEABLE"
 
 [[ "$MERGEABLE" == "MERGEABLE" ]] || die "mergeable=$MERGEABLE — resolve conflicts first."
-[[ "$CI" == "SUCCESS" ]] || die "CI is '$CI' against $SHORT, not SUCCESS."
-ok "CI green on current head"
+case "$CI" in
+  SUCCESS) ok "CI green on current head: $PASSED" ;;
+  FAILING) die "CI FAILING against $SHORT: $FAILED" ;;
+  pending) die "CI still pending against $SHORT: $PENDING" ;;
+  none)    die "no CI checks reported against $SHORT — nothing has verified this build." ;;
+esac
 
 if [[ "$CODE" -eq 0 ]]; then
   ok "docs/tooling only — gate not required"

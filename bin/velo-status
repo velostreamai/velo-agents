@@ -50,9 +50,23 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
   PID=$(running_pid_for "$WT")
   LOG=$(ls -t /tmp/{deepseek,glm,velo-local}-"$ISSUE"*.log 2>/dev/null | head -1)
   WORKER="-"
-  # Log names vary: deepseek-1898.log, glm-1895.log, velo-local-1899.log,
-  # deepseek-1877-stage1.log. The worker is whatever precedes "-<issue>".
-  if [[ -n "$LOG" ]]; then BN=$(basename "$LOG"); WORKER="${BN%%-$ISSUE*}"; fi
+  if [[ -n "$PID" ]]; then
+    # A worker IS running: name it from the live process, not from a log glob.
+    # Logs are matched by mtime, so a stale log from an EARLIER worker on the
+    # same issue would otherwise mislabel the one actually running.
+    CMD=$(ps -o command= -p "$PID" 2>/dev/null)
+    case "$CMD" in
+      *deepseek/deepseek*)  WORKER="deepseek" ;;
+      *z-ai/glm*)           WORKER="glm" ;;
+      *lmstudio-agent-sdk*) WORKER="velo-local" ;;
+      *)                    WORKER="running?" ;;
+    esac
+  elif [[ -n "$LOG" ]]; then
+    # Not running: the most recent log is the best available evidence of who
+    # ran last. Names vary (deepseek-1898.log, deepseek-1877-stage1.log), so
+    # take whatever precedes "-<issue>".
+    BN=$(basename "$LOG"); WORKER="${BN%%-$ISSUE*}"
+  fi
 
   if [[ -n "$PID" ]]; then
     STATE_W=running; STATE_C="$GRN"

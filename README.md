@@ -17,6 +17,9 @@ and the tests** — never from the worker's self-report.
   bin/
     velo-dispatch                  validate a ticket, prep the worktree, launch a worker
     velo-status                    one-shot state of every dispatched worker
+    velo-gate                      record/inspect a PR's gate state (a LABEL, not memory)
+    velo-gate-post                 post a reviewer's report on its behalf
+    velo-merge                     merge only if gated against the CURRENT head
     velo-openrouter-agent          wrapper -> the SDK worker (DeepSeek / GLM)
     velo-openrouter-agent-sdk.py   OpenRouter-backed worker runner
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
@@ -205,16 +208,38 @@ symbol renamed        -> ANCHORS ARE STALE — symbol 'Uri(PathBuf)' NOT FOUND
 
 ## Reviewing the result
 
-Gate a PR with an independent reviewer plus `check-code`; add `check-spec` when
-the issue has multiple acceptance bars. Start every gate comment with:
-
+```bash
+velo-gate 1902 --plan       # which gates does this PR need, and why
+velo-gate 1902 --running    # gates dispatched
+velo-gate 1902 --pass       # or --block, once the reviewers report
+velo-merge 1902             # refuses unless gate:passed AND gate sha == head
 ```
-gate: <name> @ <sha>
+
+`--plan` derives the gates from the diff: docs/tooling-only needs none, `src/`
+touched adds `check-code`, a linked issue with 3+ acceptance bars adds
+`check-spec`.
+
+**Gate state is a LABEL** (`gate:none` / `running` / `passed` / `blocked`), so
+"this has not been gated" is visible rather than merely absent. Verifying a PR
+yourself is NOT gating it — that is how an ungated PR gets described as ready.
+
+**Every gate comment starts `gate: <name> @ <sha>`.** A result is only valid
+for the commit it ran against; a PR was once green against a commit that had
+already been replaced. `velo-merge` compares that SHA to `headRefOid` and
+refuses on mismatch.
+
+**Deliver the report yourself.** A reviewer that cannot reach the GitHub API
+produces a good report and then silently fails to post it — indistinguishable
+from a gate that never ran. Have the reviewer RETURN its report, then:
+
+```bash
+velo-gate-post 1902 codex-review report.md      # stamps the header, posts it
+somereviewer | velo-gate-post 1902 check-code -  # or from stdin
 ```
 
-A gate result is only valid for the commit it ran against — a PR's CI was once
-green against a commit that had already been replaced. Comparing that SHA to
-the PR's `headRefOid` is the whole staleness check.
+It refuses an empty report, enforces a lowercase-kebab gate name, defaults the
+SHA to the PR's current head, and warns (rather than back-dating) when you
+record against an older one.
 
 ---
 

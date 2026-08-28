@@ -1,0 +1,41 @@
+{
+  "issue": 1888,
+  "worker": "local",
+  "design": "pinned",
+  "verified_against": "0da059efc",
+  "evidence": "code",
+  "audit": "done:0da059efc",
+  "depends_on": [],
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/join/layout.rs",
+      "symbol": "let canonical = alias.unwrap_or(source);",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/processors/join.rs",
+      "symbol": "JoinLayout::for_relation",
+      "expect": 4,
+      "note": "2 calls at :1268,:1270 plus 2 comment mentions; the check counts text occurrences"
+    }
+  ],
+  "tests": {
+    "fail_to_pass": [],
+    "pass_to_stay": [
+      "l9_prefixed_field_name_call_sites_match_the_allowlist",
+      "unaliased_two_relation_join_agrees_on_names_and_positions"
+    ],
+    "known_red": [
+      "benchmark_three_hop_processor_pipeline"
+    ]
+  },
+  "acceptance": [
+    "an unaliased JOIN side qualified by its source name RESOLVES at runtime - no silent NULL, no skipped SET_HEADER",
+    "the symmetric case is pinned: alias declared => {source}.{field} rejected",
+    "join_operator_phase10f_test.rs's alias workaround revisited"
+  ],
+  "forbidden": [
+    "do not change the layout authority - it already emits the source-name key",
+    "do not emit {source}.{field} when an alias IS declared (an alias hides the source name)"
+  ]
+}
