@@ -111,6 +111,32 @@ gh pr list --repo "$REPO" --state open --limit 10 \
   --jq '.[] | "  #\(.number) \(.mergeable // "?") \((.statusCheckRollup[0].conclusion) // "pending")  \(.title[0:66])"' \
   2>/dev/null || echo "  (gh unavailable)"
 
+# ---- parent efforts ---------------------------------------------------------
+# Most work here belongs to an umbrella issue, signalled by a "[#NNNN]" title
+# prefix. Showing progress against that umbrella answers "how much of this
+# effort is left", which a per-PR view cannot.
+PARENTS=$(gh pr list --repo "$REPO" --state open --json title --jq '.[].title' 2>/dev/null \
+          | grep -oE '^\[#[0-9]+\]' | tr -d '[]#' | sort -u)
+if [[ -n "$PARENTS" ]]; then
+  echo
+  echo "parent efforts:"
+  for P in $PARENTS; do
+    PT=$(gh issue view "$P" --repo "$REPO" --json title,state --jq '"\(.state) \(.title)"' 2>/dev/null)
+    [[ -n "$PT" ]] || continue
+    O=$(gh issue list --repo "$REPO" --search "\"[#$P]\" in:title" --state open   --limit 200 --json number --jq 'length' 2>/dev/null)
+    C=$(gh issue list --repo "$REPO" --search "\"[#$P]\" in:title" --state closed --limit 200 --json number --jq 'length' 2>/dev/null)
+    T=$(( ${O:-0} + ${C:-0} ))
+    if [[ "$T" -gt 0 ]]; then
+      PCT=$(( ${C:-0} * 100 / T ))
+      printf '  #%-5s %3s/%-3s closed (%2s%%)  %s\n' "$P" "${C:-0}" "$T" "$PCT" "${PT:0:56}"
+      # Name what is still open — "9 left" is less useful than which 9.
+      gh issue list --repo "$REPO" --search "\"[#$P]\" in:title" --state open --limit 200 \
+        --json number,title,labels \
+        --jq '.[]|"      #\(.number) \([.labels[].name]|map(select(startswith("worker:")or.=="blocked"or.=="needs-design"))|join(","))  \(.title[0:52])"' 2>/dev/null
+    fi
+  done
+fi
+
 # ---- disk -------------------------------------------------------------------
 AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
 echo
