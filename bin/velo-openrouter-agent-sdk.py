@@ -57,6 +57,61 @@ def fail(message: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+
+# --- skill injection ---------------------------------------------------------
+# Workers run with a fixed `allowed_tools` list and no `setting_sources`, so they
+# have NO Skill tool: a brief that says "/check-code" is inert text to them, and
+# whatever the orchestrator remembers of the skill gets hand-copied into the
+# brief instead — differently every time. So resolve the skill file here and
+# prepend its CONTENT, and let the brief carry only the scope.
+SKILL_SEARCH = (
+    "{home}/.agents/skills/{name}/SKILL.md",
+    "{home}/.claude/skills/{name}/SKILL.md",
+    "{home}/.claude/commands/{name}.md",
+)
+
+_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+
+
+def resolve_skill(name: str) -> tuple[str, str]:
+    """Return (path, body) for a skill, or fail loudly.
+
+    Failing loudly matters: a silently-missing skill produces a review that
+    looks like it ran a gate and did not.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        fail(f"invalid skill name '{name}' (expected lowercase-kebab)")
+    home = str(pathlib.Path.home())
+    tried = []
+    for tpl in SKILL_SEARCH:
+        p = pathlib.Path(tpl.format(home=home, name=name))
+        tried.append(str(p))
+        if p.is_file():
+            body = _FRONTMATTER_RE.sub("", p.read_text(errors="replace")).strip()
+            if not body:
+                fail(f"skill '{name}' resolved to an empty file: {p}")
+            return str(p), body
+    fail("skill '" + name + "' not found. Tried:\n  " + "\n  ".join(tried))
+    raise AssertionError("unreachable")
+
+
+def apply_skills(task: str, names: list[str]) -> str:
+    if not names:
+        return task
+    blocks = []
+    for name in names:
+        path, body = resolve_skill(name)
+        print(f"  skill: /{name} <- {path} ({len(body)} chars)", file=sys.stderr)
+        blocks.append(
+            f"=== SKILL: /{name} ===\n"
+            f"You do NOT have a Skill tool. The full definition of /{name} is\n"
+            f"inlined below; follow it as written for the scope given after it.\n\n"
+            f"{body}\n"
+            f"=== END SKILL: /{name} ===\n"
+        )
+    return "\n".join(blocks) + "\n\n=== SCOPE ===\n" + task
+
+
 def git_output(root: pathlib.Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -590,6 +645,17 @@ def main() -> None:
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--task", required=True)
     parser.add_argument(
+        "--skill",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Inline a skill definition ahead of the task (repeatable, or "
+            "comma-separated). Resolved from ~/.agents/skills/<n>/SKILL.md, "
+            "~/.claude/skills/<n>/SKILL.md, then ~/.claude/commands/<n>.md."
+        ),
+    )
+    parser.add_argument(
         "--base-url",
         default=os.environ.get("CODEANY_BASE_URL", DEFAULT_BASE_URL),
         help=f"OpenAI-compatible provider base URL (default: {DEFAULT_BASE_URL})",
@@ -673,6 +739,8 @@ def main() -> None:
     if not api_key:
         fail("OPENROUTER_API_KEY (or CODEANY_API_KEY) is not set")
 
+    skills = [n for item in args.skill for n in item.split(",") if n.strip()]
+
     root = pathlib.Path(args.cwd).expanduser().resolve()
     policy_path = pathlib.Path(args.policy).expanduser().resolve()
 
@@ -688,7 +756,7 @@ def main() -> None:
             model=args.model,
             root=root,
             policy=policy,
-            task=args.task,
+            task=apply_skills(args.task, skills),
             api_key=api_key,
             base_url=args.base_url,
             max_turns=args.max_turns,

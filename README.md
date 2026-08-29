@@ -14,6 +14,9 @@ and the tests** — never from the worker's self-report.
 
 ```
 .agents/
+  install.sh                       repo -> ~/.agents (idempotent; --check reports drift)
+  update.sh                        ~/.agents -> repo (recover live edits before committing)
+  CHANGELOG.md                     what changed, and the failure each change prevents
   bin/
     velo-dispatch                  validate a ticket, prep the worktree, launch a worker
     velo-status                    one-shot state of every dispatched worker
@@ -30,6 +33,8 @@ and the tests** — never from the worker's self-report.
     velo-deepseek/SKILL.md         orchestrator-facing routing + usage
     velo-glm/SKILL.md
     velo-local/SKILL.md
+    check-code/SKILL.md            review skills, inlined into a worker via --skill
+    check-spec/SKILL.md
   tasks/
     SCHEMA.md                      task-spec format
     <issue>.json                   per-issue machine-checkable spec
@@ -37,21 +42,36 @@ and the tests** — never from the worker's self-report.
 
 ## Installation
 
-The tooling is used from `~/.agents/`; this directory is the versioned source.
+The tooling runs from `~/.agents/`; this directory is the versioned source.
 
 ```bash
-mkdir -p ~/.agents ~/.claude/skills
-cp -R .agents/bin .agents/rules .agents/skills ~/.agents/
-chmod +x ~/.agents/bin/*        # every script, not a hand-listed subset
-
-# make the skills visible to Claude Code
-for s in velo-deepseek velo-glm velo-local; do
-  mkdir -p ~/.claude/skills/$s
-  ln -sf ~/.agents/skills/$s/SKILL.md ~/.claude/skills/$s/SKILL.md
-done
-
+./.agents/install.sh
 export PATH="$HOME/.agents/bin:$PATH"      # add to ~/.zshrc
 ```
+
+Idempotent — re-run after every pull. It copies `bin/`, `rules/`, `skills/` and
+`tasks/`, `chmod +x`es **every** script (a hand-listed subset misses new ones and
+fails at dispatch time), and symlinks the orchestrator skills into
+`~/.claude/skills`.
+
+```bash
+./.agents/install.sh --check    # report drift, change nothing
+```
+
+`--check` reports drift in **both** directions and says which it is. A file newer
+in `~/.agents` than in the repo is unpushed work, and installing over it loses
+it — so recover it first:
+
+```bash
+./.agents/update.sh --dry-run   # what would come back
+./.agents/update.sh             # copy live -> repo, then review the diff and commit
+```
+
+**`~/.agents/` is what actually runs; this directory is the source of truth.**
+Edit here, then `install.sh`. If you edited live during a debugging session, run
+`update.sh` before anything else. Add a `CHANGELOG.md` entry naming the failure
+the change prevents — if you cannot name one, the change probably is not worth
+carrying.
 
 ### Requirements
 
@@ -140,6 +160,35 @@ not dangerous — just slower and noisier.
   ok brief satisfies the spec checklist
   ok disk: 223GB free
 ```
+
+### Running a review skill in a worker — `--skill`
+
+Workers run with a fixed `allowed_tools` list and no `setting_sources`, so they
+have **no Skill tool**: a brief saying "run /check-code" is inert text to them.
+`--skill` resolves the skill file and inlines its content ahead of the task.
+
+```bash
+velo-openrouter-agent --model z-ai/glm-5.3-flash --skill check-code --skill check-spec \
+  --policy ~/.agents/rules/velo-impl.md --cwd ~/RustroverProjects/velostream-1883 \
+  --task "$(cat scope.txt)"
+```
+
+Resolution order, first hit wins:
+
+```
+~/.agents/skills/<name>/SKILL.md
+~/.claude/skills/<name>/SKILL.md
+~/.claude/commands/<name>.md
+```
+
+YAML frontmatter is stripped. A missing skill is a hard error naming every path
+tried — a silently-absent skill yields a review that looks like it ran a gate
+and did not.
+
+**The brief then carries only the scope**: the PR, the worktree, what the change
+does, and the few questions the diff alone will not answer. Restating the review
+dimensions in the brief is the anti-pattern this replaces — it drifted between
+dispatches, and it drifted away from the skill.
 
 ### 5. Watch, then **verify from git**
 
@@ -258,7 +307,8 @@ record against an older one.
 |---|---|
 | worker dies mid-run, no error in its log | disk full. `df -h`; `rm -rf <merged-worktree>/target` |
 | run ends `exceeded 1800s` | raise `--prompt-timeout`; ensure the brief mandates incremental commits |
-| `leaked_tool_calls=N` | model emitted a tool call as text; it never ran. Report is untrustworthy — re-run, keep quoting simple |
+| `leaked_tool_calls=N` | model emitted a tool call as text; it never ran. Report is untrustworthy — re-run, keep quoting simple. Backticks in the brief are a known trigger on DeepSeek |
+| review brief restates the review checklist | use `--skill`; a hand-copied checklist drifts from the skill it was copied from |
 | runner says "no worktree changes" but work exists | fixed: the snapshot now includes `HEAD`, so a commit counts as a change |
 | reviewer returns a report but nothing appears on the PR | its sandbox could not reach api.github.com. Reviewers should RETURN the report; relay it with `velo-gate-post` |
 | `velo-merge` refuses with `CI is 'SKIPPED'` | fixed: it evaluates ALL checks now. Optional lanes report SKIPPED and used to mask a green required build |
