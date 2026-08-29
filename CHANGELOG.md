@@ -8,6 +8,29 @@ Newest first.
 
 ## 2026-08-29
 
+### Added — `velo-status` summarises each worktree's `agent.log`
+The STATE column reads **processes**, so it reported `idle`/`running` and
+nothing else. Two things went wrong because of that.
+
+A worker wedged mid-validation — alive, but its Bash call never returned — and
+showed as `running` for ~11 minutes before anyone noticed. And the reasoning
+trail workers are required to keep was never surfaced at all, so state got
+re-derived from `git` and task notifications when `agent.log` already had it,
+better organised: six revert-then-restore proofs with their assertion texts, a
+self-caught fabricated-timestamp correction, and a data-loss incident.
+
+New `AGENT-LOG` column: line count, age of the **last entry**, and flags —
+`S`=STOP, `F`=FINDING, `C`=CORRECTION, `!`=SECURITY/DATA-LOSS.
+
+- Age comes from the last UTC stamp **in the file**, not the file mtime: an
+  agent can touch the log without progressing, and mtime would call that fresh.
+- It reads `<worktree>/agent.log`, not the runner's `/tmp` stdout. The first cut
+  read the wrong file and reported `-` for a worktree holding a 30KB trail —
+  caught by running it, not by reading it.
+- Yellow when a worker is alive but its log has not moved in 10m+: wedged, **or**
+  not writing the ~10-minute heartbeats the policy requires. Both leave this
+  view blind to progress, so both are worth colouring.
+
 ### Fixed — `velo-merge` could never merge a docs-only PR
 `ci.yml` carries `paths-ignore: ['docs/**', '*.md', …]`, so a documentation
 change triggers no lane at all. `velo-merge` treated "no CI checks" as
