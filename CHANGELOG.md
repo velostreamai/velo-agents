@@ -8,6 +8,27 @@ Newest first.
 
 ## 2026-08-29
 
+### Fixed — `velo-merge` could never merge a docs-only PR
+`ci.yml` carries `paths-ignore: ['docs/**', '*.md', …]`, so a documentation
+change triggers no lane at all. `velo-merge` treated "no CI checks" as
+`die "nothing has verified this build"` — a guard that was unsatisfiable by
+construction for exactly the PRs it fired on.
+
+Worse, `--force` did not help: the `case "$CI"` block dies before `--force` is
+consulted, so the only route left was merging by hand, which skips the gate
+label, the stale-gate SHA check and the conflict check as well. A guard that
+cannot be satisfied does not add safety; it routes people around every other
+guard.
+
+Now a `none` CI result warns for a docs/tooling-only PR (no `src/`, no `tests/`)
+and still dies for a code PR, where "no CI" genuinely means something is wrong.
+The warning says plainly that nothing automated verified the change and the PR
+body must state what did.
+
+Found while merging #1924. Related: #1925 — 1168 ```sql blocks across 60 doc
+files are parsed by nothing, which is why a docs PR has no automated
+verification to point at in the first place.
+
 ### Added — `install.sh`, `update.sh`, this changelog
 The README described installation as a block of `cp` commands to run by hand.
 Two things went wrong with that. A partial copy left a runner and its policy on

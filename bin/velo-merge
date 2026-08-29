@@ -21,6 +21,7 @@ set -uo pipefail
 REPO="velostreamai/velostream"
 die()  { printf '\n\033[31mREFUSING TO MERGE:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
 PR="${1:-}"; FORCE=0
 [[ "${2:-}" == "--force" ]] && FORCE=1
@@ -56,7 +57,20 @@ case "$CI" in
   SUCCESS) ok "CI green on current head: $PASSED" ;;
   FAILING) die "CI FAILING against $SHORT: $FAILED" ;;
   pending) die "CI still pending against $SHORT: $PENDING" ;;
-  none)    die "no CI checks reported against $SHORT — nothing has verified this build." ;;
+  none)
+    # No lane ran. For a docs/tooling-only PR that is BY DESIGN — ci.yml carries
+    # `paths-ignore: ['docs/**', '*.md', …]`, so a docs change triggers nothing
+    # and this guard could never be satisfied. Dying here made docs PRs
+    # permanently unmergeable through this tool, which just pushes people to
+    # merge by hand and skip every other check as well.
+    #
+    # Code changes still die: there, "no CI" means something is wrong.
+    if [[ "$CODE" -eq 0 ]]; then
+      warn "no CI checks — expected for a docs/tooling-only PR (ci.yml paths-ignore). Nothing automated has verified this; the PR body must say what did."
+    else
+      die "no CI checks reported against $SHORT — nothing has verified this build."
+    fi
+    ;;
 esac
 
 if [[ "$CODE" -eq 0 ]]; then
