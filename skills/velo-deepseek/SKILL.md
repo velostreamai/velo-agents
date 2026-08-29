@@ -74,8 +74,15 @@ Use:
 ## Invocation — use `velo-dispatch`, do not hand-roll
 
 ```bash
-velo-dispatch <issue> <brief-file> [--branch <name>] [--dry-run] [--force]
+velo-dispatch <issue> <brief-file> --dry-run   # ALWAYS first — validates, launches nothing
+velo-dispatch <issue> <brief-file> [--branch <name>] [--force]
 ```
+
+Dry-run first, every time. It runs the full gate set — issue state, labels,
+task-spec anchors, computed blast radius, brief completeness, disk — without
+creating a worktree or launching anything. Brief defects (a missing STOP
+condition, no grammar reference on a task that writes SQL) surface there
+instead of through a failed dispatch.
 
 `~/.agents/bin/velo-dispatch` validates the ticket, prepares the worktree off
 current `origin/master`, assigns the issue at dispatch time, and launches the

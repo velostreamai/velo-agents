@@ -113,11 +113,21 @@ blast-radius checks and injects acceptance criteria into the brief.
 Must satisfy `rules/velo-brief-spec.md`. `velo-dispatch` checks for the required
 sections and names any that are missing.
 
-### 4. Dispatch
+### 4. Check the brief FIRST, then dispatch
 
 ```bash
-velo-dispatch 1898 /tmp/brief-1898.txt
+velo-dispatch 1898 /tmp/brief-1898.txt --dry-run   # validates everything, launches nothing
+velo-dispatch 1898 /tmp/brief-1898.txt             # only after the dry run is clean
 ```
+
+**Always dry-run first.** It runs every gate — issue state, labels, task-spec
+anchors, computed blast radius, brief completeness, disk — and creates no
+worktree, assigns nothing, launches nothing. A brief that is missing a STOP
+condition or a grammar reference is caught here rather than by a wasted
+dispatch attempt.
+
+The gates refuse before any side effect either way, so skipping the dry run is
+not dangerous — just slower and noisier.
 
 ```
 ── validating #1898 ─────────────────────────────────

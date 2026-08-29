@@ -1,0 +1,45 @@
+{
+  "issue": 1769,
+  "worker": "deepseek",
+  "design": "pinned",
+  "verified_against": "2f2f358ad",
+  "evidence": "code",
+  "audit": "done:2f2f358ad",
+  "depends_on": [],
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/stream_record/view.rs",
+      "symbol": "strip_counters::record_view_strip();",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/stream_record/accessors_record.rs",
+      "symbol": "strip_counters::record_accessors_strip();",
+      "expect": 1
+    }
+  ],
+  "blast_radius": {
+    "pattern": "\\.resolve_column(",
+    "files": 10,
+    "refs": 26,
+    "note": "3 in src/, 23 in tests/ \u2014 deletion touches src/ only, but tests exercise it widely"
+  },
+  "tests": {
+    "fail_to_pass": [],
+    "pass_to_stay": [
+      "p4_4a_measure_bare_name_strip_firings"
+    ],
+    "known_red": [
+      "benchmark_three_hop_processor_pipeline"
+    ]
+  },
+  "acceptance": [
+    "a qualified reference never resolves to a different relation's column at runtime",
+    "view_strip and accessors_strip counters are structurally unreachable after deletion",
+    "no new per-record cost on the resolved path"
+  ],
+  "forbidden": [
+    "do not change resolve_column's return type without reporting first",
+    "do not delete the strip before the counter test proves it never fires"
+  ]
+}
