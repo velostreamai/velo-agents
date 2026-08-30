@@ -145,6 +145,22 @@ done
 
 [[ $FOUND -eq 1 ]] || { echo "no velostream-* worktrees found"; exit 0; }
 
+# Stale stashes are a trap for the next worker, and stashes are REPO-GLOBAL:
+# every worktree shares one stash stack. A worker that runs `git stash pop`
+# expecting its own entry pops whichever abandoned run left the top one.
+# That happened on #1928 — the worker popped an unrelated
+# `1748-v1-overrejects` stash into its tree, hit a conflict in a file it had
+# never touched, and spent the recovery diagnosing someone else's work.
+STASHES=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$STASHES" -gt 0 ]]; then
+  echo
+  printf '%bwarn:%b %s stale stash entr%s on the SHARED stack — a worker running `git stash pop`\n' \
+    "$YEL" "$OFF" "$STASHES" "$([[ "$STASHES" == 1 ]] && echo y || echo ies)"
+  echo "      will pop whichever is on top, not its own. Clear them or brief workers not to stash."
+  git stash list 2>/dev/null | head -3 | sed 's/^/      /'
+  [[ "$STASHES" -gt 3 ]] && echo "      ... and $((STASHES - 3)) more"
+fi
+
 echo
 echo "${YEL}n!${OFF} = commits not yet pushed   ${RED}LEAKED${OFF} = tool calls emitted as text, never ran"
 echo "AGENT-LOG = lines, age of last entry, flags: S=STOP  F=FINDING  C=CORRECTION  ${RED}!${OFF}=SECURITY/DATA-LOSS"

@@ -6,6 +6,99 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+## 2026-08-30
+
+### Fixed — `velo-pr-gate` scoped re-reviews to the wrong range, two ways
+The review range is derived from the last recorded `gate: … @ <sha>` comment so
+a re-review sees only the delta. Both halves of that were broken.
+
+The pattern matched the literal string `codex-review`. On PR #1929 Codex could
+not run at all — its wrapper only forwards to a background task it cannot poll,
+and it returned a handle instead of a report — so the review was done by a
+declared substitute and recorded as `gate: code-review @ …`. The pattern missed
+it, `GSHA` came back empty, and the range silently widened to the entire branch.
+The reviewer would have re-derived several hundred lines already cleared and
+reported them as new findings. Now matches any `*review` gate name.
+
+Second, a recorded sha can be **orphaned by a rebase**: the review genuinely
+happened, but its commit is no longer an ancestor of HEAD, so `$GSHA..$HEAD`
+replays every rebased commit as unreviewed. The reviewer on #1929 spotted
+exactly this and said so in its scope note — the tooling could not. Now checks
+`merge-base --is-ancestor` and warns loudly before falling back, instead of
+handing over a range that quietly means something other than "the delta".
+
+Both failures are silent and both produce a review that looks fine, which is
+the reason they are worth a row here.
+
+### Fixed — `velo-dispatch` validated a different tree than the worker gets
+Anchors and blast radius are read from the WORKING TREE, but the worker's
+worktree is cut off `origin/master`. The `git fetch` lived AFTER validation, so
+a stale checkout could not even be detected: validation measured code the
+worker would never see, and passed or failed for the wrong reason.
+
+Dispatching #1934 hit both halves. Anchors reported a test file MISSING because
+the merge that added it was not checked out locally, and the declared blast
+radius was off by 6 because that same merge added 6 refs. Both looked like
+brief errors. Neither was — the brief was right and the checkout was stale.
+
+The fetch moves to before validation, and dispatch now refuses outright when
+HEAD is not `origin/master`, naming how far behind or ahead and the exact
+`git pull` to run. Verified both ways: passes at `origin/master`, and fires
+with the right message from `HEAD~1`.
+
+### Added — `velo-status` warns about stale stashes on the SHARED stack
+Stashes are repo-global: every worktree shares one stack. A worker that runs
+`git stash pop` expecting its own entry pops whichever abandoned run left the
+top one.
+
+That happened on #1928. The worker popped an unrelated
+`1748-v1-overrejects` stash into its tree, hit a conflict in
+`pian/column_resolution.rs` — a file it had never touched — and spent its
+recovery diagnosing someone else's work. Ten such entries are on the stack
+right now, the oldest from July.
+
+Nothing surfaced them, so each new worker rediscovers the trap. The footer now
+lists the count and the top three.
+
+### Added — `velo-pr-gate` says what to do when Codex returns a handle
+The script routes `code-review` to Codex and prints a brief for the caller to
+run. On #1929 Codex never ran: its wrapper forwards to a single background task
+it cannot poll, and it returned "waiting for the background task to complete"
+having reviewed nothing. Asked again, it said it could not inspect the repo,
+read the brief, or retrieve its own task's output.
+
+A handle is indistinguishable from a report to anyone not reading closely, and
+recording one as a gate result is a green tick over an unrun gate. The script
+now says so, and says that substituting another reviewer is fine provided the
+substitution is DECLARED in the gate comment — an unrun gate is worse than a
+substituted one, but a mislabelled reviewer is its own defect.
+
+### Removed — the `VELO_AGENT_IMPL=legacy` escape hatch, which could not work
+`velo-openrouter-agent` exec'd `velo-openrouter-agent.py` when that variable
+was set. That runner is untracked, and its first act is
+`from velo_context import ...` — a module living in `~/.claude/lib/`, not on
+the runner's import path. Running it gives
+`ModuleNotFoundError: No module named 'velo_context'`. Verified by executing it.
+
+Both worker skills already say "Do not set `VELO_AGENT_IMPL`". So it was a
+fallback that was documented as forbidden AND broken if used: someone hitting
+an SDK problem would set it expecting relief and get a confusing import error.
+A fallback that cannot run is worse than none — one path, per the project's
+no-silent-fallback rule.
+
+### Added — three skills that were live but untracked
+`improve-codebase-architecture`, `pr-gate` and `velo-implementation` existed in
+`~/.agents/skills/` and were absent from the repo, so `install.sh` on a fresh
+clone would not produce them and `install.sh --check` reported permanent drift.
+The repo is supposed to describe what actually runs.
+
+### Fixed — `.bak` files next to tracked scripts are gitignored
+`.agents/bin/` held `velo-local-agent.py.bak`, `velo-openrouter-agent.py.bak`,
+`.bak1` and `.BAK` — untracked, sitting beside tracked scripts. A `git add -A`
+while staging a real fix swept all of them into the index, and they were only
+caught by reading `git status` before committing. A bare `.bak` is against
+policy anyway (backups carry a UTC timestamp).
+
 ## 2026-08-29
 
 ### Added — `velo-status` summarises each worktree's `agent.log`

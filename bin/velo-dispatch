@@ -99,6 +99,33 @@ case "$WORKERS" in
 esac
 ok "routed to $NAME"
 
+# ---- 3a. the checkout must BE origin/master before anything is measured -----
+#
+# Anchors and blast radius are read from the WORKING TREE, but the worker's
+# worktree is cut off `origin/master` (section 6). If the local checkout is
+# behind, validation measures a tree the worker will never see: anchors resolve
+# against stale code, and the blast-radius count is taken over the wrong file
+# set. Both then "pass" while describing something else.
+#
+# The fetch used to live in section 6 — AFTER validation — so this could not
+# even be detected. Dispatching #1934 hit both halves: anchors reported a test
+# file MISSING because the merge that added it was not checked out, and the
+# declared blast radius was off by 6 because the same merge added 6 refs. Both
+# looked like brief errors; neither was.
+git -C "$ROOT" fetch -q origin || die "git fetch failed"
+LOCAL_HEAD=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)
+ORIGIN_HEAD=$(git -C "$ROOT" rev-parse origin/master 2>/dev/null)
+if [[ "$LOCAL_HEAD" != "$ORIGIN_HEAD" ]]; then
+  BEHIND_N=$(git -C "$ROOT" rev-list --count HEAD..origin/master 2>/dev/null || echo "?")
+  AHEAD_N=$(git -C "$ROOT" rev-list --count origin/master..HEAD 2>/dev/null || echo "?")
+  die "checkout is not at origin/master (behind $BEHIND_N, ahead $AHEAD_N).
+  Anchors and blast radius are measured from THIS tree, but the worker gets a
+  worktree cut off origin/master — so validation would describe code the worker
+  never sees, and pass or fail for the wrong reason.
+    git -C $ROOT pull --ff-only origin master"
+fi
+ok "checkout is at origin/master ($(git -C "$ROOT" rev-parse --short HEAD))"
+
 # ---- 3b. task spec sidecar (authoritative when present) ---------------------
 SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
 if [[ -f "$SPEC" ]]; then
@@ -208,7 +235,7 @@ ok "disk: ${AVAIL}GB free"
 [[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
 WT="$WORKTREE_BASE/velostream-$ISSUE"
 
-git -C "$ROOT" fetch -q origin || die "git fetch failed"
+# (fetch already done in section 3a, before anchors were measured)
 BASE=$(git -C "$ROOT" rev-parse --short origin/master)
 
 if [[ $DRY -eq 1 ]]; then

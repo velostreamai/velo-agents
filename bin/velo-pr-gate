@@ -89,9 +89,30 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # back as a task handle, and another that wrote into a live PR worktree.
   BASE=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null)
   HEAD=$(git -C "$WTPATH" rev-parse --short HEAD 2>/dev/null)
+  # Match ANY review gate, not just 'codex-review'. The old pattern was literal,
+  # so a review recorded under any other name — including a declared substitute
+  # when Codex was unavailable — left GSHA empty and the range silently widened
+  # to the whole branch. A reviewer then re-derives everything already cleared
+  # and reports it as new. Silent, and it wastes the expensive gate.
   GSHA=$(gh pr view "$PR" --repo "$REPO" --json comments \
-          --jq '[.comments[].body | capture("gate: *codex-review *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
-  [[ "$GSHA" == "null" || -z "$GSHA" ]] && RANGE="origin/$BASE...HEAD" || RANGE="$GSHA..$HEAD"
+          --jq '[.comments[].body | capture("gate: *[a-z0-9-]*review *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
+
+  # A recorded sha can be ORPHANED by a rebase: the review really happened, but
+  # its commit is no longer an ancestor of HEAD, so `$GSHA..$HEAD` replays every
+  # rebased commit as if unreviewed. Verify reachability and say so out loud
+  # rather than handing the reviewer a range that quietly means something else.
+  if [[ "$GSHA" != "null" && -n "$GSHA" ]]; then
+    if git -C "$WTPATH" merge-base --is-ancestor "$GSHA" HEAD 2>/dev/null; then
+      RANGE="$GSHA..$HEAD"
+    else
+      warn "last recorded gate sha $GSHA is NOT an ancestor of $HEAD — orphaned by a rebase."
+      warn "Falling back to the full branch range; the reviewer will re-derive cleared work."
+      warn "If that is wasteful, re-record a gate against a live sha first."
+      RANGE="origin/$BASE...HEAD"
+    fi
+  else
+    RANGE="origin/$BASE...HEAD"
+  fi
 
   # An empty range is a review of nothing, and it comes back "approve" — a
   # vacuous gate wearing a green tick. Refuse instead. This fires when the last
@@ -154,6 +175,15 @@ EOF
   warn "code-review is NOT dispatched by this script — it is an Agent call."
   ok "brief generated: $OUT   (diff range: $RANGE)"
   echo "  Fill in the ATTACK section, then run it as a Codex agent."
+  echo
+  echo "  If Codex returns a task handle instead of a report, it did NOT review."
+  echo "  Its wrapper forwards to one background task it cannot poll, so it can"
+  echo "  come back with 'waiting for the background task' having reviewed nothing."
+  echo "  Observed on #1929. Do not record that as a gate result."
+  echo
+  echo "  Substituting another reviewer is fine — an unrun gate is worse than a"
+  echo "  substituted one — but DECLARE the substitution in the gate comment, so"
+  echo "  the label does not imply a reviewer that never ran."
   echo
   echo "  Then relay every report and record the verdict:"
   echo "    velo-gate-post $PR codex-review <report>"

@@ -3,12 +3,18 @@ set -euo pipefail
 
 SDK_PY="/Users/neilavery/.venvs/velo-openrouter-agent/bin/python"
 SDK_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent-sdk.py"
-LEGACY_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent.py"
 
-if [[ "${VELO_AGENT_IMPL:-sdk}" == "legacy" ]]; then
-  echo "[velo-openrouter-agent] implementation=legacy" >&2
-  exec "$LEGACY_AGENT" "$@"
-else
-  echo "[velo-openrouter-agent] implementation=sdk" >&2
-  exec "$SDK_PY" "$SDK_AGENT" "$@"
-fi
+# The `VELO_AGENT_IMPL=legacy` escape hatch was REMOVED — it could not work.
+#
+# It exec'd `velo-openrouter-agent.py`, a pre-SDK runner that is untracked and
+# whose first act is `from velo_context import ...`. That module lives in
+# `~/.claude/lib/`, which is not on the runner's import path, so the branch
+# died with `ModuleNotFoundError: No module named 'velo_context'` — verified by
+# running it. Both worker skills also instruct "Do not set VELO_AGENT_IMPL".
+#
+# So it was a fallback that was documented as forbidden AND broken if used:
+# someone hitting an SDK problem would set it expecting relief and get a
+# confusing import error instead. A fallback that cannot run is worse than no
+# fallback. One path, per the project's no-silent-fallback rule.
+echo "[velo-openrouter-agent] implementation=sdk" >&2
+exec "$SDK_PY" "$SDK_AGENT" "$@"

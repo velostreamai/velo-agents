@@ -23,9 +23,13 @@ Always invoke:
 
     ~/.agents/bin/velo-openrouter-agent
 
-Do not set `VELO_AGENT_IMPL`.
-Do not invoke the legacy worker directly.
+Do not invoke a legacy worker directly.
 Do not switch worker implementations as a fallback.
+
+(The `VELO_AGENT_IMPL=legacy` escape hatch has been REMOVED — it exec'd a
+pre-SDK runner whose `velo_context` import could not resolve, so it failed with
+`ModuleNotFoundError` rather than falling back to anything. Setting that
+variable now does nothing.)
 
 If the SDK worker fails, returns no implementation, or exits prematurely:
 1. diagnose the SDK worker failure;
@@ -191,9 +195,8 @@ task context. Name the exact files and symbols it may edit. Ask it to make the
 change, run only the focused tests needed for that issue, and return a final
 report.
 
-The primary orchestrator must not set `VELO_AGENT_IMPL`, must not use the
-legacy worker, and must not implement the patch itself unless the user
-explicitly asks. After Stage 2, it must review the diff and reported
+The primary orchestrator must not use a legacy worker, and must not
+implement the patch itself unless the user explicitly asks. After Stage 2, it must review the diff and reported
 validation before considering the issue complete.
 
 ---
