@@ -1,0 +1,161 @@
+#!/bin/bash
+# velo-pr-gate — run every gate a PR needs, each on the right model.
+#
+#   velo-pr-gate <pr> <scope-file>     dispatch the local gates, print the rest
+#   velo-pr-gate <pr> --plan           show what would run, dispatch nothing
+#
+# Why this exists: `velo-gate --plan` says WHICH gates a PR needs, but nothing
+# said which MODEL runs each. Left to judgement, the routing drifted — reviews
+# went to a worker whose single review returned MERGE-READY while missing a HIGH
+# and asserting a false fact, and implementation jumped straight to the most
+# expensive tier without trying the one designed for it.
+#
+# The routing, and the evidence for it:
+#
+#   code-review  -> Codex      adversarial; found a real defect in EVERY round it
+#                              ran, including against designs the orchestrator had
+#                              pinned and code the orchestrator wrote
+#   check-code   -> velo-local free; fine at mechanical dimension-checking
+#   check-spec   -> velo-local free; fine at bar-by-bar verification
+#
+# Codex cannot be launched from a shell — it is an Agent call — so this script
+# dispatches the local gates and prints the Codex brief for the caller to run.
+# That asymmetry is deliberate: the expensive gate stays a conscious act.
+
+set -uo pipefail
+REPO="velostreamai/velostream"
+die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+
+PR="${1:-}"; SCOPE="${2:-}"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> | <pr> --plan"
+
+PLAN=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null) || die "PR #$PR not found"
+echo "$PLAN"
+echo
+
+NEEDS_REVIEW=0; NEEDS_CODE=0; NEEDS_SPEC=0
+grep -q 'code-review' <<<"$PLAN" && NEEDS_REVIEW=1
+grep -q 'check-code'  <<<"$PLAN" && NEEDS_CODE=1
+grep -q 'check-spec'  <<<"$PLAN" && NEEDS_SPEC=1
+
+if grep -q 'none —' <<<"$PLAN"; then
+  ok "no gates required — docs/tooling only"
+  exit 0
+fi
+
+if [[ "$SCOPE" == "--plan" ]]; then
+  echo "would dispatch:"
+  [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> velo-local"
+  [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
+  [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> Codex  (Agent call, run by the caller)"
+  exit 0
+fi
+
+[[ -f "$SCOPE" ]] || die "scope file not found: $SCOPE
+  It carries what the diff cannot say: what the change does, and the few
+  questions a reviewer should spend effort on. Without it a gate reports
+  dimensions rather than findings."
+
+WT=$(gh pr view "$PR" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null)
+[[ -n "$WT" ]] || die "could not read head branch for #$PR"
+WTPATH=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$WT" '
+  /^worktree /{p=$2} /^branch /{if($2==b) print p}' | head -1)
+[[ -n "$WTPATH" ]] || die "no local worktree checked out on '$WT' — a gate must read the tree it reviews"
+
+ok "worktree: $WTPATH"
+~/.agents/bin/velo-gate "$PR" --running >/dev/null 2>&1 && ok "gate:running"
+
+PY=/Users/neilavery/.venvs/velo-openrouter-agent/bin/python
+RUNNER=/Users/neilavery/.agents/bin/velo-lmstudio-agent-sdk.py
+POLICY=/Users/neilavery/.agents/rules/velo-impl.md
+
+dispatch_local() {  # $1 = skill, $2 = log suffix
+  local skill="$1" log="/tmp/gate-${PR}-$2.log"
+  nohup "$PY" "$RUNNER" --policy "$POLICY" --skill "$skill" \
+      --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
+      --task "$(cat "$SCOPE")" > "$log" 2>&1 &
+  ok "$skill -> velo-local (pid $!)  log: $log"
+}
+
+[[ $NEEDS_CODE -eq 1 ]] && dispatch_local check-code code
+[[ $NEEDS_SPEC -eq 1 ]] && dispatch_local check-spec spec
+
+if [[ $NEEDS_REVIEW -eq 1 ]]; then
+  # Generate the review brief. Everything that is invariant is written HERE, so
+  # it is byte-identical on every run; only the judgement section is left blank.
+  # Hand-writing the whole brief each time is what produced a review that came
+  # back as a task handle, and another that wrote into a live PR worktree.
+  BASE=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null)
+  HEAD=$(git -C "$WTPATH" rev-parse --short HEAD 2>/dev/null)
+  GSHA=$(gh pr view "$PR" --repo "$REPO" --json comments \
+          --jq '[.comments[].body | capture("gate: *codex-review *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
+  [[ "$GSHA" == "null" || -z "$GSHA" ]] && RANGE="origin/$BASE...HEAD" || RANGE="$GSHA..$HEAD"
+
+  # An empty range is a review of nothing, and it comes back "approve" — a
+  # vacuous gate wearing a green tick. Refuse instead. This fires when the last
+  # review already ran at the current head, i.e. nothing new has landed yet.
+  if [[ -z "$(git -C "$WTPATH" diff --name-only $RANGE 2>/dev/null)" ]]; then
+    warn "diff range $RANGE is EMPTY — nothing has landed since the last review."
+    warn "Not generating a review brief: reviewing an empty diff yields a vacuous approve."
+    echo "  Wait for the worker to push, then re-run."
+    exit 0
+  fi
+
+  OUT="/tmp/gate-${PR}-review-brief.md"
+  cat > "$OUT" <<EOF
+READ-ONLY review. Return the report as your final message — plain text, NOT a
+task handle. Do NOT write or modify any file: this is a live PR worktree and a
+previous run wrote into one, then stalled without delivering.
+
+WORKTREE: $WTPATH (head $HEAD)
+
+    git -C $WTPATH diff $RANGE
+    gh pr view $PR --repo $REPO --comments
+
+SCOPE: exactly that range. $( [[ "$RANGE" == *".."* && "$RANGE" != *"..."* ]] && echo "Everything below $GSHA you have already reviewed and cleared — do not re-derive it." || echo "This is the first review of this PR." )
+
+--- WHAT IT DOES -------------------------------------------------------------
+$(cat "$SCOPE")
+--- END SCOPE ----------------------------------------------------------------
+
+## ATTACK
+
+<<< FILL THIS IN — the specific things worth this reviewer's effort. >>>
+<<< A generic checklist produces a generic review. Name the shapes that would  >>>
+<<< actually break this change, and any claim the author made that rests on    >>>
+<<< reasoning rather than evidence.                                            >>>
+
+## Also confirm
+
+- no src/ file touched unless the change is meant to touch src/
+- cargo fmt --all -- --check is clean
+- any ratchet, floor or manifest in the diff still holds
+
+IGNORE Kafka/integration failures — a known broker container-lifecycle race,
+unrelated, passes in isolation.
+
+OUTPUT — plain text, final message:
+
+## Codex review — PR $PR @ $HEAD
+**Verdict:** approve | approve-with-findings | blocked
+
+### Findings
+Severity, file:line, the claim, and a concrete failure scenario. Say whether you
+REPRODUCED it or it is reasoning-only.
+
+### Refutation attempts that FAILED
+
+Mark anything unverifiable as UNVERIFIED. Be brief — a short report with two
+real findings beats a long one with eight speculative ones.
+EOF
+  echo
+  warn "code-review is NOT dispatched by this script — it is an Agent call."
+  ok "brief generated: $OUT   (diff range: $RANGE)"
+  echo "  Fill in the ATTACK section, then run it as a Codex agent."
+  echo
+  echo "  Then relay every report and record the verdict:"
+  echo "    velo-gate-post $PR codex-review <report>"
+  echo "    velo-gate $PR --pass | --block"
+fi

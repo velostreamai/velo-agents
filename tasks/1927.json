@@ -1,0 +1,49 @@
+{
+  "issue": 1927,
+  "worker": "local",
+  "design": "pinned",
+  "verified_against": "39b3e12fc",
+  "evidence": "code",
+  "audit": "done:39b3e12fc",
+  "depends_on": [],
+  "_why": "Six features documented as working that the parser rejects. Audited against the codebase: TWO are implemented downstream and only unreachable from the parser (ANY/ALL, INSERT INTO ... SELECT) and are NOT in this task. FOUR are genuinely not features and their documentation must be corrected: WITHIN GROUP, CTEs, the ~ operator, and the kafka:// URI shorthand.",
+  "anchors": [
+    {
+      "file": "docs/sql/COPY_PASTE_EXAMPLES.md",
+      "symbol": "WITHIN GROUP",
+      "expect": 7
+    },
+    {
+      "file": "docs/sql/COPY_PASTE_EXAMPLES.md",
+      "symbol": "kafka://",
+      "expect": 4
+    }
+  ],
+  "blast_radius": {
+    "pattern": "WITHIN GROUP",
+    "files": 13,
+    "refs": 53,
+    "_note": "velo-dispatch measures src/ tests/ examples/ only, hence 53. The DOCS spread, which is where this task actually works, is 22 refs and is not covered by the tool's check \u2014 worth knowing when reading a green blast-radius result on a docs task. My first two declarations here were both wrong: 13 from a partial grep, then 75 from including docs/ against a tool that excludes it."
+  },
+  "tests": {
+    "fail_to_pass": [],
+    "pass_to_stay": [
+      "test_all_sql_files_parse"
+    ],
+    "known_red": [
+      "benchmark_three_hop_processor_pipeline"
+    ]
+  },
+  "acceptance": [
+    "WITHIN GROUP examples replaced by the supported two-argument PERCENTILE_CONT(col, fraction) form",
+    "CTE examples removed; there is no WITH-statement production anywhere in src/",
+    "the ~ regex operator removed from the operators table and from any example using it",
+    "the kafka:// and file:// FROM-source shorthand documented as REMOVED BY DESIGN per #1898/#1905, not as unimplemented",
+    "no claim is left that a feature works when the parser rejects it"
+  ],
+  "forbidden": [
+    "touching ANY/ALL or INSERT INTO ... SELECT \u2014 those are parser gaps with working execution, tracked separately",
+    "editing any file under src/ or tests/",
+    "deleting a doc section without replacing the guidance it carried"
+  ]
+}

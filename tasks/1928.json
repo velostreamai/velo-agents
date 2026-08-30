@@ -1,0 +1,63 @@
+{
+  "issue": 1928,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "39b3e12fc",
+  "evidence": "code",
+  "audit": "done:39b3e12fc",
+  "depends_on": [],
+  "_why": "parse_query dispatches on the first token and returns the sub-parser's result without checking the input was consumed. A sub-parser that reads a valid PREFIX returns Ok and the remainder is silently discarded. Three independent reproducers, all this root cause: #1895's WITHIN GROUP, the bare-alias counter-example, and a statement-merge found by #1929's gate.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/parser/common.rs",
+      "symbol": "pub fn parse_query",
+      "expect": 1,
+      "_note": "the defect: dispatch, return, no EOF check"
+    },
+    {
+      "file": "src/velostream/sql/parser/mod.rs",
+      "symbol": "parser.parse_query()",
+      "expect": 1,
+      "_note": "the ONLY call site \u2014 the single insertion point for the fix"
+    },
+    {
+      "file": "src/velostream/sql/parser/mod.rs",
+      "symbol": "Eof",
+      "expect": 1,
+      "_note": "TokenType::Eof already exists; the check needs no new token"
+    }
+  ],
+  "blast_radius": {
+    "pattern": "parse_query",
+    "files": 12,
+    "refs": 45,
+    "_note": "Measured across src/ tests/ examples/, not src/ alone \u2014 an src/-only count said 12 and was wrong by 33. The CODE change is one call site; the bulk of these refs are TESTS, which is the real work: every test asserting today's lenient truncation will newly fail. The brief requires enumerating and classifying that fallout, with a STOP at >15."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "parse_rejects_trailing_tokens_after_valid_statement",
+      "parse_rejects_bare_select_list_alias",
+      "parse_rejects_second_statement_without_terminator"
+    ],
+    "pass_to_stay": [
+      "test_all_sql_files_parse",
+      "test_ast_round_trip_over_corpus"
+    ],
+    "known_red": [
+      "benchmark_three_hop_processor_pipeline"
+    ]
+  },
+  "acceptance": [
+    "parse_query errors when tokens remain after a successful sub-parse, naming the first unconsumed token and its position",
+    "a trailing semicolon, whitespace and comments are still accepted",
+    "all three reproducers are rejected by the GENERAL check, not by construct-specific guards",
+    "#1895's WITHIN GROUP guard is assessed for redundancy and REPORTED, not removed in this PR",
+    "every newly-failing test is classified: (a) was asserting truncated behaviour -> fix the test, or (b) the check is wrong -> fix the check"
+  ],
+  "forbidden": [
+    "weakening the check to a warning",
+    "adding a construct-specific exemption to make a test pass",
+    "removing the WITHIN GROUP guard in this PR",
+    "deleting, skipping or narrowing any test"
+  ]
+}

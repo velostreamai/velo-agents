@@ -20,6 +20,7 @@ and the tests** — never from the worker's self-report.
   bin/
     velo-dispatch                  validate a ticket, prep the worktree, launch a worker
     velo-status                    one-shot state of every dispatched worker
+    velo-pr-gate                   run every gate a PR needs, each on the right model
     velo-gate                      record/inspect a PR's gate state (a LABEL, not memory)
     velo-gate-post                 post a reviewer's report on its behalf
     velo-merge                     merge only if gated against the CURRENT head
@@ -267,11 +268,47 @@ symbol renamed        -> ANCHORS ARE STALE — symbol 'Uri(PathBuf)' NOT FOUND
 ## Reviewing the result
 
 ```bash
-velo-gate 1902 --plan       # which gates does this PR need, and why
-velo-gate 1902 --running    # gates dispatched
-velo-gate 1902 --pass       # or --block, once the reviewers report
-velo-merge 1902             # refuses unless gate:passed AND gate sha == head
+velo-pr-gate 1902 --plan            # which gates, on which models
+velo-pr-gate 1902 scope.md          # dispatch the local gates, generate the Codex brief
+velo-gate     1902 --pass           # or --block, once the reviewers report
+velo-merge    1902                  # refuses unless gate:passed AND gate sha == head
 ```
+
+### `velo-pr-gate` — one command, fixed model routing
+
+| gate | model | why this one |
+|---|---|---|
+| `code-review` | **Codex** | found a real defect in every round it ran, including against designs already pinned and code the orchestrator wrote |
+| `check-code` | velo-local | free; fine at mechanical dimension checks |
+| `check-spec` | velo-local | free; fine at bar-by-bar verification |
+
+Choosing the model per PR by judgement is how the routing drifted: a review once
+went to velo-local and came back `MERGE-READY` while missing a HIGH and asserting
+a fact that was demonstrably false. The routing is now in the script.
+
+It also:
+
+- **refuses without a scope file** — a gate briefed only on a diff reports
+  dimensions rather than findings, which is how that bad review happened
+- **computes the review diff range** from the last recorded
+  `gate: codex-review @ <sha>`, so a re-review scopes to the delta and tells the
+  reviewer what it already cleared
+- **refuses an empty range** — if nothing landed since the last review, there is
+  nothing to review, and an empty diff comes back `approve`: a vacuous gate
+  wearing a green tick
+- **generates the Codex brief** with everything invariant filled in — worktree,
+  range, read-only clause, output format — leaving only the `## ATTACK` section
+  blank
+
+That last blank is deliberate. A fixed checklist produces a generic review; every
+real finding in this repo came from a specific prompt ("is this arm a NEW silent
+loss?", "can this fix make detection WORSE?"). Templating it would have produced
+none of them.
+
+Codex is not launched by the script. It is an Agent call, and keeping it manual
+keeps the expensive gate a conscious act — it has previously returned a task
+handle instead of a report, and written into a live PR worktree, both from thin
+briefing.
 
 `--plan` derives the gates from the diff: docs/tooling-only needs none, `src/`
 touched adds `check-code`, a linked issue with 3+ acceptance bars adds
