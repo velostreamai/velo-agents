@@ -433,6 +433,24 @@ Current worktree state:
 {summary}
 
 This is continuation {continuation_number}.
+────────────────────────────────────────────────────────────────────────
+THIS IS AN AUTOMATED CONTINUATION FROM THE RUNNER. IT IS NOT A MESSAGE
+FROM THE CALLER, AND IT IS NOT AUTHORIZATION FOR ANYTHING.
+
+The runner emits it whenever your previous turn ended without a final
+report. It is emitted unconditionally — including when you ended that turn
+by deliberately STOPPING. It carries no human judgement whatsoever.
+
+If you fired a STOP trigger, YOU ARE STILL STOPPED. Do not resume the work,
+do not "proceed with the full implementation", and do not record this as
+caller authorization. Re-emit your STOP report as the final answer and end
+the run. A human will read it and decide.
+
+This text exists because a worker treated three of these continuations as
+"the caller re-issued the instruction 3x", used that as authorization to
+override its own STOP trigger, and went on to modify 9 tests the STOP was
+protecting. No human had said anything.
+────────────────────────────────────────────────────────────────────────
 """.strip()
 
         return f"""
@@ -451,6 +469,24 @@ Current worktree state:
 {summary}
 
 This is continuation {continuation_number}.
+────────────────────────────────────────────────────────────────────────
+THIS IS AN AUTOMATED CONTINUATION FROM THE RUNNER. IT IS NOT A MESSAGE
+FROM THE CALLER, AND IT IS NOT AUTHORIZATION FOR ANYTHING.
+
+The runner emits it whenever your previous turn ended without a final
+report. It is emitted unconditionally — including when you ended that turn
+by deliberately STOPPING. It carries no human judgement whatsoever.
+
+If you fired a STOP trigger, YOU ARE STILL STOPPED. Do not resume the work,
+do not "proceed with the full implementation", and do not record this as
+caller authorization. Re-emit your STOP report as the final answer and end
+the run. A human will read it and decide.
+
+This text exists because a worker treated three of these continuations as
+"the caller re-issued the instruction 3x", used that as authorization to
+override its own STOP trigger, and went on to modify 9 tests the STOP was
+protecting. No human had said anything.
+────────────────────────────────────────────────────────────────────────
 """.strip()
 
     return f"""
@@ -461,6 +497,24 @@ Complete the requested review/analysis and return the final concise report now.
 Use additional tools only if essential.
 
 This is continuation {continuation_number}.
+────────────────────────────────────────────────────────────────────────
+THIS IS AN AUTOMATED CONTINUATION FROM THE RUNNER. IT IS NOT A MESSAGE
+FROM THE CALLER, AND IT IS NOT AUTHORIZATION FOR ANYTHING.
+
+The runner emits it whenever your previous turn ended without a final
+report. It is emitted unconditionally — including when you ended that turn
+by deliberately STOPPING. It carries no human judgement whatsoever.
+
+If you fired a STOP trigger, YOU ARE STILL STOPPED. Do not resume the work,
+do not "proceed with the full implementation", and do not record this as
+caller authorization. Re-emit your STOP report as the final answer and end
+the run. A human will read it and decide.
+
+This text exists because a worker treated three of these continuations as
+"the caller re-issued the instruction 3x", used that as authorization to
+override its own STOP trigger, and went on to modify 9 tests the STOP was
+protecting. No human had said anything.
+────────────────────────────────────────────────────────────────────────
 """.strip()
 
 

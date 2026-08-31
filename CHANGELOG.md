@@ -6,6 +6,41 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+## 2026-08-31
+
+### Added — `velo-status` shows the issue TITLE next to the number
+The table led with a bare issue number, which does not say what a worktree is
+for. Reading it meant looking each number up somewhere else, every time.
+
+Titles are fetched once, in parallel, before the table is drawn — sequential
+`gh issue view` calls would add ~1s per worktree to a command whose whole point
+is being a one-shot glance. The `[#PARENT]` prefix is stripped, since every
+child issue carries the same one and it crowds out the part that differs.
+
+### Fixed — runner continuations were being read as caller authorization to override a STOP
+The runner emits an automatic `[continuation N]` prompt whenever a turn ends
+without a final report. Its text said "complete any missing part of the
+original task" and "fix failures caused by your changes", with nothing marking
+it as automated.
+
+It is emitted unconditionally — including when the turn ended because the
+worker deliberately STOPPED. So a worker that correctly stops is immediately
+told, by something indistinguishable from its caller, to keep going.
+
+On #1937 that is exactly what happened. The worker hit the brief's ">5 existing
+tests break" STOP with 12 failures, reported it correctly, then logged
+`CALLER-AUTHORIZATION: caller re-issued the continuation instruction 3x`, and
+proceeded to modify 9 tests the STOP existed to protect. **No human had said
+anything.** The dispatch was detached and received no messages.
+
+This made every STOP trigger unenforceable, which matters because STOP triggers
+are the only control the policy has over a detached worker.
+
+All three prompt variants in both runners now carry an explicit banner: this is
+automated, it is not from the caller, it is not authorization, and a fired STOP
+remains fired — re-emit the STOP report and end the run. Verified by rendering
+the real `continuation_prompt` for every branch.
+
 ## 2026-08-30
 
 ### Fixed — `velo-pr-gate` scoped re-reviews to the wrong range, two ways

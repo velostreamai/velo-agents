@@ -33,8 +33,32 @@ running_pid_for() {
   pgrep -f "velo-(openrouter-agent-sdk|lmstudio-agent-sdk)\.py.*--cwd $wt( |$)" 2>/dev/null | head -1
 }
 
-printf '%-7s %-11s %-8s %-7s %-6s %-16s %s\n' ISSUE WORKER STATE COMMITS DIRTY AGENT-LOG BRANCH
-printf '%s\n' "────────────────────────────────────────────────────────────────────────"
+# Issue titles, fetched ONCE and in PARALLEL before the table is drawn.
+#
+# A bare number does not say what a worktree is for — reading the table meant
+# going and looking each one up. Sequential `gh issue view` calls would add a
+# second or so per worktree to a command whose whole point is being a one-shot
+# glance, so they are forked together and collected.
+TITLE_DIR=$(mktemp -d)
+trap 'rm -rf "$TITLE_DIR"' EXIT
+for WT in "$WORKTREE_BASE"/velostream-*; do
+  [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
+  N="${WT##*velostream-}"
+  [[ "$N" =~ ^[0-9]+$ ]] || continue          # docsql / prgate etc. have no issue
+  [[ -n "$ONLY" && "$N" != "$ONLY" ]] && continue
+  ( gh issue view "$N" --repo "$REPO" --json title --jq .title 2>/dev/null \
+      > "$TITLE_DIR/$N" ) &
+done
+wait
+
+title_for() {  # $1 = issue number -> title, stripped of the [#PARENT] prefix
+  local f="$TITLE_DIR/$1"
+  [[ -s "$f" ]] || { printf -- '-'; return; }
+  sed -E 's/^\[#[0-9]+\] *//' "$f" | head -1
+}
+
+printf '%-7s %-11s %-8s %-7s %-6s %-16s %-26s %s\n' ISSUE WORKER STATE COMMITS DIRTY AGENT-LOG BRANCH TITLE
+printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 FOUND=0
 for WT in "$WORKTREE_BASE"/velostream-*; do
@@ -134,9 +158,10 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
     fi
   fi
 
-  printf '%-7s %-11s %s %s%-7s%s %-6s %s%-16s%s %s\n' \
+  TITLE=$(title_for "$ISSUE")
+  printf '%-7s %-11s %s %s%-7s%s %-6s %s%-16s%s %-26s %s%s%s\n' \
     "$ISSUE" "${WORKER:0:11}" "$STATE" "$CFLAG_C" "$CFLAG_W" "$OFF" "$DIRTY" \
-    "$LOGC" "$LOGSUM" "$OFF" "$BRANCH"
+    "$LOGC" "$LOGSUM" "$OFF" "${BRANCH:0:26}" "$DIM" "${TITLE:0:60}" "$OFF"
 
   if [[ $VERBOSE -eq 1 && -n "$LOG" ]]; then
     printf '        %s%s%s\n' "$DIM" "$(tail -1 "$LOG" | cut -c1-100)" "$OFF"
