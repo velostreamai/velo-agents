@@ -8,6 +8,32 @@ Newest first.
 
 ## 2026-08-31
 
+### Fixed — review gates were classified as implementation tasks and failed for writing nothing
+The runner decides "implementation vs review" by scanning the TASK TEXT for
+phrases like "read-only" or "do not modify". A review brief that simply never
+used those words was classified as an implementation and then FAILED with
+"exhausted same-session continuation attempts without making worktree changes
+for an implementation task".
+
+That happened to `check-spec` on #1942 **twice**, producing no report at all
+both times.
+
+The inverse was worse. Because a run only counted as successful if the worktree
+changed, the one review gate that did "succeed" — `check-spec` on #1943 — did
+so by writing its report into the PR worktree as a stray untracked file. A
+read-only gate was effectively required to dirty the tree it was reviewing, and
+that file was then swept away by a routine pre-commit cleanup before anyone
+read it.
+
+A gate's nature comes from its SKILL, not from whether its brief happens to
+contain a magic phrase. Applying any of `check-code`, `check-spec`,
+`code-review` or `pr-gate` now prepends an explicit read-only declaration,
+which both fixes the classifier and tells the model that writing nothing is the
+correct outcome.
+
+Verified with the exact brief that failed twice: classified implementation
+before, read-only after, while a genuine implementation task is unchanged.
+
 ### Added — `velo-status` shows the issue TITLE next to the number
 The table led with a bare issue number, which does not say what a worktree is
 for. Reading it meant looking each number up somewhere else, every time.

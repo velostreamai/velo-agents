@@ -29,6 +29,8 @@ DEFAULT_PROMPT_TIMEOUT_SECONDS = 1800
 DEFAULT_BASH_TIMEOUT_MS = 2_400_000
 DEFAULT_LOG_DIR = pathlib.Path.home() / ".agents" / "logs"
 
+REVIEW_SKILLS = ("check-code", "check-spec", "code-review", "pr-gate")
+
 READ_ONLY_MARKERS = (
     "read-only",
     "read only",
@@ -95,6 +97,29 @@ def resolve_skill(name: str) -> tuple[str, str]:
     raise AssertionError("unreachable")
 
 
+READ_ONLY_DECLARATION = """=== THIS IS A READ-ONLY REVIEW TASK ===
+The skill applied below is a REVIEW skill. Do not modify, create or delete any
+file in the worktree. Your report is your FINAL MESSAGE — not a file.
+
+Two things went wrong that this exists to prevent:
+
+  * The runner decides "implementation vs review" by scanning the task text for
+    phrases like "read-only". A review brief that simply never used those words
+    was classified as an implementation, and then FAILED for not changing any
+    file — twice, on the same gate, producing no report at all.
+
+  * The inverse: because a run only counted as successful if the worktree
+    changed, the one review gate that DID "succeed" did so by writing its
+    report into the PR worktree as a stray untracked file. A read-only gate was
+    effectively required to dirty the tree it was reviewing.
+
+Writing nothing is the CORRECT outcome for this task, and the runner now knows
+that.
+=== END READ-ONLY DECLARATION ===
+
+"""
+
+
 def apply_skills(task: str, names: list[str]) -> str:
     if not names:
         return task
@@ -109,7 +134,8 @@ def apply_skills(task: str, names: list[str]) -> str:
             f"{body}\n"
             f"=== END SKILL: /{name} ===\n"
         )
-    return "\n".join(blocks) + "\n\n=== SCOPE ===\n" + task
+    prefix = READ_ONLY_DECLARATION if any(n in REVIEW_SKILLS for n in names) else ""
+    return prefix + "\n".join(blocks) + "\n\n=== SCOPE ===\n" + task
 
 
 def git_output(root: pathlib.Path, *args: str) -> str:
