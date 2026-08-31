@@ -65,6 +65,23 @@ handing over a range that quietly means something other than "the delta".
 Both failures are silent and both produce a review that looks fine, which is
 the reason they are worth a row here.
 
+### Fixed — `velo-dispatch` validates the REF, so the local checkout stops mattering
+Anchors and blast radius now read `origin/master` directly — `git show
+origin/master:<file>` and `git grep origin/master` — instead of the working
+tree. The worker's worktree is cut from that ref, so it is the only tree whose
+contents mean anything.
+
+This supersedes the guard added in the previous entry, which was the wrong
+shape: it fixed the correctness hole by REFUSING to run unless the checkout
+equalled `origin/master`, i.e. by handing the tool's job to the operator. It
+then fired twice in one hour, once needing a `git pull` that itself failed on
+untracked files that had become tracked upstream.
+
+Reading the ref removes the requirement rather than enforcing it. A stale,
+dirty, or mid-rebase checkout is now simply irrelevant. Verified by running
+both scripts against the same checkout deliberately set 3 commits behind: the
+old one refuses, the new one validates and reports the correct counts.
+
 ### Fixed — `velo-dispatch` validated a different tree than the worker gets
 Anchors and blast radius are read from the WORKING TREE, but the worker's
 worktree is cut off `origin/master`. The `git fetch` lived AFTER validation, so
