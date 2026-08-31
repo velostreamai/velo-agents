@@ -1,0 +1,64 @@
+{
+  "issue": 1949,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "33e52add0",
+  "evidence": "code",
+  "audit": "done:33e52add0",
+  "depends_on": [],
+  "_why": "Plain `parse_select` handles clauses as a fixed if-sequence WINDOW(342) -> HAVING(363) -> ORDER BY(369), i.e. WINDOW BEFORE HAVING. The documented order (src/velostream/sql/CLAUDE.md:46) is GROUP BY -> HAVING -> WINDOW -> ORDER BY. So a plain SELECT in the documented order stops at WINDOW and \u2014 before #1928's end-of-input check \u2014 returned Ok with the window AND the ordering silently discarded. THREE select paths exist: parse_select (~340) and parse_select_no_with (~1120) both use the fixed sequence and are affected; only parse_select_for_create_table (~834) uses an order-independent match loop and works. A streaming aggregate that silently loses its window is a wrong-results defect.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "// Parse WINDOW clause after GROUP BY",
+      "expect": 2,
+      "_note": "TWO fixed-sequence sites, not one: parse_select (~340) and parse_select_no_with (~1120). Both order WINDOW before HAVING and both need the fix. I originally declared 1 and the dispatch gate caught it \u2014 the brief would have sent the worker to fix half the defect."
+    },
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "GROUP BY clause must come before WINDOW clause",
+      "expect": 1,
+      "_note": "the plain path's own error message states 'GROUP BY ... WINDOW ... HAVING' \u2014 the OPPOSITE of CLAUDE.md:46. Two conflicting statements of clause order inside one codebase."
+    },
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "// Loop to parse clauses in any order",
+      "expect": 1,
+      "_note": "the CREATE path's order-independent loop \u2014 the shape the plain path should adopt"
+    },
+    {
+      "file": "src/velostream/sql/CLAUDE.md",
+      "symbol": "Clause order is fixed",
+      "expect": 1,
+      "_note": "the documented authority: SELECT -> FROM -> WHERE -> GROUP BY -> HAVING -> WINDOW -> ORDER BY -> LIMIT"
+    }
+  ],
+  "blast_radius": {
+    "pattern": "TokenType::Window",
+    "files": 2,
+    "refs": 4,
+    "_note": "Measured by `git grep -c 'TokenType::Window' origin/master -- src tests examples`. The CODE change is confined to the plain-SELECT clause sequence in parser/select.rs; the rest are the CREATE path, the tokenizer and existing tests. The real risk is not the count but REGRESSION: existing SQL writes WINDOW before HAVING, and that must keep working."
+  },
+  "grammar_reference": {
+    "files": [
+      "src/velostream/sql/CLAUDE.md",
+      "docs/claude/SQL_GRAMMAR_RULES.md",
+      "docs/sql/PARSER_GRAMMAR.md"
+    ],
+    "_note": "CLAUDE.md:46 is the authority for clause order. SQL_GRAMMAR_RULES.md:189 shows the order under a '### Correct Order' heading and has NEVER parsed on the plain path \u2014 it passes the #1925 doc gate only because the truncation is silent."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "plain_select_accepts_having_then_window",
+      "plain_select_still_accepts_window_then_having",
+      "plain_and_create_paths_agree_on_clause_order",
+      "grammar_doc_correct_order_example_parses"
+    ],
+    "_note": "Assert STRUCTURALLY \u2014 window and order_by must be PRESENT in the AST, never `is_ok()`. `is_ok()` is exactly what hid this for so long: the parser returned Ok having thrown both clauses away."
+  },
+  "stop_conditions": [
+    "making the plain path order-independent breaks more than 5 existing tests \u2014 STOP and report the list",
+    "the fix appears to require changing the CREATE path too \u2014 STOP; that path already works and is not in scope",
+    "you conclude the documented order in CLAUDE.md:46 is wrong and WINDOW-before-HAVING is correct \u2014 STOP and report rather than changing the documented order; that is an owner decision"
+  ]
+}
