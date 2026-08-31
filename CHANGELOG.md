@@ -6,6 +6,28 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Fixed — `code-review` now actually dispatches to Codex
+The script generated a Codex brief and stopped, on the stated belief that
+"Codex cannot be launched from a shell — it is an Agent call". That is false:
+`codex review` runs non-interactively and takes its prompt on stdin.
+
+What actually failed was the codex-rescue AGENT wrapper — it forwards to a
+single background task it cannot poll, so it returns a task handle instead of
+a report, twice, including when asked directly for the report.
+
+The cost of the wrong diagnosis: every `code-review` gate on #1929, #1942 and
+#1943 fell back to a substituted Opus agent — five on #1943 alone — while the
+routing table in this very script said Codex. Each substitution was declared on
+the gate comment, so the record is honest, but the routing was fiction.
+
+`codex review` is now dispatched like any other gate, in the background with
+its own log. Verified end-to-end against #1952's diff before wiring: it read
+the code and answered both attack questions correctly.
+
+The script refuses to dispatch while the brief's `## ATTACK` section is still
+the placeholder — a generic brief produces a generic review, which is how one
+came back MERGE-READY while missing a HIGH.
+
 ## 2026-08-31
 
 ### Fixed — review gates were classified as implementation tasks and failed for writing nothing

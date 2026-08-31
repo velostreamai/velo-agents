@@ -18,9 +18,19 @@
 #   check-code   -> velo-local free; fine at mechanical dimension-checking
 #   check-spec   -> velo-local free; fine at bar-by-bar verification
 #
-# Codex cannot be launched from a shell — it is an Agent call — so this script
-# dispatches the local gates and prints the Codex brief for the caller to run.
-# That asymmetry is deliberate: the expensive gate stays a conscious act.
+# All three gates are dispatched by this script. `codex review` runs
+# non-interactively and takes its prompt on stdin.
+#
+# This header used to say "Codex cannot be launched from a shell — it is an
+# Agent call". That was wrong, and it cost real money: every review on #1929,
+# #1942 and #1943 fell back to a substituted Opus agent — five on #1943 alone —
+# while the routing table above said Codex. What actually failed was the
+# codex-rescue AGENT wrapper, which forwards to one background task it cannot
+# poll and so returns a task handle instead of a report. The CLI has no such
+# problem.
+#
+# The one thing still required of the caller is filling in the brief's ATTACK
+# section; the script refuses to dispatch a stub.
 
 set -uo pipefail
 REPO="velostreamai/velostream"
@@ -49,7 +59,7 @@ if [[ "$SCOPE" == "--plan" ]]; then
   echo "would dispatch:"
   [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> velo-local"
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
-  [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> Codex  (Agent call, run by the caller)"
+  [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
   exit 0
 fi
 
@@ -125,6 +135,18 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   fi
 
   OUT="/tmp/gate-${PR}-review-brief.md"
+
+  # Do NOT clobber a brief whose ATTACK section has already been filled in.
+  #
+  # The first cut regenerated the template on every run and THEN refused because
+  # the placeholder was present — unsatisfiable by construction, and it fired on
+  # the very first real use. Regenerate only when the brief is absent or still a
+  # stub; otherwise reuse what the caller wrote.
+  if [[ -f "$OUT" ]] && ! grep -q "<<< FILL THIS IN" "$OUT"; then
+    ok "reusing filled brief: $OUT"
+    REUSED_BRIEF=1
+  else
+    REUSED_BRIEF=0
   cat > "$OUT" <<EOF
 READ-ONLY review. Return the report as your final message — plain text, NOT a
 task handle. Do NOT write or modify any file: this is a live PR worktree and a
@@ -171,21 +193,43 @@ REPRODUCED it or it is reasoning-only.
 Mark anything unverifiable as UNVERIFIED. Be brief — a short report with two
 real findings beats a long one with eight speculative ones.
 EOF
+  fi
   echo
-  warn "code-review is NOT dispatched by this script — it is an Agent call."
-  ok "brief generated: $OUT   (diff range: $RANGE)"
-  echo "  Fill in the ATTACK section, then run it as a Codex agent."
-  echo
-  echo "  If Codex returns a task handle instead of a report, it did NOT review."
-  echo "  Its wrapper forwards to one background task it cannot poll, so it can"
-  echo "  come back with 'waiting for the background task' having reviewed nothing."
-  echo "  Observed on #1929. Do not record that as a gate result."
-  echo
-  echo "  Substituting another reviewer is fine — an unrun gate is worse than a"
-  echo "  substituted one — but DECLARE the substitution in the gate comment, so"
-  echo "  the label does not imply a reviewer that never ran."
+  # Dispatch the review to the Codex CLI, like any other gate.
+  #
+  # This used to print the brief and stop, on the belief that Codex "cannot be
+  # launched from a shell — it is an Agent call". That was wrong. `codex review`
+  # runs non-interactively and takes its prompt on stdin. What actually failed
+  # was the codex-rescue AGENT wrapper: it forwards to one background task it
+  # cannot poll, so it returns a task handle instead of a report. Every review
+  # on #1929, #1942 and #1943 was therefore run by a substituted Opus agent —
+  # five of them on #1943 alone — while the routing table said Codex.
+  #
+  # The ATTACK section must be filled in before this is worth running; a generic
+  # brief produces a generic review. Refuse rather than dispatch a stub.
+  if grep -q "<<< FILL THIS IN" "$OUT"; then
+    warn "brief still has an unfilled ## ATTACK section: $OUT"
+    warn "Fill it in, then re-run. A gate briefed only on a diff reports"
+    warn "dimensions rather than findings — that is how a review came back"
+    warn "MERGE-READY while missing a HIGH."
+    exit 1
+  fi
+
+  CODEX_LOG="/tmp/gate-${PR}-review.log"
+  if command -v codex >/dev/null 2>&1; then
+    nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
+    ok "code-review -> codex (pid $!)  log: $CODEX_LOG"
+    echo "     brief: $OUT   (diff range: $RANGE)"
+    echo "     Codex writes its report to the log; read the tail, not the whole file."
+  else
+    warn "codex CLI not found on PATH — code-review NOT dispatched."
+    ok "brief generated: $OUT   (diff range: $RANGE)"
+    echo "     Run it yourself, and DECLARE the substitution in the gate comment"
+    echo "     so the label does not imply a reviewer that never ran."
+  fi
+
   echo
   echo "  Then relay every report and record the verdict:"
-  echo "    velo-gate-post $PR codex-review <report>"
+  echo "    velo-gate-post $PR code-review <report>"
   echo "    velo-gate $PR --pass | --block"
 fi
