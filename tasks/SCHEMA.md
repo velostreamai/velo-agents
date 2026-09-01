@@ -82,3 +82,30 @@ comment with:
 A gate result is only valid for the SHA it ran against — a PR's CI was once
 green against a commit that had already been replaced. Comparing that SHA to
 `headRefOid` is the whole staleness check; no extra tooling needed.
+
+## `reviewed` — required
+
+```json
+"reviewed": {
+  "by": "<who>",
+  "at": "2026-09-01T19:23:08Z",
+  "brief_sha256": "<sha256 of the brief file>"
+}
+```
+
+`velo-dispatch` refuses without it, and refuses again if either half has moved:
+
+| check | fails when | why |
+|---|---|---|
+| `brief_sha256` vs the brief's actual hash | the brief was edited after review | editing the brief post-review is the easiest way to send a worker instructions nobody checked |
+| `at` vs the issue's `updatedAt` | the issue was edited **or commented** after review | a ruling posted as a comment is the commonest way a brief goes stale, and no code-based check can see it |
+
+Write it with `velo-spec-review <issue> <brief-file>`, **after** reading the issue and its comments.
+
+### Why this exists
+
+Every other spec check asks *"does this still match the CODE?"* — anchors, blast radius, `verified_against`. None asked *"does it still match the ISSUE?"*, and none asked whether anyone had read it.
+
+Both gaps fired in one session. A worker was briefed to "emit every legal spelling" hours after the issue recorded that doing so **is** the defect. Another was briefed on a failure count the issue had already corrected, and stopped to say so. Anchors were green in both cases, because the code had not moved — the **intent** had.
+
+`at` is stamped from the issue's own `updatedAt` rather than wall-clock now, so a comment landing between reading and attesting still fails the next dispatch instead of being papered over.

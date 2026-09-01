@@ -1,0 +1,61 @@
+{
+  "issue": 1958,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "3f9ed8e00",
+  "evidence": "code",
+  "audit": "done:3f9ed8e00",
+  "depends_on": [],
+  "_why": "The #1929 doc-SQL gate parses THREE files. Its own debt register records that 1805 of 1988 ```sql fences under docs/ across 191 files are inventory-only \u2014 counted, never parsed. That gap has concrete cost: #1956 stage A could migrate only 45 of 131 downstream-form doc sites, because the other 86 live in files nothing can verify, and hand-editing unverifiable SQL is what produced five wrong corpus counts on that issue. Ungated doc SQL also rots silently: SQL_GRAMMAR_RULES.md's 'Correct Order' example had NEVER parsed, COPY_PASTE_EXAMPLES.md carried a WITH (config_file = ...) shape the engine rejects, and its UNION ALL example split wrongly \u2014 each found only because that file happened to be inside the enforced three.",
+  "anchors": [
+    {
+      "file": "tests/unit/sql/validation/doc_sql_examples_test.rs",
+      "symbol": "const ENFORCED_FILES: &[&str] = &[",
+      "expect": 1,
+      "_note": "the three-file enforced list to widen. The module doc explains WHY it is a fixed list rather than a directory walk \u2014 read that before changing its shape."
+    },
+    {
+      "file": "tests/unit/sql/validation/doc_sql_examples_test.rs",
+      "symbol": "const UNGATED_MD_SQL_BLOCK_COUNTS: &[(&str, usize)] = &[",
+      "expect": 1,
+      "_note": "the debt register: 191 files, 1805 blocks, computed 2026-08-29. It fails in BOTH directions \u2014 a new ungated block is a regression, a stale entry must be deleted. Every file promoted to ENFORCED_FILES must leave this list."
+    },
+    {
+      "file": "tests/unit/sql/validation/doc_sql_examples_test.rs",
+      "symbol": "const KNOWN_ENGINE_GAPS: &[Gap] = &[",
+      "expect": 1,
+      "_note": "the allowlist for genuine engine gaps, keyed (file, anchor, reason, issue). Promoting files WILL surface real breakage; an entry here needs a filed issue, and is NOT a way to silence a doc that is simply wrong."
+    }
+  ],
+  "blast_radius": {
+    "pattern": "ENFORCED_FILES",
+    "files": 0,
+    "refs": 17,
+    "_note": "Small in code, large in data: the decision surface is 191 .md files carrying 1805 fences. The work is mostly CLASSIFICATION (executable SQL vs prose that quotes SQL), and the bulk action is retagging non-executable fences ```sql -> ```text, which is cheap and safe. Only the executable residue earns a place on ENFORCED_FILES, and each promotion surfaces real breakage."
+  },
+  "grammar_reference": {
+    "files": [
+      "docs/sql/PARSER_GRAMMAR.md",
+      "docs/claude/SQL_GRAMMAR_RULES.md",
+      "src/velostream/sql/CLAUDE.md"
+    ],
+    "_note": "Canonical clause order after #1962: SELECT -> FROM -> JOIN -> WHERE -> WINDOW -> GROUP BY -> HAVING -> ORDER BY -> LIMIT. A Kafka sink needs all three of '<name>.type', '<name>.bootstrap.servers', '<name>.topic'. Known unimplemented shapes that will surface: `FROM x AS y` (#1959) and `EMIT FINAL ORDER BY` (#1960) \u2014 both are ENGINE gaps, so allowlist with the issue number rather than rewriting the doc."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "enforced_files_covers_every_executable_sql_doc",
+      "ungated_block_register_matches_reality"
+    ],
+    "_note": "The register must keep failing in BOTH directions after the change: a newly added ungated block is a regression, and an entry for a file that is now enforced or retagged is stale and must be deleted. A promotion that leaves its old register entry in place is the failure mode to guard."
+  },
+  "stop_conditions": [
+    "promoting a file surfaces more than 10 new parse failures \u2014 STOP and report the list rather than mass-allowlisting; that many failures means the file needs classification work first",
+    "you cannot tell whether a fence is executable SQL or illustrative prose \u2014 STOP and report those files; guessing is what this issue exists to stop",
+    "closing a failure requires editing SQL whose meaning you cannot verify \u2014 STOP; that is the exact hazard #1956 hit"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-01T06:35:09Z",
+    "brief_sha256": "cd4a59fb8b2a3eaa1b02b32d8bf771c38c1e69a173dbbe5f5e3b37053c46a188"
+  }
+}

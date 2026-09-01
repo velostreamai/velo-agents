@@ -146,6 +146,63 @@ print('' if d is None else (json.dumps(d) if isinstance(d,(list,dict)) else d))
     ok "dependencies closed"
   fi
 
+  # ---- REVIEW ATTESTATION + SPEC-vs-ISSUE DRIFT -----------------------------
+  #
+  # Every other check here asks "does the spec still match the CODE?". Neither
+  # asked "does it still match the ISSUE?", nor "did anyone review it?".
+  #
+  # Both gaps are load-bearing. A spec is authored against an issue at a moment
+  # in time; the issue then acquires a ruling, a correction, or a scope cut, and
+  # the brief silently contradicts it. That happened repeatedly in one session:
+  # a worker was briefed to "emit every legal spelling" hours after the issue
+  # recorded that doing so IS the defect; another was briefed on a failure count
+  # the issue had already corrected. Anchors were green both times, because the
+  # code had not moved — the INTENT had.
+  #
+  # So: the spec must carry a `reviewed` block, and both halves are checked.
+  #
+  #   "reviewed": {
+  #     "by":          "<who>",              # a name, not a role
+  #     "at":          "2026-09-01T19:00:00Z",
+  #     "brief_sha256": "<sha256 of the brief file>"
+  #   }
+  #
+  # brief_sha256 pins the BRIEF, not just the spec: editing the brief after
+  # review is the easiest way to smuggle unreviewed instructions to a worker,
+  # and it is exactly what an orchestrator does mid-flight when it is in a hurry.
+  REV=$(y reviewed.by); REV_AT=$(y reviewed.at); REV_SHA=$(y reviewed.brief_sha256)
+
+  [[ -n "$REV" && -n "$REV_AT" ]] || die "spec: no 'reviewed' block.
+  A spec that nobody attests to having read against the issue is a guess with
+  JSON syntax. Add:
+
+    \"reviewed\": { \"by\": \"<who>\", \"at\": \"$(date -u +%FT%TZ)\",
+                  \"brief_sha256\": \"$(shasum -a 256 "$BRIEF" | cut -d" " -f1)\" }"
+
+  BRIEF_NOW=$(shasum -a 256 "$BRIEF" | cut -d' ' -f1)
+  if [[ -n "$REV_SHA" && "$REV_SHA" != "$BRIEF_NOW" ]]; then
+    die "spec: THE BRIEF CHANGED SINCE REVIEW.
+  reviewed.brief_sha256 = $REV_SHA
+  actual                = $BRIEF_NOW
+  Editing the brief after review sends a worker instructions nobody checked
+  against the issue. Re-read it, then update reviewed.at and brief_sha256."
+  fi
+
+  # Spec-vs-issue drift. `updatedAt` moves on edits AND on new comments, which
+  # is what we want: a ruling posted as a comment is the commonest way a brief
+  # goes stale, and it is invisible to every code-based check above.
+  ISSUE_UPD=$(gh issue view "$ISSUE" --repo "$REPO" --json updatedAt --jq .updatedAt 2>/dev/null)
+  if [[ -n "$ISSUE_UPD" && "$ISSUE_UPD" > "$REV_AT" ]]; then
+    die "spec: ISSUE MOVED AFTER REVIEW — the brief may contradict it.
+  reviewed.at      = $REV_AT
+  issue updatedAt  = $ISSUE_UPD
+  #$ISSUE was edited or commented after this spec was reviewed. Read what
+  changed (gh issue view $ISSUE --comments), reconcile the brief, then bump
+  reviewed.at. Anchors passing means the CODE did not move; it says nothing
+  about the intent."
+  fi
+  ok "reviewed by $REV at $REV_AT; brief hash matches; issue unchanged since"
+
   # Anchors: SYMBOLS re-verified against the tree. Line numbers rot; symbols do not.
   ANCH=$(y anchors)
   if [[ "$ANCH" != "[]" && -n "$ANCH" ]]; then

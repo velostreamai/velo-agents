@@ -1,0 +1,56 @@
+#!/bin/bash
+# velo-spec-review — attest that a task spec + brief were read against the issue.
+#
+#   velo-spec-review <issue> <brief-file> [--by <name>]
+#
+# Writes the `reviewed` block velo-dispatch requires:
+#
+#   "reviewed": { "by": ..., "at": <now>, "brief_sha256": <hash of brief> }
+#
+# It deliberately does NOT judge the spec — it records that a human did, and
+# pins WHAT they read. `brief_sha256` is the point: it makes a post-review edit
+# to the brief fail the next dispatch, which is the failure this exists to stop.
+#
+# Run it AFTER reading the issue (including comments) and the brief. Running it
+# reflexively to clear a gate defeats it — the hash and timestamp are evidence,
+# and a wrong attestation is worse than none because it looks like diligence.
+set -uo pipefail
+REPO="velostreamai/velostream"
+die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+
+ISSUE="${1:-}"; BRIEF="${2:-}"; BY="${USER:-unknown}"
+shift 2 2>/dev/null || true
+while [[ $# -gt 0 ]]; do case "$1" in --by) BY="$2"; shift 2;; *) shift;; esac; done
+
+[[ "$ISSUE" =~ ^[0-9]+$ ]] || die "usage: velo-spec-review <issue> <brief-file> [--by <name>]"
+[[ -f "$BRIEF" ]] || die "brief not found: $BRIEF"
+# Same ROOT as velo-dispatch, deliberately hardcoded rather than derived from
+# the cwd. They must read the SAME spec file: an early version used
+# `git rev-parse --show-toplevel`, so attesting from a worktree wrote a
+# `reviewed` block that dispatch — reading the canonical repo — never saw, and
+# the gate refused a spec that had in fact been reviewed. Caught by testing the
+# two together; it would have looked like a flaky gate.
+ROOT="$HOME/RustroverProjects/velostream"
+SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
+[[ -f "$SPEC" ]] || die "no task spec: $SPEC"
+
+UPD=$(gh issue view "$ISSUE" --repo "$REPO" --json updatedAt --jq .updatedAt 2>/dev/null) \
+  || die "could not read issue #$ISSUE"
+
+# Attest as of the issue's OWN updatedAt, not wall-clock now. If a comment lands
+# between reading and attesting, the next dispatch must catch it — stamping
+# `now` would paper over exactly that race.
+HASH=$(shasum -a 256 "$BRIEF" | cut -d' ' -f1)
+
+python3 - "$SPEC" "$BY" "$UPD" "$HASH" <<'PY'
+import json, sys
+spec, by, at, h = sys.argv[1:5]
+d = json.load(open(spec))
+d["reviewed"] = {"by": by, "at": at, "brief_sha256": h}
+json.dump(d, open(spec, "w"), indent=2)
+PY
+
+printf '\033[32m  ok\033[0m #%s reviewed by %s\n' "$ISSUE" "$BY"
+printf '     at           %s   (the issue'"'"'s own updatedAt)\n' "$UPD"
+printf '     brief sha256 %s\n' "$HASH"
+printf '     Any later edit to the brief, or any new comment on #%s, now fails dispatch.\n' "$ISSUE"

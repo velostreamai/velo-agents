@@ -1,0 +1,71 @@
+{
+  "issue": 1965,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "0d987762e",
+  "evidence": "code",
+  "audit": "done:0d987762e",
+  "depends_on": [],
+  "_why": "TIER A of #1749 level 2, split out after a wider brief wedged. #1749 level 2. No stage owns the contract 'every reference resolves or this fails'. apply_strict_gate (plan/mod.rs:497) is the nearest thing and is not it: it runs only from build_optimized_plan*, is conditional on schema-rich sources, and is bypassable four ways (build_plan_no_gate*, non-schema-rich sources, VELOSTREAM_STRICT_SCHEMA_RESOLUTION=0, empty catalog via PrimedQuery::new_with_config). The #1967 ruling makes the rule mechanical rather than vague: SchemaAuthority (catalog.rs:87, carried on Scan at logical.rs:995, stamped by stamp_schema_authority at mod.rs:210) ALREADY encodes deferred-ness \u2014 Declared means an absent column is a misconfiguration to reject at plan time, Sampled/Unknown mean it may legitimately not be known yet. So the invariant is: an Expr::Column surviving past plan time is legal iff its governing Scan's authority is not Declared. What is missing is REACHABILITY \u2014 nothing answers 'which Scan governs this reference?' during a plan walk.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/plan/mod.rs",
+      "symbol": "fn apply_strict_gate(",
+      "expect": 1,
+      "_note": "the existing partial gate \u2014 survives as defence in depth per #1749 acceptance, is NOT the new mechanism, and must not be deleted"
+    },
+    {
+      "file": "src/velostream/sql/plan/mod.rs",
+      "symbol": "fn stamp_schema_authority(",
+      "expect": 1,
+      "_note": "where SchemaAuthority is stamped onto Scan nodes \u2014 the check runs after this"
+    },
+    {
+      "file": "src/velostream/sql/plan/column_resolution.rs",
+      "symbol": "pub fn collect_unresolved_column_names(",
+      "expect": 1,
+      "_note": "existing raw material; count_unresolved_columns sits beside it at :1785. Neither knows which Scan governs a reference \u2014 that is the gap to close."
+    },
+    {
+      "file": "src/velostream/sql/plan/catalog.rs",
+      "symbol": "pub enum SchemaAuthority {",
+      "expect": 1,
+      "_note": "the typed state per the #1967 ruling. Document the invariant HERE so nobody reinvents an Expr variant."
+    }
+  ],
+  "blast_radius": {
+    "pattern": "count_unresolved_columns",
+    "files": 0,
+    "refs": 78,
+    "_note": "Gate-style literal count over src/ tests/ examples/ \u2014 mostly existing test assertions on the counter, not sites to edit. The real risk is the OPPOSITE of a large diff: a check that is too strict breaks the ~163 test files depending on empty-catalog planning via PrimedQuery::new_with_config. The #1967 ruling makes that safe by construction \u2014 an empty catalog stamps Unknown, so unresolved is legal there \u2014 but VERIFY it, do not assume it. If those tests break, the authority is being stamped wrongly and that is the real bug (a STOP condition), not a reason to loosen the check."
+  },
+  "grammar_reference": {
+    "files": [
+      "src/velostream/sql/CLAUDE.md",
+      "docs/architecture/query-planning.md"
+    ],
+    "_note": "System columns are exempt by design (mod.rs:295) and must be exempt by explicit policy in the new check, not by accident."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "unknown_qualifier_fails_with_no_catalog_at_all",
+      "unknown_qualifier_fails_under_every_schema_authority",
+      "unknown_qualifier_fails_with_strict_resolution_disabled",
+      "ambiguous_bare_name_across_join_fails_at_plan_time",
+      "known_qualifier_still_resolves",
+      "system_columns_exempt"
+    ],
+    "_note": "TIER A ONLY. Relation/alias scope and ambiguity, decidable from FROM/JOIN in the AST with no schema, no catalog, and independent of VELOSTREAM_STRICT_SCHEMA_RESOLUTION. Tier B (field existence under Declared) and the reachability work are NOT in this task \u2014 a previous run covering all three produced nothing in 30 minutes and was killed. column_resolution.rs's existing QualifierScope / nearest_alias_and_scope (built for the #1748 check) is most of the machinery needed."
+  },
+  "stop_conditions": [
+    "the check breaks more than 10 tests that use an empty catalog \u2014 STOP and report; per the #1967 ruling an empty catalog stamps Unknown so unresolved is legal, and breakage means the authority is being stamped wrongly, which is the real bug",
+    "making the governing Scan reachable requires changing the LogicalPlan node shape \u2014 STOP and report; that is a structural change needing a decision",
+    "the first-record half turns out to need more than a self-contained addition \u2014 STOP and report; plan-time totality alone is a shippable increment",
+    "tier A cannot be made independent of VELOSTREAM_STRICT_SCHEMA_RESOLUTION without changing tier B's behaviour \u2014 STOP and report; that is a structural finding, not a reason to weaken either tier"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-01T06:19:27Z",
+    "brief_sha256": "e28c890aaa33dc931b9dabdd586463cb8dc1df09d799a893413e16c3bdf57eb0"
+  }
+}

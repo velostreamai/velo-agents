@@ -1,0 +1,64 @@
+{
+  "issue": 1959,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "ee44c522a",
+  "evidence": "code",
+  "audit": "done:ee44c522a",
+  "depends_on": [],
+  "_why": "docs/claude/SQL_GRAMMAR_RULES.md Rule 6 states FROM/JOIN aliases accept AS optionally, with two checkmarked examples. Neither parses. parse_select (select.rs:334) and parse_select_no_with (:1140) accept only a bare Identifier as the FROM alias, so given `FROM orders AS o` the current token is As, from_alias stays None, and `AS o` is left unconsumed. Before #1928 added an end-of-input check that was SILENTLY DISCARDED \u2014 a well-formed AST returned for a query nobody wrote, with the alias simply gone. parse_select_for_create_table (:825) already handles both spellings, so `CREATE STREAM s AS SELECT * FROM orders AS o` works while the plain SELECT does not. This is the third instance of the same 2-of-3 path divergence: clause ordering (#1949, fixed), FROM AS aliases (this), EMIT position (#1960).",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "// Parse optional alias for FROM clause (e.g., \"FROM events s\" or \"FROM 'file://data.csv' f\")",
+      "expect": 2,
+      "_note": "the TWO lagging sites: :334 in parse_select and :1140 in parse_select_no_with. Both are identifier-only and must gain AS handling."
+    },
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "// Check for alias (AS keyword or direct identifier)",
+      "expect": 1,
+      "_note": ":825 inside parse_select_for_create_table \u2014 the CORRECT reference implementation. Copy its behaviour; do not change it."
+    },
+    {
+      "file": "src/velostream/sql/parser/select.rs",
+      "symbol": "pub(super) fn parse_select_for_create_table",
+      "expect": 1,
+      "_note": "the third path, already correct"
+    }
+  ],
+  "blast_radius": {
+    "pattern": "from_alias",
+    "files": 0,
+    "refs": 382,
+    "_note": "Measured over src/ tests/ examples/. Most are AST plumbing untouched by this change. The edit is the two alias-parse sites; the risk is that from_alias becomes Some() where it was None, so any test asserting from_alias.is_none() for `FROM x AS y` was pinning the BUG and must be corrected, not preserved."
+  },
+  "grammar_reference": {
+    "files": [
+      "docs/claude/SQL_GRAMMAR_RULES.md",
+      "docs/sql/PARSER_GRAMMAR.md"
+    ],
+    "_note": "Rule 6: SELECT-list aliases REQUIRE AS (correct and enforced today); FROM/JOIN aliases accept AS optionally (NOT implemented). Do not 'fix' the doc to match the engine \u2014 the engine is wrong here. Canonical clause order after #1962: SELECT -> FROM -> JOIN -> WHERE -> WINDOW -> GROUP BY -> HAVING -> ORDER BY -> LIMIT."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "from_alias_with_as_parses",
+      "from_alias_without_as_parses",
+      "join_alias_with_as_parses",
+      "join_alias_without_as_parses",
+      "qualified_ref_through_as_alias_resolves",
+      "as_alias_parity_across_all_three_select_paths"
+    ],
+    "_note": "Assert the alias is BOUND (from_alias == Some(\"t\")), never merely that the statement parses \u2014 'it parsed' is exactly what was true while the alias was being discarded. qualified_ref_through_as_alias_resolves is the one that matters most: `SELECT o.id FROM orders AS o` must resolve through the alias, which is the behaviour the silent discard was hiding."
+  },
+  "stop_conditions": [
+    "JOIN aliases turn out to need a different fix than FROM aliases \u2014 report both, do not silently do only one",
+    "more than 5 existing tests break \u2014 STOP and report the list; a test asserting from_alias is None for `FROM x AS y` was pinning the bug and should be corrected, but that is a decision to report",
+    "unifying the three paths looks necessary \u2014 STOP and report; that is a larger architectural change recorded on #1749, not this task"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-01T06:34:55Z",
+    "brief_sha256": "83ccdbc1d9bdb1572bb1b753f6c3a19144a74076c241025dcd82ba462fb70789"
+  }
+}
