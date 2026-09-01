@@ -31,6 +31,25 @@
 #
 # The one thing still required of the caller is filling in the brief's ATTACK
 # section; the script refuses to dispatch a stub.
+#
+# --exec — let the reviewer RUN things
+#
+# `codex review` is sandboxed by default, and that is the right default: a
+# reviewer should not need to execute anything, and the sandbox is what stops a
+# review agent writing into a live PR worktree.
+#
+# But it makes a review VACUOUS when the PR's subject IS runtime behaviour. On
+# #1963 (a benchmark whose assertions were the whole change) the reviewer could
+# not bind a Unix socket, so both benchmarks panicked with PermissionDenied, it
+# could not run the test the PR was about, and every runtime claim came back
+# "reasoning-only / UNVERIFIED". It still found a real P1 by reading — but it
+# could not check the one thing that mattered.
+#
+# `--exec` passes --dangerously-bypass-approvals-and-sandbox so the reviewer can
+# compile and run tests. Use it ONLY when the diff is test/benchmark/runtime code
+# and a static read cannot reach the claim. It is deliberately not the default:
+# it hands a review agent write access to a live worktree, and the brief's
+# "do NOT write any file" instruction becomes a request rather than a guarantee.
 
 set -uo pipefail
 REPO="velostreamai/velostream"
@@ -38,8 +57,14 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
-PR="${1:-}"; SCOPE="${2:-}"
-[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> | <pr> --plan"
+PR="${1:-}"; SCOPE=""; EXEC=0
+for a in "${@:2}"; do
+  case "$a" in
+    --exec) EXEC=1 ;;
+    *)      [[ -z "$SCOPE" ]] && SCOPE="$a" ;;
+  esac
+done
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] | <pr> --plan"
 
 PLAN=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null) || die "PR #$PR not found"
 echo "$PLAN"
@@ -60,6 +85,7 @@ if [[ "$SCOPE" == "--plan" ]]; then
   [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> velo-local"
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
   [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
+  [[ $NEEDS_REVIEW -eq 1 && $EXEC -eq 1 ]] && echo "                 --exec: sandbox BYPASSED, reviewer can compile and run tests"
   exit 0
 fi
 
@@ -151,6 +177,25 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
 READ-ONLY review. Return the report as your final message — plain text, NOT a
 task handle. Do NOT write or modify any file: this is a live PR worktree and a
 previous run wrote into one, then stalled without delivering.
+$( [[ $EXEC -eq 1 ]] && cat <<'EXECNOTE'
+
+RUNNING IS ALLOWED ON THIS REVIEW (--exec). The sandbox is bypassed, so you CAN
+compile and run tests, and you SHOULD when a claim depends on runtime behaviour
+— reproduce it rather than reasoning about it, and say REPRODUCED rather than
+UNVERIFIED.
+
+Read-only still applies to FILES. You may create nothing and modify nothing in
+this worktree; `cargo` writing to target/ is fine. If a check would require
+editing a file to run, describe what you would have changed and mark the finding
+reasoning-only instead.
+
+Useful here:
+    cargo nextest run --no-default-features -E 'test(<name>)'
+    cargo check --no-default-features
+Do NOT run a bare `cargo nextest run` with no filter — it builds every
+integration and performance binary and will burn your budget.
+EXECNOTE
+)
 
 WORKTREE: $WTPATH (head $HEAD)
 
@@ -217,8 +262,16 @@ EOF
 
   CODEX_LOG="/tmp/gate-${PR}-review.log"
   if command -v codex >/dev/null 2>&1; then
-    nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
-    ok "code-review -> codex (pid $!)  log: $CODEX_LOG"
+    if [[ $EXEC -eq 1 ]]; then
+      nohup sh -c "cd '$WTPATH' && codex review --dangerously-bypass-approvals-and-sandbox - < '$OUT'" > "$CODEX_LOG" 2>&1 &
+      ok "code-review -> codex (pid $!)  log: $CODEX_LOG"
+      warn "--exec: sandbox BYPASSED — the reviewer can compile, run tests, AND write."
+      warn "The brief still says do-not-write, but nothing now enforces it."
+      warn "Check \`git -C $WTPATH status\` when the review finishes."
+    else
+      nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
+      ok "code-review -> codex (pid $!)  log: $CODEX_LOG"
+    fi
     echo "     brief: $OUT   (diff range: $RANGE)"
     echo "     Codex writes its report to the log; read the tail, not the whole file."
   else
