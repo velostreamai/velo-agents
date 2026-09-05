@@ -43,12 +43,56 @@ ISSUE=$(jq -r '.body' <<<"$META" | grep -oE '(Closes|Fixes) #[0-9]+' | head -1 |
 BARS=0
 if [[ -n "$ISSUE" ]]; then
   BARS=$(gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body 2>/dev/null \
-         | sed -n '/^#\{1,\} *Acceptance/,/^#\{1,\} /p' | grep -cE '^\s*[-*] ' || true)
+         | awk '
+             # Close only on a heading at the SAME OR SHALLOWER depth than the
+             # one that opened the range. The previous regex closed on ANY
+             # heading, so bars under a subsection were never counted:
+             #   ## Acceptance
+             #   ### Parser        <- closed the range here, count 0
+             #   - parses A
+             # Also ignores fenced blocks, so an example "# Acceptance" inside
+             # ``` cannot open a bogus range.
+             /^```/            { fence = !fence; next }
+             fence             { next }
+             /^#+[ \t]*Acceptance/ && !inrange { inrange=1; depth=index($0," ")-1; next }
+             inrange && /^#+[ \t]/ {
+               d=index($0," ")-1
+               if (d <= depth) { inrange=0; next }
+             }
+             inrange && /^[ \t]*[-*][ \t]/ { n++ }
+             END { print n+0 }' || true)
 fi
 
+# The orchestration scripts are not "just tooling": they are what GUARANTEES
+# every other gate's premise. velo-dispatch decides the tree a worker starts
+# from; velo-gate decides which gates run at all; velo-pr-gate decides who runs
+# them. A defect there is systemic — it does not fail loudly in one PR, it
+# silently weakens every run after it.
+#
+# Measured, in one session: velo-gate's acceptance-bar regex matched prose and
+# silently skipped check-spec entirely; velo-dispatch reused a worktree 15
+# commits behind master while printing "off origin/master <sha>", costing a full
+# worker run and producing a brief that instructed the worker to reinstate an
+# escape hatch master had already deleted. All the fixes were authored and
+# merged with NO independent review, because this function classified them as
+# "no buildable code".
+#
+# Compilability was never the right test. Blast radius is.
+# bin/ and rules/ are the executables and policy. tasks/ and skills/ are read
+# AS INPUT by those executables — a task sidecar carries the design pinning,
+# review attestation, anchors and blast radius dispatch validates against, and a
+# skill IS the instruction text a worker runs on. install/update.sh put any of
+# it in place. Weakening a sidecar constraint or swapping an installed policy is
+# a change to how every run behaves, and scored 0 under a bin|rules-only rule.
+TOUCHES_ORCH=$(( $(grep -cE '^\.agents/(bin|rules|skills|tasks)/' <<<"$FILES" || true) \
+               + $(grep -cE '^\.agents/(install|update)\.sh$' <<<"$FILES" || true) ))
+
 NEED=()
-if [[ "$TOUCHES_SRC" -eq 0 && "$TOUCHES_TEST" -eq 0 ]]; then
-  NEED+=("none — docs/tooling only, no buildable code")
+if [[ "$TOUCHES_ORCH" -gt 0 ]]; then
+  NEED+=("code-review  (orchestration: $TOUCHES_ORCH file(s) under .agents/ — governs every other run)")
+  [[ "$TOUCHES_SRC" -gt 0 ]] && NEED+=("check-code   (src/ touched: $TOUCHES_SRC files)")
+elif [[ "$TOUCHES_SRC" -eq 0 && "$TOUCHES_TEST" -eq 0 ]]; then
+  NEED+=("none — docs only, no buildable code and no orchestration")
 else
   NEED+=("code-review  (independent reviewer)")
   [[ "$TOUCHES_SRC" -gt 0 ]] && NEED+=("check-code   (src/ touched: $TOUCHES_SRC files)")

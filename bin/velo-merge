@@ -47,7 +47,22 @@ elif [[ -n "$PASSED"  ]]; then CI="SUCCESS"
 else CI="none"; fi
 LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$M")
 FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$M")
-CODE=$(( $(grep -c '^src/' <<<"$FILES" || true) + $(grep -c '^tests/' <<<"$FILES" || true) ))
+# Orchestration counts as CODE for gating purposes. `.agents/` has no src/ or
+# tests/ path, so the old sum scored it 0 and this script printed
+# "docs/tooling only — gate not required" for a change to the very scripts that
+# decide what every other gate does. velo-gate --plan was fixed to REQUIRE
+# review for these paths; without the same rule here, the requirement was
+# unenforceable at the merge boundary — the PR that fixed --plan had exactly
+# this shape.
+#
+# Scope matches velo-gate: executables and policy under bin/ and rules/, plus
+# the inputs dispatch actually READS (tasks/*.json sidecars carry design
+# pinning, review attestation, anchors and blast radius) and the skills injected
+# as worker instructions, and the installers that put any of it in place.
+CODE=$(( $(grep -c '^src/' <<<"$FILES" || true) \
+        + $(grep -c '^tests/' <<<"$FILES" || true) \
+        + $(grep -cE '^\.agents/(bin|rules|skills|tasks)/' <<<"$FILES" || true) \
+        + $(grep -cE '^\.agents/(install|update)\.sh$' <<<"$FILES" || true) ))
 
 echo "── #$PR $TITLE"
 echo "   head $SHORT   mergeable=$MERGEABLE"
@@ -74,7 +89,7 @@ case "$CI" in
 esac
 
 if [[ "$CODE" -eq 0 ]]; then
-  ok "docs/tooling only — gate not required"
+  ok "docs only — no code, no orchestration; gate not required"
 else
   if [[ ",$LABELS," == *",gate:passed,"* ]]; then
     ok "gate:passed"

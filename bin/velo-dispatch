@@ -346,6 +346,17 @@ if [[ -d "$WT" ]]; then
   or discard it and re-run with --force."
     warn "discarding existing worktree with work ($DIRTY dirty, $AHEAD commits) — --force"
   fi
+  # `agent.log` is git-IGNORED but MANDATED by the implementation policy as the
+  # worker's append-only reasoning trail — the record of why a run did what it
+  # did, and what a post-mortem reads. DIRTY counts tracked files only, so a
+  # completed worktree carrying nothing but agent.log scores 0/0 and would be
+  # removed here WITHOUT the caller passing --force. Preserve it first.
+  if [[ -f "$WT/agent.log" ]]; then
+    KEEP="$WORKTREE_BASE/agent-logs/${ISSUE}-$(date -u +%Y%m%dT%H%M%SZ).log"
+    mkdir -p "$(dirname "$KEEP")"
+    cp "$WT/agent.log" "$KEEP" 2>/dev/null \
+      && warn "preserved worker reasoning trail: $KEEP"
+  fi
   git -C "$ROOT" worktree remove "$WT" --force >/dev/null 2>&1 \
     || die "could not remove existing worktree $WT"
   ok "removed stale worktree $WT (recreating from origin/master)"
