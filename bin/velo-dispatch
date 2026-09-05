@@ -88,13 +88,20 @@ COUNT=$(grep -c . <<<"$WORKERS" || true)
   Add one of:
     worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
     worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
-    worker:glm       pricier. Multi-step reasoning / per-case judgement."
+    worker:glm       pricier. Multi-step reasoning / per-case judgement.
+    worker:codex     most capable, most expensive. Architecture-weight work:
+                     anything where a WRONG answer costs more than the run.
+                     On #1988 it found 2 P1s that two local gates missed while
+                     both returned approve; on #1967 every load-bearing claim
+                     in its analysis survived independent verification. glm
+                     produced ZERO code in 186 turns on #1747."
 [[ "$COUNT" -eq 1 ]] || die "#$ISSUE has $COUNT worker labels ($(tr '\n' ' ' <<<"$WORKERS"))— exactly one required."
 
 case "$WORKERS" in
   worker:local)    NAME="velo-local"; LOGTAG="velo-local" ;;
   worker:deepseek) NAME="velo-deepseek"; LOGTAG="deepseek" ;;
   worker:glm)      NAME="velo-glm"; LOGTAG="glm" ;;
+  worker:codex)    NAME="codex"; LOGTAG="codex" ;;
   *) die "unrecognised worker label: $WORKERS" ;;
 esac
 ok "routed to $NAME"
@@ -336,6 +343,20 @@ LOG="/tmp/${LOGTAG}-${ISSUE}.log"
 TASK=$(cat "$BRIEF")
 
 case "$NAME" in
+  codex)
+    # `codex exec` takes the brief as its prompt argument and runs
+    # non-interactively. --dangerously-bypass-approvals-and-sandbox is required
+    # for an IMPLEMENTATION run: the worker must compile and run tests. A
+    # read-only ANALYSIS task should be dispatched with a brief that forbids
+    # writes and verified after (`git status --porcelain` must be empty),
+    # because nothing here enforces it.
+    command -v codex >/dev/null 2>&1 \
+      || die "worker:codex but the codex CLI is not on PATH.
+  Do NOT silently substitute a local model — that is what produced a green
+  report over two P1s on #1988. Install codex or relabel the issue."
+    nohup codex exec --dangerously-bypass-approvals-and-sandbox \
+      --cd "$WT" "$TASK" > "$LOG" 2>&1 &
+    ;;
   velo-local)
     nohup "$HOME/.venvs/velo-openrouter-agent/bin/python" \
       "$HOME/.agents/bin/velo-lmstudio-agent-sdk.py" \
