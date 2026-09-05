@@ -92,7 +92,74 @@ if [[ "$CODE" -eq 0 ]]; then
   ok "docs only — no code, no orchestration; gate not required"
 else
   if [[ ",$LABELS," == *",gate:passed,"* ]]; then
-    ok "gate:passed"
+    # `gate:passed` is one label, but a src/ PR runs MORE THAN ONE gate. The
+    # printed handoff only ever named code-review, so a check-code finding could
+    # be dropped and nothing would notice — the label would still say passed.
+    # Require a recorded comment per gate the plan demanded.
+    # FAIL CLOSED. `velo-gate --plan` dies with no stdout on a gh failure, so an
+    # empty NEEDED used to mean "nothing demanded" and merged silently — the
+    # exact check this block adds, skipped on the very transient failure it
+    # should be most careful about.
+    PLAN_OUT=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null)
+    if [[ -z "$PLAN_OUT" ]]; then
+      [[ $FORCE -eq 1 ]] || die "could not read the gate plan for #$PR (velo-gate --plan returned nothing).
+  Refusing rather than assuming no gates were required — that assumption is
+  indistinguishable from a correctly-gated PR."
+      warn "gate plan unreadable — proceeding under --force"
+      PLAN_OUT=""
+    fi
+    NEEDED=$(grep -oE '^ *- (code-review|check-code|check-spec)' <<<"$PLAN_OUT" | awk '{print $2}')
+    # PLAN_OUT non-empty but NEEDED empty means the plan PARSED to nothing —
+    # a --plan format change (indentation, bullet char, JSON) would silently
+    # reproduce the vacuous check this block exists to prevent. Guard the
+    # variable the invariant is actually about, not just its input.
+    if [[ -z "$NEEDED" ]]; then
+      [[ $FORCE -eq 1 ]] || die "read the gate plan for #$PR but parsed NO gate names from it.
+  velo-gate --plan's output format has probably changed. Refusing rather than
+  treating an unparsed plan as 'no gates required'.
+  Plan output was:
+$PLAN_OUT"
+      warn "gate plan parsed to nothing — proceeding under --force"
+    fi
+    RECORDED=$(gh pr view "$PR" --repo "$REPO" --json comments \
+      --jq '[.comments[].body | capture("gate: *(?<n>[a-z0-9-]+) *@")] | map(.n) | unique | join(" ")' 2>/dev/null)
+    MISSING=""
+    for g in $NEEDED; do
+      # Match the gate FAMILY, not the exact string. A review is legitimately
+      # recorded as `codex-review` (the README's own worked example) or under
+      # any `<who>-review` name when a reviewer is substituted. velo-pr-gate's
+      # GSHA regex already learned this — it matches `[a-z0-9-]*review` — and a
+      # literal `code-review` test here would refuse a fully-gated PR.
+      case "$g" in
+        code-review)
+          # An explicit allowlist, NOT a bare `*review*` substring. The
+          # substring form accepted the intended `codex-review` but would also
+          # accept `self-review`, `pre-review`, or any invented `*review` name —
+          # a false ACCEPT, which is worse than the false refuse it replaced.
+          # Names are only ever minted by velo-gate-post/velo-pr-gate today;
+          # this keeps that true by construction rather than by convention.
+          MATCHED=0
+          for alias in code-review codex-review opus-review sonnet-review; do
+            [[ " $RECORDED " == *" $alias "* ]] && { MATCHED=1; break; }
+          done
+          [[ $MATCHED -eq 1 ]] || MISSING="$MISSING $g"
+          ;;
+        *) [[ " $RECORDED " == *" $g "* ]] || MISSING="$MISSING $g" ;;
+      esac
+    done
+    if [[ -n "$MISSING" ]]; then
+      [[ $FORCE -eq 1 ]] || die "#$PR is gate:passed but has NO recorded report for:$MISSING
+  A gate whose result never reached the PR is indistinguishable from one that
+  never ran. Post it:
+    velo-gate-post $PR <gate-name> <report-file>
+  Recorded so far: ${RECORDED:-none}"
+      warn "missing gate reports:$MISSING — proceeding under --force"
+    fi
+    if [[ -n "$MISSING" ]]; then
+      warn "gate:passed label present, but the cross-check was BYPASSED (--force)"
+    else
+      ok "gate:passed (reports recorded:${RECORDED:+ $RECORDED})"
+    fi
   else
     CUR=$(tr ',' '\n' <<<"$LABELS" | grep '^gate:' | head -1); [[ -n "$CUR" ]] || CUR="gate:none"
     [[ $FORCE -eq 1 ]] || die "#$PR touches $CODE code file(s) and is '$CUR', not gate:passed.

@@ -334,6 +334,8 @@ EOF
 
   echo
   echo "  Then relay every report and record the verdict:"
+  [[ $NEEDS_CODE  -eq 1 ]] && echo "    velo-gate-post $PR check-code  <report>"
+  [[ $NEEDS_SPEC  -eq 1 ]] && echo "    velo-gate-post $PR check-spec  <report>"
   echo "    velo-gate-post $PR code-review <report>"
   echo "    velo-gate $PR --pass | --block"
 fi

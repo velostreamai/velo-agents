@@ -323,6 +323,23 @@ for the commit it ran against; a PR was once green against a commit that had
 already been replaced. `velo-merge` compares that SHA to `headRefOid` and
 refuses on mismatch.
 
+**One label, several gates.** `gate:passed` is a single label, but a `src/` PR
+runs up to three gates. `velo-merge` therefore cross-checks the gates
+`velo-gate --plan` demanded against the `gate: <name> @ <sha>` comments actually
+recorded, and refuses when any is missing — a finding that never reached the PR
+is indistinguishable from a gate that never ran, and the printed handoff used to
+name only `code-review`, so two could be silently dropped. `velo-pr-gate` now
+prints a `velo-gate-post` line per gate it dispatched.
+
+**Orchestration counts as code.** Anything under `.agents/{bin,rules,skills,tasks}/`
+or `install|update.sh` requires `code-review` and is gated at merge, even though
+it has no `src/` or `tests/` path. Compilability was never the right test — blast
+radius is: these scripts decide which tree a worker starts from, which gates run,
+and who runs them. They were previously classified "docs/tooling only, no
+buildable code" and merged unreviewed; in one session that shipped a gate whose
+regex silently skipped itself and a dispatcher that handed a worker a tree 15
+commits stale while reporting it current.
+
 **Deliver the report yourself.** A reviewer that cannot reach the GitHub API
 produces a good report and then silently fails to post it — indistinguishable
 from a gate that never ran. Have the reviewer RETURN its report, then:
