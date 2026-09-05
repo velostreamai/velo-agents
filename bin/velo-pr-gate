@@ -15,8 +15,23 @@
 #   code-review  -> Codex      adversarial; found a real defect in EVERY round it
 #                              ran, including against designs the orchestrator had
 #                              pinned and code the orchestrator wrote
-#   check-code   -> velo-local free; fine at mechanical dimension-checking
-#   check-spec   -> velo-local free; fine at bar-by-bar verification
+#   check-code   -> Codex      src/ correctness needs the reviewer that finds
+#                              things. On #1988 the local model APPROVED a diff
+#                              carrying two P1s and asserted the OPPOSITE of one
+#                              of them ("no fourth ingest path found" — there
+#                              were five, two uncaptured), plus claimed four
+#                              contract tests were absent when they were present
+#                              and passing. Three false statements, one approve.
+#                              A gate that manufactures confidence is worse than
+#                              no gate.
+#   check-spec   -> velo-local free; bar-by-bar verification against EXPLICIT
+#                              criteria, plus deletion-greps — both mechanical.
+#                              Its judgement calls are still unreliable (it also
+#                              returned MERGE-READY on #1988 asserting the PR
+#                              "closes the null-pad column sourcing gap", which
+#                              is exactly what code-review disproved), so treat
+#                              a check-spec pass as "found nothing", never as
+#                              "nothing is there".
 #
 # All three gates are dispatched by this script. `codex review` runs
 # non-interactively and takes its prompt on stdin.
@@ -82,7 +97,7 @@ fi
 
 if [[ "$SCOPE" == "--plan" ]]; then
   echo "would dispatch:"
-  [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> velo-local"
+  [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> codex review (needs the brief's ATTACK section filled in)"
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
   [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
   [[ $NEEDS_REVIEW -eq 1 && $EXEC -eq 1 ]] && echo "                 --exec: sandbox BYPASSED, reviewer can compile and run tests"
@@ -115,7 +130,8 @@ dispatch_local() {  # $1 = skill, $2 = log suffix
   ok "$skill -> velo-local (pid $!)  log: $log"
 }
 
-[[ $NEEDS_CODE -eq 1 ]] && dispatch_local check-code code
+# check-code is dispatched to Codex alongside code-review below — see the
+# routing table in this file's header for the measurement that moved it.
 [[ $NEEDS_SPEC -eq 1 ]] && dispatch_local check-spec spec
 
 if [[ $NEEDS_REVIEW -eq 1 ]]; then
@@ -258,6 +274,41 @@ EOF
     warn "dimensions rather than findings — that is how a review came back"
     warn "MERGE-READY while missing a HIGH."
     exit 1
+  fi
+
+  # check-code runs as a SECOND Codex pass over the same brief, not folded into
+  # code-review: two separately-recorded reports, because a gate whose result is
+  # buried inside another gate's prose cannot be posted, stamped, or gone stale
+  # on its own.
+  CODE_LOG="/tmp/gate-${PR}-code.log"
+  CODE_BRIEF="/tmp/gate-${PR}-code-brief.md"
+  if [[ $NEEDS_CODE -eq 1 ]] && command -v codex >/dev/null 2>&1; then
+    {
+      echo "You are running the CHECK-CODE gate, not the code review."
+      echo
+      echo "Scope: coverage, error handling, edge cases, duplication, hot-path"
+      echo "efficiency, complexity. Report what the DIFF does wrong on those"
+      echo "dimensions. Do not re-derive the design — a separate code-review"
+      echo "gate covers adversarial correctness against the author's claims."
+      echo
+      echo "State every finding as: file:line, what breaks, and the input or"
+      echo "state that makes it break. If you cannot name the failing case, say"
+      echo "the finding is reasoning-only and mark it as such."
+      echo
+      echo "Do NOT write to the worktree. Read-only."
+      echo
+      cat "$OUT"
+    } > "$CODE_BRIEF"
+    if [[ $EXEC -eq 1 ]]; then
+      nohup sh -c "cd '$WTPATH' && codex review --dangerously-bypass-approvals-and-sandbox - < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
+    else
+      nohup sh -c "cd '$WTPATH' && codex review - < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
+    fi
+    ok "check-code -> codex (pid $!)  log: $CODE_LOG"
+  elif [[ $NEEDS_CODE -eq 1 ]]; then
+    warn "codex CLI not found on PATH — check-code NOT dispatched."
+    warn "Do NOT substitute a local model: on #1988 it approved a diff carrying"
+    warn "two P1s and asserted the opposite of one of them."
   fi
 
   CODEX_LOG="/tmp/gate-${PR}-review.log"

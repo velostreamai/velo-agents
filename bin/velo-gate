@@ -43,7 +43,7 @@ ISSUE=$(jq -r '.body' <<<"$META" | grep -oE '(Closes|Fixes) #[0-9]+' | head -1 |
 BARS=0
 if [[ -n "$ISSUE" ]]; then
   BARS=$(gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body 2>/dev/null \
-         | sed -n '/^#* *Acceptance/,/^#* [A-Z]/p' | grep -cE '^\s*[-*] ' || true)
+         | sed -n '/^#\{1,\} *Acceptance/,/^#\{1,\} /p' | grep -cE '^\s*[-*] ' || true)
 fi
 
 NEED=()
