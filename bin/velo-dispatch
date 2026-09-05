@@ -317,22 +317,65 @@ if [[ $DRY -eq 1 ]]; then
   exit 0
 fi
 
+# A worker's tree is CUT FROM THE FETCHED REF, never inherited from whatever is
+# lying around on disk.
+#
+# This used to reuse an existing directory when it looked "clean" (no local
+# edits, no commits of its own). But a worktree left by an EARLIER dispatch of
+# the same issue scores exactly that — 0 dirty, 0 ahead — so it was
+# indistinguishable from a fresh one, and #1965's worker was handed a tree 15
+# commits behind master while the script printed "off origin/master <sha>". It
+# never saw #1969 or #1988; its 21 failures were stale-base artefacts, and the
+# brief written from them told it to preserve an escape hatch master had
+# already deleted.
+#
+# Adding a "behind" check to the reuse path would only narrow that hole. The
+# reuse path itself is the defect: there is no reason to inherit a tree when
+# cutting a new one from `origin/master` costs a second and is unambiguous.
+# `origin/master` here is the ref fetched in section 3a — the same ref every
+# other gate (anchors, blast radius, spec drift) validates against, so the
+# worker's tree and the validation now agree by construction.
 if [[ -d "$WT" ]]; then
-  DIRTY=$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')
+  DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
   AHEAD=$(git -C "$WT" log --oneline origin/master..HEAD 2>/dev/null | wc -l | tr -d ' ')
   if [[ "$DIRTY" != "0" || "$AHEAD" != "0" ]]; then
-    [[ $FORCE -eq 1 ]] || die "worktree $WT already has work ($DIRTY dirty, $AHEAD commits).
-  Inspect it before discarding. Re-run with --force to reset to origin/master."
-    git -C "$WT" reset --hard origin/master -q && git -C "$WT" clean -qfd
-    warn "reset existing worktree (--force)"
+    [[ $FORCE -eq 1 ]] || die "worktree $WT already exists and HAS WORK ($DIRTY dirty, $AHEAD commits).
+  It will not be reused or reset silently — inspect it first.
+    git -C $WT log --oneline origin/master..HEAD
+  Then either keep it (rebase onto origin/master and dispatch with --worktree),
+  or discard it and re-run with --force."
+    warn "discarding existing worktree with work ($DIRTY dirty, $AHEAD commits) — --force"
   fi
-  ok "worktree exists, clean: $WT"
-else
-  git -C "$ROOT" worktree add "$WT" -b "$BRANCH" origin/master -q 2>/dev/null \
-    || git -C "$ROOT" worktree add "$WT" "$BRANCH" -q \
-    || die "could not create worktree $WT on branch $BRANCH"
-  ok "worktree created: $WT ($BRANCH off $BASE)"
+  git -C "$ROOT" worktree remove "$WT" --force >/dev/null 2>&1 \
+    || die "could not remove existing worktree $WT"
+  ok "removed stale worktree $WT (recreating from origin/master)"
 fi
+
+# The branch may also survive an earlier dispatch. Delete it only when it has no
+# commits of its own; otherwise refuse rather than silently discard someone's work.
+if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  BR_AHEAD=$(git -C "$ROOT" rev-list --count "origin/master..$BRANCH" 2>/dev/null || echo 0)
+  if [[ "$BR_AHEAD" != "0" ]]; then
+    [[ $FORCE -eq 1 ]] || die "branch '$BRANCH' already exists with $BR_AHEAD commit(s) not on master.
+  Cutting a fresh worktree would abandon them.
+    git -C $ROOT log --oneline origin/master..$BRANCH
+  Keep them: rebase onto origin/master, then dispatch with --worktree <path>.
+  Discard them: re-run with --force, or use --branch fix/${ISSUE}-v2."
+    warn "deleting branch $BRANCH with $BR_AHEAD commit(s) — --force"
+  fi
+  git -C "$ROOT" branch -D "$BRANCH" >/dev/null 2>&1 \
+    || die "could not delete existing branch $BRANCH"
+fi
+
+git -C "$ROOT" worktree add "$WT" -b "$BRANCH" origin/master -q \
+  || die "could not create worktree $WT on branch $BRANCH off origin/master"
+ok "worktree cut from origin/master: $WT ($BRANCH @ $BASE)"
+
+# Assert it, rather than trusting the command above — this is the dispatcher's
+# one core promise and it is the thing that silently broke.
+WT_BEHIND=$(git -C "$WT" rev-list --count HEAD..origin/master 2>/dev/null || echo "?")
+[[ "$WT_BEHIND" == "0" ]] \
+  || die "internal: freshly-cut worktree is $WT_BEHIND commits behind origin/master"
 
 # ---- 7. assign (only now that work is actually starting) --------------------
 gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1 \
