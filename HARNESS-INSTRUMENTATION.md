@@ -1,6 +1,6 @@
 # Harness instrumentation — spec
 
-Status: Phase 1 built (2026-09-05); Phases 2–4 proposed
+Status: Phase 1 shipped (#1998, #2001); Phase 2 rescoped by #2007; Phases 3–4 proposed
 Written: 2026-09-05; Phase 1 built against master `3897f65f9`
 Tracking: #1992
 
@@ -176,7 +176,15 @@ the history untrustworthy in exactly the way this spec exists to prevent.
 Both SDK runners already carry an `Outcome` dataclass and already log a
 completion line. Add `input_tokens`, `output_tokens`, `usd` to `Outcome`,
 populate from the SDK result's usage if it exposes one, and fall back to
-OpenRouter's generation endpoint keyed on the response id.
+OpenRouter's real billed cost.
+
+**Correction (2026-09-06, measured — see #2007).** This section originally said
+"fall back to OpenRouter's generation endpoint keyed on the response id". That
+is the wrong mechanism: `GET /api/v1/generation?id=…` returned **404** when
+called seconds after the generation it names. The route that works is the
+chat-completions response itself — send `"usage": {"include": true}` and it
+carries a real `cost` float, `cost_details.upstream_inference_cost`, and
+`prompt_tokens_details.cached_tokens`. No second request needed.
 
 If neither is available for a given worker — likely for the LM Studio local
 model, which has no billing — record `"usd": 0.0, "source": "sdk"` with real
@@ -241,11 +249,26 @@ Verified end-to-end after the fixes: real run → `input_tokens=20775`,
 `output_tokens=74`, `cached_input_tokens=0`, `usd=null`,
 `source=sdk-estimate-unpriced`, `outcome=reported`.
 
-**Still unproven:** the OpenRouter path (deepseek/glm) has not been run — only
-LM Studio has. `total_cost` there is still an SDK estimate at the invented rate,
-so real spend needs OpenRouter's generation endpoint keyed on the response id.
-That is the remaining cost work, and it is now a known gap rather than a
-surprise.
+**Since resolved, and it changed the plan — see #2007 (2026-09-06).** This said
+the OpenRouter path was unproven and that real spend needed the generation
+endpoint. Both halves turned out wrong, and the measurement that settled it
+found something larger:
+
+- The generation endpoint **404s**; `"usage": {"include": true}` on the
+  chat-completions call returns the real `cost` directly.
+- `cached_tokens` reads 0 in every Phase 1 record because
+  `openai_provider.py:266-269` **hardcodes it**, not because caching is absent.
+- And caching genuinely is absent — but for a reason nothing here anticipated.
+  OpenRouter load-balances every request across provider endpoints, and a prefix
+  cache is per-endpoint, so consecutive turns never hit one. Measured: three
+  identical calls landed on Morph, Relace and OpenInference with `cached=0` and
+  a 2.7x cost spread. Pinning the provider gave **97% cached tokens and 4.4x
+  lower cost** on the third call.
+
+The lesson is the same one this document is about. A billing figure that sat
+below a list-rate estimate was read as evidence of a cache discount; a cheaper
+provider endpoint explained it equally well, and that is what was happening. One
+API call would have separated them, and no amount of arithmetic could.
 
 **Step 1 — commit on the branch.** Stage `.agents/bin` and `.agents/install.sh`
 explicitly. Five modified files, three new.
@@ -282,7 +305,26 @@ section.
 
 ---
 
-## Phase 2 — supervise the stall
+## Phase 2 — RESCOPED by #2007
+
+This phase was written as "supervise the stall" and nothing else. Phase 1's data
+plus a design review and a live probe re-ranked it: the dominant cost is not
+stalls, it is that **every request lands on a different provider so the prefix
+cache never hits** (measured: 97% cached and 4.4x cheaper once pinned). #2007
+carries the full ranking; the order there is provider pinning → real telemetry →
+failure-path salvage → compaction → turn budget → policy split → runner merge.
+
+Two things below survive that rescope, and one is superseded:
+
+- **Superseded in part.** The checkpoint-on-stall idea is subsumed by #2007's
+  cheaper version: checkpoint-commit in the runner's own exception path, which
+  needs no poll loop and no second process. That covers the *failure exit*.
+- **Still stands.** A worker that is ALIVE but wedged never reaches an exception
+  handler, so nothing in-process will ever catch it. The stall predicate below
+  is the only thing that can, and `wt_is_stalled` / `WT_STALL_MINUTES` already
+  exist in `velo-worktree-lib.sh` for exactly this.
+
+The rest of this section describes that surviving piece.
 
 `velo-status:154` already computes the condition: worker process alive, and no
 new timestamped line in the worktree's `agent.log` for ≥10 minutes. It colours
