@@ -104,6 +104,19 @@ The trigger list is exhaustive; if an operation doesn't match it, `Edit` is fine
 
 ### Type-aware refactors — LSP-first, ast-grep-after
 
+> **FIRST: do you actually have an LSP tool?** This policy governs two kinds of
+> worker and only one of them does.
+>
+> - **Native Claude Code agents** have the `LSP` tool. Follow this section as
+>   written.
+> - **Delegated workers** (`worker:local` / `deepseek` / `glm` / `codex`) have
+>   exactly `Read, Glob, Grep, Bash, Edit, Write`. There is no LSP tool — the
+>   SDK ships a 43-line stub whose every call returns
+>   `"LSP operation is not yet implemented"`. Skip to
+>   **"Without LSP"** below. Do not attempt the steps here; they cannot be run,
+>   and step 1 would have you STOP on every single task.
+
+
 **ast-grep is type-blind.** A pattern like `$X.record_count` matches every `.record_count` in the codebase regardless of `$X`'s type. Field names collide across structs — e.g. `record_count` exists as a field on `ProcessorContext`, `ProducerSpanContext`, `TumblingWindowStrategy::stats`, and others. Bulk-rewriting with the bare pattern WILL break unrelated structs.
 
 **Pre-warm rust-analyzer at startup.** Indexing the velostream workspace takes 30s–2min on first run; doing it mid-task means LSP `findReferences` returns empty until indexing completes, silently degrading the agent to grep-based rewriting. Kick rust-analyzer in the background as the FIRST shell action on the worktree, then continue with brief-reading + field-map reading while it indexes:
@@ -129,6 +142,41 @@ If `rust-analyzer` is not on `$PATH` or fails, fall back to `cargo check --no-de
 7. **Migration order**: ALL field-access sites must migrate to method syntax BEFORE the legacy field is renamed or removed. Use LSP `findReferences` on the legacy field name as the final-check: zero results = safe to remove.
 
 **Why this discipline matters at scale**: ADR-707 Phase 5a-followup migrates ~65 fields × N callers. A 7-site spike on `spike/707-accessor-dual-syntax` (2026-06-17) caught a `telemetry.rs:792` false positive (`ctx.record_count` where `ctx: ProducerSpanContext`, not `ProcessorContext`) using only `grep` — exactly the failure mode the LSP-first mechanic prevents.
+
+### Without LSP — what a delegated worker must do instead
+
+You have `ast-grep` (via Bash — verified present) and `cargo check`. `ast-grep`
+is **type-blind**: `$X.record_count` matches 79 sites across 14 files in this
+repo and cannot tell a `ProcessorContext` from a `ProducerSpanContext`. Nothing
+in your toolset can, *before* the edit.
+
+`cargo check --no-default-features` **is** type-aware, but only *after* the
+write — it reports false hits as `no method named …` / `expected … found …`.
+That is a verifier, not a filter, and the difference decides what you may do:
+
+1. **A rewrite confined to ONE file, or to a set of sites you have read
+   individually and confirmed by their binding, is fine.** Read the code, check
+   what each receiver actually is, then edit. `cargo check` afterwards, always.
+
+2. **A bulk rewrite of a bare field/method pattern that collides across types
+   is FORBIDDEN.** You cannot establish which sites are in scope, and
+   `cargo check` catches the damage only once it is written across the tree —
+   at which point you are reverting a partially-applied migration by hand.
+
+3. **When a task requires (2), STOP and report.** Say that it needs type-aware
+   filtering you do not have, and name the symbol and the site count from
+   `ast-grep`. That is a useful result. Guessing is not: this exact class —
+   `ctx.record_count` where `ctx` was the wrong type — is the failure the spike
+   above was written to record.
+
+Check for collision before you start: `ast-grep run --pattern '$X.<name>' --lang
+rust src/ --json | jq length`. A handful in one module is case (1). Dozens
+across many files is case (2) — stop.
+
+**Migration order**, adapted: all access sites must migrate before the legacy
+field is renamed or removed, and the final check is `cargo check` plus
+`ast-grep --pattern '$X.<legacy_name>'` returning zero — not LSP
+`findReferences`, which you cannot run.
 
 ## Tool-use efficiency
 
