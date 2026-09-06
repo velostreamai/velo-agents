@@ -26,8 +26,20 @@ wt_dirty() {    # <worktree> -> count of dirty paths
 }
 
 wt_unpushed() { # <worktree> <branch> -> commits not on the remote branch
-  # An unset upstream makes this the same as wt_commits, which is the correct
-  # answer: nothing has been pushed, because there is nowhere to have pushed to.
+  # With NO remote branch, `git log origin/<b>..HEAD` errors, stderr is
+  # suppressed, stdout is empty and `wc -l` returns 0 — which reads as "nothing
+  # left to push" for a branch that has never been pushed at all. velo-record
+  # then recorded pushed=true for two local-only commits on #2006 (#2012 R1).
+  #
+  # The comment this replaces claimed that case "is the correct answer: nothing
+  # has been pushed, because there is nowhere to have pushed to" — describing the
+  # value as if it equalled wt_commits. It did not; it was 0. The direction of
+  # the error is the dangerous one: unpushed work is exactly the state that gets
+  # silently lost when a worktree is reset.
+  if ! git -C "$1" rev-parse --verify --quiet "refs/remotes/origin/$2" >/dev/null 2>&1; then
+    wt_commits "$1"   # no remote branch => everything local is unpushed
+    return
+  fi
   git -C "$1" log --oneline "origin/$2..HEAD" 2>/dev/null | wc -l | tr -d ' '
 }
 

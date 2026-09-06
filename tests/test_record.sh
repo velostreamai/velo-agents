@@ -97,6 +97,24 @@ check "non-zero rc -> failed"                     "$(run_record 5 "$TMP/clean" "
 # fallback every codex review — the gate velo-pr-gate routes to — scored failed.
 check "codex (no TOTALS) + read-only brief"       "$(run_record 6 "$TMP/empty" "$TMP/no-totals.log" "$TMP/ro-brief.md" 0)"   "reported"
 
+echo "push state (#2012 R1)"
+# `git log origin/<b>..HEAD` on a branch with NO remote errors to empty, so
+# wc -l returned 0 — "nothing left to push" for a branch never pushed at all.
+# The error direction is the dangerous one: unpushed work is what gets lost.
+check "no remote branch -> all commits unpushed" "$(wt_unpushed "$TMP/clean" fix/never-pushed)" \
+      "$(wt_commits "$TMP/clean")"
+check "and that is not zero"                     "$([[ "$(wt_unpushed "$TMP/clean" fix/never-pushed)" != "0" ]] && echo yes || echo no)" "yes"
+
+echo "read-only classification (#2012 R2)"
+# A brief that is read-only TO SRC but mandates committing an analysis is not a
+# read-only run. Collapsing it to one accused a compliant worker of a violation.
+printf 'READ-ONLY analysis of the join path. Do not modify src/.\n\n## Incremental commits — MANDATORY\nCommit after each section you complete. Do NOT push.\n' > "$TMP/ro-but-commits.md"
+check "read-only brief that mandates commits -> landed" \
+      "$(run_record 7 "$TMP/clean" "$TMP/no-totals.log" "$TMP/ro-but-commits.md" 0)" "landed"
+# ...while a genuinely read-only brief that commits is still a violation.
+check "genuinely read-only brief that commits -> violation" \
+      "$(run_record 8 "$TMP/clean" "$TMP/ro.log" "$TMP/ro-brief.md" 0)" "read-only-violation"
+
 echo "record file"
 # The JSON-array append was an unlocked read-modify-write: six concurrent
 # recorders left 1 of 6 rows, silently, in the file whose stated purpose is that

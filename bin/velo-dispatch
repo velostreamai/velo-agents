@@ -119,7 +119,16 @@ ok "routed to $NAME"
 # the ref removes the requirement instead of enforcing it: a stale, dirty, or
 # mid-rebase checkout is now simply irrelevant to validation.
 git -C "$ROOT" fetch -q origin || die "git fetch failed"
-ok "validating against origin/master ($(git -C "$ROOT" rev-parse --short origin/master))"
+# A worktree directory removed by hand leaves its registration behind, and
+# `git branch -D` then refuses forever — --force included (#2012 M4). Pruning is
+# the documented fix and appeared nowhere in this script.
+git -C "$ROOT" worktree prune 2>/dev/null || true
+# Resolve ONCE. Every gate below used to re-resolve the symbolic ref, so a merge
+# landing mid-validation gave the worker a tree the anchors never described —
+# and the self-check compared against that same new ref, making the mismatch
+# invisible in every output (#2012 M1). This is #1965 through a narrower window.
+BASE_SHA=$(git -C "$ROOT" rev-parse origin/master) || die "cannot resolve origin/master"
+ok "validating against origin/master (${BASE_SHA:0:9}) — pinned for this run"
 
 # ---- 3b. task spec sidecar (authoritative when present) ---------------------
 SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
@@ -145,11 +154,15 @@ print('' if d is None else (json.dumps(d) if isinstance(d,(list,dict)) else d))
 
   DEPS=$(y depends_on)
   if [[ -n "$DEPS" && "$DEPS" != "null" ]]; then
-    for d in $(tr -d '[]," ' <<<"$DEPS" | tr ',' ' '); do
+    # `tr -d` already deletes the commas, so the old second `tr ',' ' '` split
+    # nothing and [1956, 1958] collapsed to the single token 19561958 (#2012 M2).
+    for d in $(python3 -c 'import json,sys; print(" ".join(str(x) for x in json.loads(sys.argv[1])))' "$DEPS" 2>/dev/null); do
       [[ -n "$d" ]] || continue
       DS=$(gh issue view "$d" --repo "$REPO" --json state --jq .state 2>/dev/null)
       [[ "$DS" == "CLOSED" ]] || die "spec: depends_on #$d is $DS — must be CLOSED before dispatch."
     done
+    [[ -n "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$DEPS" 2>/dev/null)" ]] \
+      || die "spec: depends_on is not valid JSON: $DEPS"
     ok "dependencies closed"
   fi
 
@@ -179,43 +192,62 @@ print('' if d is None else (json.dumps(d) if isinstance(d,(list,dict)) else d))
   # and it is exactly what an orchestrator does mid-flight when it is in a hurry.
   REV=$(y reviewed.by); REV_AT=$(y reviewed.at); REV_SHA=$(y reviewed.brief_sha256)
 
-  [[ -n "$REV" && -n "$REV_AT" ]] || die "spec: no 'reviewed' block.
-  A spec that nobody attests to having read against the issue is a guess with
-  JSON syntax. Add:
+  # `brief_sha256` is REQUIRED, not optional-if-present (#2012 H2). It used to be
+  # guarded by `[[ -n "$REV_SHA" && … ]]`, so omitting the field — the fiddliest
+  # one to write by hand — silently disabled brief-pinning while the ok line
+  # below still announced "brief hash matches". A gate you can switch off by
+  # leaving a field out, which then claims it ran, is worse than no gate.
+  [[ -n "$REV" && -n "$REV_AT" && -n "$REV_SHA" ]] || die "spec: incomplete 'reviewed' block.
+  All three fields are required — by/at attest that someone read the spec against
+  the issue, brief_sha256 pins the BRIEF they read. Editing the brief after
+  review is the easiest way to smuggle unreviewed instructions to a worker.
 
     \"reviewed\": { \"by\": \"<who>\", \"at\": \"$(date -u +%FT%TZ)\",
                   \"brief_sha256\": \"$(shasum -a 256 "$BRIEF" | cut -d" " -f1)\" }"
 
   BRIEF_NOW=$(shasum -a 256 "$BRIEF" | cut -d' ' -f1)
-  if [[ -n "$REV_SHA" && "$REV_SHA" != "$BRIEF_NOW" ]]; then
+  if [[ "$REV_SHA" != "$BRIEF_NOW" ]]; then
     die "spec: THE BRIEF CHANGED SINCE REVIEW.
   reviewed.brief_sha256 = $REV_SHA
   actual                = $BRIEF_NOW
   Editing the brief after review sends a worker instructions nobody checked
   against the issue. Re-read it, then update reviewed.at and brief_sha256."
   fi
+  ok "brief hash matches reviewed.brief_sha256"
 
   # Spec-vs-issue drift. `updatedAt` moves on edits AND on new comments, which
   # is what we want: a ruling posted as a comment is the commonest way a brief
   # goes stale, and it is invisible to every code-based check above.
+  #
+  # This must FAIL CLOSED (#2012 H3). `set -e` is off and stderr is discarded, so
+  # a rate-limit, expired token or transient 5xx produced an empty string, the
+  # `-n` guard skipped the comparison, and the ok line still reported "issue
+  # unchanged since" — a rubber stamp on the exact failure this was built for.
   ISSUE_UPD=$(gh issue view "$ISSUE" --repo "$REPO" --json updatedAt --jq .updatedAt 2>/dev/null)
-  if [[ -n "$ISSUE_UPD" && "$ISSUE_UPD" > "$REV_AT" ]]; then
+  [[ -n "$ISSUE_UPD" ]] || die "spec: could not re-read #$ISSUE to check for drift.
+  gh returned nothing (rate limit, expired token, or network). Refusing rather
+  than skipping: an unanswered drift check is not a passed one."
+  if [[ "$ISSUE_UPD" > "$REV_AT" ]]; then
     die "spec: ISSUE MOVED AFTER REVIEW — the brief may contradict it.
   reviewed.at      = $REV_AT
   issue updatedAt  = $ISSUE_UPD
   #$ISSUE was edited or commented after this spec was reviewed. Read what
   changed (gh issue view $ISSUE --comments), reconcile the brief, then bump
   reviewed.at. Anchors passing means the CODE did not move; it says nothing
-  about the intent."
+  about the intent.
+
+  NOTE: a PREVIOUS dispatch of this issue bumps updatedAt by assigning it, so
+  a re-dispatch can trip this on a change the tooling itself made (#2012 L3).
+  Check the timeline before assuming someone edited the issue."
   fi
-  ok "reviewed by $REV at $REV_AT; brief hash matches; issue unchanged since"
+  ok "reviewed by $REV at $REV_AT; issue unchanged since"
 
   # Anchors: SYMBOLS re-verified against the tree. Line numbers rot; symbols do not.
   ANCH=$(y anchors)
   if [[ "$ANCH" != "[]" && -n "$ANCH" ]]; then
-    STALE=$(python3 - "$ROOT" "$SPEC" <<'PYA'
+    STALE=$(python3 - "$ROOT" "$SPEC" "$BASE_SHA" <<'PYA'
 import sys, json, subprocess
-root, spec = sys.argv[1], sys.argv[2]
+root, spec, base = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def at_origin(path):
     """File content as it exists at origin/master — NOT in the working tree.
@@ -225,13 +257,21 @@ def at_origin(path):
     describe code the worker would never see: a stale checkout once reported a
     test file MISSING and a blast radius short by 6, both of which looked like
     errors in the brief and were not."""
-    r = subprocess.run(["git", "-C", root, "show", f"origin/master:{path}"],
+    r = subprocess.run(["git", "-C", root, "show", f"{base}:{path}"],
                        capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else None
 
 bad=[]
 for a in (json.load(open(spec)) or {}).get("anchors") or []:
     f, sym, exp = a.get("file"), a.get("symbol"), a.get("expect")
+    # A comment is not an anchor. SCHEMA.md sells these as "SYMBOLS, never line
+    # numbers", but the check is a substring count over raw file text, so a
+    # comment left behind by a refactor keeps reporting "verified" for code that
+    # moved (#2012 L1). Two of #1959's three anchors were comments.
+    if sym and sym.lstrip().startswith(("//", "#", "/*", "*")):
+        bad.append(f"{f}: anchor {sym[:40]!r} is a COMMENT, not a symbol — "
+                   "a refactor can move the code and leave it behind")
+        continue
     content = at_origin(f)
     if content is None:
         bad.append(f"{f}: FILE MISSING at origin/master"); continue
@@ -250,19 +290,32 @@ $STALE
   fi
 
   # Blast radius: COMPUTE it. An author's estimate produced '1 call site' for 66.
-  BRP=$(y blast_radius.pattern); BRR=$(y blast_radius.refs)
+  BRP=$(y blast_radius.pattern); BRR=$(y blast_radius.refs); BRF=$(y blast_radius.files)
   if [[ -n "$BRP" && -n "$BRR" ]]; then
     # `git grep <ref>` reads the REF, so this measures the same tree the worker
     # gets rather than whatever happens to be checked out locally.
-    ACT=$(git -C "$ROOT" grep -F -c "$BRP" origin/master -- src tests examples 2>/dev/null \
-          | awk -F: '{n+=$NF} END{print n+0}')
+    # -o counts REFERENCES, not matching lines: -c undercounts any line using the
+# symbol twice (#2012 M5).
+    ACT=$(git -C "$ROOT" grep -F -o "$BRP" "$BASE_SHA" -- src tests examples 2>/dev/null | wc -l | tr -d ' ')
     DELTA=$(( ACT > BRR ? ACT - BRR : BRR - ACT ))
     LIM=$(( BRR / 10 + 2 ))
     [[ "$DELTA" -le "$LIM" ]] || die "spec: BLAST RADIUS MISMATCH for '$BRP'.
   declared $BRR refs, actually $ACT (git grep of origin/master over src/ tests/ examples/).
   A wrong estimate is how a worker burned its entire budget hand-editing 66
   call sites it was told was one. Re-measure and update the spec."
-    ok "blast radius: $ACT refs (declared $BRR)"
+    # SCHEMA.md promises "computed refs/FILES vs declared -> refuse on mismatch"
+    # and files was never read. Both live specs declared 0 and passed (#2012 M5).
+    if [[ -n "$BRF" && "$BRF" != "null" ]]; then
+      ACTF=$(git -C "$ROOT" grep -F -l "$BRP" "$BASE_SHA" -- src tests examples 2>/dev/null | wc -l | tr -d ' ')
+      DELTAF=$(( ACTF > BRF ? ACTF - BRF : BRF - ACTF ))
+      LIMF=$(( BRF / 10 + 2 ))
+      [[ "$DELTAF" -le "$LIMF" ]] || die "spec: BLAST RADIUS FILE COUNT MISMATCH for '$BRP'.
+  declared $BRF files, actually $ACTF.
+  A declared 0 used to pass silently — SCHEMA.md says this is enforced."
+      ok "blast radius: $ACT refs / $ACTF files (declared $BRR / $BRF)"
+    else
+      ok "blast radius: $ACT refs (declared $BRR); files not declared"
+    fi
   fi
 
   BEHIND=$(git -C "$ROOT" rev-list --count "$(y verified_against)..origin/master" 2>/dev/null || echo "?")
@@ -280,6 +333,8 @@ grep -qiE "do not.*cd|don't.*cd" "$BRIEF"     || MISSING+=("no 'do NOT cd' instr
 grep -qiE "STOP and report|STOP —|STOP if"    "$BRIEF" || MISSING+=("no STOP conditions (spec §5)")
 grep -qiE "commit incrementally|commit after each" "$BRIEF" || MISSING+=("no incremental-commit rule (spec §12) — a timeout will lose all work")
 grep -qiE "cargo (check|nextest)" "$BRIEF"    || MISSING+=("no validation commands (spec §7)")
+grep -qiE "do not commit|may commit|commit and push|do not push|do not open a pr|authorized to (commit|push)" "$BRIEF" \
+  || MISSING+=("no explicit commit/push authorization (spec §8) — the brief is the only thing telling a worker what it may do")
 if grep -qiE "\.sql|SELECT .* FROM" "$BRIEF"; then
   grep -q "SQL_GRAMMAR_RULES\|PARSER_GRAMMAR" "$BRIEF" \
     || MISSING+=("brief writes SQL but cites no grammar reference (spec §6)")
@@ -304,7 +359,7 @@ ok "disk: ${AVAIL}GB free"
 WT="$WORKTREE_BASE/velostream-$ISSUE"
 
 # (fetch already done in section 3a, before anchors were measured)
-BASE=$(git -C "$ROOT" rev-parse --short origin/master)
+BASE="${BASE_SHA:0:9}"
 
 if [[ $DRY -eq 1 ]]; then
   echo
@@ -374,11 +429,13 @@ if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
   Discard them: re-run with --force, or use --branch fix/${ISSUE}-v2."
     warn "deleting branch $BRANCH with $BR_AHEAD commit(s) — --force"
   fi
-  git -C "$ROOT" branch -D "$BRANCH" >/dev/null 2>&1 \
+  # `branch -D` prints "Deleted branch X (was <sha>)" — the easiest recovery path
+# for work this flag just discarded. It was sent to /dev/null (#2012 L5).
+DELETED=$(git -C "$ROOT" branch -D "$BRANCH" 2>&1) \
     || die "could not delete existing branch $BRANCH"
 fi
 
-git -C "$ROOT" worktree add "$WT" -b "$BRANCH" origin/master -q \
+git -C "$ROOT" worktree add "$WT" -b "$BRANCH" "$BASE_SHA" -q \
   || die "could not create worktree $WT on branch $BRANCH off origin/master"
 ok "worktree cut from origin/master: $WT ($BRANCH @ $BASE)"
 
@@ -393,9 +450,18 @@ gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1
   && ok "assigned to $ASSIGNEE" || warn "could not assign (non-fatal)"
 
 # ---- 8. launch --------------------------------------------------------------
-LOG="/tmp/${LOGTAG}-${ISSUE}.log"
+# Timestamped: this used to be deterministic per (worker, issue) and opened with
+# `>`, so a re-dispatch truncated the log the PREVIOUS record cites — and
+# velo-record derives turns, status, leaked calls and the whole cost block from
+# it, so a post-mortem silently read the newer run's numbers (#2012 M3).
+LOG="/tmp/${LOGTAG}-${ISSUE}-$(date -u +%Y%m%dT%H%M%SZ).log"
 TASK=$(cat "$BRIEF")
 STARTED=$(date -u +%FT%TZ)
+
+# Recorded turn cap defaults to the real one; the codex route clears it because
+# it has none, and a fabricated cap is the same class of lie as a fabricated
+# cost (#2012 L2).
+RECORD_MAX_TURNS="$MAX_TURNS"
 
 # The runner command is BUILT, not launched, because the supervisor wrapper
 # below must be identical for every worker. Four inline launches would be four
@@ -416,7 +482,28 @@ case "$NAME" in
     # codex writes no TOTALS line, so its record carries cost source
     # "unavailable" rather than a zero. A fabricated zero on the MOST expensive
     # worker would invert every cost comparison the record exists to support.
-    CMD=( codex exec --dangerously-bypass-approvals-and-sandbox --cd "$WT" "$TASK" )
+    #
+    # The SDK routes below splice velo-impl.md into the system prompt via
+    # `--policy`. codex has no such flag, and this route passed the brief ALONE
+    # (#2012 H1) — so the only worker running with the sandbox bypassed was also
+    # the only one that never saw "never delete a test", "never swallow errors",
+    # "never commit unless the brief authorizes it", or the STOP-trigger list.
+    # Verified those reach it through no other path: zero occurrences in the
+    # worktree's CLAUDE.md or AGENTS.md. The risk ordering was exactly inverted.
+    #
+    # Prepend the policy to the prompt, which is the only channel codex has.
+    [[ -r "$POLICY" ]] || die "worker:codex needs the policy at $POLICY — not readable.
+  The SDK routes fail closed on this (--policy is required=True); this route
+  must too, or codex runs unconstrained."
+    CODEX_PROMPT=$(printf '%s\n\n%s\n\n---\n\n%s\n' \
+      "The following implementation policy is authoritative and mandatory for this task." \
+      "$(cat "$POLICY")" "$TASK")
+    # And a wall-clock bound: codex takes no --prompt-timeout, so without this
+    # the "unattended for up to N hours" limit simply does not exist here.
+    CMD=( timeout "$PROMPT_TIMEOUT" codex exec --dangerously-bypass-approvals-and-sandbox
+          --cd "$WT" "$CODEX_PROMPT" )
+    # No --max-turns on this route, so do not let the record claim one (#2012 L2).
+    RECORD_MAX_TURNS=""
     ;;
   velo-local)
     MODEL_ID='qwen3-coder-next-mlx@6bit'
@@ -459,7 +546,7 @@ nohup bash -c '
   "$HOME/.agents/bin/velo-record" "$RI" --worktree "$RWT" --worker "$RNAME" \
     --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
     --rc "$rc" --max-turns "$RMT" --base "$RBASE" >> "$LOGF" 2>&1 || true
-' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$MAX_TURNS" "$BASE" \
+' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
   "${CMD[@]}" > /dev/null 2>&1 &
 PID=$!
 

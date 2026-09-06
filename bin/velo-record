@@ -119,6 +119,16 @@ if [[ -z "$READ_ONLY" && -n "$BRIEF" && -f "$BRIEF" ]]; then
   if grep -qiE 'read-only|read only|do not modify|do not edit|no changes|without modifying' "$BRIEF"; then
     READ_ONLY=true
   fi
+  # ...but a brief that MANDATES commits is not read-only, whatever else it says.
+  # #2006's brief is "read-only to src, commit your analysis" — it matched one
+  # marker, its two required commits were then recorded as a violation, and the
+  # run was accused of disobeying instructions it had followed (#2012 R2).
+  #
+  # Inferring intent from prose is the actual defect; this only stops the worst
+  # misreading. velo-dispatch knows the classification and should pass it.
+  if grep -qiE 'commit after each|commit incrementally|commits are expected|MANDATORY' "$BRIEF"; then
+    READ_ONLY=false
+  fi
 fi
 
 if [[ "${LEAKED:-0}" != "0" ]]; then      OUTCOME="failed"
