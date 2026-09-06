@@ -6,6 +6,68 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — every dispatch now records what it DID (#1992 Phase 1, PR #1998)
+
+Every gate here validated a run **before** it started. Nothing recorded what
+happened after: `velo-dispatch` ended by printing "Detached — no completion
+event", `.agents/tasks/` held 20 specs and **zero** results, and neither runner
+captured token usage at all.
+
+So the routing table in this README — local free, deepseek cheap, glm pricier —
+was a set of **labels, not measurements**. It could not answer which worker
+lands work per unit cost, whether the cheap path stays cheap once rework is
+counted, or how much work a stall loses.
+
+`velo-record` now writes one record per dispatch to `<issue>.result.jsonl`,
+called from a supervisor that `velo-dispatch` wraps around the runner, so a
+crash and a timeout leave a row as surely as a clean finish. `velo-worktree-lib.sh`
+holds the git derivations `velo-status` and `velo-record` share — a copy would
+let the live view and the recorded history disagree, and then neither is
+trustworthy.
+
+**The failure this prevents is a plausible wrong number, not a crash.** Using
+the thing caught four of them, each of which had passed unit-level checks:
+
+- usage was never captured at all — the RESULT event carries `total_usage`,
+  while `usage` is the per-message field and is `None` there
+- every dollar figure was fiction: `estimate_cost` falls back to an invented
+  `{3.0, 15.0}` rate for any model outside its Anthropic/OpenAI table, which is
+  all of ours. A free local run was costed at $0.063; a real review reported
+  **$56.93 against ~$1.22 of actual spend, 47×**. `usd` is now null unless the
+  rate was real
+- read-only runs scored `abandoned`, so every review gate read as a failure
+- an empty `TokenUsage` counted as data — the guard rejected a *missing* object
+  but not an *empty* one, recording "we know a floor of zero" for "we know
+  nothing"
+
+A `.agents/tests/` suite (24 checks, `run.sh`, seconds) pins all of it. It is
+deterministic against a synthetic event stream rather than a live model because
+two attempts to reproduce a mid-flight death by tuning timeouts both COMPLETED
+inside the window, and the RESULT-double-count case has no timing expression at
+all — timing tests could not have caught either. It found the fourth defect
+above on its first run.
+
+Also fixed here, all found by review rather than by use:
+
+- `install.sh`'s drift check decided "which side is newer" from **mtime**, which
+  inverts the moment you edit the repo copy — exactly when it matters. It now
+  counts lines unique to each side and declines to guess whether they are
+  unmerged work or a deliberate replacement.
+- The STOP predicate matched lines saying a STOP did **not** happen. `velo-impl.md`
+  tells every worker to end its report with "Any STOP triggers hit", so
+  "no STOP triggers hit" is the *documented format* — and `stopped` outranks
+  `landed` and is defined as not-a-failure, so a run that landed commits
+  vanished from both columns.
+- `leaked_tool_calls` was accumulated in two places, so it double-counted the
+  first prompt on the normal path **and** dropped every intermediate
+  continuation's leaks. Reported as pre-existing; fixed anyway, because
+  pre-existing says where a bug came from, not whether it should ship, and this
+  change is what made the number durable.
+
+**Known gap:** `velo-gate --plan` classifies an `.agents/`-only diff as
+tooling-only and requires **no gate at all**. This change needed a manually
+dispatched review to get one, and that review found 2 HIGH.
+
 ### Fixed — `code-review` now actually dispatches to Codex
 The script generated a Codex brief and stopped, on the stated belief that
 "Codex cannot be launched from a shell — it is an Agent call". That is false:

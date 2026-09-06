@@ -24,9 +24,15 @@ and the tests** — never from the worker's self-report.
     velo-gate                      record/inspect a PR's gate state (a LABEL, not memory)
     velo-gate-post                 post a reviewer's report on its behalf
     velo-merge                     merge only if gated against the CURRENT head
+    velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
+    velo-worktree-lib.sh           worktree derivations shared by velo-status + velo-record
     velo-openrouter-agent          wrapper -> the SDK worker (DeepSeek / GLM)
     velo-openrouter-agent-sdk.py   OpenRouter-backed worker runner
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
+  tests/
+    run.sh                         both suites, in seconds — run when touching .agents/
+    test_runner_accounting.py      usage / leak / cost-provenance invariants
+    test_record.sh                 STOP detection, outcome ladder, record writing
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
     velo-brief-spec.md             what a task brief MUST contain, and why
@@ -39,6 +45,7 @@ and the tests** — never from the worker's self-report.
   tasks/
     SCHEMA.md                      task-spec format
     <issue>.json                   per-issue machine-checkable spec
+    <issue>.result.jsonl           what each dispatch DID — one record per run
 ```
 
 ## Installation
@@ -201,6 +208,42 @@ git -C ~/RustroverProjects/velostream-1898 log --oneline origin/master..HEAD
 A worker's own report is not evidence. A worker that commits looks "unchanged"
 to its runner, and one that emits a tool call as plain text reports success
 having executed nothing (`velo-status` flags that as `LEAKED`).
+
+### 6. Read what the run actually cost — `<issue>.result.jsonl`
+
+Every dispatch appends one record when its worker exits, written by `velo-record`
+from the supervisor `velo-dispatch` wraps around the runner. Crashes, timeouts
+and clean finishes all leave a row — a record that only appears on the happy
+path measures the happy path.
+
+```bash
+velo-status 1898          # renders every recorded run for one issue
+jq -s 'map({outcome, worker, wall_clock_s, cost})' .agents/tasks/1898.result.jsonl
+```
+
+Records are **appended, never overwritten**: a re-dispatch of the same issue is
+the interesting row, not one to discard. JSONL rather than a JSON array because
+the array was an unlocked read-modify-write — six concurrent recorders left one
+of six rows, silently, exit 0.
+
+**`cost.usd` is null unless the price was real.** The SDK's `estimate_cost`
+silently applies an invented `{input: 3.0, output: 15.0}` rate to any model
+outside its Anthropic/OpenAI table — which is every worker here — so a free
+local run was costed at $0.063, and one real review reported **$56.93 for
+~$1.22 of actual spend**. When the rate is not known the estimate is preserved
+under `usd_sdk_estimate_invented_rate`, a name nobody will mistake for a price.
+Token counts are always real; only the dollars are suspect.
+
+`outcome` is one of:
+
+| value | meaning |
+|---|---|
+| `landed` | ran clean and left commits |
+| `reported` | read-only task, wrote nothing — the CORRECT result for a review gate |
+| `read-only-violation` | read-only task that committed anyway |
+| `stopped` | hit a STOP trigger and reported — a success of the policy, not a failure |
+| `abandoned` | no commits, no STOP, no error |
+| `failed` | non-zero exit, or a leaked tool call (an intended action never ran) |
 
 ---
 
