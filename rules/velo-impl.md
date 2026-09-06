@@ -173,6 +173,46 @@ Check for collision before you start: `ast-grep run --pattern '$X.<name>' --lang
 rust src/ --json | jq length`. A handful in one module is case (1). Dozens
 across many files is case (2) — stop.
 
+**But narrow before you conclude case (2).** ast-grep cannot infer an
+expression's type, but its RELATIONAL rules can scope a match to its containing
+`impl` — which answers "is this access on the type I care about" for every
+`self.` access, and those are usually the majority. Verified on this repo:
+`$X.record_count` gives 79 undifferentiated sites, of which 55 are `self.`;
+scoping to a named impl partitions them precisely.
+
+Write a rule file rather than a bare pattern:
+
+```yaml
+# scope-to-impl.yml — matches only inside `impl ProcessorContext`
+id: scoped
+language: rust
+rule:
+  pattern: self.$FIELD
+  inside:
+    pattern: 'impl ProcessorContext { $$$ }'
+    stopBy: end          # REQUIRED — without it, only the immediate parent is
+                         # searched and you get zero matches, which reads as
+                         # "no sites" rather than "wrong query"
+```
+
+```bash
+ast-grep scan --rule scope-to-impl.yml --json src/ | jq length
+```
+
+Verified working: that rule returns 211 `self.$FIELD` matches inside
+`impl ProcessorContext` in `context.rs`, correctly partitioned by field.
+
+Two cautions, both learned by getting them wrong:
+
+- **A zero result is ambiguous.** It means either "no such sites" or "your rule
+  is wrong" — and the two look identical. Prove the rule works on a case whose
+  answer you already know before trusting a zero. `impl $ANY $TYPE` and
+  `field:`-based selectors both silently returned 0 here where a plain
+  `pattern:` returned 211.
+- **This scopes by containing impl, NOT by receiver type.** It handles `self.x`.
+  It cannot tell you what `buffer.x` or `stats.x` are — for those you still read
+  the binding, or you are in case (2).
+
 **Migration order**, adapted: all access sites must migrate before the legacy
 field is renamed or removed, and the final check is `cargo check` plus
 `ast-grep --pattern '$X.<legacy_name>'` returning zero — not LSP
