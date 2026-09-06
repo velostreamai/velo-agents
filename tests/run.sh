@@ -25,6 +25,9 @@ RC=0
 echo "── sdk patches ────────────────────────────────────────"
 "$PY" "$HERE/test_sdk_patches.py" || RC=1
 echo
+echo "── context + turn budget ──────────────────────────────"
+"$PY" "$HERE/test_context_and_budget.py" || RC=1
+echo
 echo "── failure salvage ────────────────────────────────────"
 "$PY" "$HERE/test_salvage.py" || RC=1
 echo

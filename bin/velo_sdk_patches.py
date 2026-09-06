@@ -260,3 +260,92 @@ def install_provider_pinning(model: str, logger=None) -> list[str]:
     OpenAIProvider._velo_provider_patched = True
     _log(f"velo-patch: provider order={order or 'unpinned'} usage.include=true")
     return order
+
+
+# Real context windows, from GET /api/v1/models/:model/endpoints (2026-09-06).
+# The SDK's table holds only Anthropic/OpenAI names and prefix-matches, so every
+# worker model missed and took DEFAULT_CONTEXT_WINDOW = 200_000 — roughly 5x too
+# small, tripping the 187k auto-compact threshold with enormous headroom left.
+CONTEXT_WINDOWS: dict[str, int] = {
+    "deepseek/deepseek-v4-flash-0731": 1_048_576,
+    "z-ai/glm-5.3-flash": 1_048_576,
+}
+
+
+def install_context_windows(logger=None) -> bool:
+    """Teach the SDK our models' real context windows (#2007 F4).
+
+    This is the ONLY half of the compaction problem worth fixing, and the reason
+    is worth stating plainly: **the SDK's compactor must not be repaired.**
+
+    Three defects stack in `utils/compact.py`:
+
+    1. the window lookup misses every worker model and defaults to 200_000, so
+       the threshold trips ~5x too early;
+    2. `compact.py:68` calls `client.messages.create` — an ANTHROPIC client —
+       against an OpenAI-compatible base URL, so the call always fails;
+    3. `compact.py:113` swallows that with a bare `except` and stops trying after
+       three consecutive failures.
+
+    The obvious fix is to route (2) through `config.provider`. Do not. A
+    SUCCEEDING compaction (`compact.py:80-99`) discards the entire conversation
+    and replaces it with two synthetic messages — every tool result, every file
+    the worker read, and the tool_use/tool_result pairing along with it. At a
+    threshold 5x too low that is mid-run context destruction, and today's silent
+    no-op is strictly safer.
+
+    So: correct the window, which stops the misfiring, the wasted failed
+    round-trips and the false `COMPACT_BOUNDARY` event that `engine.py:208`
+    yields unconditionally even when nothing was compacted. Leave the call
+    broken, deliberately, until there is a compactor worth enabling.
+    """
+    def _log(msg: str) -> None:
+        if logger is not None:
+            logger.emit(msg)
+        else:
+            print(msg, file=sys.stderr, flush=True)
+
+    try:
+        from open_agent_sdk.utils import tokens as _tokens
+    except Exception as exc:  # pragma: no cover
+        _log(f"WARNING velo-patch: no tokens module ({exc}); context windows unset")
+        return False
+
+    try:
+        _tokens._CONTEXT_WINDOWS.update(CONTEXT_WINDOWS)
+        _log(f"velo-patch: registered {len(CONTEXT_WINDOWS)} real context windows")
+        return True
+    except Exception as exc:
+        _log(f"WARNING velo-patch: could not register context windows ({exc})")
+        return False
+
+
+def turn_budget_notice(max_turns: int) -> str:
+    """A turn budget the worker can actually see (#2007 F5).
+
+    The runner knows `--max-turns`; the worker was told only by whatever the
+    brief author happened to write. A review run once spent 60 of 60 turns
+    exploring and returned 332 characters — no report at all — because hitting
+    the cap exits through `ERROR_MAX_TURNS` and the result text is just the last
+    assistant message.
+
+    Honesty about the evidence: that run was ALSO given a larger cap when the
+    budget text was added, so the improvement is not attributable to this text
+    alone. The mechanism stands on its own — an agent that does not know its
+    budget cannot reserve any of it — but this is a reasoned change, not a
+    measured one.
+    """
+    reserve = 2 if max_turns <= 40 else 4
+    deadline = max(1, max_turns - reserve)
+    return (
+        f"\n\n=== TURN BUDGET ===\n"
+        f"You have {max_turns} tool-use turns in this segment and the run is KILLED\n"
+        f"at the limit — a run that spends every turn exploring returns nothing,\n"
+        f"which is worth nothing to anyone.\n\n"
+        f"Deliver your result by turn {deadline}, whatever state your work is in.\n"
+        f"Reserve the last {reserve} turns for committing and reporting. A short\n"
+        f"report naming what you actually verified beats an exhausted budget and\n"
+        f"silence; mark anything you ran out of time to check as UNVERIFIED —\n"
+        f"that is a useful result, silence is not.\n"
+        f"=== END TURN BUDGET ===\n"
+    )

@@ -19,7 +19,11 @@ from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 # Runtime corrections to the SDK, applied before any tool can run (#2010).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from velo_runner_lib import salvage_on_failure  # noqa: E402
-from velo_sdk_patches import install_tool_input_normalisation  # noqa: E402
+from velo_sdk_patches import (  # noqa: E402
+    install_context_windows,
+    install_tool_input_normalisation,
+    turn_budget_notice,
+)
 
 DEFAULT_MODEL = os.environ.get("LM_STUDIO_MODEL", "qwen3-coder-next-mlx-4bit")
 DEFAULT_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -730,6 +734,7 @@ async def run_agent(
     # input tokens that way).
     if not install_tool_input_normalisation(logger):
         logger.emit("WARNING string tool-call inputs are NOT normalised — see #2010")
+    install_context_windows(logger)
 
     agent = create_agent(AgentOptions(**options_kwargs))
     state = RunState(initial_snapshot=git_snapshot(root))
@@ -765,7 +770,9 @@ async def run_agent(
         )
         logger.emit(startup)
 
-        result = await run_prompt(task, "prompt 1")
+        # The runner knows the cap; the worker only ever learned it from
+        # whatever the brief author wrote (#2007 F5).
+        result = await run_prompt(task + turn_budget_notice(max_turns), "prompt 1")
 
         for continuation_number in range(1, max_continuations + 1):
             text = result_text(result)

@@ -21,8 +21,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from velo_runner_lib import salvage_on_failure  # noqa: E402
 from velo_sdk_patches import (  # noqa: E402
     LEDGER,
+    install_context_windows,
     install_provider_pinning,
     install_tool_input_normalisation,
+    turn_budget_notice,
 )
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
@@ -754,6 +756,10 @@ async def run_agent(
     # turn — measured 97% cached and 4.4x cheaper once pinned.
     LEDGER.reset()
     install_provider_pinning(model, logger)
+    # Real context windows, so auto-compaction stops tripping ~5x too early
+    # (#2007 F4). The compactor itself is deliberately left broken — see the
+    # docstring; a working one discards the whole conversation.
+    install_context_windows(logger)
 
     agent = create_agent(AgentOptions(**options_kwargs))
     state = RunState(initial_snapshot=git_snapshot(root))
@@ -789,7 +795,9 @@ async def run_agent(
         )
         logger.emit(startup)
 
-        result = await run_prompt(task, "prompt 1")
+        # The runner knows the cap; the worker only ever learned it from
+        # whatever the brief author wrote (#2007 F5).
+        result = await run_prompt(task + turn_budget_notice(max_turns), "prompt 1")
 
         for continuation_number in range(1, max_continuations + 1):
             text = result_text(result)
