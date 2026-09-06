@@ -18,6 +18,7 @@ from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 
 # Runtime corrections to the SDK, applied before any tool can run (#2010).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from velo_runner_lib import salvage_on_failure  # noqa: E402
 from velo_sdk_patches import install_tool_input_normalisation  # noqa: E402
 
 DEFAULT_MODEL = os.environ.get("LM_STUDIO_MODEL", "qwen3-coder-next-mlx-4bit")
@@ -852,8 +853,17 @@ async def run_agent(
             )
 
     except SystemExit:
+        # fail() lands here. The run is over either way; salvage first (#2007 F3).
+        salvage_on_failure(root=str(root), agent=agent, log_path=str(logger.path),
+                           reason="stop-or-fail", read_only=task_is_read_only(task),
+                           logger=logger)
         raise
     except Exception as exc:
+        # Timeout, 402, SDK crash. agent._engine.messages still holds every turn
+        # of the dead prompt at this instant; after the raise it is gone.
+        salvage_on_failure(root=str(root), agent=agent, log_path=str(logger.path),
+                           reason=type(exc).__name__, read_only=task_is_read_only(task),
+                           logger=logger)
         fail(f"{type(exc).__name__}: {exc}")
     finally:
         # Emitted from `finally`, so it is present on EVERY exit path — including
