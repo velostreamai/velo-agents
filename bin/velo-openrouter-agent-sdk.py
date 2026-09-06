@@ -271,11 +271,113 @@ def find_leaked_tool_calls(text: str) -> list[str]:
     return [name for name, pattern in LEAKED_TOOL_CALL_PATTERNS if pattern.search(scannable)]
 
 
+def extract_usage(event) -> tuple[int, int, int, float, str]:
+    """Token counts and cost off an SDK RESULT event, with their PROVENANCE.
+
+    The RESULT event carries `total_usage` (a TokenUsage) and `total_cost`;
+    `usage`/`cost` are the PER-MESSAGE fields and are None on a RESULT. Reading
+    only `usage` therefore returned nothing on every real run while passing
+    every synthetic test — verified against a live LM Studio run on 2026-09-05,
+    which reported usage_source=unavailable with the SDK holding the numbers all
+    along. Both spellings are read here so an assistant-level event also works.
+
+    cache_read_input_tokens is captured because cached input is the largest
+    single cost lever and it is invisible in a raw input-token count: identical
+    work can differ ~70x in spend on cache behaviour alone.
+
+    Provenance is reported rather than defaulted, because a fabricated cost is
+    worse than a missing one — it gets averaged into worker comparisons and
+    silently moves routing decisions.
+    """
+    usage = getattr(event, "total_usage", None) or getattr(event, "usage", None)
+    cost = getattr(event, "total_cost", None)
+    if cost is None:
+        cost = getattr(event, "cost", None)
+
+    # No usage object AND no non-zero cost means the provider told us nothing.
+    # `total_cost` defaults to 0.0, so it alone cannot distinguish "free" from
+    # "unknown" — the usage object is what settles it. A local model that really
+    # did cost nothing still reports source=sdk with real token counts.
+    if usage is None and not cost:
+        return 0, 0, 0, 0.0, "unavailable"
+
+    inp = int(getattr(usage, "input_tokens", 0) or 0)
+    out = int(getattr(usage, "output_tokens", 0) or 0)
+    cached = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    cost = float(cost or 0.0)
+
+    # An all-zero usage object carries no information — it is indistinguishable
+    # from a provider that sent an empty struct. Reporting it as "sdk" would
+    # claim we know a floor of zero when we know nothing, which is the same
+    # fabricated-certainty failure as pricing an unpriced model.
+    if not (inp or out or cached or cost):
+        return 0, 0, 0, 0.0, "unavailable"
+
+    return inp, out, cached, cost, "sdk"
+
+
+try:
+    from open_agent_sdk.utils.tokens import MODEL_PRICING as _SDK_MODEL_PRICING
+except Exception:  # pragma: no cover - SDK internals may move
+    _SDK_MODEL_PRICING = {}
+
+
+def model_is_priced(model: str) -> bool:
+    """Does the SDK have a real price for this model?
+
+    `estimate_cost` matches MODEL_PRICING by prefix and, on a miss, silently
+    falls back to {"input": 3.0, "output": 15.0} — frontier-Claude rates. The
+    table holds only Anthropic/OpenAI names, so EVERY worker this repo routes to
+    (local qwen, deepseek, glm) misses and is billed at that invented rate. A
+    live local run on 2026-09-05 reported $0.063 for a model that costs nothing.
+
+    That number is not merely imprecise, it is the same invented rate for every
+    worker, so comparing workers on it compares token counts wearing a dollar
+    sign — while looking entirely plausible. Hence: report the estimate, but
+    never let it be mistaken for a price.
+
+    EXACT match only. The first cut prefix-matched in both directions, which
+    priced `deepseek-chat-v3-0324-mlx` off the `deepseek-chat` key and matched
+    a one-character model id `g` against `gpt-4o`. Prefix matching answers "is
+    there a vendor model whose name starts like this", which is not the question
+    — the question is whether THIS request was billed at a rate we know, and a
+    name has never been evidence of that.
+    """
+    return model in _SDK_MODEL_PRICING
+
+
 @dataclass
 class RunState:
     initial_snapshot: str
     prompts_sent: int = 0
     leaked_tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    cost_usd: float = 0.0
+    usage_source: str = "unavailable"
+
+    def absorb(self, outcome: "PromptOutcome") -> None:
+        """Accumulate ONE prompt's usage AND its leaked tool calls.
+
+        Called after EVERY prompt, including intermediate continuations. A run
+        that continues four times and is only measured on the first and last
+        prompt under-reports its own cost, which defeats the point of measuring.
+
+        Leaks live here rather than at the call sites because keeping the two
+        counters in separate places is exactly how they drifted: the leak total
+        was accumulated once after prompt 1 and once after the loop, which
+        double-counted prompt 1 on the normal break path and dropped the leaks
+        of every continuation except the last. One absorb point, one chance to
+        get it wrong.
+        """
+        self.input_tokens += outcome.input_tokens
+        self.output_tokens += outcome.output_tokens
+        self.cached_tokens += outcome.cached_tokens
+        self.cost_usd += outcome.cost_usd
+        self.leaked_tool_calls += outcome.leaked_tool_calls
+        if outcome.usage_source != "unavailable":
+            self.usage_source = outcome.usage_source
 
 
 @dataclass
@@ -285,6 +387,11 @@ class PromptOutcome:
     status: SDKResultStatus | None = None
     saw_result: bool = False
     leaked_tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    cost_usd: float = 0.0
+    usage_source: str = "unavailable"
 
 
 class WorkerLogger:
@@ -364,9 +471,18 @@ def log_sdk_event(logger: WorkerLogger, label: str, event) -> None:
         logger.emit(f"[{label}] sdk event={event_type}")
 
 
-async def collect_prompt_events(agent, prompt: str, logger: WorkerLogger, label: str) -> PromptOutcome:
-    """Run a prompt through the SDK stream so tool lifecycle events are observable."""
-    outcome = PromptOutcome()
+async def collect_prompt_events(
+    agent, prompt: str, logger: WorkerLogger, label: str, outcome: PromptOutcome | None = None
+) -> PromptOutcome:
+    """Run a prompt through the SDK stream so tool lifecycle events are observable.
+
+    `outcome` is accepted from the caller so that a prompt which dies MID-FLIGHT
+    still leaves its partial usage somewhere the caller can reach. Tokens spent
+    before a 402 or a timeout were really spent; a run that burned 42 turns and
+    then died recorded input_tokens=0, which biases every later cost comparison
+    towards whichever worker fails most often.
+    """
+    outcome = outcome if outcome is not None else PromptOutcome()
     async for event in agent.query(prompt):
         log_sdk_event(logger, label, event)
         if event.type == SDKMessageType.RESULT:
@@ -374,7 +490,29 @@ async def collect_prompt_events(agent, prompt: str, logger: WorkerLogger, label:
             outcome.text = event.text or ""
             outcome.num_turns = event.num_turns
             outcome.status = event.status
-        elif event.type == SDKMessageType.ASSISTANT and event.text:
+            inp, out, cached, cost, source = extract_usage(event)
+            if source != "unavailable":
+                # RESULT carries total_usage — CUMULATIVE for the whole prompt.
+                # Replace the per-message tally rather than adding to it, or the
+                # assistant-level accumulation below is counted twice.
+                outcome.input_tokens = inp
+                outcome.output_tokens = out
+                outcome.cached_tokens = cached
+                outcome.cost_usd = cost
+                outcome.usage_source = source
+        if event.type == SDKMessageType.ASSISTANT:
+            # Per-message usage, accumulated as we go. If a RESULT arrives it
+            # supersedes this; if the prompt dies first, this is all the honest
+            # accounting that exists. Marked "sdk-partial" so a consumer can
+            # tell an incomplete tally from a complete one.
+            inp, out, cached, cost, source = extract_usage(event)
+            if source != "unavailable":
+                outcome.input_tokens += inp
+                outcome.output_tokens += out
+                outcome.cached_tokens += cached
+                outcome.cost_usd += cost
+                outcome.usage_source = "sdk-partial"
+        if event.type == SDKMessageType.ASSISTANT and event.text:
             # Preserve the SDK's fallback text behaviour, but never mistake it
             # for a final response unless a RESULT event is also received.
             outcome.text = event.text
@@ -395,12 +533,17 @@ async def prompt_with_watchdog(
     logger: WorkerLogger,
     label: str,
     timeout_seconds: float,
+    outcome: PromptOutcome | None = None,
 ) -> PromptOutcome:
     started = time.monotonic()
     logger.emit(f"[{label}] start timeout_seconds={timeout_seconds:g}")
+    # The caller may pass its own outcome object so that partial usage survives
+    # an exception — see collect_prompt_events. Tokens spent before a failure
+    # were still spent.
+    outcome = outcome if outcome is not None else PromptOutcome()
     try:
         outcome = await asyncio.wait_for(
-            collect_prompt_events(agent, prompt, logger, label),
+            collect_prompt_events(agent, prompt, logger, label, outcome),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError as exc:
@@ -592,6 +735,27 @@ async def run_agent(
     agent = create_agent(AgentOptions(**options_kwargs))
     state = RunState(initial_snapshot=git_snapshot(root))
 
+    async def run_prompt(prompt_text: str, label: str) -> PromptOutcome:
+        """One prompt, whose usage is absorbed even when it dies mid-flight.
+
+        Every prompt goes through here so the accounting cannot diverge between
+        the first prompt and the continuations. The `except` is the point of it:
+        a prompt killed by a timeout or a 402 has still spent whatever it spent,
+        and dropping that produced records reading input_tokens=0 for runs that
+        had really burned dozens of turns.
+        """
+        partial = PromptOutcome()
+        try:
+            outcome = await prompt_with_watchdog(
+                agent, prompt_text, logger, label, prompt_timeout, partial
+            )
+        except Exception:
+            state.absorb(partial)
+            raise
+        state.prompts_sent += 1
+        state.absorb(outcome)
+        return outcome
+
     try:
         startup = (
             f"[velo-openrouter-agent:{model}] backend=open-agent-sdk "
@@ -602,15 +766,7 @@ async def run_agent(
         )
         logger.emit(startup)
 
-        result = await prompt_with_watchdog(
-            agent,
-            task,
-            logger,
-            "prompt 1",
-            prompt_timeout,
-        )
-        state.prompts_sent += 1
-        state.leaked_tool_calls += result.leaked_tool_calls
+        result = await run_prompt(task, "prompt 1")
 
         for continuation_number in range(1, max_continuations + 1):
             text = result_text(result)
@@ -645,20 +801,15 @@ async def run_agent(
                 f"reason={reason}"
             )
 
-            result = await prompt_with_watchdog(
-                agent,
+            result = await run_prompt(
                 continuation_prompt(
                     task=task,
                     root=root,
                     initial_snapshot=state.initial_snapshot,
                     continuation_number=continuation_number,
                 ),
-                logger,
                 f"continuation {continuation_number}",
-                prompt_timeout,
             )
-            state.prompts_sent += 1
-        state.leaked_tool_calls += result.leaked_tool_calls
 
         final_text = result_text(result)
         changed = worktree_changed(root, state.initial_snapshot)
@@ -707,6 +858,30 @@ async def run_agent(
     except Exception as exc:
         fail(f"{type(exc).__name__}: {exc}")
     finally:
+        # Emitted from `finally`, so it is present on EVERY exit path — including
+        # a timeout, a crash, and the leaked-tool-call failure below. A totals
+        # line that only appears on the happy path measures only the happy path,
+        # and the failures are the rows worth having.
+        # Token counts come from the provider and are real. The dollar figure is
+        # the SDK's own estimate, and for an unpriced model it is an invented
+        # rate — so it is labelled, not silently passed off as a price.
+        usage_source = state.usage_source
+        if usage_source.startswith("sdk") and not model_is_priced(model):
+            usage_source += "-unpriced"
+        logger.emit(
+            f"TOTALS prompts={state.prompts_sent} "
+            f"leaked_tool_calls={state.leaked_tool_calls} "
+            f"input_tokens={state.input_tokens} "
+            f"output_tokens={state.output_tokens} "
+            f"cached_tokens={state.cached_tokens} "
+            f"cost_usd={state.cost_usd:.6f} "
+            f"usage_source={usage_source} "
+            # The runner is the only place that knows whether this task was
+            # classified read-only. Without it the recorder scores a review gate
+            # — which correctly produces no commits — as "abandoned", and every
+            # review in the history reads as a failed run.
+            f"read_only={str(task_is_read_only(task)).lower()}"
+        )
         try:
             await agent.close()
         except Exception as exc:

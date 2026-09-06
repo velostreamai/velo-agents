@@ -395,7 +395,11 @@ gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1
 # ---- 8. launch --------------------------------------------------------------
 LOG="/tmp/${LOGTAG}-${ISSUE}.log"
 TASK=$(cat "$BRIEF")
+STARTED=$(date -u +%FT%TZ)
 
+# The runner command is BUILT, not launched, because the supervisor wrapper
+# below must be identical for every worker. Four inline launches would be four
+# places for the outcome recording to be silently missing from one of them.
 case "$NAME" in
   codex)
     # `codex exec` takes the brief as its prompt argument and runs
@@ -408,41 +412,68 @@ case "$NAME" in
       || die "worker:codex but the codex CLI is not on PATH.
   Do NOT silently substitute a local model — that is what produced a green
   report over two P1s on #1988. Install codex or relabel the issue."
-    nohup codex exec --dangerously-bypass-approvals-and-sandbox \
-      --cd "$WT" "$TASK" > "$LOG" 2>&1 &
+    MODEL_ID='codex'
+    # codex writes no TOTALS line, so its record carries cost source
+    # "unavailable" rather than a zero. A fabricated zero on the MOST expensive
+    # worker would invert every cost comparison the record exists to support.
+    CMD=( codex exec --dangerously-bypass-approvals-and-sandbox --cd "$WT" "$TASK" )
     ;;
   velo-local)
-    nohup "$HOME/.venvs/velo-openrouter-agent/bin/python" \
-      "$HOME/.agents/bin/velo-lmstudio-agent-sdk.py" \
-      --model 'qwen3-coder-next-mlx@6bit' \
-      --base-url "$LMSTUDIO_URL" \
-      --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT" \
-      --cwd "$WT" --task "$TASK" > "$LOG" 2>&1 &
+    MODEL_ID='qwen3-coder-next-mlx@6bit'
+    CMD=( "$HOME/.venvs/velo-openrouter-agent/bin/python"
+          "$HOME/.agents/bin/velo-lmstudio-agent-sdk.py"
+          --model "$MODEL_ID" --base-url "$LMSTUDIO_URL"
+          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --cwd "$WT" --task "$TASK" )
     ;;
   velo-deepseek)
-    nohup "$HOME/.agents/bin/velo-openrouter-agent" \
-      --model deepseek/deepseek-v4-flash-0731 \
-      --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT" \
-      --cwd "$WT" --task "$TASK" > "$LOG" 2>&1 &
+    MODEL_ID='deepseek/deepseek-v4-flash-0731'
+    CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
+          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --cwd "$WT" --task "$TASK" )
     ;;
   velo-glm)
-    nohup "$HOME/.agents/bin/velo-openrouter-agent" \
-      --model z-ai/glm-5.3-flash \
-      --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT" \
-      --cwd "$WT" --task "$TASK" > "$LOG" 2>&1 &
+    MODEL_ID='z-ai/glm-5.3-flash'
+    CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
+          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --cwd "$WT" --task "$TASK" )
     ;;
 esac
+
+# Supervisor: run the worker, then record the outcome (#1992 Phase 1).
+#
+# This script used to background the runner and return, printing "Detached — no
+# completion event" — exactly true, and the reason nothing was ever written down
+# about what a dispatch produced. The wrapper waits on the runner and hands its
+# exit code to velo-record, so a crash, a timeout and a clean finish all leave a
+# row. The failures are the rows worth having.
+#
+# velo-record is observational and always exits 0; it can never fail a run that
+# has already finished. The `|| true` is belt and braces on that promise.
+nohup bash -c '
+  LOGF="$1"; RI="$2"; RWT="$3"; RNAME="$4"; RMODEL="$5"
+  RBRIEF="$6"; RSTART="$7"; RMT="$8"; RBASE="$9"
+  shift 9
+  "$@" > "$LOGF" 2>&1
+  rc=$?
+  "$HOME/.agents/bin/velo-record" "$RI" --worktree "$RWT" --worker "$RNAME" \
+    --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
+    --rc "$rc" --max-turns "$RMT" --base "$RBASE" >> "$LOGF" 2>&1 || true
+' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$MAX_TURNS" "$BASE" \
+  "${CMD[@]}" > /dev/null 2>&1 &
 PID=$!
 
 echo
 echo "── dispatched ─────────────────────────────────────────"
 echo "  #$ISSUE  $TITLE"
-echo "  worker : $NAME   pid $PID"
+echo "  worker : $NAME   supervisor pid $PID"
 echo "  branch : $BRANCH  (off origin/master $BASE)"
 echo "  log    : $LOG"
+echo "  record : .agents/tasks/${ISSUE}.result.jsonl  (appended on exit)"
 echo
 echo "  poll:   tail -3 $LOG"
 echo "  result: git -C $WT log --oneline origin/master..HEAD"
 echo
-echo "  Detached — no completion event. Verify from git and the tests,"
+echo "  Detached. The supervisor records the outcome when the worker exits,"
+echo "  including on crash or timeout. Still verify from git and the tests,"
 echo "  never from the worker's self-report."

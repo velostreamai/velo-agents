@@ -1,0 +1,311 @@
+#!/bin/bash
+# velo-record — write the outcome of one dispatch to .agents/tasks/<issue>.result.json
+#
+# Usage (called by velo-dispatch on worker exit; also runnable by hand):
+#   velo-record <issue> --worktree P --worker W --model M --brief F --log L \
+#               --started <iso> --rc <n> --max-turns <n> [--base <sha>]
+#
+# Why this exists (issue #1992): every gate in this directory validates what
+# happens BEFORE a worker runs. Nothing recorded what happened after, so the
+# routing table in velo-dispatch — local free / deepseek cheap / glm pricier —
+# was a set of labels rather than a set of measurements. We could not say which
+# worker lands work per unit cost, nor whether the cheap path stays cheap once
+# rework is counted (#1973 -> #1975 says it does not always).
+#
+# Records are APPENDED to a JSON array, never overwritten. A re-dispatch of the
+# same issue is the most interesting row in the file, not a row to discard.
+#
+# This is OBSERVATIONAL. It exits 0 whatever it finds and refuses nothing. If
+# recording ever blocks a dispatch, the measurement has become more expensive
+# than the thing it measures.
+
+set -uo pipefail
+
+# Records outlive the worktree they describe — a worktree is deleted after merge,
+# and the rework history is the most interesting part of the data — so they land
+# in the canonical checkout, not the worker's tree.
+#
+# The override exists because that default writes into a SHARED checkout other
+# agents are using. A test run must be able to send its records somewhere else;
+# without this, validating velo-record meant dropping stray files into master's
+# working tree, which is exactly the cross-contamination the worktree discipline
+# is there to prevent.
+ROOT="${VELO_RECORD_ROOT:-$HOME/RustroverProjects/velostream}"
+LIB="$(dirname "${BASH_SOURCE[0]}")/velo-worktree-lib.sh"
+[[ -f "$LIB" ]] || LIB="$ROOT/.agents/bin/velo-worktree-lib.sh"
+# shellcheck source=/dev/null
+source "$LIB"
+
+ISSUE="${1:-}"; shift || true
+WORKTREE=""; WORKER=""; MODEL=""; BRIEF=""; LOG=""; STARTED=""; RC=0; MAXTURNS=""; BASE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --worktree)  WORKTREE="$2"; shift 2 ;;
+    --worker)    WORKER="$2";   shift 2 ;;
+    --model)     MODEL="$2";    shift 2 ;;
+    --brief)     BRIEF="$2";    shift 2 ;;
+    --log)       LOG="$2";      shift 2 ;;
+    --started)   STARTED="$2";  shift 2 ;;
+    --rc)        RC="$2";       shift 2 ;;
+    --max-turns) MAXTURNS="$2"; shift 2 ;;
+    --base)      BASE="$2";     shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+[[ -n "$ISSUE" && -n "$WORKTREE" ]] || { echo "velo-record: need <issue> and --worktree" >&2; exit 0; }
+
+FINISHED=$(date -u +%FT%TZ)
+
+# ---- runner facts, parsed from the worker's stdout log ----------------------
+# The log is the only durable evidence of what the RUNNER saw. The worker's own
+# final report is not evidence — a worker that leaks a tool call reports success
+# having executed nothing, which is why leaked_tool_calls is recorded separately
+# and treated as a failure below.
+kv() {  # <key> <text> -> last value of key=value in text
+  sed -n "s/.*[[:space:]]$1=\([^[:space:]]*\).*/\1/p" <<<"$2" | tail -1
+}
+
+TURNS=""; STATUS=""; LEAKED=0; TIMEDOUT=false; READ_ONLY=""
+IN_TOK=0; OUT_TOK=0; CACHED_TOK=0; COST=0; USAGE_SRC="unavailable"
+
+if [[ -n "$LOG" && -f "$LOG" ]]; then
+  RESULT_LINE=$(grep 'sdk result status=' "$LOG" 2>/dev/null | tail -1)
+  [[ -n "$RESULT_LINE" ]] && { TURNS=$(kv turns "$RESULT_LINE"); STATUS=$(kv status "$RESULT_LINE"); }
+
+  TOTALS=$(grep 'TOTALS ' "$LOG" 2>/dev/null | tail -1)
+  if [[ -n "$TOTALS" ]]; then
+    LEAKED=$(kv leaked_tool_calls "$TOTALS")
+    IN_TOK=$(kv input_tokens "$TOTALS")
+    OUT_TOK=$(kv output_tokens "$TOTALS")
+    CACHED_TOK=$(kv cached_tokens "$TOTALS")
+    READ_ONLY=$(kv read_only "$TOTALS")
+    COST=$(kv cost_usd "$TOTALS")
+    USAGE_SRC=$(kv usage_source "$TOTALS")
+  fi
+  grep -qE 'exceeded [0-9.]+s|timeout after_seconds' "$LOG" 2>/dev/null && TIMEDOUT=true
+fi
+
+# ---- worktree facts, via the shared lib -------------------------------------
+BRANCH=$(wt_branch "$WORKTREE")
+COMMITS=$(wt_commits "$WORKTREE")
+DIRTY=$(wt_dirty "$WORKTREE")
+UNPUSHED=$(wt_unpushed "$WORKTREE" "$BRANCH")
+read -r FILES INS DELS <<<"$(wt_diffstat "$WORKTREE")"
+PUSHED=false
+[[ "$COMMITS" != "0" && "$UNPUSHED" == "0" ]] && PUSHED=true
+
+# ---- comparability keys -----------------------------------------------------
+# Two rows only compare workers if the brief and spec they ran against match.
+# Without these, a table of per-worker averages measures the ISSUES, not the
+# workers — the same asterisk that made a published 98.6% need one.
+BRIEF_SHA=""
+[[ -n "$BRIEF" && -f "$BRIEF" ]] && BRIEF_SHA=$(shasum -a 256 "$BRIEF" | cut -c1-16)
+[[ -n "$BASE" ]] || BASE=$(git -C "$ROOT" rev-parse --short origin/master 2>/dev/null)
+
+# ---- outcome ----------------------------------------------------------------
+# Order matters. A leaked tool call outranks everything: the run may look clean
+# and have commits, but an intended action never executed, so the report cannot
+# be trusted. A STOP is a SUCCESS of the policy, not a failure of the worker —
+# recording it as "failed" would penalise exactly the behaviour we want.
+STOPPED=false
+wt_stop_fired "$WORKTREE" && STOPPED=true
+
+# A worker with no TOTALS line — codex emits none — never reports read_only, so
+# fall back to classifying the BRIEF the same way the runners do. Without this,
+# every codex run scores `abandoned`: the worker that velo-pr-gate routes
+# code-review to is the one whose read-only runs would all read as failures.
+if [[ -z "$READ_ONLY" && -n "$BRIEF" && -f "$BRIEF" ]]; then
+  if grep -qiE 'read-only|read only|do not modify|do not edit|no changes|without modifying' "$BRIEF"; then
+    READ_ONLY=true
+  fi
+fi
+
+if [[ "${LEAKED:-0}" != "0" ]]; then      OUTCOME="failed"
+elif [[ "$STOPPED" == true ]]; then       OUTCOME="stopped"
+elif [[ "$RC" != "0" ]]; then             OUTCOME="failed"
+# A read-only task that COMMITTED did the one thing it was forbidden to do. That
+# is the "worker ignored its instructions" case a record exists to surface, so
+# it gets its own value rather than hiding under the same label as a clean
+# review — `outcome` is the field any routing table will aggregate on.
+elif [[ "$READ_ONLY" == "true" && "$COMMITS" != "0" ]]; then
+                                          OUTCOME="read-only-violation"
+# A read-only task producing no commits is the CORRECT outcome, not an
+# abandonment — writing nothing is what a review gate is supposed to do. Without
+# this branch every review in the history reads as a failed run.
+elif [[ "$READ_ONLY" == "true" ]]; then   OUTCOME="reported"
+elif [[ "$COMMITS" == "0" ]]; then        OUTCOME="abandoned"
+else                                      OUTCOME="landed"
+fi
+
+# ---- assemble ---------------------------------------------------------------
+# Values go through the environment, not the command line: a brief path or model
+# name with a quote in it must not be able to corrupt the record.
+# JSONL, one record per line, opened O_APPEND. Not cosmetic: the previous
+# read-modify-write of a JSON array lost 5 of 6 records when six recorders
+# finished at once, silently and with exit 0 — in the one file whose stated
+# purpose is that re-dispatches ACCUMULATE. A single short line appended to an
+# O_APPEND fd is atomic on POSIX, so concurrent recorders interleave instead of
+# clobbering, and no reader can catch the file mid-rewrite.
+OUT="$ROOT/.agents/tasks/${ISSUE}.result.jsonl"
+
+VR_ISSUE="$ISSUE" VR_STARTED="$STARTED" VR_FINISHED="$FINISHED" \
+VR_WORKER="$WORKER" VR_MODEL="$MODEL" VR_BRIEF_SHA="$BRIEF_SHA" VR_BASE="$BASE" \
+VR_BRANCH="$BRANCH" VR_TURNS="$TURNS" VR_MAXTURNS="$MAXTURNS" VR_STATUS="$STATUS" \
+VR_LEAKED="${LEAKED:-0}" VR_TIMEDOUT="$TIMEDOUT" VR_RC="$RC" \
+VR_IN="$IN_TOK" VR_OUT="$OUT_TOK" VR_CACHED="$CACHED_TOK" VR_COST="$COST" VR_USAGE_SRC="$USAGE_SRC" \
+VR_COMMITS="$COMMITS" VR_DIRTY="$DIRTY" VR_FILES="$FILES" VR_INS="$INS" VR_DELS="$DELS" \
+VR_PUSHED="$PUSHED" VR_OUTCOME="$OUTCOME" VR_LOG="$LOG" VR_SPECDIR="$ROOT/.agents/tasks" \
+VR_OUTFILE="$OUT" \
+python3 <<'PY'
+import json, os, pathlib, datetime
+
+g = os.environ.get
+def i(name, default=0):
+    try:    return int(float(g(name) or default))
+    except (TypeError, ValueError): return default
+def f(name, default=0.0):
+    try:    return float(g(name) or default)
+    except (TypeError, ValueError): return default
+def b(name):
+    return (g(name) or "").lower() == "true"
+def s(name):
+    v = g(name)
+    return v if v else None
+
+issue = i("VR_ISSUE")
+
+# Wall clock from the two stamps, not from a timer: the recorder may run long
+# after the worker exited if a supervisor batched it.
+wall = None
+try:
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    a = datetime.datetime.strptime(g("VR_STARTED"), fmt)
+    z = datetime.datetime.strptime(g("VR_FINISHED"), fmt)
+    wall = int((z - a).total_seconds())
+    # A negative duration means the caller passed a bad --started. Record null
+    # rather than the nonsense value: a null is visibly missing, whereas a
+    # negative silently drags any average of wall_clock_s towards zero.
+    if wall < 0:
+        wall = None
+except Exception:
+    pass
+
+# Declared test expectations come from the task spec. Phase 1 does NOT run them,
+# so source is "unverified" — and must stay that way until something actually
+# executes them. Recording "run" without running is how a metric starts lying.
+spec_sha, ftp, pts = None, None, None
+spec_path = pathlib.Path(g("VR_SPECDIR")) / f"{issue}.json"
+if spec_path.exists():
+    try:
+        spec = json.loads(spec_path.read_text()) or {}
+        spec_sha = spec.get("verified_against")
+        tests = spec.get("tests") or {}
+        ftp = len(tests.get("fail_to_pass") or [])
+        pts = len(tests.get("pass_to_stay") or [])
+    except Exception:
+        pass
+
+def _cost_block():
+    """Token counts are real; the dollar figure very often is not.
+
+    The SDK's estimate_cost falls back to an invented {3.0, 15.0} rate for any
+    model missing from its Anthropic/OpenAI pricing table — which is every
+    worker this repo routes to. So `usd` is populated ONLY when the rate was
+    real, and the estimate is preserved beside it under a name nobody will
+    mistake for a price. A plausible-looking fabricated cost is worse than a
+    null: it gets averaged, and it moves routing decisions.
+
+    Cached input is recorded separately because it is the largest single cost
+    lever and is invisible in the raw input count — identical work can differ
+    ~70x in spend on cache behaviour alone.
+    """
+    source = g("VR_USAGE_SRC") or "unavailable"
+    estimate = round(f("VR_COST"), 6)
+    block = {
+        "input_tokens": i("VR_IN"),
+        "output_tokens": i("VR_OUT"),
+        "cached_input_tokens": i("VR_CACHED"),
+        "usd": None,
+        "source": source,
+    }
+    # Vocabulary: sdk | sdk-partial | sdk-*-unpriced | unavailable.
+    # `usd` is populated ONLY for a tally that is both complete and priced.
+    # "partial" means the prompt died mid-flight — the tokens are real but the
+    # total is a floor, not a total, and averaging floors understates the very
+    # runs that failed.
+    partial = "partial" in source
+    if source == "sdk":
+        block["usd"] = estimate
+    elif "unpriced" in source:
+        block["usd_sdk_estimate_invented_rate"] = estimate
+    elif source.startswith("sdk"):
+        # A partial tally's TOKENS come from per-message usage, but its COST does
+        # not: SDKMessage.total_cost defaults to 0.0 on an assistant event, so a
+        # prompt that died contributes tokens and exactly zero dollars. The
+        # figure therefore covers only the prompts that COMPLETED — a floor of a
+        # different shape from the token floor, and named so nobody averages the
+        # two as if they matched.
+        key = "usd_sdk_estimate_completed_prompts_only" if partial else "usd_sdk_estimate"
+        block[key] = estimate
+    block["tokens_are_partial"] = partial
+    return block
+
+
+record = {
+    "issue": issue,
+    "dispatched_at": s("VR_STARTED"),
+    "finished_at": s("VR_FINISHED"),
+    "wall_clock_s": wall,
+    "worker": s("VR_WORKER"),
+    "model": s("VR_MODEL"),
+    "brief_sha256": s("VR_BRIEF_SHA"),
+    "spec_sha": spec_sha,
+    "base_sha": s("VR_BASE"),
+    "branch": s("VR_BRANCH"),
+    "runner": {
+        "turns": i("VR_TURNS") or None,
+        "max_turns": i("VR_MAXTURNS") or None,
+        "status": s("VR_STATUS"),
+        "exit_code": i("VR_RC"),
+        "leaked_tool_calls": i("VR_LEAKED"),
+        "timed_out": b("VR_TIMEDOUT"),
+        "log": s("VR_LOG"),
+    },
+    "cost": _cost_block(),
+    "work": {
+        "commits": i("VR_COMMITS"),
+        "dirty": i("VR_DIRTY"),
+        "files_changed": i("VR_FILES"),
+        "insertions": i("VR_INS"),
+        "deletions": i("VR_DELS"),
+        "pushed": b("VR_PUSHED"),
+    },
+    "tests": {
+        "fail_to_pass": {"declared": ftp, "flipped": None},
+        "pass_to_stay": {"declared": pts, "held": None},
+        "source": "unverified",
+    },
+    "gate": {"run_commit_fast": None, "pr": None, "pr_gate_verdict": None, "blockers": None},
+    "stalls": [],
+    "outcome": g("VR_OUTCOME"),
+}
+
+out = pathlib.Path(g("VR_OUTFILE"))
+out.parent.mkdir(parents=True, exist_ok=True)
+# One line, one record, O_APPEND. No read, so nothing to lose: a concurrent
+# recorder cannot clobber this row, and a concurrent READER cannot catch the
+# file mid-rewrite and conclude the whole history is corrupt.
+line = json.dumps(record, separators=(",", ":"))
+with out.open("a", encoding="utf-8") as fh:
+    fh.write(line + "\n")
+_c = record["cost"]
+_shown = f"${_c['usd']}" if _c["usd"] is not None else "no-price"
+_wall = f"{record['wall_clock_s']}s" if record["wall_clock_s"] is not None else "?"
+print(f"velo-record: {out}  outcome={record['outcome']} "
+      f"wall={_wall} commits={record['work']['commits']} "
+      f"tokens={_c['input_tokens']}in/{_c['output_tokens']}out "
+      f"cost={_shown} ({_c['source']})")
+PY
+
+exit 0

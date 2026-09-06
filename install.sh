@@ -38,10 +38,29 @@ for d in bin rules skills; do
     if [[ ! -e "$DEST/$rel" ]]; then
       warn "not installed: $rel"; drift=1
     elif ! cmp -s "$f" "$DEST/$rel"; then
-      if [[ "$DEST/$rel" -nt "$f" ]]; then
-        warn "LIVE COPY IS NEWER: $rel — copy it back into the repo before installing, or the edit is lost"
+      # mtime is NOT evidence of provenance, and trusting it inverted this
+      # warning exactly when it mattered. Editing the REPO copy makes it newer
+      # than a live copy holding work the repo has never seen, so the alarming
+      # "LIVE COPY IS NEWER" silently became the reassuring "repo is newer".
+      # That fired on velo-dispatch, whose live copy carried 133 lines the repo
+      # lacked — a whole worker route plus two validation gates — and installing
+      # would have deleted all of it without a word.
+      #
+      # Count the lines each way instead. Content cannot lie about which side
+      # holds something the other does not.
+      live_only=$(diff "$f" "$DEST/$rel" | grep -c '^>' || true)
+      repo_only=$(diff "$f" "$DEST/$rel" | grep -c '^<' || true)
+      if [[ "$live_only" -gt 0 ]]; then
+        # This cannot distinguish "work the repo never received" from "lines you
+        # deliberately replaced" — only a human reading the diff can. It reports
+        # the fact and insists you look, which is the whole job: the old check
+        # answered confidently and was wrong.
+        warn "LIVE COPY HAS $live_only LINE(S) THE REPO LACKS: $rel"
+        warn "      READ THE DIFF before installing — these are either unmerged"
+        warn "      work or lines you meant to replace, and install cannot tell:"
+        warn "      diff $f $DEST/$rel"
       else
-        warn "differs (repo is newer): $rel"
+        warn "differs, repo ahead by $repo_only line(s), live has nothing unique: $rel"
       fi
       drift=1
     fi
