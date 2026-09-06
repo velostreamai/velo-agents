@@ -250,12 +250,17 @@ surprise.
 **Step 1 — commit on the branch.** Stage `.agents/bin` and `.agents/install.sh`
 explicitly. Five modified files, three new.
 
-**Step 2 — force a real review.** `velo-gate --plan` classifies a `.agents/`
-diff as tooling-only and returns "none", so this change gets no gate by
-construction. That is wrong for this diff specifically: a silent bug in
+**Step 2 — the review is REQUIRED, not optional.** An earlier draft of this
+step claimed `velo-gate --plan` returns "none" for an `.agents/` diff, so the
+change would get no gate by construction. That was wrong: #1995 already fixed
+it, and `velo-gate --plan` reports `code-review (orchestration: … under
+.agents/ — governs every other run)`. The claim came from reading
+`velo-pr-gate`'s early-exit branch rather than running the tool.
+
+The reasoning still holds and is why #1995 made the change: a silent bug in
 `velo-record` does not fail loudly, it poisons every measurement that routing
-decisions are later made from. Route it to Codex with a filled-in ATTACK
-section. The classification gap itself is worth a follow-up issue.
+decisions are later read from. Route it to Codex with a filled-in ATTACK
+section.
 
 **Step 3 — PR against #1992**, carrying the as-built deviations below.
 

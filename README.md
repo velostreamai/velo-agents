@@ -99,17 +99,25 @@ velo-status
 
 ---
 
-## The three workers
+## The four workers
 
 | skill | model | cost | pick it for |
 |---|---|---|---|
 | `velo-local` | `qwen3-coder-next-mlx@6bit` (LM Studio) | **free** | default — scoped implementation, audits, anything latency-insensitive |
 | `velo-deepseek` | `deepseek/deepseek-v4-flash-0731` | **very cheap** | fast scoped implementation against a pinned design |
 | `velo-glm` | `z-ai/glm-5.3-flash` | **pricier, good value** | multi-step reasoning, per-case classification judgement |
+| `worker:codex` | `codex exec` (CLI) | **most expensive** | architecture-weight work — anything where a WRONG answer costs more than the run |
 
 Cost-first: default to local, reach for DeepSeek when turnaround matters, spend
-GLM deliberately. They share one policy and can run **concurrently** — give each
-its own git worktree and non-overlapping files.
+GLM deliberately, and keep Codex for work whose blast radius justifies it. On
+#1988 Codex found 2 P1s that two local gates missed while both returned
+*approve*; on #1967 every load-bearing claim in its analysis survived
+independent verification; GLM produced ZERO code in 186 turns on #1747.
+
+They share one policy and can run **concurrently** — give each its own git
+worktree and non-overlapping files. Note that concurrent OpenRouter dispatches
+share one in-flight credit budget: three large-context runs at once returned
+HTTP 402 `in_flight_budget_exhausted` before any of them sent a prompt.
 
 Routing comes from the issue's `worker:*` label, not from which skill you read.
 

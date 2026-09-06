@@ -64,9 +64,20 @@ Also fixed here, all found by review rather than by use:
   pre-existing says where a bug came from, not whether it should ship, and this
   change is what made the number durable.
 
-**Known gap:** `velo-gate --plan` classifies an `.agents/`-only diff as
-tooling-only and requires **no gate at all**. This change needed a manually
-dispatched review to get one, and that review found 2 HIGH.
+**Correction to the entry as first written.** It claimed `velo-gate --plan`
+classifies an `.agents/`-only diff as tooling-only and requires no gate. That is
+**false** — #1995 had already fixed exactly this, hours earlier, and
+`velo-gate 1998 --plan` reports `code-review (orchestration: 7 file(s) under
+.agents/ — governs every other run)`.
+
+The claim came from *reading* `velo-pr-gate`'s early-exit branch instead of
+*running* `velo-gate --plan`, and was then repeated into a PR body, a spec and
+this file. Left recorded rather than quietly deleted, because the whole entry
+above is about numbers that look right and are not, and a doc asserting a gate
+does not exist is the same failure in prose.
+
+The review this change received was therefore required, not optional — and it
+found 2 HIGH.
 
 ### Fixed — `code-review` now actually dispatches to Codex
 The script generated a Codex brief and stopped, on the stated belief that
