@@ -149,8 +149,22 @@ def pricing_cases(openrouter, lmstudio) -> None:
 
 
 async def main() -> int:
-    openrouter = load("velo-openrouter-agent-sdk.py")
-    lmstudio = load("velo-lmstudio-agent-sdk.py")
+    # Both shims share one implementation now (#2007 F7); the profile is what
+    # differs, so load the body once and swap the profile between assertions.
+    runner = load("velo_worker_runner.py")
+
+    class _Profile:
+        """A profile-pinned view. Sets the global on EVERY attribute access, so
+        correctness does not depend on assertion order — the previous version
+        left the module on whichever profile ran last, and moving one check
+        would have silently run it under the wrong profile (#2018 F7)."""
+        def __init__(self, name): self._name = name
+        def __getattr__(self, attr):
+            runner.PROVIDER = runner.PROVIDERS[self._name]
+            return getattr(runner, attr)
+
+    openrouter = _Profile("openrouter")
+    lmstudio = _Profile("lmstudio")
 
     await usage_cases(openrouter)
     await leak_cases(openrouter)
