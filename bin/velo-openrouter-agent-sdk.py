@@ -16,6 +16,10 @@ from datetime import UTC, datetime
 from open_agent_sdk import AgentOptions, create_agent
 from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 
+# Runtime corrections to the SDK, applied before any tool can run (#2010).
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from velo_sdk_patches import install_tool_input_normalisation  # noqa: E402
+
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MAX_TURNS = 50
@@ -731,6 +735,13 @@ async def run_agent(
     )
     if max_budget_usd is not None:
         options_kwargs["max_budget_usd"] = max_budget_usd
+
+    # Before any tool can run: the SDK hands a provider's tool-call `input`
+    # downstream as a str on two paths, and the first `.get()` on it kills the
+    # run mid-flight with nothing committed (#2010 — one dispatch lost 9.9M
+    # input tokens that way).
+    if not install_tool_input_normalisation(logger):
+        logger.emit("WARNING string tool-call inputs are NOT normalised — see #2010")
 
     agent = create_agent(AgentOptions(**options_kwargs))
     state = RunState(initial_snapshot=git_snapshot(root))
