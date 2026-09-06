@@ -18,7 +18,11 @@ from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 
 # Runtime corrections to the SDK, applied before any tool can run (#2010).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from velo_sdk_patches import install_tool_input_normalisation  # noqa: E402
+from velo_sdk_patches import (  # noqa: E402
+    LEDGER,
+    install_provider_pinning,
+    install_tool_input_normalisation,
+)
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -743,6 +747,13 @@ async def run_agent(
     if not install_tool_input_normalisation(logger):
         logger.emit("WARNING string tool-call inputs are NOT normalised — see #2010")
 
+    # Pin the provider endpoint and ask for real usage (#2007 F1/F2). OpenRouter
+    # load-balances every request, and a prefix cache is per-endpoint, so an
+    # agent loop that re-sends its transcript each turn missed the cache on every
+    # turn — measured 97% cached and 4.4x cheaper once pinned.
+    LEDGER.reset()
+    install_provider_pinning(model, logger)
+
     agent = create_agent(AgentOptions(**options_kwargs))
     state = RunState(initial_snapshot=git_snapshot(root))
 
@@ -877,15 +888,24 @@ async def run_agent(
         # the SDK's own estimate, and for an unpriced model it is an invented
         # rate — so it is labelled, not silently passed off as a price.
         usage_source = state.usage_source
-        if usage_source.startswith("sdk") and not model_is_priced(model):
+        # OpenRouter returns the REAL billed cost when usage.include is set. It
+        # beats the SDK's price-table estimate outright, and it retires the
+        # invented-rate problem for this path rather than labelling it.
+        cost_usd = state.cost_usd
+        cached_tokens = state.cached_tokens
+        if LEDGER.saw_real_cost:
+            cost_usd = LEDGER.cost_usd
+            cached_tokens = LEDGER.cached_tokens
+            usage_source = "openrouter-billed"
+        elif usage_source.startswith("sdk") and not model_is_priced(model):
             usage_source += "-unpriced"
         logger.emit(
             f"TOTALS prompts={state.prompts_sent} "
             f"leaked_tool_calls={state.leaked_tool_calls} "
             f"input_tokens={state.input_tokens} "
             f"output_tokens={state.output_tokens} "
-            f"cached_tokens={state.cached_tokens} "
-            f"cost_usd={state.cost_usd:.6f} "
+            f"cached_tokens={cached_tokens} "
+            f"cost_usd={cost_usd:.6f} "
             f"usage_source={usage_source} "
             # The runner is the only place that knows whether this task was
             # classified read-only. Without it the recorder scores a review gate

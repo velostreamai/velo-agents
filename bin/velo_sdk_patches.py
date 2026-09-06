@@ -12,6 +12,84 @@ from typing import Any
 
 _MAX_DECODE_DEPTH = 3
 
+# Preferred provider endpoints, cheapest-first, per model (#2007 F1).
+#
+# OpenRouter load-balances each request across endpoints and a prefix cache is
+# per-endpoint. Three single-shot probe calls landed on Morph, Relace and
+# OpenInference with cached=0 and a 2.7x cost spread, so bouncing genuinely does
+# prevent a cache from warming.
+#
+# BUT the benefit of pinning is NOT the 4.4x that probe suggested. That figure
+# compared a cold call to a warm one and credited the pin. Measured end-to-end
+# through the runner, three runs of one task:
+#
+#   1 pinned   (cold)  cached 65.5%  $0.000743
+#   2 unpinned (warm)  cached 98.2%  $0.000460
+#   3 pinned   (warm)  cached 98.7%  $0.000353
+#
+# Warmth dominates; the runner's prefix warms up either way. What pinning
+# actually buys at steady state is the CHEAPER ENDPOINT — ~23% here, consistent
+# with Relace at $0.045/M against the ~$0.05-0.065 the balancer picks. Worth
+# doing on price; not the headline the probe implied.
+#
+# Ordered preference WITH fallbacks, deliberately — `allow_fallbacks: false`
+# trades availability for cache locality, and a failed dispatch costs more than
+# an occasional cold miss. Prices are $/M input, from
+# GET /api/v1/models/:model/endpoints on 2026-09-06.
+PROVIDER_ORDER: dict[str, list[str]] = {
+    # 29 endpoints; Relace is both the cheapest ($0.045 vs $0.065 list) and the
+    # one the cache probe confirmed.
+    "deepseek/deepseek-v4-flash-0731": ["Relace", "Baidu", "OpenInference"],
+    # 23 endpoints, four tied at $0.075. Z.AI is the model's own vendor.
+    "z-ai/glm-5.3-flash": ["Z.AI", "DeepInfra", "Novita"],
+}
+
+
+def provider_order_for(model: str) -> list[str]:
+    """Preferred endpoints for a model, or [] to let OpenRouter choose.
+
+    `VELO_PROVIDER_ORDER` overrides (comma-separated) so a pin can be changed or
+    disabled without a code edit — set it empty to restore load-balancing.
+    """
+    import os
+    override = os.environ.get("VELO_PROVIDER_ORDER")
+    if override is not None:
+        return [p.strip() for p in override.split(",") if p.strip()]
+    return PROVIDER_ORDER.get(model, [])
+
+
+class UsageLedger:
+    """Real billed usage, accumulated out-of-band from the SDK's own accounting.
+
+    The SDK types `CreateMessageResponse.usage` as `dict[str, int]` with four
+    fixed keys and computes cost from its own price table, so OpenRouter's real
+    `cost` float has nowhere to ride. Rather than change three SDK files, the
+    provider patch accumulates it here and the runner reads it at TOTALS time.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cached_tokens = 0
+        self.cost_usd = 0.0
+        self.calls = 0
+        self.saw_real_cost = False
+
+    def add(self, *, prompt: int, completion: int, cached: int, cost) -> None:
+        self.input_tokens += prompt
+        self.output_tokens += completion
+        self.cached_tokens += cached
+        self.calls += 1
+        if cost is not None:
+            self.cost_usd += float(cost)
+            self.saw_real_cost = True
+
+
+LEDGER = UsageLedger()
+
 
 def normalise_tool_input(raw: Any, *, on_drop=None) -> dict[str, Any]:
     """Coerce a provider's tool-call `arguments` into the dict the SDK assumes.
@@ -90,6 +168,28 @@ def install_tool_input_normalisation(logger=None) -> bool:
 
     def patched(self, data: dict[str, Any]):
         response = original(self, data)
+
+        # --- real usage (#2007 F2) -------------------------------------------
+        # `_convert_response` reads prompt/completion tokens and then hardcodes
+        # both cache fields to 0, so `cached_tokens` was 0 in every record — an
+        # observability hole, not an absent cache. Read them properly here.
+        try:
+            usage_data = (data or {}).get("usage") or {}
+            details = usage_data.get("prompt_tokens_details") or {}
+            cached = int(details.get("cached_tokens", 0) or 0)
+            prompt = int(usage_data.get("prompt_tokens", 0) or 0)
+            completion = int(usage_data.get("completion_tokens", 0) or 0)
+            LEDGER.add(prompt=prompt, completion=completion, cached=cached,
+                       cost=usage_data.get("cost"))
+            if isinstance(getattr(response, "usage", None), dict):
+                # OpenAI-style `prompt_tokens` INCLUDES cached tokens; the
+                # Anthropic-shaped field the SDK fills EXCLUDES them. Subtract,
+                # or every cached token is counted twice and charged at 110%.
+                response.usage["input_tokens"] = max(prompt - cached, 0)
+                response.usage["cache_read_input_tokens"] = cached
+        except Exception as exc:  # never let telemetry kill a run
+            _log(f"WARNING velo-patch: usage extraction failed ({exc})")
+
         for block in getattr(response, "content", None) or []:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
@@ -106,3 +206,57 @@ def install_tool_input_normalisation(logger=None) -> bool:
     OpenAIProvider._convert_response = patched
     OpenAIProvider._velo_tool_input_patched = True
     return True
+
+
+def install_provider_pinning(model: str, logger=None) -> list[str]:
+    """Pin the provider endpoint and ask OpenRouter for real usage (#2007 F1/F2).
+
+    Two fields on the request body, both absent before:
+
+    - `provider.order` — OpenRouter load-balances each request across endpoints
+      and a prefix cache is per-endpoint, so an agent loop that re-sends its
+      whole transcript every turn missed the cache on every single turn. Input
+      scales quadratically with turns, so this is the dominant cost.
+    - `usage.include` — without it the response carries no real `cost` and no
+      `prompt_tokens_details`, which is why cache hits were invisible.
+
+    `allow_fallbacks` stays TRUE: a pin that cannot fail over turns a cold cache
+    into a failed dispatch, which costs far more than the miss.
+
+    Returns the order applied ([] if none). Never raises.
+    """
+    def _log(msg: str) -> None:
+        if logger is not None:
+            logger.emit(msg)
+        else:
+            print(msg, file=sys.stderr, flush=True)
+
+    try:
+        from open_agent_sdk.providers.openai_provider import OpenAIProvider
+    except Exception as exc:  # pragma: no cover
+        _log(f"WARNING velo-patch: no OpenAIProvider ({exc}); provider not pinned")
+        return []
+
+    if getattr(OpenAIProvider, "_velo_provider_patched", False):
+        return provider_order_for(model)
+
+    order = provider_order_for(model)
+
+    # The body is built inside create_message, so wrap the POST — the one place
+    # every request passes through with the finished body in hand.
+    original_post = OpenAIProvider._post_chat_completions
+
+    async def patched_post(self, body: dict[str, Any]):
+        try:
+            body.setdefault("usage", {"include": True})
+            if order:
+                body.setdefault("provider", {"order": list(order),
+                                             "allow_fallbacks": True})
+        except Exception as exc:  # a malformed body must not break the call
+            _log(f"WARNING velo-patch: could not set provider/usage ({exc})")
+        return await original_post(self, body)
+
+    OpenAIProvider._post_chat_completions = patched_post
+    OpenAIProvider._velo_provider_patched = True
+    _log(f"velo-patch: provider order={order or 'unpinned'} usage.include=true")
+    return order

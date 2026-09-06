@@ -58,8 +58,15 @@ reader tell whether two rows are comparable at all.
 
 ## Non-goals
 
-- No change to routing policy. This spec measures the current routing; it does
-  not re-decide it.
+- No change to **worker** routing policy. This spec measures the current
+  worker table — local / deepseek / glm / codex — it does not re-decide it.
+
+  **Narrowed 2026-09-06 (#2007 F1).** This originally read "no change to routing
+  policy", which is broad enough to forbid pinning a PROVIDER ENDPOINT — a
+  different axis the spec never contemplated, and one where measurement showed
+  OpenRouter load-balancing across endpoints defeats the prefix cache entirely
+  (97% cached and 4.4x cheaper once pinned). Endpoint selection is in scope for
+  Phase 2; which WORKER serves an issue is still not.
 - No change to any existing validation gate. The pre-dispatch checks stay as
   they are.
 - The result record is **observational in Phase 1**. Nothing refuses to run
