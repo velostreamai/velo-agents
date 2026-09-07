@@ -40,6 +40,20 @@ WTPATH="$(cd "$HERE/../.." && pwd)"
 BRANCH="$(git -C "$WTPATH" branch --show-current 2>/dev/null)"
 [[ -n "$BRANCH" ]] || { echo "  SKIP  not on a branch"; exit 0; }
 
+# velo-pr-gate REFUSES an empty diff range ("reviewing an empty diff yields a
+# vacuous approve"), so from a checkout with nothing ahead of origin/master it
+# never reaches the dispatch code and every assertion below fails for a reason
+# that has nothing to do with the code under test. That is what happened the
+# moment #2027 merged and the suite was first run from the main checkout: seven
+# FAILs, all environmental. Skip loudly instead — a suite that goes red for the
+# wrong reason trains people to ignore it.
+if [[ "$(git -C "$WTPATH" rev-list --count origin/master..HEAD 2>/dev/null || echo 0)" == "0" ]]; then
+  echo "  SKIP  $WTPATH has nothing ahead of origin/master — velo-pr-gate refuses"
+  echo "        an empty diff range, so the gate-health cases cannot run here."
+  echo "        Run this from a feature worktree with at least one commit."
+  exit 0
+fi
+
 cat > "$TMPD/bin/gh" <<EOF
 #!/bin/bash
 case "\$*" in
