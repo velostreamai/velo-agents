@@ -268,7 +268,14 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
       warn "  had:  $(grep -o '<!-- velo-gate-brief[^>]*-->' "$OUT" 2>/dev/null || echo '<no trailer — hand-written or from an older velo-pr-gate>')"
       warn "  want: <!-- velo-gate-brief scope=$SCOPE_SIG range=$RANGE -->"
       cp "$OUT" "$OUT.superseded.$(date -u +%Y%m%dT%H%M%SZ)"
-      warn "  previous brief saved alongside; re-fill ATTACK before dispatching"
+      # Keep the two most recent and drop the rest. A hand-filled ATTACK section
+      # is worth preserving across one or two regenerations; it is not worth an
+      # unbounded pile in shared /tmp. Eight copies had accumulated for three PRs
+      # within a day of this guard landing.
+      ls -1t "$OUT".superseded.* 2>/dev/null | tail -n +3 | while read -r old; do
+        rm -f "$old"
+      done
+      warn "  previous brief saved alongside (2 most recent kept); re-fill ATTACK before dispatching"
     fi
     REUSED_BRIEF=0
   cat > "$OUT" <<EOF

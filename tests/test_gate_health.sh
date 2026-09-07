@@ -46,7 +46,13 @@ TMPD=$(mktemp -d)
 FLAG="$TMPD/running.flag"
 cleanup() {
   pkill -f "$MARKER" 2>/dev/null
-  rm -rf "$TMPD"; rm -f "$BRIEF" "$BRIEF".superseded.* "/tmp/gate-${TPR}-code.log" "/tmp/gate-${TPR}-review.log"
+  rm -rf "$TMPD"
+  # EVERY file velo-pr-gate derives from the PR number, not the three I happened
+  # to think of. The earlier list omitted -code-brief.md, and with a per-process
+  # TPR that turned one reused file into a NEW leaked file on every run: /tmp
+  # already held gate-959197, gate-960256..8, gate-999999 and gate-888888 code
+  # briefs from a single afternoon. Fixing a race by leaking is not fixing it.
+  rm -f /tmp/gate-"${TPR}"-* 2>/dev/null
 }
 trap cleanup EXIT
 rm -f "$BRIEF" "$BRIEF".superseded.*
