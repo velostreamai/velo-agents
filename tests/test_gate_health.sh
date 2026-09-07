@@ -24,12 +24,28 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$(cd "$HERE/.." && pwd)/bin/velo-pr-gate"
 FAILURES=0
-TPR=999999
+# A PR number unique to THIS process, not a fixed 999999.
+#
+# velo-pr-gate derives its brief and log paths from the PR number and puts them
+# in /tmp, which is per MACHINE while worktrees are not. With a fixed number, two
+# `run.sh` runs from different worktrees — the normal state of this repo — write
+# and delete the same /tmp/gate-999999-* files, and the loser fails on a gate
+# assertion that has nothing to do with its change. That is #2040 exactly, which
+# was fixed in tests/velo_sql_test.rs (#2041) while this file shipped the same
+# defect on the same day — in the suite whose purpose is catching it.
+#
+# Must stay numeric: velo-pr-gate requires ^[0-9]+$. Kept far above any real PR
+# number so a stray file is obviously a test artifact.
+TPR=$(( 900000 + ($$ % 90000) ))
+# Same reasoning for the stub marker: `pkill -f velo-test-gate-sleep` matched
+# EVERY concurrent run's stubs, so two suites killed each other's reviewers and
+# one reported `Terminated: 15`. Caught by actually running two at once.
+MARKER="velo-test-gate-sleep-$$"
 BRIEF="/tmp/gate-${TPR}-review-brief.md"
 TMPD=$(mktemp -d)
 FLAG="$TMPD/running.flag"
 cleanup() {
-  pkill -f 'velo-test-gate-sleep' 2>/dev/null
+  pkill -f "$MARKER" 2>/dev/null
   rm -rf "$TMPD"; rm -f "$BRIEF" "$BRIEF".superseded.* "/tmp/gate-${TPR}-code.log" "/tmp/gate-${TPR}-review.log"
 }
 trap cleanup EXIT
@@ -74,16 +90,16 @@ chmod +x "$TMPD/bin/gh" "$TMPD/home/.agents/bin/velo-gate"
 
 make_codex() {
   if [[ "$1" == "kill-check-code" ]]; then
-    cat > "$TMPD/bin/codex" <<'EOF'
+    sed "s/MARKERTOKEN/$MARKER/" > "$TMPD/bin/codex" <<'EOF'
 #!/bin/bash
 IN=$(cat)
 if grep -q "CHECK-CODE gate" <<<"$IN"; then echo "quota exceeded"; exit 1; fi
-exec -a velo-test-gate-sleep sleep 400
+exec -a MARKERTOKEN sleep 400
 EOF
   else
-    cat > "$TMPD/bin/codex" <<'EOF'
+    sed "s/MARKERTOKEN/$MARKER/" > "$TMPD/bin/codex" <<'EOF'
 #!/bin/bash
-cat >/dev/null; exec -a velo-test-gate-sleep sleep 400
+cat >/dev/null; exec -a MARKERTOKEN sleep 400
 EOF
   fi
   chmod +x "$TMPD/bin/codex"
@@ -96,7 +112,7 @@ invoke() {
   rm -f "$FLAG"
   HOME="$TMPD/home" PATH="$TMPD/bin:$PATH" \
     bash "$GATE" "$TPR" "$SCOPE" >"$TMPD/out.txt" 2>&1
-  pkill -f 'velo-test-gate-sleep' 2>/dev/null
+  pkill -f "$MARKER" 2>/dev/null
   sleep 1
 }
 
@@ -220,7 +236,7 @@ fi
 # the string was only ever written to stdout, so every run leaked its stubs for
 # 400s (#2027 round 8, P2). Assert the cleanup rather than trusting it.
 sleep 1
-LEAKED=$(pgrep -f velo-test-gate-sleep 2>/dev/null | wc -l | tr -d ' ')
+LEAKED=$(pgrep -f "$MARKER" 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$LEAKED" == "0" ]]; then
   echo "  PASS  no stub reviewers leaked"
 else
