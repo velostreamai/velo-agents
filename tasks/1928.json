@@ -2,9 +2,9 @@
   "issue": 1928,
   "worker": "glm",
   "design": "pinned",
-  "verified_against": "39b3e12fc",
+  "verified_against": "330412fcd",
   "evidence": "code",
-  "audit": "done:39b3e12fc",
+  "audit": "done:330412fcd",
   "depends_on": [],
   "_why": "parse_query dispatches on the first token and returns the sub-parser's result without checking the input was consumed. A sub-parser that reads a valid PREFIX returns Ok and the remainder is silently discarded. Three independent reproducers, all this root cause: #1895's WITHIN GROUP, the bare-alias counter-example, and a statement-merge found by #1929's gate.",
   "anchors": [
@@ -18,7 +18,7 @@
       "file": "src/velostream/sql/parser/mod.rs",
       "symbol": "parser.parse_query()",
       "expect": 1,
-      "_note": "the ONLY call site \u2014 the single insertion point for the fix"
+      "_note": "the ONLY call site — the single insertion point for the fix"
     },
     {
       "file": "src/velostream/sql/parser/mod.rs",
@@ -30,8 +30,8 @@
   "blast_radius": {
     "pattern": "parse_query",
     "files": 12,
-    "refs": 45,
-    "_note": "Measured across src/ tests/ examples/, not src/ alone \u2014 an src/-only count said 12 and was wrong by 33. The CODE change is one call site; the bulk of these refs are TESTS, which is the real work: every test asserting today's lenient truncation will newly fail. The brief requires enumerating and classifying that fallout, with a STOP at >15."
+    "refs": 54,
+    "_note": "54 refs across src/ tests/ examples/ (was 45 when first specced). Most are CALLERS of parse_query, and that is the point: every one of them currently accepts a valid prefix. The change is ~30 lines in mod.rs; the WORK is the fallout across those call sites and the SQL corpus."
   },
   "tests": {
     "fail_to_pass": [
@@ -48,16 +48,27 @@
     ]
   },
   "acceptance": [
-    "parse_query errors when tokens remain after a successful sub-parse, naming the first unconsumed token and its position",
-    "a trailing semicolon, whitespace and comments are still accepted",
-    "all three reproducers are rejected by the GENERAL check, not by construct-specific guards",
-    "#1895's WITHIN GROUP guard is assessed for redundancy and REPORTED, not removed in this PR",
-    "every newly-failing test is classified: (a) was asserting truncated behaviour -> fix the test, or (b) the check is wrong -> fix the check"
+    "parse_query returns Err when the input is not fully consumed, naming the first unconsumed token and its position",
+    "a trailing statement terminator (`;`) is still tolerated — some callers pass SQL with it intact",
+    "the three named fail_to_pass tests exist, and each was verified to FAIL before the production change",
+    "every pre-existing test and shipped .sql file that now fails is TRIAGED, not silenced: each is either a genuine defect the check surfaced (fix the SQL, cite it) or a legitimate construct the parser should support (fix the parser, cite it)",
+    "full suite returns to 0 failures"
   ],
   "forbidden": [
-    "weakening the check to a warning",
-    "adding a construct-specific exemption to make a test pass",
-    "removing the WITHIN GROUP guard in this PR",
-    "deleting, skipping or narrowing any test"
-  ]
+    "do not weaken or narrow the EOF check to make a failing test pass — a test that now fails is the check working; triage it",
+    "do not delete, #[ignore] or narrow any existing test",
+    "do not assume the existing STEP 1 commit on this branch is correct — evaluate it",
+    "do not create a branch: the worktree is already on the branch velo-dispatch cut for you"
+  ],
+  "stop_conditions": [
+    "more than ~15 pre-existing tests fail — STOP and report the list; that is a corpus-wide decision, not a fix to grind through",
+    "a shipped demo/*.sql or docs example turns out to rely on prefix-truncation — STOP and report which, before changing it",
+    "the fix appears to need changes inside individual sub-parsers rather than the one call site — STOP, that is a wider structural change than this spec pins",
+    "you cannot make a named fail_to_pass test fail before the change — report it rather than writing a vacuous test"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-06T12:12:12Z",
+    "brief_sha256": "5384fc73b090ee0a960d3d70512fcb718de4d7f870dc59ee16817cd1a08c37f4"
+  }
 }
