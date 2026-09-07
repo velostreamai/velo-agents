@@ -100,6 +100,262 @@ velo-status
 
 ---
 
+## Why bother
+
+Because an AI worker left alone on a large Rust codebase fails in ways that look
+like success, and every gate here was paid for by one that did.
+
+A worker will report that it committed — truthfully — to a branch nobody reads.
+It will describe code that was fixed last week. It will weaken a test until the
+suite goes green. It will burn four hours and a million tokens and produce
+nothing, and its final message will be a confident summary. **None of that is
+visible from the worker's own report**, which is why every rule below reduces to
+one idea: verify from git and the tests, never from what the worker says.
+
+What this tooling buys you:
+
+- **A ticket is refused before a worker is paid for it.** Eight preflight checks,
+  each encoding a specific wasted run — stale anchors, a mis-declared blast
+  radius, an unpinned design, a brief missing STOP conditions.
+- **Parallelism without collisions.** Several workers on one repo, each in its
+  own git worktree, each on its own branch, none able to see the others' edits.
+- **A record of what every run actually cost and produced**, so routing is a
+  measurement rather than a hunch.
+
+If you are dispatching one task by hand and watching it, you do not need this.
+It exists for the case where three workers are running unattended against the
+same repository and you need to know, afterwards, which of them can be trusted.
+
+## Prerequisites — this is git- and GitHub-shaped
+
+The tooling is not a generic runner. It assumes a specific working model, and
+degrades badly without it:
+
+| assumption | why it is load-bearing |
+|---|---|
+| a **git repository with worktree support** | isolation between concurrent workers IS `git worktree`; there is no other sandbox |
+| a **GitHub repo with issues**, reachable via authenticated `gh` | the issue is the unit of work — state, labels and comments are read at preflight, and routing comes from a `worker:*` label |
+| **`origin/master` fetchable** | every check validates against the ref the worker's tree is cut from, not your local checkout |
+| a **branch-per-issue convention** (`fix/<issue>-auto`) | `velo-status`, `velo-merge` and the result record all key on it |
+| **~20GB free disk per concurrent worker** | each worktree carries its own `target/`; a full disk kills workers with errors that look like compile bugs |
+
+`gh` must be authenticated (`gh auth status`) before anything works — issue
+state, labels, `updatedAt` drift and PR gating are all API reads.
+
+## Concurrency and isolation
+
+Workers run **unattended, with permissions bypassed, for up to four hours**. The
+isolation model is deliberately boring:
+
+```
+velostream/                     main checkout — orchestrator only, never a worker
+velostream-1898/  fix/1898-auto ── worker A   ─┐
+velostream-1902/  fix/1902-auto ── worker B    ├─ one worktree each,
+velostream-1907/  fix/1907-auto ── worker C   ─┘  own branch, own target/
+```
+
+Rules that make it hold:
+
+- **One worktree per issue, cut fresh from `origin/master`.** `velo-dispatch`
+  creates it; do not reuse one by hand. A worktree left by an earlier dispatch
+  scores 0-dirty/0-ahead and is indistinguishable from a fresh one — that is how
+  a worker was handed a tree 15 commits behind master while the script printed
+  that it was current.
+- **A worker never `cd`s.** Briefs say so explicitly and the brief checklist
+  refuses one that omits it: `git -C <worktree>` and
+  `cargo --manifest-path <worktree>/Cargo.toml`. A `cd` in a shared shell is how
+  one worker's edit lands in another's tree.
+- **`git stash` is repo-global.** Every worktree shares one stash stack, so a
+  worker running `git stash pop` gets whichever entry is on top — not its own.
+  `velo-status` warns when the stack is non-empty for exactly this reason.
+- **The orchestrator does not work in a worker's tree**, and vice versa. The main
+  checkout is for dispatching and reviewing.
+- **Concurrent OpenRouter dispatches share one in-flight credit budget.** Three
+  large-context runs at once returned HTTP 402 before any of them sent a prompt.
+
+## How the orchestrator decides what to run
+
+There is no autonomy here — each script tells you what it needs, and refuses
+when it cannot answer. The loop is:
+
+| you want to | run | what decides |
+|---|---|---|
+| know if a ticket is workable | `velo-dispatch <n> <brief> --dry-run` | eight preflight checks; it names the one that fails |
+| dispatch it | `velo-dispatch <n> <brief>` | the issue's `worker:*` label picks the model — not your judgement |
+| see what is running | `velo-status [-v] [n]` | reads the **process table and git**, never a worker's report |
+| know what a run cost | `velo-status <n>` | the appended `<issue>.result.jsonl` record |
+| gate a PR | `velo-pr-gate <pr> <scope-file>` | `velo-gate --plan` derives the gates **from the diff** |
+| merge | `velo-merge <pr>` | refuses unless the recorded gate names the CURRENT head |
+
+Two of those deserve emphasis, because they are where judgement is deliberately
+removed:
+
+**Which gates a PR needs is computed, not chosen.** `velo-gate --plan` reads the
+diff: `src/` touched adds `check-code`; a linked issue with 3+ acceptance bars
+adds `check-spec`; anything under `.agents/` requires `code-review`, because
+tooling governs every other run. **Which model runs each gate is fixed** —
+`code-review` to Codex, `check-code`/`check-spec` to the local worker. Hand-
+picking drifted twice in one session, once sending a review to a worker that
+returned MERGE-READY while missing a HIGH.
+
+**Skills are inlined, not invoked.** Workers have no Skill tool, so a brief
+saying "/check-code" is inert text to them. `--skill check-code` resolves the
+skill file and prepends its CONTENT to the prompt. If you find yourself pasting
+remembered skill text into a brief, use the flag instead — that hand-copying is
+what made two reviews differ for no reason.
+
+## Coordination lives on the GitHub issue
+
+The issue is not a ticket that points at the work — it **is** the coordination
+surface. Nothing here keeps a separate queue, database or state file, and that is
+deliberate: two sources of truth about what is being worked on is how two workers
+end up on the same code.
+
+**Labels are input, not decoration.** `velo-dispatch` reads them and refuses on
+what it finds:
+
+| label | effect |
+|---|---|
+| `worker:local` / `worker:deepseek` / `worker:glm` / `worker:codex` | **routing.** Exactly one required — zero or two is a refusal. The label picks the model; the orchestrator does not |
+| `needs-design` | refuses. A worker must never choose between design options — pin the design on the issue, or dispatch a READ-ONLY analysis brief that presents options and stops |
+| `blocked` | refuses. Resolve the dependency first |
+| `triage-needed` | refuses without `--force`. Four issues in one session turned out already-fixed; the label means "claims not yet verified against master" |
+
+**Assignment marks live work.** `velo-dispatch` assigns the issue **only at
+launch**, never at validation — so an assignee means a worker is or was actually
+running, not that someone intended to look at it. Assign-then-refuse would make
+the signal meaningless.
+
+**Gate state is a comment, not memory.** `velo-gate` writes
+`gate: <name> @ <sha>` and the labels `gate:running` / `gate:passed` /
+`gate:blocked` / `gate:none`. Two consequences worth internalising:
+
+- **A gate result is only valid for the commit it names.** `velo-merge` refuses
+  when the recorded sha is not the current head, and re-gating scopes the review
+  to the delta since that sha rather than re-deriving cleared work. A PR was once
+  green against a commit that had already been replaced.
+- **A substituted reviewer must be declared in the comment.** If Codex is
+  unavailable and something else runs, say so — otherwise the label implies a
+  reviewer that never ran, which is how five reviews on one PR were silently
+  performed by the wrong model.
+
+**Findings go on the issue or PR, not into chat.** A worker's completion comment,
+a gate's findings, and the correction when a finding turns out to be wrong all
+belong in the thread. The next dispatch reads the issue; it cannot read your
+terminal. This is also why the drift check compares the issue's `updatedAt`
+against the spec's `reviewed.at` — a ruling posted as a comment is real state, and
+a brief written before it is stale.
+
+**Cross-link related work.** Child issues carry the parent in the title
+(`[#1749] …`), which is what lets `velo-status` show progress against an umbrella
+effort rather than a flat list of open tickets.
+
+## How a worker searches the code
+
+Four layers, and the split matters because reaching for the wrong one is how a
+worker produces a confident wrong answer:
+
+| layer | tool | answers | does NOT answer |
+|---|---|---|---|
+| **discovery** | `zg query "..."` | "where is the code that does X", in plain English, when you have no symbol name | anything about types |
+| **text** | `rg` | "where does this literal appear" | ranking, structure |
+| **structural** | `ast-grep` | "every `impl` of X", "every call to `f($$$)`", scoped to a containing `impl` | which TYPE a receiver is |
+| **semantic** | `cargo check` | whether what you just wrote type-checks | anything before you write it |
+
+The order is deliberate: `zg` when you cannot yet name the thing, `ast-grep` once
+you can, `cargo check` after you have changed it.
+
+**Why `zg` exists.** `rg "null.?pad" src/` returns 13 unranked files, and
+`ast-grep` needs the symbol you are trying to find. `zg query "where the
+null-padded column set for an unmatched outer join row is decided"` returns
+`coordinator/mod.rs → merge_left_with_nulls_batch` as its second hit. Nothing
+else in the toolchain covers that phase.
+
+`velo-dispatch` builds the index into the worktree before the worker starts —
+measured at 35s, 0.10GB peak, 325MB on disk. Synchronously and before launch on
+purpose: a worker querying a half-built index gets nothing, and "no results" is
+indistinguishable from "not ready yet" — the ambiguity that made a stale language
+server silently degrade an agent to grep-based rewriting. `VELO_SKIP_INDEX=1`
+opts out; a failed build warns and the dispatch continues.
+
+**Reached through Bash, not a tool call.** A worker's `allowed_tools` is fixed at
+`Read, Glob, Grep, Bash, Edit, Write`, and the SDK's own LSP tool is a stub that
+errors on every call. `zg` is a CLI on `PATH` (`.agents/bin/zg`), invoked like
+`cargo` — no SDK change, no `allowed_tools` change. The worker knows it exists
+because `velo-impl.md` says so, and that file is spliced into every system
+prompt.
+
+**Three limits, in the policy because they matter:**
+
+1. **A snapshot** taken at worktree creation. It does not track the worker's own
+   edits — for locating existing code, never for verifying a change just made.
+2. **Not type-aware.** It will not say which of 79 `.record_count` sites are
+   `ProcessorContext`. *Nothing* in the worker's toolset will.
+3. **A miss is not proof of absence.** Falling back to `rg` is correct;
+   concluding "there is no such code" is not.
+
+## Anchors, not line numbers
+
+A task spec pins the code it describes with **symbols**, never `file.rs:130`:
+
+```json
+"anchors": [
+  { "file": "src/velostream/sql/parser/select.rs",
+    "symbol": "StreamSource::Uri", "expect": 4 }
+]
+```
+
+`velo-dispatch` re-counts each symbol **against `origin/master`** at dispatch
+time and refuses if the count moved. Line numbers rot between writing a brief and
+running it — `join.rs:130` had already moved to `:147` when a brief shipped it —
+whereas a symbol that has genuinely disappeared is a real signal that the issue
+describes code that no longer exists. Four issues in one session turned out to be
+already fixed, and this is the check that catches that class.
+
+The same idea covers intent, not just code: the spec carries a `reviewed` block
+with a timestamp and the brief's sha256, and dispatch refuses if the **issue** has
+been edited or commented since — a ruling posted as a comment is the commonest
+way a brief goes stale, and no code-based check can see it.
+
+---
+
+## How this works with Claude Code and Codex
+
+Two runtimes, three roles. Getting these confused is how a gate ends up reported
+as run when nothing ran.
+
+| role | who | what it can do |
+|---|---|---|
+| **orchestrator** | a Claude Code session (usually), or Codex | runs `velo-dispatch` / `velo-status` / `velo-pr-gate`; writes briefs and specs; never writes the feature code itself |
+| **delegated worker** | `velo-local`, `velo-deepseek`, `velo-glm` via the SDK runner; `worker:codex` via `codex exec` | implements one scoped task in its own worktree, unattended |
+| **review gate** | `codex review` for `code-review`; `velo-local` for `check-code` / `check-spec` | reads a diff read-only and returns findings |
+
+Codex appears in **two** of those roles and they are not interchangeable:
+`worker:codex` implements (via `codex exec`, dispatched by `velo-dispatch`),
+while `codex review` gates (dispatched by `velo-pr-gate`). Same CLI, different
+subcommand, different brief, different failure modes.
+
+**Capability differs by runtime, and the policy accounts for it.** A Claude Code
+orchestrator has the LSP tool, the Skill tool and MCP servers. A delegated worker
+has exactly `Read, Glob, Grep, Bash, Edit, Write` — no LSP (the SDK ships a stub
+that errors on every call), no Skill tool (review skills are inlined into the
+prompt by `--skill` instead). `rules/velo-impl.md` forks its type-aware refactor
+section on precisely this: LSP-first for agents that have LSP, `ast-grep` plus
+`cargo check` for everyone else.
+
+**Policy delivery also differs.** The three SDK routes take `--policy` and splice
+`velo-impl.md` into the system prompt. `codex exec` has no such flag, so
+`velo-dispatch` prepends the policy to its prompt — its only channel. Until that
+was fixed the most permissive worker (it runs with the sandbox bypassed) was the
+only one running with no policy at all.
+
+**A gate that cannot run must say so.** `codex review` dying on quota used to
+print `ok code-review -> codex (pid N)` and mark the PR `gate:running`, and its
+log looked like a report because the brief is echoed before the model is called.
+`velo-pr-gate` now watches the process briefly and refuses rather than claiming.
+If you substitute a different reviewer, **declare it in the gate comment** — the
+label must not imply a reviewer that never ran.
+
 ## The four workers
 
 | skill | model | cost | pick it for |
@@ -357,10 +613,16 @@ real finding in this repo came from a specific prompt ("is this arm a NEW silent
 loss?", "can this fix make detection WORSE?"). Templating it would have produced
 none of them.
 
-Codex is not launched by the script. It is an Agent call, and keeping it manual
-keeps the expensive gate a conscious act — it has previously returned a task
-handle instead of a report, and written into a live PR worktree, both from thin
-briefing.
+Codex IS launched by the script — `codex review` runs non-interactively and
+takes its prompt on stdin. This paragraph used to say the opposite ("it is an
+Agent call"), and that belief cost real money: every `code-review` on #1929,
+#1942 and #1943 silently fell back to a substituted Opus agent — five on #1943
+alone — while the routing table said Codex. What actually failed was the
+codex-rescue AGENT wrapper, which forwards to a background task it cannot poll
+and so returns a task handle instead of a report. The CLI has no such problem.
+
+The gate still refuses to dispatch while the brief's `## ATTACK` section is a
+placeholder, which is what keeps it a conscious act.
 
 `--plan` derives the gates from the diff: docs/tooling-only needs none, `src/`
 touched adds `check-code`, a linked issue with 3+ acceptance bars adds
