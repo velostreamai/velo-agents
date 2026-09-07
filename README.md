@@ -427,12 +427,76 @@ not dangerous — just slower and noisier.
   ok open: [arch] Remove StreamSource::Uri — the AST carries labels, not locators
   ok no blocking labels
   ok routed to velo-deepseek
+  ok validating against origin/master (8daed48e1) — pinned for this run
   ok dependencies closed
-  ok anchors verified against tree
-  ok blast radius: 94 refs (declared 94)
+  ok reviewed by neilavery at 2026-09-01T06:35:09Z; issue unchanged since
+  ok anchors verified against origin/master
+  ok blast radius: 94 refs / 12 files (declared 94 / 12)
+  ok brief BRANCH/WORKTREE match what will be cut
   ok brief satisfies the spec checklist
   ok disk: 223GB free
 ```
+
+A real dispatch (without `--dry-run`) continues past those into the side-effecting
+steps:
+
+```
+  ok worktree cut from origin/master: ~/RustroverProjects/velostream-1898 (fix/1898-auto @ 8daed48e1)
+  ok discovery index excluded from git on every worktree (verified via check-ignore)
+  .. building discovery index (~35s, skip with VELO_SKIP_INDEX=1)
+  ok discovery index built (325M) — worker can run: zg query "..."
+  ok assigned to bluemonk3y
+```
+
+#### The brief must describe the run it is actually getting
+
+Two of those lines are comparisons, not announcements.
+
+`ok brief BRANCH/WORKTREE match what will be cut` means the `BRANCH:` and
+`WORKTREE:` headers in your brief were checked against what this dispatch will
+really create. A mismatch **refuses**:
+
+```
+NOT READY: brief WORKTREE does not match the worktree this dispatch will use.
+  brief says : /tmp/completely-wrong
+  will use   : /Users/neilavery/RustroverProjects/velostream-1898
+```
+
+This exists because nothing used to compare them, and the failure is silent and
+splits the work: a worker that follows the brief commits to a branch
+`velo-status` and `velo-merge` never look at, reports success *truthfully*, and
+the dispatch branch sits empty. Fix the brief, or pass `--branch <name>` to cut
+what it names.
+
+The `WORKTREE:` line is **required**, not optional — `velo-brief-spec` §1, and
+dispatch refuses without it:
+
+| brief says | result |
+|---|---|
+| a worktree matching what will be cut | `ok brief BRANCH/WORKTREE match what will be cut` |
+| a worktree that differs | **refused** — mismatch, shown above |
+| a `## Worktree` heading with no readable path | **refused** — malformed, not ambiguous: fix the declaration rather than deleting it |
+| nothing at all | **refused** — `brief declares no WORKTREE` |
+| nothing, and a `## Branch` line naming several paths | `warn`, not compared — prose cannot disambiguate; add an explicit `WORKTREE:` line to have it checked |
+
+#### When the discovery index is refused
+
+`ok discovery index excluded from git … (verified via check-ignore)` is likewise a
+check, not a claim: the exclusion is written to the git **common dir's**
+`info/exclude` and then confirmed with `git check-ignore`. If git still says the
+index is trackable — usually `info/exclude` being read-only or a symlink —
+dispatch **refuses to build it**:
+
+```
+warn: could NOT exclude the discovery index from git — NOT building it.
+warn:   Refusing to build: an unignorable 325MB index is one failed run away
+warn:   from being committed by salvage's 'git add -A'.
+```
+
+That is deliberate. The failure salvage path runs `git add -A`, so an
+unignorable index would be committed by the very mechanism meant to preserve a
+dying run's work. Workers keep `rg` and `ast-grep`, which is a smaller loss than
+a poisoned branch. `VELO_SKIP_INDEX=1` skips the build outright.
 
 ### Running a review skill in a worker — `--skill`
 
@@ -689,3 +753,22 @@ record against an older one.
 `~/.agents/` is the live copy; **this directory is the source of truth**. Change
 here, commit, then re-run the install step. A change made only in `~/.agents/`
 is lost on the next sync.
+
+**Run the tests.** `.agents/tests/run.sh` drives the real scripts — not
+re-implementations of them — under stubbed `gh`, `codex` and `velo-gate`:
+
+```bash
+.agents/tests/run.sh
+```
+
+Two suites need more than the repo to run, and **skip loudly** rather than
+passing quietly when they cannot:
+
+- `test_gate_health.sh` needs a checkout with at least one commit ahead of
+  `origin/master`, because `velo-pr-gate` refuses an empty diff range. From the
+  main checkout on `master` it prints `SKIP` and the reason.
+- `test_dispatch_preflight.sh` needs `VELO_TEST_ISSUE` set to an open issue that
+  carries a `worker:*` label and has no `.agents/tasks/<n>.json`.
+
+A `SKIP` is not a pass. If you changed `velo-dispatch` or `velo-pr-gate`, run the
+suite from a feature worktree so those cases actually execute.
