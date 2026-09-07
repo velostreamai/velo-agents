@@ -445,6 +445,95 @@ WT_BEHIND=$(git -C "$WT" rev-list --count HEAD..origin/master 2>/dev/null || ech
 [[ "$WT_BEHIND" == "0" ]] \
   || die "internal: freshly-cut worktree is $WT_BEHIND commits behind origin/master"
 
+# ---- 6b. discovery index (#2032) --------------------------------------------
+#
+# Workers have rg (text), ast-grep (structural, type-blind) and cargo check
+# (type-aware, but only AFTER the write). None answers "where is the code that
+# does X" when the symbol name is not known yet — the phase BEFORE a pattern can
+# be written, where a worker otherwise burns turns grepping blind.
+#
+# Measured on this workspace: 35s, 0.10GB peak, 325MB on disk. For contrast,
+# rust-analyzer is 22-39GB resident and its SCIP batch mode crashes here.
+#
+# Built SYNCHRONOUSLY and BEFORE the worker launches, deliberately. Backgrounding
+# it would let the worker query a half-built index and get nothing — and "no
+# results" is indistinguishable from "not ready yet". That ambiguity is exactly
+# what made a stale LSP silently degrade an agent to grep-based rewriting. 35s on
+# a run measured in hours is noise; an unanswerable query is not.
+#
+# Non-fatal: a worker without an index still has rg, ast-grep and cargo check.
+# Skipped entirely with VELO_SKIP_INDEX=1.
+#
+# The ignore rule is written to the repo's git EXCLUDE file, not relied on from
+# the tracked .gitignore, because the tracked file only protects branches that
+# CONTAIN it. This PR adds `.zvec-grep/` to .gitignore, but every worktree cut
+# before it merges — 1928, 1958, 1965, 1987, 1994, 2000, 2006 as of writing — is
+# on a branch without that line. On those, the 325MB index is simply untracked:
+#
+#   $ git status --porcelain
+#   ?? .zvec-grep/
+#   $ git add -A --dry-run
+#   add '.zvec-grep/db/index.bin'
+#
+# and `velo_runner_lib.salvage_on_failure()` runs exactly `git add -A` before
+# committing. A run that times out would therefore commit the whole index. The
+# failure path we added to PRESERVE work would be the one that poisons the branch.
+#
+# info/exclude lives in the git COMMON dir, so one write covers every worktree
+# including the ones already on disk, it is untracked so it cannot appear in a
+# diff, and it does not depend on which branch is checked out. Idempotent.
+# >>> velo-index-exclude (extracted verbatim by tests/test_index_exclude.sh)
+GIT_COMMON=$(git -C "$WT" rev-parse --git-common-dir 2>/dev/null)
+if [[ -n "$GIT_COMMON" ]]; then
+  [[ "$GIT_COMMON" = /* ]] || GIT_COMMON="$WT/$GIT_COMMON"
+  mkdir -p "$GIT_COMMON/info" 2>/dev/null
+  for PAT in '.zvec-grep/' 'graphify-out/'; do
+    # Braces so the 2>/dev/null covers the REDIRECTION failure, which the shell
+    # reports, not printf's own stderr. Without them a read-only exclude printed
+    # a raw "Permission denied" above the warn that explains it properly.
+    { grep -qxF "$PAT" "$GIT_COMMON/info/exclude" \
+      || printf '%s\n' "$PAT" >> "$GIT_COMMON/info/exclude"; } 2>/dev/null
+  done
+fi
+
+# Verify the exclusion TOOK EFFECT; do not infer it from having written the file.
+#
+# The first cut of this printed success as long as the redirect did not crash the
+# script. With `info/exclude` symlinked to /dev/null, or read-only, the append
+# silently fails and `git status` still shows `?? .zvec-grep/` — so the dispatcher
+# announced the index was safe and then built a 325MB index that salvage's
+# `git add -A` could commit. Writing the guard is not the same as the guard
+# holding, which is the whole failure mode this section exists to close.
+#
+# Asking git is the only authority: it accounts for symlinks, permissions, the
+# common dir, core.excludesFile and .gitignore together.
+INDEX_SAFE=0
+if git -C "$WT" check-ignore -q .zvec-grep 2>/dev/null; then
+  INDEX_SAFE=1
+  ok "discovery index excluded from git on every worktree (verified via check-ignore)"
+else
+  warn "could NOT exclude the discovery index from git — NOT building it."
+  warn "  git check-ignore says .zvec-grep/ is still trackable in $WT."
+  warn "  Cause is usually $GIT_COMMON/info/exclude being read-only or a symlink."
+  warn "  Refusing to build: an unignorable 325MB index is one failed run away"
+  warn "  from being committed by salvage's 'git add -A'. Workers keep rg +"
+  warn "  ast-grep, which is a smaller loss than a poisoned branch."
+fi
+# <<< velo-index-exclude
+
+if [[ "$INDEX_SAFE" == "1" ]] \
+   && [[ "${VELO_SKIP_INDEX:-0}" != "1" ]] && [[ -x "$HOME/.agents/bin/zg" ]]; then
+  printf '  .. building discovery index (~35s, skip with VELO_SKIP_INDEX=1)\n'
+  if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index \
+         --embedding local/potion-code-16m-v2 ) >/tmp/zg-index-${ISSUE}.log 2>&1; then
+    ok "discovery index built ($(du -sh "$WT/.zvec-grep" 2>/dev/null | cut -f1)) — worker can run: zg query \"...\""
+  else
+    warn "discovery index FAILED (see /tmp/zg-index-${ISSUE}.log) — worker falls back to rg + ast-grep"
+  fi
+else
+  warn "discovery index skipped — worker has rg + ast-grep only"
+fi
+
 # ---- 7. assign (only now that work is actually starting) --------------------
 gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1 \
   && ok "assigned to $ASSIGNEE" || warn "could not assign (non-fatal)"

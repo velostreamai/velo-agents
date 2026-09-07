@@ -22,6 +22,9 @@ PY="${VELO_TEST_PYTHON:-$HOME/.venvs/velo-openrouter-agent/bin/python}"
 [[ -x "$PY" ]] || { echo "python with open_agent_sdk not found at $PY"; echo "set VELO_TEST_PYTHON"; exit 1; }
 
 RC=0
+echo "── discovery-index exclusion ──────────────────────────"
+bash "$HERE/test_index_exclude.sh" || RC=1
+echo
 echo "── sdk patches ────────────────────────────────────────"
 "$PY" "$HERE/test_sdk_patches.py" || RC=1
 echo

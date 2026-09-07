@@ -1,0 +1,51 @@
+#!/bin/bash
+# zg — discovery search for workers (#2032).
+#
+# Workers reach this through Bash, not through an SDK tool: their allowed_tools
+# is ["Read","Glob","Grep","Bash","Edit","Write"], and the SDK's own LSP tool is
+# a 43-line stub that errors on every call. A CLI on PATH needs no SDK change and
+# no allowed_tools change — which is the whole reason this is a shim rather than
+# a tool registration.
+#
+# `~/.agents/bin` is on PATH (install.sh), so this file IS the `zg` command the
+# policy tells workers to run. Without it, velo-impl.md's `zg query "..."`
+# guidance is a command-not-found.
+#
+# Prefers a globally-installed binary; falls back to npx so a machine without the
+# global install still works, just slower (npx re-resolves per call).
+set -uo pipefail
+
+for real in /opt/homebrew/bin/zg /usr/local/bin/zg "$HOME/.npm-global/bin/zg"; do
+  [[ -x "$real" ]] && exec "$real" "$@"
+done
+# A global install found via PATH, but not this shim (avoid exec'ing ourselves).
+GLOBAL=$(PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v "$(dirname "${BASH_SOURCE[0]}")" | paste -sd: -) command -v zg 2>/dev/null || true)
+[[ -n "$GLOBAL" && "$GLOBAL" != "${BASH_SOURCE[0]}" ]] && exec "$GLOBAL" "$@"
+
+command -v npx >/dev/null 2>&1 || {
+  echo "zg: neither a global install nor npx is available." >&2
+  echo "    Install with: npm install -g @zvec/zvec-grep   (needs Node 22+)" >&2
+  echo "    Discovery search is optional — rg and ast-grep still work." >&2
+  exit 127
+}
+# BOUNDED, and it says so when it gives up (#2033 review, P2).
+#
+# `exec npx ...` unbounded was measured hanging for the full length of an
+# external `timeout 20` with no output at all, when npm resolution was
+# unavailable. A worker is told by velo-impl.md to run `zg query "..."`; an
+# unbounded silent hang spends its turns and, worse, an empty result is
+# indistinguishable from "no matches" — the precise ambiguity the synchronous
+# index build in velo-dispatch exists to avoid. Failing loudly and fast is the
+# only useful answer here, because rg and ast-grep are right there.
+if command -v timeout >/dev/null 2>&1; then
+  timeout 120 npx --yes @zvec/zvec-grep@latest "$@"
+  RC=$?
+  if [[ $RC -eq 124 ]]; then
+    echo "zg: npx fallback timed out after 120s (no global install, npm unreachable)." >&2
+    echo "    This is NOT 'no matches' — the query never ran. Use rg / ast-grep," >&2
+    echo "    or install: npm install -g @zvec/zvec-grep" >&2
+    exit 124
+  fi
+  exit $RC
+fi
+exec npx --yes @zvec/zvec-grep@latest "$@"

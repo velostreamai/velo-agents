@@ -89,6 +89,7 @@ carrying.
 | LM Studio at `http://<host>:1234/v1` | the free local worker. Override the host with `VELO_LMSTUDIO_URL` (defaults to a LAN address). |
 | `gh`, authenticated | issue/PR validation |
 | `python3`, `jq`, `git`, `cargo`, `cargo-nextest`, `ast-grep` | dispatch + worker runtime |
+| **Node 22+** (optional) | the `zg` discovery index built per worktree at dispatch. Absent, dispatch warns and workers fall back to `rg` + `ast-grep`. `npm i -g @zvec/zvec-grep` makes it fast; without it the `zg` shim falls back to `npx` per call |
 
 Verify:
 

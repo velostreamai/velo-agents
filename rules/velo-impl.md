@@ -143,6 +143,40 @@ If `rust-analyzer` is not on `$PATH` or fails, fall back to `cargo check --no-de
 
 **Why this discipline matters at scale**: ADR-707 Phase 5a-followup migrates ~65 fields × N callers. A 7-site spike on `spike/707-accessor-dual-syntax` (2026-06-17) caught a `telemetry.rs:792` false positive (`ctx.record_count` where `ctx: ProducerSpanContext`, not `ProcessorContext`) using only `grep` — exactly the failure mode the LSP-first mechanic prevents.
 
+### Finding code you cannot yet name — `zg`
+
+Before you can write an ast-grep pattern you need a symbol, and often you do not
+have one: *"where is the null-padded column set for an unmatched outer join row
+decided?"* is a real question with no greppable answer. `rg "null.?pad" src/`
+returns 13 unranked files; ast-grep needs the name you are trying to find.
+
+`velo-dispatch` builds a local search index in your worktree before you start
+(#2032). Use it for that phase:
+
+```bash
+zg query "where the null-padded column set for an unmatched outer join row is decided"
+zg query --fts "JoinCoordinator"          # lexical, when you DO know the term
+zg query --rg -F "merge_left_with_nulls"  # ripgrep, plus enclosing-symbol context
+```
+
+On this repo the first of those returns `coordinator/mod.rs →
+merge_left_with_nulls_batch` as its second hit. That is the phase it is for.
+
+**Three limits, and they matter:**
+
+1. **It is a snapshot.** The index is built when your worktree is created and
+   does NOT track your edits. It is for locating code that already exists, never
+   for verifying a change you just made. If a hit disagrees with the file, the
+   file is right.
+2. **It is not type-aware.** It will not tell you which of 79 `.record_count`
+   sites are `ProcessorContext`. Nothing in your toolset will — see the section
+   below. Use it to find candidates, then read them.
+3. **A miss is not proof of absence.** Falling back to `rg` and `ast-grep` when
+   `zg` returns nothing is correct; concluding "there is no such code" is not.
+
+If `zg` is absent (the index build can fail; the dispatch says so and continues)
+carry on with `rg` and `ast-grep`. Nothing here depends on it.
+
 ### Without LSP — what a delegated worker must do instead
 
 You have `ast-grep` (via Bash — verified present) and `cargo check`. `ast-grep`

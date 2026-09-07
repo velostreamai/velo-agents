@@ -136,3 +136,15 @@ wall-clock, not tokens.
 - Check `df -h` before a batch — worktree `target/` dirs are ~20 GB each and a
   full disk kills workers with errors that look like code bugs.
 - Check the runner's final line for `changed=` and `leaked_tool_calls=`.
+
+## Discovery tooling — do not re-specify it
+
+Briefs must NOT hand-hold `zg`, `rg` or `ast-grep` usage. `velo-impl.md` covers
+what each is for and what none of them can do, and it is injected into every
+worker's system prompt. Repeating it in a brief means two sources that drift, and
+the brief loses to the policy when they disagree.
+
+What a brief SHOULD say is which of the three the task actually needs, when that
+is not obvious — e.g. "this is a classification pass over docs, not a refactor;
+you will not need ast-grep" — and any known trap, such as a symbol whose name
+collides across types.
