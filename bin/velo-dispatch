@@ -327,6 +327,123 @@ else
 fi
 
 # ---- 4. brief sanity — cheap checks against velo-brief-spec.md --------------
+#
+# The brief's own BRANCH:/WORKTREE: lines are MECHANICAL CLAIMS, and until #2004
+# nothing compared them to what this script was about to cut. On #2000 the brief
+# said `fix/2000-nullpad-union`, velo-dispatch cut `fix/2000-auto`, and all eight
+# preflight checks passed — the mismatch printed two lines apart with nothing
+# reading both. A worker that believes the brief commits to a branch velo-status
+# and velo-merge never look at, and its self-report is TRUE while the dispatch
+# branch sits empty.
+[[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
+WT="$WORKTREE_BASE/velostream-$ISSUE"
+
+# Two declaration forms exist in this repo: `BRANCH: x` and a `## Branch`
+# heading with the value on a following line. Read both (#2027 P1).
+brief_field() {   # $1 = field name -> its declared value, or empty
+  local f="$1"
+  grep -iE "^[[:space:]]*${f}:" "$BRIEF" | head -1 \
+    | sed -E "s/^[[:space:]]*${f}:[[:space:]]*//; s/[[:space:]]*\(.*//; s/[[:space:]]*\$//" | tr -d '`'
+  }
+brief_heading_line() {   # $1 = heading name -> first non-empty line beneath it
+  awk -v f="$1" 'BEGIN{IGNORECASE=1}
+    $0 ~ "^##+[[:space:]]*" f "[[:space:]]*$" {g=1; next}
+    g && /^#/ {exit}
+    g && NF { print; exit }' "$BRIEF"
+}
+# The heading form puts BOTH declarations on one prose line, e.g.
+#   fix/1937-auto — worktree at ~/RustroverProjects/velostream-1937. Do NOT cd …
+# Returning that whole line made all five heading-form briefs mismatch and, with
+# the new hard-fail, undispatchable (#2027 re-review P1). Extract the TOKEN, not
+# the sentence.
+brief_heading_branch() {
+  brief_heading_line Branch | sed -E 's/^[[:space:]]*[-*`]*[[:space:]]*//' \
+    | awk '{print $1}' | tr -d '`' | sed -E 's/[.,;:]+$//'
+}
+path_token() {   # first ABSOLUTE path in a line
+  # Anchored at a token boundary: unanchored, `~?/...` matched the slash INSIDE
+  # a branch name (`fix/1934-x` -> `/1934-x`). Backtick and open-paren count as
+  # boundaries because the real briefs write `~/RustroverProjects/...`.
+  #
+  # Only whitespace and backtick terminate the path. `,` and `)` are POSIX-legal
+  # in a path (#2027 P2), so they are stripped only when TRAILING — which still
+  # handles prose like "…/tree, then work in …" because the space ends the token.
+  grep -oE '(^|[[:space:]]|`|\()~?/[^[:space:]`]+' <<<"$1" | head -1 \
+    | sed -E 's/^[[:space:]`(]+//; s/[.,;:)]+$//' \
+    | sed -E "s#^~#$HOME#"
+}
+
+path_token_count() {   # how many distinct absolute paths a line names
+  grep -oE '(^|[[:space:]]|`|\()~?/[^[:space:]`]+' <<<"$1" \
+    | sed -E 's/^[[:space:]`(]+//; s/[.,;:)]+$//' | sort -u | wc -l | tr -d ' '
+}
+
+brief_heading_worktree() {
+  # A DECLARED `## Worktree` section wins absolutely. Concatenating both sections
+  # let a path merely CITED in Branch prose beat a declared one (#2027 round-3).
+  local line
+  line=$(brief_heading_line Worktree)
+  if [[ -n "$line" ]]; then
+    path_token "$line"
+    return 0
+  fi
+  # Fallback: the path lives in the Branch prose. If that prose names SEVERAL
+  # paths we cannot tell which is the worktree, and guessing produces a false
+  # refusal (#2027 P2). Return nothing and let the caller skip, not refuse.
+  line=$(brief_heading_line Branch)
+  [[ "$(path_token_count "$line")" -le 1 ]] || return 0
+  path_token "$line"
+}
+BRIEF_BRANCH=$(brief_field BRANCH); [[ -n "$BRIEF_BRANCH" ]] || BRIEF_BRANCH=$(brief_heading_branch)
+if [[ -n "$BRIEF_BRANCH" && "$BRIEF_BRANCH" != "$BRANCH" ]]; then
+  die "brief BRANCH does not match the branch this dispatch will cut.
+  brief says : $BRIEF_BRANCH
+  will cut   : $BRANCH
+  A worker that follows the brief commits somewhere velo-status and velo-merge
+  do not look, and reports success truthfully while the dispatch branch is empty.
+  Fix the brief, or pass --branch $BRIEF_BRANCH to cut what it names."
+fi
+
+BRIEF_WT=$(brief_field WORKTREE); [[ -n "$BRIEF_WT" ]] || BRIEF_WT=$(brief_heading_worktree)
+
+# Absent is a FAILURE, not a skip. velo-brief-spec §1 requires both; treating an
+# unparseable value as "nothing to check" is how the first cut passed every
+# `## Branch` brief without comparing anything (#2027 P1).
+[[ -n "$BRIEF_BRANCH" ]] || die "brief declares no BRANCH.
+  velo-brief-spec §1 requires it, and without it nothing verifies the worker is
+  sent to the branch this dispatch cuts. Add either form:
+    BRANCH: $BRANCH        or        ## Branch\n$BRANCH"
+if [[ -z "$BRIEF_WT" ]]; then
+  # Order matters. A DECLARED worktree that yields no path is a MALFORMED brief
+  # and must refuse — it must never reach the ambiguity skip below (#2027 round-5
+  # P1). The skip exists only for the case where nothing was declared and the
+  # Branch prose names several paths, which cannot be disambiguated.
+  if [[ -n "$(brief_heading_line Worktree)" || -n "$(brief_field WORKTREE)" ]]; then
+    die "brief declares a WORKTREE but no path could be read from it.
+  Found the declaration, found no path in it. That is a malformed brief, not an
+  ambiguous one — fix the declaration rather than removing it:
+    WORKTREE: $WT"
+  elif [[ "$(path_token_count "$(brief_heading_line Branch)")" -gt 1 ]]; then
+    warn "brief WORKTREE not compared: nothing declares one, and the Branch line
+       names several paths, which prose cannot disambiguate. Add an explicit
+       '## Worktree' section or a 'WORKTREE:' line to have this checked."
+  else
+    die "brief declares no WORKTREE.
+  velo-brief-spec §1 requires it — add 'WORKTREE: $WT' or a '## Worktree' section."
+  fi
+elif [[ "${BRIEF_WT%/}" != "${WT%/}" ]]; then
+  # RESTORED (#2027 round-6 P1). The round-5 rewrite replaced this whole block to
+  # reorder the empty-value cases and took the comparison out with it, so any
+  # non-empty but WRONG worktree — `WORKTREE: /tmp/other` — sailed past and the
+  # script printed "BRANCH/WORKTREE match what will be cut". The check this PR
+  # exists to add, deleted by a fix to the check, while still claiming to pass.
+  die "brief WORKTREE does not match the worktree this dispatch will use.
+  brief says : $BRIEF_WT
+  will use   : $WT
+  Same failure as the BRANCH mismatch: the worker works somewhere nobody reads."
+fi
+ok "brief BRANCH/WORKTREE match what will be cut"
+
 MISSING=()
 grep -qi "worktree" "$BRIEF"                  || MISSING+=("no WORKTREE path (spec §1)")
 grep -qiE "do not.*cd|don't.*cd" "$BRIEF"     || MISSING+=("no 'do NOT cd' instruction (spec §1)")

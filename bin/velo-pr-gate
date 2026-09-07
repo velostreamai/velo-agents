@@ -116,7 +116,60 @@ WTPATH=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$WT" '
 [[ -n "$WTPATH" ]] || die "no local worktree checked out on '$WT' — a gate must read the tree it reviews"
 
 ok "worktree: $WTPATH"
-~/.agents/bin/velo-gate "$PR" --running >/dev/null 2>&1 && ok "gate:running"
+# Set AFTER the dispatches are known to be alive (#2005) — see the end of the
+# script. Marking a PR gate:running for a gate that died on quota is how a PR
+# ends up with three gate comments and zero independent scrutiny.
+GATE_RUNNING_PENDING=1
+
+# A dispatched gate that died on quota reported `ok ... (pid N)` and set
+# gate:running (#2005). The log even LOOKS like a report, because the brief —
+# ATTACK section, scope, output template — is echoed before the model is called,
+# so its tail reads as a review that ended oddly. `command -v codex` only proves
+# the binary exists; it says nothing about capacity.
+#
+# Quota/auth death is seconds; a real review is minutes. So watch briefly, and
+# judge the RUN rather than the binary.
+CODEX_FAILED=0
+# Owned by THIS process, never inherited (#2027 round 8, P2). The check-code
+# watch guards on `[[ -n "${CODE_PID:-}" ]]`, so an exported CODE_PID in the
+# caller's environment would make a code-review-only run watch a PID it never
+# launched: dead, and the gate refuses gate:running for no reason; alive, and it
+# waits another 10s then prints a check-code success for a gate that never ran.
+CODE_PID=""
+# Did ANY gate actually get dispatched? (#2005 acceptance criterion 1)
+#
+# CODEX_FAILED only distinguishes "dispatched and died" from "dispatched and
+# lived". It says nothing about "never dispatched at all", which is what happens
+# when the codex CLI is missing: both blocks warn and fall through, nothing runs,
+# and the script went on to print `ok gate:running`. Same failure #2005 was filed
+# for — the gate says it ran — in the branch the original fix did not cover.
+GATE_DISPATCHED=0
+codex_health_check() {   # $1 = pid, $2 = log, $3 = gate name
+  local pid="$1" log="$2" name="$3" i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    ok "$name still running after 10s — dispatched for real"
+    return 0
+  fi
+  # Exited within 10s: too fast to be a review of anything.
+  # Classify from the TAIL only, and with phrases that cannot appear in a brief.
+  # The brief is echoed into the log before the model is called, and it contains
+  # the word "authorized" — so a bare `auth` match reported AUTH FAILURE for
+  # every fast exit regardless of cause (#2027 P2). Scanning the whole log means
+  # scanning our own prompt.
+  local tail_only; tail_only=$(tail -25 "$log" 2>/dev/null)
+  local why="exited in under 10s"
+  grep -qiE "usage limit|quota exceeded|rate.?limit|Upgrade to Pro" <<<"$tail_only" && why="OUT OF QUOTA"
+  grep -qiE "not logged in|unauthorized|invalid api key|authentication failed|401" <<<"$tail_only" && why="AUTH FAILURE"
+  CODEX_FAILED=1
+  warn "FAIL: $name did NOT run — $why"
+  warn "  log: $log"
+  sed -n '$p' "$log" 2>/dev/null | sed 's/^/  last line: /' >&2
+  return 1
+}
 
 PY=/Users/neilavery/.venvs/velo-openrouter-agent/bin/python
 RUNNER=/Users/neilavery/.agents/bin/velo-lmstudio-agent-sdk.py
@@ -184,10 +237,39 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # the placeholder was present — unsatisfiable by construction, and it fired on
   # the very first real use. Regenerate only when the brief is absent or still a
   # stub; otherwise reuse what the caller wrote.
-  if [[ -f "$OUT" ]] && ! grep -q "<<< FILL THIS IN" "$OUT"; then
+  #
+  # "Not a stub" was originally just "does not contain the placeholder", and that
+  # is far too weak, because $OUT is a long-lived path in shared /tmp. Observed on
+  # this PR while dispatching round 8: the reused file's entire contents were
+  #
+  #     filled attack section
+  #
+  # — a placeholder someone had written to get PAST the stub check. It matched
+  # "no placeholder", so the script announced `ok reusing filled brief` and
+  # dispatched a review briefed on nothing, silently DISCARDING the round-8 scope
+  # file passed on the command line. The refusal at the bottom of this section
+  # exists precisely to stop a stub being dispatched; the reuse path walked around
+  # it. A gate briefed on nothing reports dimensions rather than findings — which
+  # is how a review came back MERGE-READY while missing a HIGH (#1988).
+  #
+  # So reuse now requires the brief to be FOR THIS REVIEW: same scope file content
+  # and same diff range as the run that generated it, recorded in a trailer at
+  # generation time. A hand-filled ATTACK section still survives, because filling
+  # it in does not change either value — which was the original point.
+  SCOPE_SIG=$(shasum -a 256 "$SCOPE" 2>/dev/null | cut -c1-16)
+  if [[ -f "$OUT" ]] \
+     && ! grep -q "<<< FILL THIS IN" "$OUT" \
+     && grep -qF "<!-- velo-gate-brief scope=$SCOPE_SIG range=$RANGE -->" "$OUT"; then
     ok "reusing filled brief: $OUT"
     REUSED_BRIEF=1
   else
+    if [[ -f "$OUT" ]] && ! grep -q "<<< FILL THIS IN" "$OUT"; then
+      warn "discarding a brief that is not for this review (different scope or range)"
+      warn "  had:  $(grep -o '<!-- velo-gate-brief[^>]*-->' "$OUT" 2>/dev/null || echo '<no trailer — hand-written or from an older velo-pr-gate>')"
+      warn "  want: <!-- velo-gate-brief scope=$SCOPE_SIG range=$RANGE -->"
+      cp "$OUT" "$OUT.superseded.$(date -u +%Y%m%dT%H%M%SZ)"
+      warn "  previous brief saved alongside; re-fill ATTACK before dispatching"
+    fi
     REUSED_BRIEF=0
   cat > "$OUT" <<EOF
 READ-ONLY review. Return the report as your final message — plain text, NOT a
@@ -253,6 +335,8 @@ REPRODUCED it or it is reasoning-only.
 
 Mark anything unverifiable as UNVERIFIED. Be brief — a short report with two
 real findings beats a long one with eight speculative ones.
+
+<!-- velo-gate-brief scope=$SCOPE_SIG range=$RANGE -->
 EOF
   fi
   echo
@@ -304,7 +388,9 @@ EOF
     else
       nohup sh -c "cd '$WTPATH' && codex review - < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
     fi
-    ok "check-code -> codex (pid $!)  log: $CODE_LOG"
+    CODE_PID=$!
+    GATE_DISPATCHED=1
+    ok "check-code -> codex (pid $CODE_PID)  log: $CODE_LOG"
   elif [[ $NEEDS_CODE -eq 1 ]]; then
     warn "codex CLI not found on PATH — check-code NOT dispatched."
     warn "Do NOT substitute a local model: on #1988 it approved a diff carrying"
@@ -315,13 +401,19 @@ EOF
   if command -v codex >/dev/null 2>&1; then
     if [[ $EXEC -eq 1 ]]; then
       nohup sh -c "cd '$WTPATH' && codex review --dangerously-bypass-approvals-and-sandbox - < '$OUT'" > "$CODEX_LOG" 2>&1 &
-      ok "code-review -> codex (pid $!)  log: $CODEX_LOG"
+      CODEX_PID=$!
+      GATE_DISPATCHED=1
+      ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
+      codex_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
       warn "--exec: sandbox BYPASSED — the reviewer can compile, run tests, AND write."
       warn "The brief still says do-not-write, but nothing now enforces it."
       warn "Check \`git -C $WTPATH status\` when the review finishes."
     else
       nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
-      ok "code-review -> codex (pid $!)  log: $CODEX_LOG"
+      CODEX_PID=$!
+      GATE_DISPATCHED=1
+      ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
+      codex_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
     fi
     echo "     brief: $OUT   (diff range: $RANGE)"
     echo "     Codex writes its report to the log; read the tail, not the whole file."
@@ -332,10 +424,44 @@ EOF
     echo "     so the label does not imply a reviewer that never ran."
   fi
 
+  # check-code is dispatched FIRST and, until round 7 of this PR, was the ONE
+  # dispatch nothing watched. `$!` was read straight into the `ok` message and
+  # discarded, so a check-code that died on quota left CODEX_FAILED=0 and the
+  # script went on to print `ok gate:running` — the exact failure #2005 exists to
+  # prevent, still live in the other gate. The health check was written, and then
+  # wired to one of the two things that needed it.
+  #
+  # It runs AFTER the code-review dispatch on purpose: both processes are then in
+  # flight, so watching them is concurrent rather than serialised.
+  if [[ -n "${CODE_PID:-}" ]]; then
+    codex_health_check "$CODE_PID" "$CODE_LOG" "check-code"
+  fi
+
   echo
   echo "  Then relay every report and record the verdict:"
   [[ $NEEDS_CODE  -eq 1 ]] && echo "    velo-gate-post $PR check-code  <report>"
   [[ $NEEDS_SPEC  -eq 1 ]] && echo "    velo-gate-post $PR check-spec  <report>"
   echo "    velo-gate-post $PR code-review <report>"
   echo "    velo-gate $PR --pass | --block"
+fi
+
+
+# ---- #2005: only claim the gate is running if something actually is ---------
+if [[ "${GATE_RUNNING_PENDING:-0}" -eq 1 ]]; then
+  if [[ "${CODEX_FAILED:-0}" -eq 1 ]]; then
+    warn "NOT setting gate:running — a dispatched gate died before doing any work."
+    warn "Re-run when quota resets, or dispatch a DECLARED substitute and say so"
+    warn "in the gate comment. A gate that reports itself dispatched and produced"
+    warn "nothing is worse than one that refused."
+    exit 1
+  fi
+  if [[ "${GATE_DISPATCHED:-0}" -eq 0 ]]; then
+    warn "NOT setting gate:running — NOTHING was dispatched."
+    warn "The codex CLI is not on PATH, so neither gate ran. Marking the PR"
+    warn "gate:running here would be the #2005 failure exactly: a PR that says"
+    warn "it is under review, with no reviewer. Install codex, or run the review"
+    warn "yourself and DECLARE the substitution in the gate comment."
+    exit 1
+  fi
+  ~/.agents/bin/velo-gate "$PR" --running >/dev/null 2>&1 && ok "gate:running"
 fi

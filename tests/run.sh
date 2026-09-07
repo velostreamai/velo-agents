@@ -25,6 +25,15 @@ RC=0
 echo "── discovery-index exclusion ──────────────────────────"
 bash "$HERE/test_index_exclude.sh" || RC=1
 echo
+echo "── gate health (end-to-end) ───────────────────────────"
+bash "$HERE/test_gate_health.sh" || RC=1
+echo
+echo "── dispatch preflight (end-to-end) ────────────────────"
+bash "$HERE/test_dispatch_preflight.sh" || RC=1
+echo
+echo "── brief fields ───────────────────────────────────────"
+bash "$HERE/test_brief_fields.sh" || RC=1
+echo
 echo "── sdk patches ────────────────────────────────────────"
 "$PY" "$HERE/test_sdk_patches.py" || RC=1
 echo
