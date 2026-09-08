@@ -115,6 +115,41 @@ check "read-only brief that mandates commits -> landed" \
 check "genuinely read-only brief that commits -> violation" \
       "$(run_record 8 "$TMP/clean" "$TMP/ro.log" "$TMP/ro-brief.md" 0)" "read-only-violation"
 
+echo "discovery index state (audit)"
+# The ONLY evidence that an index existed was a warn line in a terminal — and it
+# turned out never to have been built at all (#2056). Recording it makes "how
+# many dispatches actually had one?" a jq query instead of an archaeology
+# exercise.
+for st in built refused failed skipped; do
+  D=$(mktemp -d); git init -q "$D"
+  git -C "$D" config user.email t@t; git -C "$D" config user.name t
+  printf 'x\n' > "$D/f"; git -C "$D" add -A; git -C "$D" commit -qm init
+  printf 'WORKTREE: %s\nSTOP and report\nYou may commit.\n' "$D" > "$D/b.md"
+  VELO_RECORD_ROOT="$D" "$BIN/velo-record" 4242 --index "$st" --worktree "$D" \
+    --worker w --model m --brief "$D/b.md" --started "$(date -u +%FT%TZ)" \
+    --rc 0 --max-turns 10 --base abc >/dev/null 2>&1
+  GOT=$(python3 -c "
+import json
+print(json.loads(open('$D/.agents/tasks/4242.result.jsonl').readline()).get('discovery_index'))
+" 2>/dev/null)
+  check "index state '$st' recorded" "$GOT" "$st"
+  rm -rf "$D"
+done
+
+# An omitted flag must not silently become a plausible value.
+D=$(mktemp -d); git init -q "$D"
+git -C "$D" config user.email t@t; git -C "$D" config user.name t
+printf 'x\n' > "$D/f"; git -C "$D" add -A; git -C "$D" commit -qm init
+printf 'WORKTREE: %s\nSTOP and report\nYou may commit.\n' "$D" > "$D/b.md"
+VELO_RECORD_ROOT="$D" "$BIN/velo-record" 4243 --worktree "$D" --worker w --model m \
+  --brief "$D/b.md" --started "$(date -u +%FT%TZ)" --rc 0 --max-turns 10 --base abc >/dev/null 2>&1
+GOT=$(python3 -c "
+import json
+print(json.loads(open('$D/.agents/tasks/4243.result.jsonl').readline()).get('discovery_index'))
+" 2>/dev/null)
+check "omitted --index is 'unknown', not a guess" "$GOT" "unknown"
+rm -rf "$D"
+
 echo "record file"
 # The JSON-array append was an unlocked read-modify-write: six concurrent
 # recorders left 1 of 6 rows, silently, in the file whose stated purpose is that

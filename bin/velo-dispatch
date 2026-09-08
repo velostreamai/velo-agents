@@ -27,9 +27,23 @@ LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://192.168.1.193:1234/v1}"
 MAX_TURNS=250
 PROMPT_TIMEOUT=14400
 
-die()  { printf '\n\033[31mNOT READY:\033[0m %s\n\n' "$1" >&2; exit 1; }
-warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
-ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+# Every decision this script makes goes through ok/warn/die and NOWHERE else, so
+# teeing these three is a complete audit trail without touching stdout wiring.
+#
+# Until now none of it was captured. The preflight prints what it validated —
+# anchors, blast radius, brief-vs-reality, the worktree it cut, whether the
+# discovery index was built — and all of it scrolled past into a terminal
+# nobody kept. That is exactly how `could NOT exclude the discovery index —
+# NOT building it` printed on EVERY dispatch for days without being noticed:
+# the feature was dead and the evidence was ephemeral.
+#
+# DLOG is empty until the state directory exists (see below), so early usage
+# failures still work; those lines simply predate the log.
+DLOG=""
+_audit() { [[ -n "$DLOG" ]] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$DLOG"; return 0; }
+die()  { _audit "DIE  $1"; printf '\n\033[31mNOT READY:\033[0m %s\n\n' "$1" >&2; exit 1; }
+warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
 ISSUE="${1:-}"; BRIEF="${2:-}"; shift 2 2>/dev/null || true
 BRANCH=""; DRY=0; FORCE=0
@@ -44,6 +58,17 @@ done
 
 [[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force]"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "issue must be a number, got '$ISSUE'"
+
+# Open the audit log now: the issue number is validated, so the path is safe to
+# build, and everything from here on is a decision worth keeping.
+mkdir -p "$VELO_STATE/dispatch/${ISSUE}" 2>/dev/null || true
+DLOG="$VELO_STATE/dispatch/${ISSUE}/dispatch-$(date -u +%Y%m%dT%H%M%SZ).log"
+: >> "$DLOG" 2>/dev/null || DLOG=""
+# $* is empty here — the flag loop above already shifted them away — so record
+# the PARSED mode instead, which is what an audit actually wants: --force is the
+# flag that bypasses the triage-needed guard, and a dry run explains why no
+# worktree or worker followed.
+_audit "START issue=$ISSUE brief=$BRIEF dry_run=$DRY force=$FORCE branch=${BRANCH:-<auto>}"
 [[ -f "$BRIEF" ]] || die "brief file not found: $BRIEF"
 [[ -s "$BRIEF" ]] || die "brief file is empty: $BRIEF"
 
@@ -655,6 +680,7 @@ else
   warn "  from being committed by salvage's 'git add -A'. Workers keep rg +"
   warn "  ast-grep, which is a smaller loss than a poisoned branch."
 fi
+INDEX_STATE="refused"     # overwritten below unless the guard refused
 # <<< velo-index-exclude
 
 INDEX_READY=0
@@ -664,11 +690,14 @@ if [[ "$INDEX_SAFE" == "1" ]] \
   if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index \
          --embedding local/potion-code-16m-v2 ) >"$VELO_STATE/dispatch/${ISSUE}/zg-index.log" 2>&1; then
     INDEX_READY=1
+    INDEX_STATE="built"
     ok "discovery index built ($(du -sh "$WT/.zvec-grep" 2>/dev/null | cut -f1)) — worker can run: zg query \"...\""
   else
+    INDEX_STATE="failed"
     warn "discovery index FAILED (see $VELO_STATE/dispatch/${ISSUE}/zg-index.log) — worker falls back to rg + ast-grep"
   fi
 else
+  [[ "$INDEX_SAFE" == "1" ]] && INDEX_STATE="skipped"
   warn "discovery index skipped — worker has rg + ast-grep only"
 fi
 
@@ -783,14 +812,16 @@ esac
 nohup bash -c '
   LOGF="$1"; RI="$2"; RWT="$3"; RNAME="$4"; RMODEL="$5"
   RBRIEF="$6"; RSTART="$7"; RMT="$8"; RBASE="$9"
-  shift 9
+  # $10 would parse as $1 followed by a literal 0, silently passing the log path
+  # as the index state, so take it after a shift instead of using ${10}.
+  shift 9; RIDX="$1"; shift 1
   "$@" > "$LOGF" 2>&1
   rc=$?
-  "$HOME/.agents/bin/velo-record" "$RI" --worktree "$RWT" --worker "$RNAME" \
+  "$HOME/.agents/bin/velo-record" "$RI" --index "$RIDX" --worktree "$RWT" --worker "$RNAME" \
     --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
     --rc "$rc" --max-turns "$RMT" --base "$RBASE" >> "$LOGF" 2>&1 || true
 ' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
-  "${CMD[@]}" > /dev/null 2>&1 &
+  "${INDEX_STATE:-unknown}" "${CMD[@]}" > /dev/null 2>&1 &
 PID=$!
 
 echo

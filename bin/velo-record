@@ -38,6 +38,11 @@ source "$LIB"
 
 ISSUE="${1:-}"; shift || true
 WORKTREE=""; WORKER=""; MODEL=""; BRIEF=""; LOG=""; STARTED=""; RC=0; MAXTURNS=""; BASE=""
+# Whether the discovery index existed for this run: built|refused|failed|skipped.
+# Recorded because the ONLY evidence of it was a warn line in a terminal, and the
+# index turned out never to have been built at all — a dead feature that a single
+# jq over these records would have exposed on day one.
+INDEX=""; export INDEX
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --worktree)  WORKTREE="$2"; shift 2 ;;
@@ -49,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --rc)        RC="$2";       shift 2 ;;
     --max-turns) MAXTURNS="$2"; shift 2 ;;
     --base)      BASE="$2";     shift 2 ;;
+    --index)     INDEX="$2"; export INDEX; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -297,6 +303,7 @@ record = {
         "source": "unverified",
     },
     "gate": {"run_commit_fast": None, "pr": None, "pr_gate_verdict": None, "blockers": None},
+    "discovery_index": g("INDEX") or "unknown",
     "stalls": [],
     "outcome": g("VR_OUTCOME"),
 }
