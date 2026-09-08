@@ -6,6 +6,77 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Fixed — velo-status printed the log FILENAME as the worker name (PR #2064)
+
+The state migration moved logs to `<worker>-<UTC>.log` inside a per-issue
+directory; the worker-name rule still stripped from `-<issue>`, matched nothing,
+and showed `codex-20260` for a codex run. **Prevents:** the operator's primary
+view mislabelling which model ran — indistinguishable from a worker you do not
+recognise. velo-status had no test at all; it does now.
+
+### Fixed — the worker could not run the tool its own policy names (PR #2063)
+
+`velo-impl.md` tells every worker to run `zg query`, but the runner passed an env
+of two timeout keys and the SDK merges over `os.environ`, so the worker's PATH
+was whatever shell launched the dispatch. `install.sh` only *warns* about
+`~/.agents/bin`. **Prevents:** every worker's documented first move being
+`zg: command not found`, with no way to discover the shim exists.
+
+### Fixed — the discovery index was never built, once (PR #2056)
+
+The fail-closed guard asked `git check-ignore .zvec-grep` without the trailing
+slash, against a directory-only pattern, before the directory existed. It never
+matched, so the guard refused on **every fresh worktree**. **Prevents:** a
+shipped feature that has never executed while its guard, tests, policy and README
+all describe it working. The tests passed because they created the directory
+first — a state the production path can never be in.
+
+### Added — an audit trail for what a dispatch decided (#1992, PR #2057)
+
+`dispatch-<UTC>.log` per issue, plus `discovery_index` in the durable record.
+**Prevents:** the above going unnoticed for days. There was a record of every run
+and none of the dispatch; the evidence existed once, briefly, on a screen.
+
+### Changed — runtime state left /tmp for ~/.agents/state (PR #2052)
+
+**Prevents:** four defects that all traced to one choice — a fixture race
+(#2040), two gates on one PR sharing a brief, a cleanup leaking a file per run,
+and a stale brief from a previous session being reused, dispatching a review
+briefed on nothing while printing `ok reusing filled brief`.
+
+### Added — one gate per PR, and a bounded /tmp (PR #2051)
+
+An atomic `mkdir` lock, released on every exit path including refusals.
+**Prevents:** two gates on one PR interleaving into a report neither wrote. The
+first prune was a silent no-op — `find /tmp` does not traverse a symlink on
+macOS — which is why the test asserts on the filesystem, not on the command.
+
+### Added — velo-spec-review --check, a spec review that loops (PR #2059)
+
+Codex reviews the spec itself; two consecutive CLEAN rounds on unchanged content
+are required, and any edit resets the streak. **Prevents:** dispatching against a
+spec that passes every mechanical gate and still aims the worker wrongly. Its
+first real run found four HIGH findings on an **already-dispatched** spec,
+including two `fail_to_pass` tests that do not exist — so a run that "landed" had
+an acceptance gate naming nothing.
+
+### Added — a discovery layer for workers (#2032, PR #2033)
+
+`zg` on PATH, index built per worktree before the worker starts. **Prevents:**
+burning turns grepping blind for code whose symbol you cannot yet name. Written
+to the git common dir's `info/exclude` and verified with `check-ignore`, because
+salvage runs `git add -A` and an unignorable 325MB index is one failed run from
+being committed.
+
+### Added — velo-dispatch compares the brief's claims (#2004/#2005, PR #2027)
+
+Refuses when a brief's `BRANCH:`/`WORKTREE:` differ from what will be cut, and
+judges whether a gate actually ran rather than whether its binary exists.
+**Prevents:** a worker committing where `velo-status` and `velo-merge` never
+look, and a PR marked `gate:running` with no reviewer. Took eight review rounds;
+every one found a real defect, including a fix that deleted the check it was
+fixing.
+
 ### Added — every dispatch now records what it DID (#1992 Phase 1, PR #1998)
 
 Every gate here validated a run **before** it started. Nothing recorded what

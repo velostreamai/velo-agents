@@ -108,9 +108,16 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
     esac
   elif [[ -n "$LOG" ]]; then
     # Not running: the most recent log is the best available evidence of who
-    # ran last. Names vary (deepseek-1898.log, deepseek-1877-stage1.log), so
-    # take whatever precedes "-<issue>".
-    BN=$(basename "$LOG"); WORKER="${BN%%-$ISSUE*}"
+    # ran last.
+    #
+    # Logs are $VELO_STATE/dispatch/<issue>/<worker>-<UTC>.log — the issue is the
+    # DIRECTORY, not part of the filename. The previous rule stripped from
+    # "-<issue>" onward, which was right when logs were /tmp/deepseek-1898.log
+    # and became a NO-OP the moment they moved: nothing matched, so the entire
+    # filename became the worker name and velo-status printed "codex-20260" for
+    # a codex run. Take everything before the LAST hyphen instead — that keeps
+    # multi-hyphen names like velo-local intact.
+    BN=$(basename "$LOG" .log); WORKER="${BN%-*}"
   fi
 
   if [[ -n "$PID" ]]; then

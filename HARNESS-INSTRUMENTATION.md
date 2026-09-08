@@ -133,7 +133,7 @@ the rework history is the most interesting part of the data.
     "blockers": 0
   },
 
-  "stalls": [],
+  "discovery_index" (built|refused|failed|skipped|unknown), "stalls": [],
   "outcome": "landed",
   "stop_trigger": null
 }

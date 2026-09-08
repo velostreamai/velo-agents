@@ -25,14 +25,25 @@ and the tests** — never from the worker's self-report.
     velo-gate-post                 post a reviewer's report on its behalf
     velo-merge                     merge only if gated against the CURRENT head
     velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
+    velo-spec-review               attest a spec was read; --check has Codex REVIEW it
     velo-worktree-lib.sh           worktree derivations shared by velo-status + velo-record
+    zg                             discovery-search shim — the `zg` the policy tells workers to run
+    velo_worker_runner.py          the one worker runner, two provider profiles
+    velo_sdk_patches.py            corrections applied to open-agent-sdk at import
+    velo_runner_lib.py             salvage-on-failure and other runner-side helpers
     velo-openrouter-agent          wrapper -> the SDK worker (DeepSeek / GLM)
     velo-openrouter-agent-sdk.py   OpenRouter-backed worker runner
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
   tests/
-    run.sh                         both suites, in seconds — run when touching .agents/
+    run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants
     test_record.sh                 STOP detection, outcome ladder, record writing
+    test_dispatch_preflight.sh     brief-vs-reality refusals, driving the real script
+    test_gate_health.sh            gate liveness, brief reuse, the per-PR lock
+    test_index_exclude.sh          the discovery index can never become committable
+    test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
+    test_status.sh                 velo-status worker naming
+    test_worker_env.py             the worker can run the tools its policy names
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
     velo-brief-spec.md             what a task brief MUST contain, and why
@@ -47,6 +58,35 @@ and the tests** — never from the worker's self-report.
     <issue>.json                   per-issue machine-checkable spec
     <issue>.result.jsonl           what each dispatch DID — one record per run
 ```
+
+Runtime state lives **outside the repo**, under `$VELO_STATE` (default
+`~/.agents/state`):
+
+```
+~/.agents/state/
+  dispatch/<issue>/
+    dispatch-<UTC>.log     every ok/warn/die the preflight emitted — why it ran, or refused
+    <worker>-<UTC>.log     the worker's own transcript
+    zg-index.log           output of the discovery-index build
+  gate/<pr>/
+    review-brief.md        the brief; stable, so a hand-filled ATTACK survives a re-run
+    code-brief.md
+    review.log  code.log   the reviewers' output
+    .lock                  one gate per PR at a time
+  spec/<issue>/
+    review-<UTC>.log       one `--check` round's report
+    rounds.jsonl           the round ledger: verdict, spec hash, findings
+```
+
+This was `/tmp` until four separate defects traced to it: a fixture race
+(#2040), two gates on one PR sharing a brief, a cleanup that leaked a file per
+run, and a stale brief from a previous session being reused — dispatching a
+review briefed on nothing while reporting `ok reusing filled brief`. `/tmp` is
+machine-global while worktrees are not, has no ownership semantics, and is
+simultaneously too persistent (three-day-old files read as current) and not
+persistent enough (macOS purges it). One directory per subject makes the
+directory the unit of ownership, of locking, and of pruning; gate artefacts
+older than 7 days are pruned by the tool that wrote them.
 
 ## Installation
 
@@ -576,6 +616,46 @@ Token counts are always real; only the dollars are suspect.
 
 ---
 
+## One gate per PR, and one spec review loop
+
+`velo-pr-gate` takes a per-PR lock (`~/.agents/state/gate/<pr>/.lock`, created
+with `mkdir`, which is atomic). A second gate on the same PR is **refused**
+rather than allowed to interleave:
+
+```
+ERROR: a gate is already running for #2027 (pid 41233).
+  Two gates on one PR share ~/.agents/state/gate/2027 — the brief, both code and
+  review logs — so the second would overwrite files the first is still writing.
+```
+
+A dead holder's lock is reclaimed; the lock is released on every exit path,
+including refusals, so a refused gate cannot wedge the PR. Uniquifying the paths
+would have been the obvious fix and the wrong one — the brief path is
+deliberately stable so a hand-filled ATTACK section survives a re-run.
+
+### `velo-spec-review <issue> --check`
+
+`velo-dispatch` validates a spec *mechanically*: anchors resolve, blast radius
+matches, `design` pinned, deps closed. None of that is judgement, so a spec can
+pass every check and still aim a worker at the wrong thing.
+
+`--check` puts Codex on the spec itself, with checks it must **execute**: resolve
+every anchor at `origin/master`, run each `fail_to_pass` and report whether it
+currently *fails*, name any hazard in `_why` with no matching stop condition,
+re-run the blast-radius grep, and judge whether a worker with no LSP could
+satisfy it at all.
+
+The loop **reports**; it does not edit. Clean requires **two consecutive CLEAN
+rounds on unchanged spec content** — one proves the last fix broke nothing, two
+proves the reviewer stopped finding things rather than finding different ones.
+Any spec edit resets the streak. No verdict, a timeout, or an unrecognised
+verdict all exit 2: a review that produced nothing is not a review that found
+nothing.
+
+Its first real run found four HIGH findings on a spec that had **already been
+dispatched** — including two `fail_to_pass` tests that do not exist, so the run
+that "landed" had an acceptance gate naming nothing.
+
 ## Why each gate exists
 
 Every gate was paid for by a wasted run.
@@ -638,6 +718,18 @@ symbol renamed        -> ANCHORS ARE STALE — symbol 'Uri(PathBuf)' NOT FOUND
 ---
 
 ## Reviewing the result
+
+Every dispatch appends a record to `.agents/tasks/<issue>.result.jsonl`, and it
+now carries `discovery_index` — `built` / `refused` / `failed` / `skipped` /
+`unknown`. That field exists because the discovery index shipped in #2033 and
+**was never built once**: a guard asked git the wrong question and refused on
+every fresh worktree, and the only evidence was a warn line in a terminal. One
+`jq` over these records would have shown zero on day one.
+
+```bash
+jq -r '[.issue, .worker, .discovery_index, .outcome] | @tsv' .agents/tasks/*.result.jsonl
+```
+
 
 ```bash
 velo-pr-gate 1902 --plan            # which gates, on which models
@@ -732,6 +824,28 @@ SHA to the PR's current head, and warns (rather than back-dating) when you
 record against an older one.
 
 ---
+
+## What a dispatch decided, after the fact
+
+`~/.agents/state/dispatch/<issue>/dispatch-<UTC>.log` records every `ok`, `warn`
+and `die` the preflight emitted — what it validated, what it refused, whether the
+discovery index was built:
+
+```
+2026-09-08T03:22:04Z START issue=2047 brief=/tmp/b.md dry_run=1 force=0 branch=<auto>
+2026-09-08T03:21:47Z OK   routed to velo-local
+2026-09-08T03:21:48Z OK   brief BRANCH/WORKTREE match what will be cut
+2026-09-08T03:21:48Z WARN no task spec at .agents/tasks/2047.json — validating brief only.
+2026-09-08T03:21:48Z OK   disk: 54GB free
+```
+
+There was a durable record of every *run* and none of the *dispatch*. That is
+how `could NOT exclude the discovery index — NOT building it` printed on every
+dispatch for days without anyone noticing the feature was dead: the evidence
+existed once, briefly, on someone's screen.
+
+The `START` line records the parsed mode rather than `argv` — `--force` bypasses
+the `triage-needed` guard, and that is exactly what an audit wants to see.
 
 ## Troubleshooting
 
