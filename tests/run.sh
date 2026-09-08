@@ -45,6 +45,10 @@ echo "── context + turn budget ───────────────
 echo
 echo "── failure salvage ────────────────────────────────────"
 "$PY" "$HERE/test_salvage.py" || RC=1
+
+echo "── worker environment ─────────────────────────────────"
+"$PY" "$HERE/test_worker_env.py" || RC=1
+echo
 echo
 echo "── runner accounting ──────────────────────────────────"
 "$PY" "$HERE/test_runner_accounting.py" || RC=1

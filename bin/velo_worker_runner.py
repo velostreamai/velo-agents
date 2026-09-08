@@ -189,6 +189,35 @@ def apply_skills(task: str, names: list[str]) -> str:
     return prefix + "\n".join(blocks) + "\n\n=== SCOPE ===\n" + task
 
 
+
+def worker_env(bash_timeout_ms: int) -> dict[str, str]:
+    """Environment handed to the worker's Bash tool.
+
+    ~/.agents/bin is on PATH here, GUARANTEED — never left to the operator's rc.
+
+    velo-impl.md instructs every worker to run `zg query "..."` as its discovery
+    step. The SDK merges this dict over os.environ (tools/bash.py:75), so without
+    an explicit PATH the worker inherits whatever shell launched velo-dispatch.
+    install.sh only WARNS that ~/.agents/bin should be added to a shell rc, so on
+    any machine where that was not done, the documented first move of every
+    worker is `zg: command not found` — and nothing tells the worker the shim
+    exists at all.
+
+    Observed exactly that way: a session with ~/.agents/bin absent from PATH hit
+    command-not-found on bare `zg` and never tried it again. The runner knows
+    where the tools live; the operator's shell configuration is not a dependency
+    of the worker contract.
+
+    Prepended, not appended: the shim must win over a stale global install.
+    """
+    agents_bin = pathlib.Path.home() / ".agents" / "bin"
+    return {
+        "BASH_DEFAULT_TIMEOUT_MS": str(bash_timeout_ms),
+        "BASH_MAX_TIMEOUT_MS": str(bash_timeout_ms),
+        "PATH": f"{agents_bin}:{os.environ.get('PATH', '')}",
+    }
+
+
 def git_output(root: pathlib.Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -770,10 +799,7 @@ async def run_agent(
         system_prompt=system_prompt,
         allowed_tools=["Read", "Glob", "Grep", "Bash", "Edit", "Write"],
         permission_mode="bypassPermissions",
-        env={
-            "BASH_DEFAULT_TIMEOUT_MS": str(bash_timeout_ms),
-            "BASH_MAX_TIMEOUT_MS": str(bash_timeout_ms),
-        },
+        env=worker_env(bash_timeout_ms),
         max_turns=max_turns,
         max_tokens=max_tokens,
         persist_session=False,
