@@ -485,7 +485,11 @@ if [[ $DRY -eq 1 ]]; then
   echo "  assign   : #$ISSUE -> $ASSIGNEE"
   echo "  worker   : $NAME"
   echo "  brief    : $BRIEF"
-  echo "  log      : /tmp/${LOGTAG}-${ISSUE}.log"
+  # The real run TIMESTAMPS this (see LOG= below) so a re-dispatch cannot
+  # overwrite the log velo-record reads for the previous run's cost (#2012 M3).
+  # This line printed the untimestamped name — a path that never exists. A dry
+  # run telling the operator where to look, wrongly.
+  echo "  log      : /tmp/${LOGTAG}-${ISSUE}-<UTC timestamp>.log"
   exit 0
 fi
 

@@ -116,6 +116,49 @@ WTPATH=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$WT" '
 [[ -n "$WTPATH" ]] || die "no local worktree checked out on '$WT' — a gate must read the tree it reviews"
 
 ok "worktree: $WTPATH"
+
+# ---- one gate per PR at a time, and a bounded /tmp -------------------------
+#
+# Every path below is derived from the PR number and lives in /tmp, which is per
+# MACHINE while worktrees are not. Different PRs cannot collide. Two gates on the
+# SAME PR do: they share the brief, both regenerate it, and each overwrites the
+# other's logs while codex is reading them. That is #2040's failure, and the
+# stable brief path is deliberate (a hand-filled ATTACK section must survive a
+# re-run), so uniquifying the paths would break the feature rather than fix the
+# race.
+#
+# A lock is the honest answer: refuse the second gate rather than let two
+# interleave and produce a report neither of them wrote. `mkdir` is atomic on
+# POSIX, so this is a real mutex, not a check-then-act.
+GATE_LOCK="/tmp/velo-gate-${PR}.lock"
+if ! mkdir "$GATE_LOCK" 2>/dev/null; then
+  HOLDER=$(cat "$GATE_LOCK/pid" 2>/dev/null || echo "")
+  if [[ -n "$HOLDER" ]] && kill -0 "$HOLDER" 2>/dev/null; then
+    die "a gate is already running for #$PR (pid $HOLDER).
+  Two gates on one PR share /tmp/gate-${PR}-* — the brief, both code and review
+  logs — so the second would overwrite files the first is still writing and
+  reading. Wait for it, or read its output:
+    tail -f /tmp/gate-${PR}-review.log"
+  fi
+  # Holder is gone: a previous gate was killed before releasing. Take it over.
+  warn "removing a stale gate lock for #$PR (holder ${HOLDER:-unknown} is not running)"
+  rm -rf "$GATE_LOCK"
+  mkdir "$GATE_LOCK" 2>/dev/null || die "could not take the gate lock at $GATE_LOCK"
+fi
+echo $$ > "$GATE_LOCK/pid"
+# Released on EVERY exit path, including the die()s below — a lock that leaks on
+# refusal would block the PR until someone noticed the directory.
+trap 'rm -rf "$GATE_LOCK"' EXIT
+
+# 76 gate files going back three days had accumulated with nothing pruning them.
+# Bounded here rather than by a cron: the tool that creates them is the one that
+# knows when they stop mattering. 7 days keeps a week of post-mortems.
+# `find /tmp` (no trailing slash) is a SILENT NO-OP on macOS: /tmp is a symlink
+# to private/tmp, and find will not traverse a symlink given as the start point
+# unless told to, so -maxdepth 1 matches nothing. Verified — an Aug-1 file
+# survived `find /tmp ... -mtime +7 -delete` and was removed by `find /tmp/`.
+# The trailing slash is load-bearing, which is exactly why it is commented.
+find /tmp/ -maxdepth 1 -name 'gate-*' -type f -mtime +7 -delete 2>/dev/null || true
 # Set AFTER the dispatches are known to be alive (#2005) — see the end of the
 # script. Marking a PR gate:running for a gate that died on quota is how a PR
 # ends up with three gate comments and zero independent scrutiny.

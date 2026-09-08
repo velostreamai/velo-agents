@@ -53,6 +53,7 @@ cleanup() {
   # already held gate-959197, gate-960256..8, gate-999999 and gate-888888 code
   # briefs from a single afternoon. Fixing a race by leaking is not fixing it.
   rm -f /tmp/gate-"${TPR}"-* 2>/dev/null
+  rm -rf /tmp/velo-gate-"${TPR}".lock 2>/dev/null
 }
 trap cleanup EXIT
 rm -f "$BRIEF" "$BRIEF".superseded.*
@@ -235,6 +236,70 @@ if grep -q "NOTHING was dispatched" "$TMPD/out.txt"; then
   echo "  PASS  says plainly that nothing was dispatched"
 else
   echo "  FAIL  did not explain why the gate was refused"; FAILURES=$((FAILURES+1))
+fi
+
+# ---- one gate per PR at a time (#2040 class, same-PR case) ------------------
+#
+# Different PRs cannot collide: every /tmp path is keyed by PR number. Two gates
+# on the SAME PR share the brief and both logs, so the second overwrites files
+# the first is still writing and codex is still reading. The lock refuses rather
+# than letting two interleave into a report neither wrote.
+LOCK="/tmp/velo-gate-${TPR}.lock"
+rm -rf "$LOCK"
+mkdir -p "$LOCK"; echo $$ > "$LOCK/pid"          # a LIVE holder: this shell
+HOME="$TMPD/home" PATH="$TMPD/bin:/usr/bin:/bin" \
+  bash "$GATE" "$TPR" "$SCOPE" >"$TMPD/out.txt" 2>&1
+if grep -q "a gate is already running for #$TPR" "$TMPD/out.txt"; then
+  echo "  PASS  second gate on the same PR is refused"
+else
+  echo "  FAIL  concurrent gate on the same PR was NOT refused"; FAILURES=$((FAILURES+1))
+fi
+
+# A holder that is gone must not block the PR forever — a gate killed mid-run
+# would otherwise need someone to notice a stray directory.
+rm -rf "$LOCK"; mkdir -p "$LOCK"; echo 999999999 > "$LOCK/pid"   # dead pid
+make_codex all-healthy
+invoke
+if grep -q "removing a stale gate lock" "$TMPD/out.txt"; then
+  echo "  PASS  stale lock (dead holder) is taken over"
+else
+  echo "  FAIL  stale lock was not reclaimed — the PR is wedged"; FAILURES=$((FAILURES+1))
+fi
+if [[ -d "$LOCK" ]]; then
+  echo "  FAIL  lock not released on exit — next gate would be refused forever"
+  FAILURES=$((FAILURES+1))
+  rm -rf "$LOCK"
+else
+  echo "  PASS  lock released on exit"
+fi
+
+# ---- /tmp pruning actually fires -------------------------------------------
+#
+# The first cut used `find /tmp -maxdepth 1 ...`, which is a SILENT NO-OP on
+# macOS: /tmp is a symlink to private/tmp and find will not traverse a symlink
+# start point unless told to. It deleted nothing and reported success — a
+# housekeeping step that looked done for as long as nobody measured it.
+#
+# This drives the real gate and asserts on the filesystem, because the failure
+# mode is precisely "the command ran and did nothing".
+OLDF="/tmp/gate-${TPR}-pruneprobe.log"
+: > "$OLDF"; touch -t 202601010000 "$OLDF"       # a year old
+NEWF="/tmp/gate-${TPR}-freshprobe.log"
+: > "$NEWF"
+make_codex all-healthy
+invoke
+if [[ -f "$OLDF" ]]; then
+  echo "  FAIL  stale /tmp gate file was not pruned (find is a no-op again?)"
+  FAILURES=$((FAILURES+1)); rm -f "$OLDF"
+else
+  echo "  PASS  stale /tmp gate file pruned"
+fi
+if [[ -f "$NEWF" ]]; then
+  echo "  PASS  recent gate file kept — prune is age-bounded, not a wipe"
+  rm -f "$NEWF"
+else
+  echo "  FAIL  prune deleted a FRESH file — it would eat a live gate's log"
+  FAILURES=$((FAILURES+1))
 fi
 
 # The stub reviewers must not outlive the test. `pkill -f velo-test-gate-sleep`
