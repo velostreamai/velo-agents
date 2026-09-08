@@ -637,7 +637,14 @@ fi
 # Asking git is the only authority: it accounts for symlinks, permissions, the
 # common dir, core.excludesFile and .gitignore together.
 INDEX_SAFE=0
-if git -C "$WT" check-ignore -q .zvec-grep 2>/dev/null; then
+# The TRAILING SLASH is load-bearing. The pattern written above is `.zvec-grep/`,
+# which is directory-only, and at this point the directory does NOT exist yet —
+# it is built below. Asked about `.zvec-grep`, git cannot know the path is a
+# directory, so a directory-only pattern does not match and check-ignore reports
+# NOT ignored. That made this guard refuse on EVERY fresh worktree and the
+# discovery index was never built at all: a fail-closed check that closed
+# permanently, on exactly the path it exists to protect.
+if git -C "$WT" check-ignore -q .zvec-grep/ 2>/dev/null; then
   INDEX_SAFE=1
   ok "discovery index excluded from git on every worktree (verified via check-ignore)"
 else

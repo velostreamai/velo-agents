@@ -45,6 +45,32 @@ printf 'target/\n' > "$TMPD/repo/.gitignore"
 git -C "$TMPD/repo" add -A && git -C "$TMPD/repo" commit -qm init
 git -C "$TMPD/repo" worktree add -q "$TMPD/wt" -b feature 2>/dev/null
 
+# ---- the state the REAL code is in: no index directory yet -----------------
+#
+# This case is first because its absence is what let a shipped bug survive. Every
+# case below creates .zvec-grep BEFORE running the block — but velo-dispatch runs
+# this check to decide whether to BUILD the index, so the directory does not
+# exist yet. The pattern written is `.zvec-grep/`, directory-only; asked about
+# `.zvec-grep` with nothing on disk, git cannot know it is a directory and
+# reports NOT ignored. The guard therefore refused on every fresh worktree and
+# the discovery index was never built at all.
+#
+# The tests were green throughout, because they had already made the directory.
+FRESH="$TMPD/fresh"
+git init -q "$FRESH"
+git -C "$FRESH" config user.email t@t; git -C "$FRESH" config user.name t
+printf 'target/\n' > "$FRESH/.gitignore"
+git -C "$FRESH" add -A && git -C "$FRESH" commit -qm init
+WT="$FRESH"; INDEX_SAFE=0
+ok() { :; }; warn() { :; }
+eval "$BLOCK"
+if [[ "${INDEX_SAFE:-0}" == "1" ]]; then
+  echo "  PASS  fresh worktree (no index dir yet) -> safe to build"
+else
+  echo "  FAIL  refuses on a fresh worktree — the index would NEVER be built"
+  FAILURES=$((FAILURES+1))
+fi
+
 mkdir -p "$TMPD/repo/.zvec-grep/db"; echo x > "$TMPD/repo/.zvec-grep/db/index.bin"
 mkdir -p "$TMPD/wt/.zvec-grep/db";   echo x > "$TMPD/wt/.zvec-grep/db/index.bin"
 
