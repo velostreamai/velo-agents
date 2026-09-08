@@ -1,7 +1,12 @@
 #!/bin/bash
 # velo-spec-review — attest that a task spec + brief were read against the issue.
 #
-#   velo-spec-review <issue> <brief-file> [--by <name>]
+#   velo-spec-review <issue> <brief-file> [--by <name>]   attest (as before)
+#   velo-spec-review <issue> --check                      review the SPEC (Codex)
+#
+# --check is the loop: Codex reads the spec adversarially against the issue and
+# the repo, reports findings, and exits non-zero. You fix the spec and re-run.
+# Two consecutive CLEAN rounds on unchanged spec content complete the loop.
 #
 # Writes the `reviewed` block velo-dispatch requires:
 #
@@ -18,12 +23,26 @@ set -uo pipefail
 REPO="velostreamai/velostream"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 
-ISSUE="${1:-}"; BRIEF="${2:-}"; BY="${USER:-unknown}"
-shift 2 2>/dev/null || true
-while [[ $# -gt 0 ]]; do case "$1" in --by) BY="$2"; shift 2;; *) shift;; esac; done
+ISSUE="${1:-}"; BRIEF=""; BY="${USER:-unknown}"; CHECK=0
+STATE="${VELO_STATE:-$HOME/.agents/state}"
+SPEC_TIMEOUT="${VELO_SPEC_TIMEOUT:-900}"
+SPEC_CLEAN_ROUNDS="${VELO_SPEC_CLEAN_ROUNDS:-2}"
+shift 1 2>/dev/null || true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check) CHECK=1; shift ;;
+    --by)    BY="$2"; shift 2 ;;
+    -*)      die "unknown flag: $1" ;;
+    *)       [[ -z "$BRIEF" ]] && BRIEF="$1"; shift ;;
+  esac
+done
 
-[[ "$ISSUE" =~ ^[0-9]+$ ]] || die "usage: velo-spec-review <issue> <brief-file> [--by <name>]"
-[[ -f "$BRIEF" ]] || die "brief not found: $BRIEF"
+[[ "$ISSUE" =~ ^[0-9]+$ ]] || die "usage: velo-spec-review <issue> <brief-file> [--by <name>]
+       velo-spec-review <issue> --check"
+if [[ $CHECK -eq 0 ]]; then
+  [[ -n "$BRIEF" ]] || die "attest mode needs a brief file (or pass --check to review the spec)"
+  [[ -f "$BRIEF" ]] || die "brief not found: $BRIEF"
+fi
 # Same ROOT as velo-dispatch, deliberately hardcoded rather than derived from
 # the cwd. They must read the SAME spec file: an early version used
 # `git rev-parse --show-toplevel`, so attesting from a worktree wrote a
@@ -33,6 +52,201 @@ while [[ $# -gt 0 ]]; do case "$1" in --by) BY="$2"; shift 2;; *) shift;; esac; 
 ROOT="$HOME/RustroverProjects/velostream"
 SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
 [[ -f "$SPEC" ]] || die "no task spec: $SPEC"
+
+# ---- --check: have Codex review the SPEC, and loop until it stops finding ----
+#
+# Everything velo-dispatch validates about a spec is MECHANICAL: do the anchors
+# resolve against origin/master, does the blast-radius count match, is `design`
+# pinned, are deps closed, is there a `reviewed` block. All necessary, none of
+# them judgement. A spec can pass every one of those and still send a worker at
+# the wrong thing:
+#
+#   - stop_conditions that do not cover the hazard named in `_why`
+#   - a fail_to_pass test that ALREADY passes, so it gates nothing
+#   - an anchor whose symbol was renamed after `verified_against`
+#   - acceptance criteria no run could actually demonstrate
+#
+# Two issues filed this week carried claims that did not survive being checked
+# (#2004's branch anecdote, #2007's 4.4x). The spec is the thing a worker is
+# actually paid to follow, and until now nothing read it adversarially.
+#
+# Codex, because it found a real defect in every round it ran against this
+# tooling. A spec is small, so a round is cheap next to a code review.
+#
+# The loop is deliberately NOT automatic: findings are reported, a human fixes
+# the spec, and the check is re-run. A reviewer that edits the artefact it is
+# reviewing converges on something nobody chose.
+#
+# "Clean" requires TWO consecutive clean rounds ON THE SAME SPEC CONTENT. One
+# clean round proves the last fix did not break anything obvious; two proves the
+# reviewer stopped finding things rather than merely finding different things.
+# Any edit to the spec resets the streak, because the thing under review changed.
+spec_check() {
+  local round_log streak spec_now
+  mkdir -p "$STATE/spec/$ISSUE"
+  spec_now=$(shasum -a 256 "$SPEC" | cut -d' ' -f1)
+
+  command -v codex >/dev/null 2>&1 || die "codex CLI not on PATH — cannot run the spec review.
+  Do NOT substitute a local model here: on #1988 one approved a diff carrying two
+  P1s and asserted the opposite of one of them."
+
+  round_log="$STATE/spec/$ISSUE/review-$(date -u +%Y%m%dT%H%M%SZ).log"
+  local brief="$STATE/spec/$ISSUE/brief.md"
+
+  {
+    echo "You are reviewing a TASK SPEC before a worker is dispatched against it."
+    echo "You are NOT reviewing code, and there is no diff. Read-only: do not write files."
+    echo
+    echo "The spec tells an autonomous worker what to change, what must not change,"
+    echo "when to stop, and which tests prove it worked. A worker follows it without"
+    echo "judgement, so a wrong spec spends a whole run producing confidently wrong work."
+    echo
+    echo "## The spec"
+    echo '```json'
+    cat "$SPEC"
+    echo '```'
+    echo
+    echo "## The issue it claims to implement"
+    gh issue view "$ISSUE" --repo "$REPO" --json title,body,comments \
+      --jq '"### " + .title + "\n\n" + .body + "\n\n## Comments\n" + ([.comments[] | "- " + .author.login + ": " + .body] | join("\n"))' 2>/dev/null
+    echo
+    echo "## ATTACK — verify, do not summarise"
+    echo
+    echo "You have a shell. USE IT. Every claim below is checkable against the repo"
+    echo "at $ROOT (read-only; do not modify it)."
+    echo
+    echo "1. ANCHORS. For each entry in .anchors, does that file exist at"
+    echo "   origin/master and does the named symbol still appear in it? The spec"
+    echo "   was verified against \$(jq -r .verified_against). Master has moved."
+    echo "   A stale anchor sends the worker to a line that is not there."
+    echo "2. TESTS. For each .tests.fail_to_pass, does that test EXIST, and does it"
+    echo "   currently FAIL? A fail_to_pass that already passes gates nothing and"
+    echo "   the run will look successful having changed nothing. Say which."
+    echo "   For .tests.pass_to_stay, do they exist and currently pass?"
+    echo "3. STOP CONDITIONS. Read ._why. Does .stop_conditions actually cover the"
+    echo "   hazard it describes? Name any hazard in _why with no matching stop."
+    echo "4. FORBIDDEN. If .forbidden exists, is each entry checkable after the"
+    echo "   fact from a diff? An unverifiable prohibition is decoration."
+    echo "5. BLAST RADIUS. Does .blast_radius.pattern still match the stated count"
+    echo "   at origin/master? Run the grep. Report the real number."
+    echo "6. SCOPE vs ISSUE. Does the spec implement what the issue asks, or"
+    echo "   something adjacent? Quote the divergence."
+    echo "7. ACHIEVABILITY. Could a worker with Read/Grep/Bash/Edit/Write and no"
+    echo "   LSP actually satisfy this, in the turns available? If it requires"
+    echo "   type-aware refactoring across many call sites, say so — that is a"
+    echo "   spec that cannot be honoured, not a worker that failed."
+    echo
+    echo "## OUTPUT — exact format, last line machine-read"
+    echo
+    echo "For each finding: SEVERITY (HIGH/MED/LOW), which numbered check, what is"
+    echo "wrong, and the command you ran that shows it. Mark anything you could not"
+    echo "execute as UNVERIFIED and say why."
+    echo
+    echo "End with EXACTLY one of these as the FINAL line, nothing after it:"
+    echo "  VERDICT: CLEAN"
+    echo "  VERDICT: FINDINGS <n>"
+  } > "$brief"
+
+  printf '  .. spec review round for #%s (codex, up to %ss)\n' "$ISSUE" "$SPEC_TIMEOUT"
+  ( cd "$ROOT" && timeout "$SPEC_TIMEOUT" codex review - < "$brief" ) > "$round_log" 2>&1
+  local rc=$?
+
+  local verdict findings
+  # Strip the label: the ledger and the case below compare the TOKEN. Keeping
+  # the whole match stored "VERDICT: CLEAN" and compared it against "CLEAN",
+  # so the streak never incremented and every clean round reported NOT CLEAN.
+  # Found by stubbing codex before spending a paid round on it.
+  verdict=$(grep -oE '^VERDICT: (CLEAN|FINDINGS [0-9]+)' "$round_log" | tail -1 | sed 's/^VERDICT: //')
+  if [[ $rc -eq 124 ]]; then
+    verdict="TIMEOUT"
+  elif [[ -z "$verdict" ]]; then
+    # Fail closed. A review with no parseable verdict is not a pass — it is a
+    # review that did not finish, or a model that ignored the format. Treating
+    # silence as CLEAN is how a gate reports success having produced nothing.
+    verdict="NO-VERDICT"
+  fi
+  # Digits only. A model that ends without a newline, or adds a stray character,
+  # yielded "2n" here — which crashed the ledger append below and SILENTLY LOST
+  # the round. An audit ledger that drops entries when something unexpected
+  # happens is worthless precisely when it matters.
+  findings=$(sed -nE 's/^VERDICT: FINDINGS ([0-9]+).*/\1/p' "$round_log" | tail -1 | tr -cd '0-9')
+
+  python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" "$verdict" "${findings:-0}" "$round_log" <<'PY'
+import json, sys, os, datetime
+path, spec_sha, verdict, findings, log = sys.argv[1:6]
+# Nothing here may raise. The round HAPPENED; a value we cannot parse is a
+# reason to record it as unparseable, never a reason to lose the entry.
+try:
+    n = int(findings)
+except (TypeError, ValueError):
+    n = 0
+rec = {
+    "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "spec_sha256": spec_sha, "verdict": verdict or "UNPARSEABLE",
+    "findings": n, "log": log,
+}
+if findings and not findings.isdigit():
+    rec["findings_raw"] = findings
+try:
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+except Exception as exc:
+    print(f"WARNING: could not append to the spec-review ledger: {exc}", file=sys.stderr)
+PY
+
+  streak=$(python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" <<'PY'
+import json, sys
+path, spec_sha = sys.argv[1:3]
+n = 0
+try:
+    rows = [json.loads(l) for l in open(path) if l.strip()]
+except FileNotFoundError:
+    rows = []
+# Count trailing CLEAN rounds against THIS spec content. An edit resets the
+# streak because the artefact under review changed.
+for r in reversed(rows):
+    if r.get("spec_sha256") != spec_sha or r.get("verdict") != "CLEAN":
+        break
+    n += 1
+print(n)
+PY
+)
+
+  echo
+  sed -n '/^## /,$p' "$round_log" 2>/dev/null | tail -60
+  echo
+  printf '  log: %s\n' "$round_log"
+
+  case "$verdict" in
+    CLEAN)
+      if [[ "$streak" -ge "$SPEC_CLEAN_ROUNDS" ]]; then
+        printf '\033[32m  ok\033[0m spec review CLEAN x%s on the same spec — loop complete\n' "$streak"
+        return 0
+      fi
+      printf '\033[33mwarn:\033[0m clean, but only %s of %s consecutive rounds on this spec.\n' \
+        "$streak" "$SPEC_CLEAN_ROUNDS" >&2
+      printf '      Re-run without editing the spec to confirm.\n' >&2
+      return 1 ;;
+    TIMEOUT)
+      printf '\033[31mERROR:\033[0m review timed out after %ss — no verdict.\n' "$SPEC_TIMEOUT" >&2
+      return 2 ;;
+    NO-VERDICT)
+      printf '\033[31mERROR:\033[0m no VERDICT line — treating as NOT clean.\n' >&2
+      printf '      A review that produced no verdict did not finish. Read the log.\n' >&2
+      return 2 ;;
+    FINDINGS*)
+      printf '\033[31mNOT CLEAN:\033[0m %s findings. Fix the spec, then re-run.\n' "${findings:-?}" >&2
+      return 1 ;;
+    *)
+      printf '\033[31mERROR:\033[0m unrecognised verdict %q — treating as NOT clean.\n' "$verdict" >&2
+      return 2 ;;
+  esac
+}
+
+if [[ $CHECK -eq 1 ]]; then
+  spec_check
+  exit $?
+fi
 
 UPD=$(gh issue view "$ISSUE" --repo "$REPO" --json updatedAt --jq .updatedAt 2>/dev/null) \
   || die "could not read issue #$ISSUE"
