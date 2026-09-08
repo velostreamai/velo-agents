@@ -11,6 +11,7 @@
 # leaks a tool call reports success while having executed nothing.
 
 set -uo pipefail
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 
 REPO="velostreamai/velostream"
 ROOT="$HOME/RustroverProjects/velostream"
@@ -89,7 +90,10 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
   DIRTY=$(wt_dirty "$WT")
 
   PID=$(running_pid_for "$WT")
-  LOG=$(ls -t /tmp/{deepseek,glm,velo-local}-"$ISSUE"*.log 2>/dev/null | head -1)
+  # One directory per issue, so this no longer enumerates worker tags. The old
+  # glob hardcoded {deepseek,glm,velo-local} and would silently miss any worker
+  # added later — it returned nothing for worker:codex runs.
+  LOG=$(ls -t "$VELO_STATE/dispatch/$ISSUE"/*.log 2>/dev/null | head -1)
   WORKER="-"
   if [[ -n "$PID" ]]; then
     # A worker IS running: name it from the live process, not from a log glob.

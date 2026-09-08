@@ -18,6 +18,8 @@ set -uo pipefail
 REPO="velostreamai/velostream"
 ROOT="$HOME/RustroverProjects/velostream"
 WORKTREE_BASE="$HOME/RustroverProjects"
+# See velo-pr-gate's header: worker logs live under ~/.agents/state, not /tmp.
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 POLICY="$HOME/.agents/rules/velo-impl.md"
 ASSIGNEE="bluemonk3y"
 MIN_DISK_GB=40
@@ -489,7 +491,7 @@ if [[ $DRY -eq 1 ]]; then
   # overwrite the log velo-record reads for the previous run's cost (#2012 M3).
   # This line printed the untimestamped name — a path that never exists. A dry
   # run telling the operator where to look, wrongly.
-  echo "  log      : /tmp/${LOGTAG}-${ISSUE}-<UTC timestamp>.log"
+  echo "  log      : $VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-<UTC timestamp>.log"
   exit 0
 fi
 
@@ -565,6 +567,12 @@ ok "worktree cut from origin/master: $WT ($BRANCH @ $BASE)"
 WT_BEHIND=$(git -C "$WT" rev-list --count HEAD..origin/master 2>/dev/null || echo "?")
 [[ "$WT_BEHIND" == "0" ]] \
   || die "internal: freshly-cut worktree is $WT_BEHIND commits behind origin/master"
+
+# The state dir must exist before the FIRST consumer, which is the zg redirect
+# below — not before LOG= further down. A redirect into a missing directory fails
+# the whole subshell, so every dispatch would have reported
+# "discovery index FAILED" no matter how healthy zg was.
+mkdir -p "$VELO_STATE/dispatch/${ISSUE}"
 
 # ---- 6b. discovery index (#2032) --------------------------------------------
 #
@@ -646,10 +654,10 @@ if [[ "$INDEX_SAFE" == "1" ]] \
    && [[ "${VELO_SKIP_INDEX:-0}" != "1" ]] && [[ -x "$HOME/.agents/bin/zg" ]]; then
   printf '  .. building discovery index (~35s, skip with VELO_SKIP_INDEX=1)\n'
   if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index \
-         --embedding local/potion-code-16m-v2 ) >/tmp/zg-index-${ISSUE}.log 2>&1; then
+         --embedding local/potion-code-16m-v2 ) >"$VELO_STATE/dispatch/${ISSUE}/zg-index.log" 2>&1; then
     ok "discovery index built ($(du -sh "$WT/.zvec-grep" 2>/dev/null | cut -f1)) — worker can run: zg query \"...\""
   else
-    warn "discovery index FAILED (see /tmp/zg-index-${ISSUE}.log) — worker falls back to rg + ast-grep"
+    warn "discovery index FAILED (see $VELO_STATE/dispatch/${ISSUE}/zg-index.log) — worker falls back to rg + ast-grep"
   fi
 else
   warn "discovery index skipped — worker has rg + ast-grep only"
@@ -664,7 +672,7 @@ gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1
 # `>`, so a re-dispatch truncated the log the PREVIOUS record cites — and
 # velo-record derives turns, status, leaked calls and the whole cost block from
 # it, so a post-mortem silently read the newer run's numbers (#2012 M3).
-LOG="/tmp/${LOGTAG}-${ISSUE}-$(date -u +%Y%m%dT%H%M%SZ).log"
+LOG="$VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-$(date -u +%Y%m%dT%H%M%SZ).log"
 TASK=$(cat "$BRIEF")
 STARTED=$(date -u +%FT%TZ)
 

@@ -33,6 +33,24 @@ brief() {  # $1 = worktree line, $2 = branch line
   echo "$f"
 }
 run() { bash "$DISPATCH" "$ISSUE" "$1" --dry-run 2>&1; }
+
+# The brief checks live in section 4. Everything before them — issue OPEN,
+# labels, worker routing, dependencies, anchors, disk — can refuse first, and
+# then every assertion below fails for a reason that has nothing to do with the
+# comparison under test. That is what happened the moment #2005 was closed:
+# three FAILs reading "output did not contain brief WORKTREE does not match",
+# when the real output was "issue #2005 is CLOSED — nothing to dispatch".
+#
+# Skip loudly instead. A suite that goes red for the wrong reason trains people
+# to ignore the red — the same lesson test_gate_health.sh learned separately.
+PROBE=$(run "$(brief "WORKTREE: $HOME/RustroverProjects/velostream-$ISSUE" "BRANCH: fix/$ISSUE-auto")")
+if ! grep -q "brief BRANCH/WORKTREE" <<<"$PROBE"; then
+  echo "  SKIP  #$ISSUE never reaches the brief checks — dispatch refused earlier:"
+  grep -E "NOT READY|ERROR" <<<"$PROBE" | head -2 | sed 's/^/        /'
+  echo "        Set VELO_TEST_ISSUE to an OPEN issue with a worker:* label and"
+  echo "        no .agents/tasks/<n>.json."
+  exit 0
+fi
 expect() {  # $1 label, $2 output, $3 substring
   if grep -qF "$3" <<<"$2"; then printf '  PASS  %s\n' "$1"
   else printf '  FAIL  %s: output did not contain %q\n' "$1" "$3"; FAILURES=$((FAILURES+1)); fi

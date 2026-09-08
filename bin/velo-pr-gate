@@ -68,6 +68,24 @@
 
 set -uo pipefail
 REPO="velostreamai/velostream"
+
+# Gate artefacts live under ~/.agents/state, NOT /tmp.
+#
+# /tmp is a MACHINE-global namespace shared with every other process, user and
+# session, and four separate defects traced to that in one week: #2040's fixture
+# race, two gates on one PR overwriting each other's brief and logs, a cleanup
+# that leaked a file per run, and — worst — a stale brief from a previous session
+# being reused, which dispatched a review briefed on nothing while reporting
+# `ok reusing filled brief`.
+#
+# It is also simultaneously too persistent and not persistent enough: files from
+# three days ago were still being read as current, while macOS periodically
+# purges /tmp out from under a post-mortem. And `find /tmp -maxdepth 1` is a
+# silent no-op there because /tmp is a symlink.
+#
+# One directory per PR gives ownership, a natural lock unit, a natural prune
+# unit, and survives the worktree being removed.
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
@@ -130,15 +148,17 @@ ok "worktree: $WTPATH"
 # A lock is the honest answer: refuse the second gate rather than let two
 # interleave and produce a report neither of them wrote. `mkdir` is atomic on
 # POSIX, so this is a real mutex, not a check-then-act.
-GATE_LOCK="/tmp/velo-gate-${PR}.lock"
+GATE_DIR="$VELO_STATE/gate/$PR"
+mkdir -p "$GATE_DIR"
+GATE_LOCK="$GATE_DIR/.lock"
 if ! mkdir "$GATE_LOCK" 2>/dev/null; then
   HOLDER=$(cat "$GATE_LOCK/pid" 2>/dev/null || echo "")
   if [[ -n "$HOLDER" ]] && kill -0 "$HOLDER" 2>/dev/null; then
     die "a gate is already running for #$PR (pid $HOLDER).
-  Two gates on one PR share /tmp/gate-${PR}-* — the brief, both code and review
+  Two gates on one PR share $GATE_DIR — the brief, both code and review
   logs — so the second would overwrite files the first is still writing and
   reading. Wait for it, or read its output:
-    tail -f /tmp/gate-${PR}-review.log"
+    tail -f $GATE_DIR/review.log"
   fi
   # Holder is gone: a previous gate was killed before releasing. Take it over.
   warn "removing a stale gate lock for #$PR (holder ${HOLDER:-unknown} is not running)"
@@ -158,7 +178,9 @@ trap 'rm -rf "$GATE_LOCK"' EXIT
 # unless told to, so -maxdepth 1 matches nothing. Verified — an Aug-1 file
 # survived `find /tmp ... -mtime +7 -delete` and was removed by `find /tmp/`.
 # The trailing slash is load-bearing, which is exactly why it is commented.
-find /tmp/ -maxdepth 1 -name 'gate-*' -type f -mtime +7 -delete 2>/dev/null || true
+# One directory per PR, so pruning is a directory walk with no glob to get
+# wrong — and no symlink between here and the files.
+find "$VELO_STATE/gate" -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 # Set AFTER the dispatches are known to be alive (#2005) — see the end of the
 # script. Marking a PR gate:running for a gate that died on quota is how a PR
 # ends up with three gate comments and zero independent scrutiny.
@@ -219,7 +241,7 @@ RUNNER=/Users/neilavery/.agents/bin/velo-lmstudio-agent-sdk.py
 POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 
 dispatch_local() {  # $1 = skill, $2 = log suffix
-  local skill="$1" log="/tmp/gate-${PR}-$2.log"
+  local skill="$1" log="$GATE_DIR/$2.log"
   nohup "$PY" "$RUNNER" --policy "$POLICY" --skill "$skill" \
       --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
       --task "$(cat "$SCOPE")" > "$log" 2>&1 &
@@ -272,7 +294,7 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
     exit 0
   fi
 
-  OUT="/tmp/gate-${PR}-review-brief.md"
+  OUT="$GATE_DIR/review-brief.md"
 
   # Do NOT clobber a brief whose ATTACK section has already been filled in.
   #
@@ -414,8 +436,8 @@ EOF
   # code-review: two separately-recorded reports, because a gate whose result is
   # buried inside another gate's prose cannot be posted, stamped, or gone stale
   # on its own.
-  CODE_LOG="/tmp/gate-${PR}-code.log"
-  CODE_BRIEF="/tmp/gate-${PR}-code-brief.md"
+  CODE_LOG="$GATE_DIR/code.log"
+  CODE_BRIEF="$GATE_DIR/code-brief.md"
   if [[ $NEEDS_CODE -eq 1 ]] && command -v codex >/dev/null 2>&1; then
     {
       echo "You are running the CHECK-CODE gate, not the code review."
@@ -447,7 +469,7 @@ EOF
     warn "two P1s and asserted the opposite of one of them."
   fi
 
-  CODEX_LOG="/tmp/gate-${PR}-review.log"
+  CODEX_LOG="$GATE_DIR/review.log"
   if command -v codex >/dev/null 2>&1; then
     if [[ $EXEC -eq 1 ]]; then
       nohup sh -c "cd '$WTPATH' && codex review --dangerously-bypass-approvals-and-sandbox - < '$OUT'" > "$CODEX_LOG" 2>&1 &

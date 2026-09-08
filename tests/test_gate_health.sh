@@ -26,13 +26,15 @@ GATE="$(cd "$HERE/.." && pwd)/bin/velo-pr-gate"
 FAILURES=0
 # A PR number unique to THIS process, not a fixed 999999.
 #
-# velo-pr-gate derives its brief and log paths from the PR number and puts them
-# in /tmp, which is per MACHINE while worktrees are not. With a fixed number, two
-# `run.sh` runs from different worktrees — the normal state of this repo — write
-# and delete the same /tmp/gate-999999-* files, and the loser fails on a gate
-# assertion that has nothing to do with its change. That is #2040 exactly, which
-# was fixed in tests/velo_sql_test.rs (#2041) while this file shipped the same
-# defect on the same day — in the suite whose purpose is catching it.
+# Artefacts now live under a per-run VELO_STATE (below), so this no longer
+# guards against a cross-worktree collision in /tmp — it keeps the PR namespace
+# distinct WITHIN a run, and keeps stray files obviously test-owned.
+#
+# Kept because the history is instructive: with a fixed 999999 in /tmp, two
+# `run.sh` runs from different worktrees deleted each other's files and the loser
+# failed on an unrelated gate assertion. That is #2040 exactly — fixed in
+# tests/velo_sql_test.rs (#2041) while this file shipped the same defect the same
+# day, in the suite whose purpose is catching it.
 #
 # Must stay numeric: velo-pr-gate requires ^[0-9]+$. Kept far above any real PR
 # number so a stray file is obviously a test artifact.
@@ -41,8 +43,13 @@ TPR=$(( 900000 + ($$ % 90000) ))
 # EVERY concurrent run's stubs, so two suites killed each other's reviewers and
 # one reported `Terminated: 15`. Caught by actually running two at once.
 MARKER="velo-test-gate-sleep-$$"
-BRIEF="/tmp/gate-${TPR}-review-brief.md"
 TMPD=$(mktemp -d)
+# A PRIVATE state root, exported so velo-pr-gate uses it. A test run must never
+# read, overwrite or PRUNE real gate artefacts — and this file's prune case
+# deliberately ages a directory past the 7-day threshold, which against the real
+# root would delete someone's in-flight gate.
+export VELO_STATE="$TMPD/state"
+BRIEF="$VELO_STATE/gate/${TPR}/review-brief.md"
 FLAG="$TMPD/running.flag"
 cleanup() {
   pkill -f "$MARKER" 2>/dev/null
@@ -52,8 +59,7 @@ cleanup() {
   # TPR that turned one reused file into a NEW leaked file on every run: /tmp
   # already held gate-959197, gate-960256..8, gate-999999 and gate-888888 code
   # briefs from a single afternoon. Fixing a race by leaking is not fixing it.
-  rm -f /tmp/gate-"${TPR}"-* 2>/dev/null
-  rm -rf /tmp/velo-gate-"${TPR}".lock 2>/dev/null
+  # Nothing to hand-enumerate now: the whole state root is inside $TMPD.
 }
 trap cleanup EXIT
 rm -f "$BRIEF" "$BRIEF".superseded.*
@@ -244,9 +250,9 @@ fi
 # on the SAME PR share the brief and both logs, so the second overwrites files
 # the first is still writing and codex is still reading. The lock refuses rather
 # than letting two interleave into a report neither wrote.
-LOCK="/tmp/velo-gate-${TPR}.lock"
+LOCK="$VELO_STATE/gate/${TPR}/.lock"
 rm -rf "$LOCK"
-mkdir -p "$LOCK"; echo $$ > "$LOCK/pid"          # a LIVE holder: this shell
+mkdir -p "$(dirname "$LOCK")" "$LOCK"; echo $$ > "$LOCK/pid"          # a LIVE holder: this shell
 HOME="$TMPD/home" PATH="$TMPD/bin:/usr/bin:/bin" \
   bash "$GATE" "$TPR" "$SCOPE" >"$TMPD/out.txt" 2>&1
 if grep -q "a gate is already running for #$TPR" "$TMPD/out.txt"; then
@@ -257,7 +263,7 @@ fi
 
 # A holder that is gone must not block the PR forever — a gate killed mid-run
 # would otherwise need someone to notice a stray directory.
-rm -rf "$LOCK"; mkdir -p "$LOCK"; echo 999999999 > "$LOCK/pid"   # dead pid
+rm -rf "$LOCK"; mkdir -p "$(dirname "$LOCK")" "$LOCK"; echo 999999999 > "$LOCK/pid"   # dead pid
 make_codex all-healthy
 invoke
 if grep -q "removing a stale gate lock" "$TMPD/out.txt"; then
@@ -282,10 +288,11 @@ fi
 #
 # This drives the real gate and asserts on the filesystem, because the failure
 # mode is precisely "the command ran and did nothing".
-OLDF="/tmp/gate-${TPR}-pruneprobe.log"
-: > "$OLDF"; touch -t 202601010000 "$OLDF"       # a year old
-NEWF="/tmp/gate-${TPR}-freshprobe.log"
-: > "$NEWF"
+OLDF="$VELO_STATE/gate/OLDPROBE/x.log"
+mkdir -p "$(dirname "$OLDF")"; : > "$OLDF"
+touch -t 202601010000 "$(dirname "$OLDF")"   # the DIRECTORY is the prune unit
+NEWF="$VELO_STATE/gate/${TPR}/freshprobe.log"
+mkdir -p "$(dirname "$NEWF")"; : > "$NEWF"
 make_codex all-healthy
 invoke
 if [[ -f "$OLDF" ]]; then
