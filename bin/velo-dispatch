@@ -650,11 +650,13 @@ else
 fi
 # <<< velo-index-exclude
 
+INDEX_READY=0
 if [[ "$INDEX_SAFE" == "1" ]] \
    && [[ "${VELO_SKIP_INDEX:-0}" != "1" ]] && [[ -x "$HOME/.agents/bin/zg" ]]; then
   printf '  .. building discovery index (~35s, skip with VELO_SKIP_INDEX=1)\n'
   if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index \
          --embedding local/potion-code-16m-v2 ) >"$VELO_STATE/dispatch/${ISSUE}/zg-index.log" 2>&1; then
+    INDEX_READY=1
     ok "discovery index built ($(du -sh "$WT/.zvec-grep" 2>/dev/null | cut -f1)) — worker can run: zg query \"...\""
   else
     warn "discovery index FAILED (see $VELO_STATE/dispatch/${ISSUE}/zg-index.log) — worker falls back to rg + ast-grep"
@@ -673,7 +675,23 @@ gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1
 # velo-record derives turns, status, leaked calls and the whole cost block from
 # it, so a post-mortem silently read the newer run's numbers (#2012 M3).
 LOG="$VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-$(date -u +%Y%m%dT%H%M%SZ).log"
-TASK=$(cat "$BRIEF")
+# Tell the worker whether the index EXISTS for this run.
+#
+# Without this the worker learns by failing: it runs `zg query`, gets
+# WORKSPACE_INDEX_NOT_FOUND, and burns a turn. Worse, zg's own error carries an
+# `agent_prompt` telling the agent to "Ask the user whether this workspace should
+# be indexed" — there is no user on a dispatched run, and re-indexing is not the
+# worker's job. Stating the state up front removes both the wasted turn and the
+# contradictory instruction.
+if [[ "${INDEX_READY:-0}" == "1" ]]; then
+  INDEX_NOTE="Discovery index: AVAILABLE for this worktree. \`zg query \"<plain english>\"\` works from your worktree root. It is a snapshot taken before you started — never use it to verify your own edits."
+else
+  INDEX_NOTE="Discovery index: NOT AVAILABLE for this run. \`zg query\` will fail with WORKSPACE_INDEX_NOT_FOUND. Do NOT run \`zg index\` and do NOT ask anyone whether to build one — there is nobody to ask. Use \`zg query --rg\`, \`rg\` and \`ast-grep\`, which is the documented fallback and is sufficient."
+fi
+TASK="$(cat "$BRIEF")
+
+---
+$INDEX_NOTE"
 STARTED=$(date -u +%FT%TZ)
 
 # Recorded turn cap defaults to the real one; the codex route clears it because

@@ -174,8 +174,33 @@ merge_left_with_nulls_batch` as its second hit. That is the phase it is for.
 3. **A miss is not proof of absence.** Falling back to `rg` and `ast-grep` when
    `zg` returns nothing is correct; concluding "there is no such code" is not.
 
-If `zg` is absent (the index build can fail; the dispatch says so and continues)
-carry on with `rg` and `ast-grep`. Nothing here depends on it.
+**If there is no index, do NOT build one and do NOT ask.** The dispatch states
+the index state at the end of your brief. When it is unavailable, `zg query`
+fails with:
+
+```
+Error: No zvec-grep index found for this workspace
+Code: ZVEC_GREP.ENGINE.SERVICE.WORKSPACE_INDEX_NOT_FOUND
+  agent_prompt: Ask the user whether this workspace should be indexed...
+```
+
+That `agent_prompt` is zg's generic interactive guidance and **does not apply to
+you**. There is no user on a dispatched run, and re-indexing is not your job —
+the dispatch already decided, and one of its reasons for refusing is that an
+unignorable 325MB index would be committed by the failure-salvage path. Building
+one yourself would recreate exactly that hazard.
+
+Fall back instead, in this order:
+
+```bash
+zg query --rg -F "merge_left_with_nulls"   # no index needed; adds enclosing-symbol context
+rg "null.?pad" src/                         # plain text
+ast-grep run --pattern '...' --lang rust src/
+```
+
+`zg query --rg` works with no index at all and still gives you the enclosing
+heading/symbol for each hit, so it is strictly better than bare `rg` for the
+locating phase. Nothing in this policy depends on the semantic index.
 
 ### Without LSP — what a delegated worker must do instead
 
