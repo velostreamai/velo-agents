@@ -117,6 +117,27 @@ else
   fi
 fi
 
+
+# ---- usage lists every flag the parser accepts -------------------------------
+#
+# --resume shipped accepted-but-unlisted: the parser took it, the usage line did
+# not mention it. That is the phantom-flag bug in reverse — the tool and its own
+# guidance disagreeing about which flags exist — and #1914 was caused by exactly
+# that disagreement pointing at a destructive flag.
+#
+# Derive both sets from the script so this cannot go stale.
+USAGE=$(bash "$DISPATCH" 2>&1 | grep -m1 'usage: velo-dispatch')
+PARSED=$(sed -n '/^while \[\[ \$# -gt 0 \]\]/,/^done/p' "$DISPATCH" \
+         | grep -oE '^\s+--[a-z-]+\)' | tr -d ' )' | sort -u)
+MISSING=""
+for f in $PARSED; do grep -qF -- "$f" <<<"$USAGE" || MISSING="$MISSING $f"; done
+if [[ -z "$MISSING" ]]; then
+  echo "  PASS  usage lists every accepted flag ($(wc -w <<<"$PARSED" | tr -d ' ') of them)"
+else
+  echo "  FAIL  accepted but absent from usage:$MISSING"
+  FAILURES=$((FAILURES+1))
+fi
+
 echo
 [[ $FAILURES -gt 0 ]] && { echo "FAILED: $FAILURES"; exit 1; }
 echo "all end-to-end preflight checks passed"

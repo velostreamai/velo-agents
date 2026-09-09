@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force]"
+[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force] [--resume]"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "issue must be a number, got '$ISSUE'"
 
 # Open the audit log now: the issue number is validated, so the path is safe to
