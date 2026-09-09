@@ -4,6 +4,13 @@
 #
 # Usage:
 #   velo-dispatch <issue> <brief-file> [--branch <name>] [--dry-run] [--force]
+#                                      [--resume]
+#
+# --resume continues an EXISTING worktree instead of cutting a fresh one: the
+# tree, the branch and the commits on it are left exactly as they are and a new
+# worker is dispatched into them. For a run that stopped part-way — a STOP
+# condition, a timeout, a killed session — where the alternative was --force,
+# which deletes the branch and the commits with it.
 #
 # Exits non-zero with a specific message when the ticket is NOT ready, so a
 # caller never burns a worker run on an under-specified task.
@@ -46,12 +53,13 @@ warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
 ISSUE="${1:-}"; BRIEF="${2:-}"; shift 2 2>/dev/null || true
-BRANCH=""; DRY=0; FORCE=0
+BRANCH=""; DRY=0; FORCE=0; RESUME=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --force) FORCE=1; shift ;;
+    --resume) RESUME=1; shift ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -508,7 +516,38 @@ BASE="${BASE_SHA:0:9}"
 if [[ $DRY -eq 1 ]]; then
   echo
   echo "DRY RUN — would do:"
-  echo "  worktree : $WT  (branch $BRANCH off origin/master $BASE)"
+  # A dry run that cannot describe the worktree it would use is the specific gap
+  # #1914 names: it "reports a clean plan for a dispatch that would refuse (or
+  # destroy) in reality". Say which of the three things will happen — resume,
+  # cut fresh, or refuse — because those differ in whether commits survive.
+  if [[ $RESUME -eq 1 ]]; then
+    if [[ -d "$WT" ]]; then
+      DR_BR=$(git -C "$WT" branch --show-current 2>/dev/null)
+      DR_AHEAD=$(git -C "$WT" log --oneline "origin/master..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+      DR_DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      echo "  worktree : $WT  (RESUMED — kept as-is)"
+      echo "             on '$DR_BR', $DR_AHEAD commit(s) ahead, $DR_DIRTY dirty; nothing reset"
+      [[ "$DR_BR" == "$BRANCH" ]] \
+        || echo "             WOULD REFUSE: on '$DR_BR', this dispatch targets '$BRANCH'"
+    else
+      echo "  worktree : $WT  (WOULD REFUSE — --resume but no worktree there)"
+    fi
+  elif [[ -d "$WT" ]]; then
+    DR_AHEAD=$(git -C "$WT" log --oneline "origin/master..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+    DR_DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$DR_AHEAD" != "0" || "$DR_DIRTY" != "0" ]]; then
+      if [[ $FORCE -eq 1 ]]; then
+        echo "  worktree : $WT  (--force: WOULD DESTROY $DR_AHEAD commit(s), $DR_DIRTY dirty)"
+      else
+        echo "  worktree : $WT  (WOULD REFUSE — has $DR_AHEAD commit(s), $DR_DIRTY dirty)"
+        echo "             --resume to keep them, --force to discard them"
+      fi
+    else
+      echo "  worktree : $WT  (branch $BRANCH off origin/master $BASE — existing tree is clean, recreated)"
+    fi
+  else
+    echo "  worktree : $WT  (branch $BRANCH off origin/master $BASE)"
+  fi
   echo "  assign   : #$ISSUE -> $ASSIGNEE"
   echo "  worker   : $NAME"
   echo "  brief    : $BRIEF"
@@ -538,15 +577,81 @@ fi
 # `origin/master` here is the ref fetched in section 3a — the same ref every
 # other gate (anchors, blast radius, spec drift) validates against, so the
 # worker's tree and the validation now agree by construction.
-if [[ -d "$WT" ]]; then
+if [[ $RESUME -eq 1 ]]; then
+  # ---- resume: keep the tree, keep the branch, keep the commits --------------
+  #
+  # The refusal in the `elif` below used to tell the operator to "dispatch with
+  # --worktree" — a flag this script has never accepted; its own parser answers
+  # `unknown flag: --worktree`. So the documented way to KEEP work did not exist,
+  # and the only flag that did work was --force, which deletes the branch and the
+  # commits with it. That is the whole of #1914.
+  #
+  # Resume validates and then does NOTHING to the tree. Every check refuses
+  # rather than repairs: a resume that quietly fixes up a tree is
+  # indistinguishable from the --force it exists to replace.
+  [[ $FORCE -eq 0 ]] || die "--resume and --force are opposites.
+  --resume keeps the existing worktree and its commits; --force deletes them.
+  Pick one."
+
+  [[ -d "$WT" ]] || die "--resume needs an existing worktree at $WT, and there is none.
+  Nothing to resume — dispatch normally and one will be cut from origin/master."
+
+  RES_BRANCH=$(git -C "$WT" branch --show-current 2>/dev/null)
+  [[ -n "$RES_BRANCH" ]] || die "worktree $WT is not on a branch (detached HEAD).
+  Resuming would commit somewhere nothing tracks. Check it out on a branch first."
+  if [[ "$RES_BRANCH" != "$BRANCH" ]]; then
+    die "worktree $WT is on '$RES_BRANCH', but this dispatch targets '$BRANCH'.
+  Resuming would put the worker on a branch velo-status and velo-merge are not
+  watching for this issue. Either pass --branch $RES_BRANCH to resume that one,
+  or check the worktree out on $BRANCH first."
+  fi
+
+  # A tree stopped mid-rebase or mid-merge has conflict markers in its files and
+  # a HEAD that is not what anyone thinks. A worker dispatched into it edits
+  # around the markers and commits the result.
+  RES_GITDIR=$(git -C "$WT" rev-parse --git-dir 2>/dev/null)
+  for state in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD; do
+    if [[ -e "$RES_GITDIR/$state" ]]; then
+      die "worktree $WT is mid-${state}.
+  Finish or abort it before resuming — a worker cannot tell a conflict marker
+  from code."
+    fi
+  done
+
+  RES_DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  RES_AHEAD=$(git -C "$WT" log --oneline "origin/master..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+  RES_BEHIND=$(git -C "$WT" rev-list --count "HEAD..origin/master" 2>/dev/null || echo "?")
+  ok "resuming $WT on $RES_BRANCH ($RES_AHEAD commit(s), $RES_DIRTY dirty, $RES_BEHIND behind origin/master)"
+
+  # Unpushed commits are exactly what --force destroys, and the reason this flag
+  # exists. Say so with the number, every time: pushing first makes the loss
+  # impossible, and nothing else in this script will tell you.
+  if git -C "$ROOT" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
+    RES_UNPUSHED=$(git -C "$WT" log --oneline "origin/$BRANCH..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+  else
+    RES_UNPUSHED="$RES_AHEAD"
+  fi
+  if [[ "$RES_UNPUSHED" != "0" ]]; then
+    warn "$RES_UNPUSHED commit(s) on $BRANCH are NOT on origin."
+    warn "  A --force dispatch on this branch would delete them, and this is the"
+    warn "  work you are resuming. Make it durable first:"
+    warn "    git -C $WT push -u origin $BRANCH"
+  fi
+  if [[ "$RES_BEHIND" != "0" && "$RES_BEHIND" != "?" ]]; then
+    warn "the tree is $RES_BEHIND commit(s) behind origin/master."
+    warn "  The anchors and blast radius validated above describe origin/master —"
+    warn "  a tree the worker is NOT looking at. Rebase first if the brief depends"
+    warn "  on anything that landed since."
+  fi
+elif [[ -d "$WT" ]]; then
   DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
   AHEAD=$(git -C "$WT" log --oneline origin/master..HEAD 2>/dev/null | wc -l | tr -d ' ')
   if [[ "$DIRTY" != "0" || "$AHEAD" != "0" ]]; then
     [[ $FORCE -eq 1 ]] || die "worktree $WT already exists and HAS WORK ($DIRTY dirty, $AHEAD commits).
   It will not be reused or reset silently — inspect it first.
     git -C $WT log --oneline origin/master..HEAD
-  Then either keep it (rebase onto origin/master and dispatch with --worktree),
-  or discard it and re-run with --force."
+  Keep it and continue the work:  re-run with --resume
+  Discard it and start over:      re-run with --force"
     warn "discarding existing worktree with work ($DIRTY dirty, $AHEAD commits) — --force"
   fi
   # `agent.log` is git-IGNORED but MANDATED by the implementation policy as the
@@ -565,6 +670,13 @@ if [[ -d "$WT" ]]; then
   ok "removed stale worktree $WT (recreating from origin/master)"
 fi
 
+# Everything from here to the behind-master assertion CUTS A FRESH TREE, so none
+# of it may run on a resume: the branch-delete would refuse (or with --force,
+# destroy the very commits being resumed), `worktree add` would fail because the
+# worktree exists, and the assertion would fire because a resumed tree is behind
+# origin/master by design.
+if [[ $RESUME -eq 0 ]]; then
+
 # The branch may also survive an earlier dispatch. Delete it only when it has no
 # commits of its own; otherwise refuse rather than silently discard someone's work.
 if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
@@ -573,7 +685,7 @@ if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
     [[ $FORCE -eq 1 ]] || die "branch '$BRANCH' already exists with $BR_AHEAD commit(s) not on master.
   Cutting a fresh worktree would abandon them.
     git -C $ROOT log --oneline origin/master..$BRANCH
-  Keep them: rebase onto origin/master, then dispatch with --worktree <path>.
+  Keep them:    re-run with --resume — continues this branch, destroys nothing.
   Discard them: re-run with --force, or use --branch fix/${ISSUE}-v2."
     warn "deleting branch $BRANCH with $BR_AHEAD commit(s) — --force"
   fi
@@ -592,6 +704,8 @@ ok "worktree cut from origin/master: $WT ($BRANCH @ $BASE)"
 WT_BEHIND=$(git -C "$WT" rev-list --count HEAD..origin/master 2>/dev/null || echo "?")
 [[ "$WT_BEHIND" == "0" ]] \
   || die "internal: freshly-cut worktree is $WT_BEHIND commits behind origin/master"
+
+fi   # end: cut a fresh tree (skipped entirely by --resume)
 
 # The state dir must exist before the FIRST consumer, which is the zg redirect
 # below — not before LOG= further down. A redirect into a missing directory fails

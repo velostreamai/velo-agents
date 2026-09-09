@@ -52,7 +52,7 @@ if ! grep -q "brief BRANCH/WORKTREE" <<<"$PROBE"; then
   exit 0
 fi
 expect() {  # $1 label, $2 output, $3 substring
-  if grep -qF "$3" <<<"$2"; then printf '  PASS  %s\n' "$1"
+  if grep -qF -- "$3" <<<"$2"; then printf '  PASS  %s\n' "$1"
   else printf '  FAIL  %s: output did not contain %q\n' "$1" "$3"; FAILURES=$((FAILURES+1)); fi
 }
 
@@ -70,6 +70,52 @@ expect "both correct passes" \
 expect "declared-but-empty WORKTREE refuses" \
   "$(run "$(brief "## Worktree" "## Branch")")" \
   "NOT READY"
+
+# ---- --resume (#1914) -------------------------------------------------------
+#
+# The refusal for a worktree with work used to say "dispatch with --worktree" — a
+# flag the parser rejects with `unknown flag`. The documented way to KEEP work did
+# not exist; the only flag that worked was --force, which deletes the branch and
+# its commits.
+#
+# These cases build a REAL worktree with a REAL commit, because that is the state
+# where the difference between --resume and --force is whether work survives.
+RESUME_WT="$HOME/RustroverProjects/velostream-$ISSUE"
+if [[ -e "$RESUME_WT" ]]; then
+  echo "  SKIP  $RESUME_WT already exists — not touching a real worktree to test"
+else
+  ROOT_REPO="$HOME/RustroverProjects/velostream"
+  RB="fix/$ISSUE-auto"
+  git -C "$ROOT_REPO" worktree add -q "$RESUME_WT" -b "$RB" origin/master 2>/dev/null
+  if [[ ! -d "$RESUME_WT" ]]; then
+    echo "  SKIP  could not create a scratch worktree at $RESUME_WT"
+  else
+    echo "probe" >> "$RESUME_WT/.agents/RESUME_TEST"
+    git -C "$RESUME_WT" add -A
+    git -C "$RESUME_WT" -c user.email=t@t -c user.name=t commit -qm "resume probe" >/dev/null 2>&1
+    HEAD_BEFORE=$(git -C "$RESUME_WT" rev-parse HEAD)
+    GOODBRIEF=$(brief "WORKTREE: $RESUME_WT" "BRANCH: $RB")
+
+    expect "refusal names --resume, a flag that EXISTS" \
+      "$(bash "$DISPATCH" "$ISSUE" "$GOODBRIEF" 2>&1)" "re-run with --resume"
+    expect "--resume with --force is refused" \
+      "$(bash "$DISPATCH" "$ISSUE" "$GOODBRIEF" --resume --force 2>&1)" "opposites"
+    expect "--resume --dry-run says the tree is kept" \
+      "$(bash "$DISPATCH" "$ISSUE" "$GOODBRIEF" --resume --dry-run 2>&1)" "RESUMED — kept as-is"
+    expect "plain --dry-run warns it would refuse, and how to keep the work" \
+      "$(bash "$DISPATCH" "$ISSUE" "$GOODBRIEF" --dry-run 2>&1)" "--resume to keep them"
+
+    HEAD_AFTER=$(git -C "$RESUME_WT" rev-parse HEAD 2>/dev/null)
+    if [[ "$HEAD_BEFORE" == "$HEAD_AFTER" ]]; then
+      echo "  PASS  the commit survived every one of those"
+    else
+      echo "  FAIL  HEAD moved: $HEAD_BEFORE -> $HEAD_AFTER"; FAILURES=$((FAILURES+1))
+    fi
+
+    git -C "$ROOT_REPO" worktree remove --force "$RESUME_WT" >/dev/null 2>&1
+    git -C "$ROOT_REPO" branch -D "$RB" >/dev/null 2>&1
+  fi
+fi
 
 echo
 [[ $FAILURES -gt 0 ]] && { echo "FAILED: $FAILURES"; exit 1; }

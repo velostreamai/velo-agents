@@ -420,6 +420,55 @@ Routing comes from the issue's `worker:*` label, not from which skill you read.
 
 ---
 
+## Resuming a run that stopped — `--resume`
+
+A worker stops part-way: a STOP condition, a timeout, a killed session. The
+worktree holds commits. Re-dispatching refuses, correctly — and until now the
+refusal told you to "dispatch with `--worktree`", **a flag this script has never
+accepted**. Its own parser answers `unknown flag: --worktree`. So the documented
+way to keep the work did not exist, and the only flag that did work was
+`--force`, which deletes the branch and its commits.
+
+```bash
+velo-dispatch 1958 brief.md --resume     # keep the tree, the branch, the commits
+```
+
+`--resume` validates and then does **nothing** to the tree. It refuses rather
+than repairs — a resume that quietly fixes up a tree is indistinguishable from
+the `--force` it replaces:
+
+| condition | why it refuses |
+|---|---|
+| `--resume` with `--force` | they are opposites; pick one |
+| no worktree at that path | nothing to resume |
+| detached HEAD | the worker would commit somewhere nothing tracks |
+| on a different branch | `velo-status` and `velo-merge` watch the dispatch branch |
+| mid-rebase / merge / cherry-pick | a worker cannot tell a conflict marker from code |
+
+It **warns**, loudly, when commits are not on `origin` — because that is exactly
+what a later `--force` destroys:
+
+```
+warn: 2 commit(s) on fix/1958-auto are NOT on origin.
+warn:   A --force dispatch on this branch would delete them, and this is the
+warn:   work you are resuming. Make it durable first:
+warn:     git -C ~/RustroverProjects/velostream-1958 push -u origin fix/1958-auto
+```
+
+**Push before you resume.** It costs nothing and it makes the destructive flag
+survivable. The warning exists because nothing else in the tooling tells you.
+
+`--dry-run` now says which of the three things would happen — resume, cut fresh,
+or refuse — since those differ in whether commits survive:
+
+```
+worktree : ~/RustroverProjects/velostream-2047  (RESUMED — kept as-is)
+           on 'fix/2047-auto', 1 commit(s) ahead, 0 dirty; nothing reset
+
+worktree : ~/RustroverProjects/velostream-2047  (WOULD REFUSE — has 1 commit(s), 0 dirty)
+           --resume to keep them, --force to discard them
+```
+
 ## Usage
 
 ### 1. Label the issue
