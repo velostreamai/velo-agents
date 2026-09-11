@@ -353,6 +353,61 @@ $STALE
     fi
   fi
 
+
+  # >>> velo-fail-to-pass (extracted verbatim by tests/test_fail_to_pass.sh)
+  # ---- the acceptance gate must NAME TESTS THAT EXIST ------------------------
+  #
+  # `tests.fail_to_pass` is what decides whether a run worked. Every other check
+  # here validated the WORK (anchors, blast radius, deps, brief shape) and
+  # nothing validated the GATE — so a spec could name tests that do not exist and
+  # dispatch would happily proceed.
+  #
+  # It did. #1958 declared `enforced_files_covers_every_executable_sql_doc` and
+  # `ungated_block_register_matches_reality`; neither is defined anywhere in the
+  # tree (`cargo nextest run <name>` matches zero tests). That dispatch LANDED
+  # with 6 commits — a run reporting success while its acceptance gate named
+  # nothing. A paid Codex spec review found it; this is a grep.
+  #
+  # Deliberately a NAME-EXISTENCE check, not a run: compiling the suite costs
+  # minutes and the dispatch has not even cut a worktree yet. A name that matches
+  # no `fn` is wrong regardless of whether it would pass — and that is the case
+  # that actually occurred.
+  FTP=$(y tests.fail_to_pass)
+  if [[ -n "$FTP" && "$FTP" != "null" && "$FTP" != "[]" ]]; then
+    FTP_MISSING=()
+    FTP_COUNT=0
+    while IFS= read -r tname; do
+      [[ -n "$tname" ]] || continue
+      FTP_COUNT=$((FTP_COUNT + 1))
+      # Match the definition, not a mention: a name appearing only in a comment,
+      # a spec file or another test's body is not a test. `git grep` against the
+      # pinned BASE_SHA, like every other check here, so a dirty working tree
+      # cannot make a missing test look present.
+      if ! git -C "$ROOT" grep -qE "fn[[:space:]]+${tname}[[:space:]]*\(" "$BASE_SHA" -- tests src 2>/dev/null; then
+        FTP_MISSING+=("$tname")
+      fi
+    done < <(python3 -c "
+import json,sys
+try:
+    v=json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+for t in (v if isinstance(v,list) else [v]):
+    print(t)
+" "$FTP" 2>/dev/null)
+
+    if [[ ${#FTP_MISSING[@]} -gt 0 ]]; then
+      die "spec: fail_to_pass NAMES TESTS THAT DO NOT EXIST at ${BASE_SHA:0:9}.
+    missing: ${FTP_MISSING[*]}
+    These are the tests that decide whether the run succeeded. A name matching no
+    'fn <name>(' gates nothing: the worker can finish, the suite can pass, and the
+    dispatch lands having proven nothing. #1958 landed 6 commits exactly that way.
+    Fix the names in .agents/tasks/${ISSUE}.json, or add the tests first."
+    fi
+    ok "fail_to_pass: $FTP_COUNT test(s) exist at ${BASE_SHA:0:9}"
+  fi
+  # <<< velo-fail-to-pass
+
   BEHIND=$(git -C "$ROOT" rev-list --count "$(y verified_against)..origin/master" 2>/dev/null || echo "?")
   [[ "$BEHIND" == "0" || "$BEHIND" == "?" ]] && ok "spec verified at current master" \
     || warn "spec verified $BEHIND commits behind master (anchors still check out)"

@@ -22,6 +22,9 @@ PY="${VELO_TEST_PYTHON:-$HOME/.venvs/velo-openrouter-agent/bin/python}"
 [[ -x "$PY" ]] || { echo "python with open_agent_sdk not found at $PY"; echo "set VELO_TEST_PYTHON"; exit 1; }
 
 RC=0
+echo "── fail_to_pass validation ────────────────────────────"
+bash "$HERE/test_fail_to_pass.sh" || RC=1
+echo
 echo "── velo-status ────────────────────────────────────────"
 bash "$HERE/test_status.sh" || RC=1
 echo
