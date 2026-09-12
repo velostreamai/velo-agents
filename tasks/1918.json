@@ -63,13 +63,15 @@
     "An unaliased SelectField::Expression holding a plain column reference resolves to its bare column name at BOTH sites (today schema_propagation.rs returns __expr__ for this case and builder.rs does not)",
     "No collision handling is added: no suffix bump, no rename, no duplicate detection \u2014 a comment at the generator records that #1919 owns that check",
     "New tests are registered in the parent mod.rs",
+    "docs/sql/PARSER_GRAMMAR.md documents the generated-name rule alongside the select_item production (issue #1918 acceptance bar 4) \u2014 this is a REQUIRED doc change, distinct from the forbidden corpus-editing below",
     "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed"
   ],
   "forbidden": [
     "do not add a suffix-bumping or any other collision workaround",
     "do not implement NB-005 duplicate-output-name detection \u2014 that is #1919",
     "do not touch __exists__, __raw__, or __velostream_variant \u2014 legitimate sentinels, not output-name placeholders",
-    "do not edit any file under docs/ or demo/ to make a gate pass",
+    "do not edit a SQL EXAMPLE under docs/ or demo/ to make a gate pass \u2014 editing the corpus to satisfy a validator is the escape hatch this forbids. Updating PARSER_GRAMMAR.md prose to DOCUMENT the new rule is required, not forbidden; the two are different acts",
+    "do not resolve #1469 (GROUP BY output schema ignores AS alias) while sweeping __group__ \u2014 adjacent defect, separate issue; STOP and report if the __group__ fix cannot be made without touching it",
     "do not add #[cfg(test)] or #[test] inside src/",
     "do not delete, skip, #[ignore] or narrow any existing test",
     "do not change a public signature with callers outside plan/ \u2014 STOP and report instead"
@@ -77,6 +79,6 @@
   "reviewed": {
     "by": "neilavery",
     "at": "2026-09-12T17:16:30Z",
-    "brief_sha256": "221993c8410fd0fe9cdb5fa4334759c12499fa400aefd93512542ef8b01f52c4"
+    "brief_sha256": "4d3ddf2a6254aa0b7c98e2be4e33310958f6cd33ad824bb11c379900a20338a9"
   }
 }

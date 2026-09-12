@@ -60,6 +60,11 @@ positional rule applied to its own list.
 
 Do not stop at `__expr__`. Two placeholders, one defect class, one PR.
 
+**Boundary**: #1469 (GROUP BY output schema ignores an `AS` alias) is an
+adjacent output-naming defect in the same function's neighbourhood. It is **not
+yours**. If you find the `__group__` fix cannot be made without also changing
+that behaviour, STOP and report — do not fold it in.
+
 ### 3c. The two `__expr__` sites currently DISAGREE — make them agree
 
 This is a real bug sitting underneath the naming one, and it is in scope.
@@ -196,12 +201,27 @@ at start and end — read that log and grep it.
 
 New test files **must** be registered in the parent `mod.rs`, or they do not run.
 
+## 7a. Required documentation
+
+`docs/sql/PARSER_GRAMMAR.md` must document the generated-name rule alongside the
+`select_item` production: an unaliased item whose expression is not a column
+reference is named `EXPR$<n>` by position. This is acceptance bar 4 on the issue
+and is **required work**, not optional polish.
+
+Do not confuse it with §8's corpus rule. Editing a SQL **example** so a gate
+stops complaining is forbidden; writing prose that **documents** the new
+behaviour is the job. If you find yourself changing a ```sql fence, stop and
+re-read this paragraph.
+
 ## 8. Forbidden
 
 - Do not add a suffix-bump or any collision workaround (§3d).
 - Do not implement NB-005 / duplicate-name detection — that is #1919.
 - Do not touch `__exists__`, `__raw__`, or `__velostream_variant`.
-- Do not edit any file under `docs/` or `demo/` to make a gate pass.
+- Do not edit a SQL **example** under `docs/` or `demo/` to make a gate pass.
+  (Writing the PARSER_GRAMMAR.md prose required by §7a is a different act and
+  is expected.)
+- Do not resolve #1469 while sweeping `__group__` — see §3b.
 - Do not add `#[cfg(test)]` or `#[test]` inside `src/`.
 - Do not delete, skip, `#[ignore]` or narrow any existing test.
 - Do not commit or push until the gate is green; do not open a PR or merge.
