@@ -2,10 +2,11 @@
   "issue": 1918,
   "worker": "codex",
   "design": "pinned",
-  "verified_against": "1126b36a4",
+  "verified_against": "7edba1761",
   "evidence": "code",
   "audit": "n/a",
   "depends_on": [],
+  "_scope_note": "REVISED 2026-09-12 after the velo-pr-gate run on PR #2104 found that plan-side renaming alone leaves plan and record disagreeing. Absorbs #2108 (execution-side namers) so the two land atomically: shipping EXPR$<n> in the plan while execution still emits Multiply_price_quantity replaces an obvious placeholder (__expr__) with a plausible-looking wrong name, which is worse than the defect. One defect, one landing. PR #2104 is superseded by the PR this spec produces; its two commits (plan side + SelectField::Column) are reviewed and may be used as a reference implementation of bars 1-6.",
   "anchors": [
     {
       "file": "src/velostream/sql/plan/builder.rs",
@@ -15,6 +16,11 @@
     {
       "file": "src/velostream/sql/plan/builder.rs",
       "symbol": "fn select_fields_to_project_exprs",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/builder.rs",
+      "symbol": "fn build_plan_alias_keys",
       "expect": 1
     },
     {
@@ -36,49 +42,84 @@
       "file": "src/velostream/sql/plan/schema_propagation.rs",
       "symbol": "fn expr_output_name",
       "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/schema_propagation.rs",
+      "symbol": "fn select_alias_for_group_expr",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/aggregation/accumulator.rs",
+      "symbol": "fn generate_field_name",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/aggregation/accumulator.rs",
+      "symbol": "fn expr_to_string",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/processors/select.rs",
+      "symbol": "pub fn get_expression_name",
+      "expect": 1
     }
   ],
   "blast_radius": {
-    "pattern": "__expr__",
-    "files": 2,
-    "refs": 2
+    "pattern": "get_expression_name",
+    "files": 12,
+    "refs": 29
   },
   "tests": {
     "fail_to_pass": [
       "unaliased_computed_items_get_positional_expr_names",
       "group_by_expression_key_gets_a_positional_name",
-      "plan_schema_and_project_exprs_agree_on_unaliased_expression_names"
+      "plan_schema_and_project_exprs_agree_on_unaliased_expression_names",
+      "select_field_column_is_named_identically_by_both_surfaces",
+      "emitted_record_field_name_matches_plan_schema_for_computed_select_item",
+      "group_by_expression_also_in_select_keeps_the_positional_name"
     ],
     "pass_to_stay": [
       "group_by_aliased_key_schema_carries_alias_not_raw_name",
-      "two_stage_aggregate_resolves_aliased_group_by_key"
+      "two_stage_aggregate_resolves_aliased_group_by_key",
+      "differential_sliding_computed_group_by_parity",
+      "differential_mixed_int_float_computed_group_by_parity",
+      "t27_sliding_aliased_group_by_parity",
+      "inferred_schema_chunked_output_matches_hand_computed_expected_sums"
     ],
     "known_red": []
   },
   "acceptance": [
     "No occurrence of the string __expr__ or __group__ remains in src/",
-    "An unaliased SELECT item whose expression is not a column reference is named EXPR$<n>, n = zero-based position in the select list",
-    "A GROUP BY key that is not a column reference is named by the same generator, positionally within the GROUP BY list",
-    "builder.rs::select_fields_to_project_exprs and schema_propagation.rs::schema_from_select_fields call ONE shared naming helper; neither has a private copy of the match arm",
-    "An unaliased SelectField::Expression holding a plain column reference resolves to its bare column name at BOTH sites (today schema_propagation.rs returns __expr__ for this case and builder.rs does not)",
+    "An unaliased SELECT item whose expression is not a column reference is named EXPR$<n>, n = zero-based position in the select list, and that is the name in BOTH the propagated plan schema AND the emitted record. A test asserts equality of the two through a real engine consumer, not by comparing two plan-side helpers.",
+    "A GROUP BY key that is not a column reference is named by the same generator, positionally within the GROUP BY list. A computed key that also appears in the SELECT list carries its SELECT-list position, because the output column IS the SELECT item; the GROUP BY index applies only to keys absent from SELECT.",
+    "builder.rs::select_fields_to_project_exprs and schema_propagation.rs::schema_from_select_fields call ONE shared naming helper for EVERY SelectField variant \u2014 Expression, Column, AliasedColumn, Wildcard. Neither holds a private copy of any arm. SelectField::Column must strip its qualifier at both sites via the shared helper: the parser never emits this variant, so no parsed query exercises it, which is exactly how it drifted.",
+    "An unaliased SelectField::Expression holding a plain column reference resolves to its bare column name at BOTH sites (before this change schema_propagation.rs returns __expr__ for this case and builder.rs does not)",
     "No collision handling is added: no suffix bump, no rename, no duplicate detection \u2014 a comment at the generator records that #1919 owns that check",
+    "EXPR$<n> is the name at execution too. AccumulatorManager::generate_field_name and SelectProcessor::get_expression_name no longer produce a competing output name for an unaliased computed expression: either they delegate to the shared helper, or they are demoted to a documented runtime LOOKUP key that is never an output name and never reaches a Schema. Whichever is chosen, exactly one code path decides what an output column is called.",
+    "expr_to_string's `_ => \"expr\"` catch-all no longer reaches any output name. Two computed SELECT items must never both be named \"expr\" at any layer. If the catch-all survives as a lookup-key detail, a comment states why it cannot escape to a schema.",
+    "The alias_keys write/read contract is preserved or migrated atomically. PlanNode::Aggregate::alias_keys is the key the runtime aggregate evaluator looks up, so renaming the plan side while execution still looks up the old key is silent wrong-output, not a test failure, in any path the pass_to_stay tests do not cover. State in the PR body which of the two (preserve / migrate) was done and how it was verified.",
+    "All 48 tests listed in #2108 pass without modification. Any test whose expectation must change is justified individually in the PR body per the correctness-over-parity rule \u2014 a changed expectation is a claim that the OLD behaviour was wrong, and it must be argued as such.",
+    "walk_expr_for_aggs's internal aggregate lookup key is not changed incidentally. Its own comment states it must match the runtime evaluator's lookup key; if the unification changes it, that is a deliberate, stated decision.",
     "New tests are registered in the parent mod.rs",
-    "docs/sql/PARSER_GRAMMAR.md documents the generated-name rule alongside the select_item production (issue #1918 acceptance bar 4) \u2014 this is a REQUIRED doc change, distinct from the forbidden corpus-editing below",
+    "docs/sql/PARSER_GRAMMAR.md documents the generated-name rule alongside the select_item production (issue #1918 acceptance bar 4) \u2014 this is a REQUIRED doc change, distinct from the forbidden corpus-editing below. It must describe the SHIPPED behaviour, including that the name holds at execution.",
     "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed"
   ],
   "forbidden": [
     "do not add a suffix-bumping or any other collision workaround",
     "do not implement NB-005 duplicate-output-name detection \u2014 that is #1919",
     "do not touch __exists__, __raw__, or __velostream_variant \u2014 legitimate sentinels, not output-name placeholders",
+    "do not treat __agg__ as an output-name placeholder \u2014 it surfaced alongside \"expr\" in aggregate schemas during investigation and is out of scope",
     "do not edit a SQL EXAMPLE under docs/ or demo/ to make a gate pass \u2014 editing the corpus to satisfy a validator is the escape hatch this forbids. Updating PARSER_GRAMMAR.md prose to DOCUMENT the new rule is required, not forbidden; the two are different acts",
-    "do not resolve #1469 (GROUP BY output schema ignores AS alias) while sweeping __group__ \u2014 adjacent defect, separate issue; STOP and report if the __group__ fix cannot be made without touching it",
     "do not add #[cfg(test)] or #[test] inside src/",
-    "do not delete, skip, #[ignore] or narrow any existing test",
-    "do not change a public signature with callers outside plan/ \u2014 STOP and report instead"
+    "do not delete, skip, #[ignore] or narrow any existing test. The 48 tests in #2108 are the gate for this work, not an obstacle to it \u2014 a naming change that requires silencing them has not been made correctly.",
+    "do not change EXPR$<n> itself \u2014 the form is pinned and documented in docs/sql/PARSER_GRAMMAR.md",
+    "do not route build_plan_alias_keys through the positional helper WITHOUT migrating the runtime readers in the same change. That exact one-sided edit was attempted and failed 48 tests; the failure list is in #2108 and is the blast radius of the coupling.",
+    "do not resolve #1469-class alias defects while sweeping __group__ \u2014 adjacent, separate; STOP and report if the __group__ fix cannot be made without touching one",
+    "do not change a public signature with callers outside plan/ and execution/ \u2014 STOP and report instead"
   ],
   "reviewed": {
-    "by": "neilavery",
-    "at": "2026-09-12T17:16:30Z",
-    "brief_sha256": "7b3fd0bfffb7a9c28c7d2c0a90b61f38412b39f33b5ef0c6556ea5010c664ba5"
+    "by": null,
+    "at": null,
+    "brief_sha256": null
   }
 }
