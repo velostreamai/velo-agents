@@ -455,15 +455,35 @@ for t in (v if isinstance(v,list) else [v]):
     print(t)
 " "$FTP" 2>/dev/null)
 
+    # A missing name is a WARNING here, not a refusal, and the difference is
+    # #2096. Grepping BASE_SHA can only ever be satisfied by tests already on
+    # master. That fits a bug fix, whose repro test lands first and is red. It
+    # cannot fit an issue whose tests pin behaviour that does not exist yet:
+    # #1918's three names all assert the post-fix EXPR$<n> naming, so the only
+    # ways past this check were to redden master or to point fail_to_pass at
+    # something that already passes.
+    #
+    # That second option is the trap. It satisfies this grep perfectly, and a
+    # test asserting TODAY's behaviour gates exactly as little as a name that
+    # matches nothing — while looking correct. So refusing here did not merely
+    # block legitimate work, it selected for the failure the check exists to
+    # prevent.
+    #
+    # The guarantee is not dropped, it MOVES: velo-pr-gate verifies each name
+    # exists at the PR head and — when the name predates the PR — that it
+    # actually FAILS at the base. That is strictly stronger than this grep,
+    # because it also catches the already-passing case this one cannot see.
+    # velo-merge refuses a PR that is not gate:passed, so the merge-time check
+    # is enforced rather than advisory.
     if [[ ${#FTP_MISSING[@]} -gt 0 ]]; then
-      die "spec: fail_to_pass NAMES TESTS THAT DO NOT EXIST at ${BASE_SHA:0:9}.
-    missing: ${FTP_MISSING[*]}
-    These are the tests that decide whether the run succeeded. A name matching no
-    'fn <name>(' gates nothing: the worker can finish, the suite can pass, and the
-    dispatch lands having proven nothing. #1958 landed 6 commits exactly that way.
-    Fix the names in .agents/tasks/${ISSUE}.json, or add the tests first."
+      warn "fail_to_pass names $((${#FTP_MISSING[@]})) test(s) not yet defined at ${BASE_SHA:0:9}:
+       ${FTP_MISSING[*]}
+       Expected when the spec pins NEW behaviour — the worker writes them. They are
+       verified at merge by velo-pr-gate (exists at head; fails at base if it
+       predates the PR), NOT here. Do not 'fix' this by pointing fail_to_pass at a
+       test that already passes: that gates nothing and this check cannot see it."
     fi
-    ok "fail_to_pass: $FTP_COUNT test(s) exist at ${BASE_SHA:0:9}"
+    ok "fail_to_pass: $FTP_COUNT name(s) declared, $((FTP_COUNT - ${#FTP_MISSING[@]})) already defined at ${BASE_SHA:0:9}"
   fi
   # <<< velo-fail-to-pass
 

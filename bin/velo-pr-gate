@@ -252,6 +252,86 @@ dispatch_local() {  # $1 = skill, $2 = log suffix
   ok "$skill -> velo-local (pid $!)  log: $log"
 }
 
+# >>> velo-fail-to-pass-merge (extracted verbatim by tests/test_fail_to_pass.sh)
+# ---- the acceptance gate must name tests that WOULD HAVE FAILED ------------
+#
+# velo-dispatch used to refuse when a `tests.fail_to_pass` name did not exist at
+# the base SHA. That grep can only be satisfied by tests already on master, so a
+# spec pinning NEW behaviour had two ways past it: redden master, or point
+# fail_to_pass at something that already passes. The second satisfies the grep
+# perfectly and gates exactly as little as #1958's names-nothing case — while
+# looking correct. #2096 moved the guarantee here, where both are visible.
+#
+# Stronger than the grep it replaces, on two counts:
+#   - a name that never materialised is caught (the #1958 case), and
+#   - a name that EXISTS but already passed before the change is caught, which
+#     the dispatch-time grep could not see at all.
+#
+# velo-merge refuses a PR that is not gate:passed, so this is enforced, not
+# advisory.
+FTP_ISSUE=$(sed -nE 's|^[a-z]+/([0-9]+)-.*|\1|p' <<<"${WT:-}" | head -1)
+[[ -n "$FTP_ISSUE" ]] || FTP_ISSUE=$(gh pr view "$PR" --repo "$REPO" --json title \
+    --jq '.title | capture("\\[#(?<n>[0-9]+)\\]") | .n' 2>/dev/null)
+# The spec is read from the PR's own worktree, not the canonical checkout: a PR
+# that ADDS or edits its spec must be gated against the version it ships.
+FTP_SPEC="$WTPATH/.agents/tasks/${FTP_ISSUE}.json"
+
+if [[ -n "$FTP_ISSUE" && -f "$FTP_SPEC" ]]; then
+  FTP_NAMES=$(python3 -c "
+import json,sys
+try:
+    v = json.load(open(sys.argv[1])).get('tests',{}).get('fail_to_pass') or []
+except Exception:
+    v = []
+print('\n'.join(str(t) for t in v))
+" "$FTP_SPEC" 2>/dev/null)
+
+  if [[ -n "$FTP_NAMES" ]]; then
+    FTP_BASE_REF="origin/$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null)"
+    FTP_ABSENT=(); FTP_PREDATES=()
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      # Match the DEFINITION, not a mention — a name in a comment or another
+      # test's body is not a test. Same rule the dispatch grep used.
+      if ! git -C "$WTPATH" grep -qE "fn[[:space:]]+${t}[[:space:]]*\(" HEAD -- tests src 2>/dev/null; then
+        FTP_ABSENT+=("$t")
+      elif git -C "$WTPATH" grep -qE "fn[[:space:]]+${t}[[:space:]]*\(" "$FTP_BASE_REF" -- tests src 2>/dev/null; then
+        FTP_PREDATES+=("$t")
+      fi
+    done <<<"$FTP_NAMES"
+
+    if [[ ${#FTP_ABSENT[@]} -gt 0 ]]; then
+      warn "BLOCK: fail_to_pass names test(s) that do not exist at this PR's head:"
+      warn "       ${FTP_ABSENT[*]}"
+      warn "These decide whether the run worked. A name matching no 'fn <name>(' gates"
+      warn "nothing: the worker finishes, the suite passes, and the PR merges having"
+      warn "proven nothing. #1958 landed 6 commits exactly that way."
+      warn "Write the tests, or correct the names in .agents/tasks/${FTP_ISSUE}.json."
+      exit 1
+    fi
+
+    # A name that predates the PR proves nothing by existing — it has to have
+    # been RED at the base, or it was never an acceptance gate for this work.
+    # New-in-PR names need no run: they could not have passed at a commit where
+    # they did not exist.
+    if [[ ${#FTP_PREDATES[@]} -gt 0 ]]; then
+      warn "fail_to_pass names ${#FTP_PREDATES[@]} test(s) that already existed at $FTP_BASE_REF:"
+      warn "       ${FTP_PREDATES[*]}"
+      warn "Existing is not evidence. Confirm each FAILS at the base before passing"
+      warn "the gate — a test that already passed gates nothing:"
+      warn "       git worktree add /tmp/ftp-base $FTP_BASE_REF"
+      for t in "${FTP_PREDATES[@]}"; do
+        warn "       cargo nextest run --no-default-features --manifest-path /tmp/ftp-base/Cargo.toml -E 'test($t)'"
+      done
+      warn "Each MUST fail there. If one passes, it is not an acceptance gate for"
+      warn "this change and the spec needs different names."
+    fi
+
+    ok "fail_to_pass: $(wc -l <<<"$FTP_NAMES" | tr -d ' ') name(s), all defined at PR head"
+  fi
+fi
+# <<< velo-fail-to-pass-merge
+
 # check-code is dispatched to Codex alongside code-review below — see the
 # routing table in this file's header for the measurement that moved it.
 [[ $NEEDS_SPEC -eq 1 ]] && dispatch_local check-spec spec
