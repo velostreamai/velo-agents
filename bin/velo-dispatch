@@ -999,8 +999,12 @@ case "$NAME" in
     ;;
   velo-local)
     MODEL_ID='qwen3-coder-next-mlx@6bit'
-    CMD=( "$HOME/.venvs/velo-openrouter-agent/bin/python"
-          "$HOME/.agents/bin/velo-lmstudio-agent-sdk.py"
+    # Through the WRAPPER, like every other delegated route. This used to exec
+    # velo-lmstudio-agent-sdk.py directly, so VELO_AGENT_BACKEND governed the
+    # OpenRouter workers and silently did NOT govern this one. A switch that
+    # covers some routes is worse than no switch: the fleet then runs two
+    # runtimes and nothing says which is which.
+    CMD=( "$HOME/.agents/bin/velo-openrouter-agent"
           --model "$MODEL_ID" --base-url "$LMSTUDIO_URL"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --cwd "$WT" --task "$TASK" )

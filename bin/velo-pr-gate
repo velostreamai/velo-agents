@@ -236,13 +236,17 @@ codex_health_check() {   # $1 = pid, $2 = log, $3 = gate name
   return 1
 }
 
-PY=/Users/neilavery/.venvs/velo-openrouter-agent/bin/python
-RUNNER=/Users/neilavery/.agents/bin/velo-lmstudio-agent-sdk.py
+# Through the wrapper, so the local GATES move with the workers rather than
+# staying on a runtime nobody remembers is still in use.
+WRAPPER=/Users/neilavery/.agents/bin/velo-openrouter-agent
+LOCAL_MODEL=qwen3-coder-next-mlx@6bit
+LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://127.0.0.1:1234/v1}"
 POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 
 dispatch_local() {  # $1 = skill, $2 = log suffix
   local skill="$1" log="$GATE_DIR/$2.log"
-  nohup "$PY" "$RUNNER" --policy "$POLICY" --skill "$skill" \
+  nohup "$WRAPPER" --model "$LOCAL_MODEL" --base-url "$LMSTUDIO_URL" \
+      --policy "$POLICY" --skill "$skill" \
       --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
       --task "$(cat "$SCOPE")" > "$log" 2>&1 &
   ok "$skill -> velo-local (pid $!)  log: $log"

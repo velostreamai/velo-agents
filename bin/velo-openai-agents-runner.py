@@ -55,6 +55,10 @@ from agents.exceptions import MaxTurnsExceeded  # noqa: E402
 from openai import AsyncOpenAI  # noqa: E402
 
 import velo_oai_tools as T  # noqa: E402
+# From the SHARED module, not from velo_worker_runner — importing that pulls in
+# `open_agent_sdk`, which is not installed on this runtime's venv, and would
+# couple the supported runner to the one being retired.
+from velo_skills import apply_skills  # noqa: E402
 
 set_tracing_disabled(True)
 
@@ -207,13 +211,18 @@ async def main() -> int:
     ap.add_argument("--bash-timeout-ms", type=int, default=2_400_000)
     ap.add_argument("--log-file", default=None)
     ap.add_argument("--base-url", default="https://openrouter.ai/api/v1")
+    ap.add_argument("--skill", action="append", default=[],
+                    help="Inline a skill definition ahead of the task (repeatable).")
     a = ap.parse_args()
 
     log = Logger(a.log_file)
     T.set_cwd(a.cwd)
     T.DEFAULT_BASH_TIMEOUT_S = max(1, a.bash_timeout_ms // 1000)
     policy = pathlib.Path(a.policy).read_text(encoding="utf-8")
-    read_only = task_is_read_only(a.task)
+    task = apply_skills(a.task, a.skill)
+    # Classified AFTER inlining: the review skills carry the read-only
+    # declaration, and a gate that writes is a gate that has already gone wrong.
+    read_only = task_is_read_only(task)
 
     system = (
         f"You are a full autonomous Velostream implementation worker.\n\n"
@@ -229,7 +238,19 @@ async def main() -> int:
         f"Deliver your result by turn {max(1, a.max_turns - 4)}, whatever state your work is in.\n"
     )
 
-    client = AsyncOpenAI(base_url=a.base_url, api_key=os.environ["OPENROUTER_API_KEY"])
+    # An OpenRouter key is required for OpenRouter and meaningless for a local
+    # LM Studio endpoint, which accepts any non-empty string. Demanding one there
+    # would make the local route unrunnable for the wrong reason.
+    is_gateway = "openrouter.ai" in a.base_url
+    if is_gateway:
+        key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("CODEANY_API_KEY")
+        if not key:
+            print("ERROR: OPENROUTER_API_KEY is not set", file=sys.stderr)
+            return 1
+    else:
+        key = os.environ.get("LM_STUDIO_API_KEY") or "lm-studio"
+
+    client = AsyncOpenAI(base_url=a.base_url, api_key=key)
 
     # OpenRouter's BILLED cost, read off the raw response. NOT computed from token
     # counts: fitting $/token against 53 billed observations gave a median error of
@@ -257,9 +278,13 @@ async def main() -> int:
         model_settings=ModelSettings(
             parallel_tool_calls=True,
             max_tokens=MAX_TOKENS_BY_MODEL.get(a.model, a.max_tokens),
-            extra_body={"provider": {"order": PROVIDER_ORDER.get(a.model, []),
-                                     "allow_fallbacks": True},
-                        "usage": {"include": True}}),
+            # provider.order and usage.include are OpenRouter fields. A plain
+            # OpenAI-compatible server rejects unknown body keys, so sending them
+            # to LM Studio breaks every request (cf. openai-agents#4326, where
+            # parallel_tool_calls sent to Azure did exactly that).
+            extra_body=({"provider": {"order": PROVIDER_ORDER.get(a.model, []),
+                                      "allow_fallbacks": True},
+                         "usage": {"include": True}} if is_gateway else {})),
     )
 
     hooks = Hooks(log, "prompt 1")
@@ -277,7 +302,7 @@ async def main() -> int:
         cfg = RunConfig(tool_not_found_behavior="return_error_to_model",
                         tool_execution=ToolExecutionConfig(max_function_tool_concurrency=6))
         res = await asyncio.wait_for(
-            Runner.run(agent, a.task + budget, max_turns=a.max_turns,
+            Runner.run(agent, task + budget, max_turns=a.max_turns,
                        run_config=cfg, hooks=hooks),
             timeout=a.prompt_timeout)
         text = str(res.final_output or "")
@@ -310,7 +335,12 @@ async def main() -> int:
     log.emit(
         f"TOTALS prompts=1 leaked_tool_calls=0 "
         f"input_tokens={fresh} output_tokens={hooks.out} cached_tokens={hooks.cached} "
-        f"cost_usd={hooks_ref['cost']:.6f} usage_source=openrouter-billed "
+        # A local endpoint bills nothing and reports no cost. Labelling a
+        # $0.000000 local run "openrouter-billed" would put a fabricated zero
+        # into the cost record and quietly drag every average down — the same
+        # class as the `sdk-unpriced` rows already in the history.
+        f"cost_usd={hooks_ref['cost']:.6f} "
+        f"usage_source={'openrouter-billed' if is_gateway else 'local-unpriced'} "
         f"read_only={str(read_only).lower()}"
     )
     return 0 if status == "success" else 1
