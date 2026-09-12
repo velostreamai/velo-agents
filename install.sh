@@ -33,6 +33,10 @@ die()  { printf '\033[31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 drift=0
 for d in bin rules skills; do
   [[ -d "$SRC/$d" ]] || continue
+  # __pycache__/*.pyc are python runtime artifacts, not tooling: python drops
+  # them next to any module it imports, including .agents/bin. A .pyc embeds the
+  # source mtime, so comparing them reported drift no install could ever fix
+  # (#2091). Excluded from both this walk and the copy below.
   while IFS= read -r -d '' f; do
     rel="${f#"$SRC"/}"
     if [[ ! -e "$DEST/$rel" ]]; then
@@ -64,7 +68,8 @@ for d in bin rules skills; do
       fi
       drift=1
     fi
-  done < <(find "$SRC/$d" -type f -print0)
+    # Python artifacts excluded — see the note on the copy below.
+  done < <(find "$SRC/$d" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0)
 done
 
 if [[ $CHECK -eq 1 ]]; then
@@ -77,7 +82,16 @@ mkdir -p "$DEST" "$SKILLS"
 for d in bin rules skills tasks; do
   [[ -d "$SRC/$d" ]] || continue
   mkdir -p "$DEST/$d"
-  cp -R "$SRC/$d/." "$DEST/$d/"
+  # Same exclusion as the drift check above: python artifacts are never shipped.
+  while IFS= read -r -d '' f; do
+    rel="${f#"$SRC"/}"
+    mkdir -p "$DEST/$(dirname "$rel")"
+    cp -p "$f" "$DEST/$rel"
+  done < <(find "$SRC/$d" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0)
+  # An install over a pre-#2091 live copy still carries the .pyc it shipped —
+  # remove those. Python recreates them at runtime; they are not drift.
+  while IFS= read -r -d '' p; do rm -rf "$p"; done \
+    < <(find "$DEST/$d" -depth -type d -name __pycache__ -print0)
   ok "$d -> $DEST/$d"
 done
 

@@ -6,6 +6,16 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Fixed — install.sh --check reported permanent drift (#2091)
+
+`install.sh` copied `bin/__pycache__/*.pyc` into the live tree and then compared
+them — but python regenerates a `.pyc` wherever it imports a module, so on any
+machine that had ever run a `.agents` python script, `--check` failed forever
+with drift no install could fix. **Prevents:** a drift check that always fires
+training everyone to ignore the one signal that catches a genuinely stale live
+copy. Python artifacts are now excluded from both the copy and the comparison,
+and a re-install removes the `.pyc` files earlier installs shipped.
+
 ### Fixed — velo-status printed the log FILENAME as the worker name (PR #2064)
 
 The state migration moved logs to `<worker>-<UTC>.log` inside a per-issue
