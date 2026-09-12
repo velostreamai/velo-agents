@@ -116,30 +116,81 @@ if [[ ",$LABELS," == *",triage-needed,"* ]]; then
 fi
 ok "no blocking labels"
 
-# ---- 3. exactly one worker label -------------------------------------------
+# ---- 3. routing: reconcile the label and the spec --------------------------
+#
+# Routing used to come from the GitHub label ALONE, while `.agents/tasks/SCHEMA.md`
+# documented a `worker:` spec field as "-> routing" that NOTHING read (#2085). A
+# documented field that does nothing does not stay consistent, and it did not:
+# 3 of 27 specs disagreed with their issue's label.
+#
+# One of those disagreements ran the wrong model. #2000's spec said `glm`, the
+# label said `deepseek`, and `2000.result.jsonl` records deepseek executing
+# twice. A cheaper, weaker model ran than the spec asked for, the tracked spec
+# still claims glm, and nothing anywhere reported a conflict. The other two
+# (#2026 `codex`, #2046 `claude`) had a spec worker and NO label, so dispatch
+# refused outright while holding the answer.
+#
+# So: read both, use whichever exists, and DIE when both exist and disagree.
+# Choosing a winner silently is how #2000 happened; refusing when only one source
+# is present is how #2026 happened. Neither failure is acceptable and the fix for
+# both is to stop having an unreconciled second source of truth.
 WORKERS=$(tr ',' '\n' <<<"$LABELS" | grep '^worker:' || true)
 COUNT=$(grep -c . <<<"$WORKERS" || true)
-[[ "$COUNT" -ne 0 ]] || die "#$ISSUE has no 'worker:*' label — routing is undefined.
-  Add one of:
-    worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
-    worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
-    worker:glm       pricier. Multi-step reasoning / per-case judgement.
-    worker:codex     most capable, most expensive. Architecture-weight work:
-                     anything where a WRONG answer costs more than the run.
-                     On #1988 it found 2 P1s that two local gates missed while
-                     both returned approve; on #1967 every load-bearing claim
-                     in its analysis survived independent verification. glm
-                     produced ZERO code in 186 turns on #1747."
-[[ "$COUNT" -eq 1 ]] || die "#$ISSUE has $COUNT worker labels ($(tr '\n' ' ' <<<"$WORKERS"))— exactly one required."
+[[ "$COUNT" -le 1 ]] || die "#$ISSUE has $COUNT worker labels ($(tr '\n' ' ' <<<"$WORKERS"))— at most one."
+LABEL_WORKER=""
+[[ "$COUNT" -eq 1 ]] && LABEL_WORKER="${WORKERS#worker:}"
 
-case "$WORKERS" in
-  worker:local)    NAME="velo-local"; LOGTAG="velo-local" ;;
-  worker:deepseek) NAME="velo-deepseek"; LOGTAG="deepseek" ;;
-  worker:glm)      NAME="velo-glm"; LOGTAG="glm" ;;
-  worker:codex)    NAME="codex"; LOGTAG="codex" ;;
-  *) die "unrecognised worker label: $WORKERS" ;;
+SPEC_WORKER=""
+SPEC_PATH="$ROOT/.agents/tasks/${ISSUE}.json"
+if [[ -f "$SPEC_PATH" ]]; then
+  SPEC_WORKER=$(python3 -c "
+import json,sys
+try: print(json.load(open('$SPEC_PATH')).get('worker') or '')
+except Exception: print('')
+" 2>/dev/null)
+fi
+
+# The label OVERRIDES the spec. They are not two competing sources of truth —
+# the spec's `worker` is the proposal written before dispatch, and the label is
+# the operator's live control, changeable without editing a versioned file. That
+# is what happened on #2000: the spec proposed `glm`, the label said `deepseek`,
+# deepseek ran. Working as designed, not a defect.
+#
+# Refusing on disagreement (the first cut of this change) would have BROKEN the
+# override: re-routing by editing a label would start requiring a matching spec
+# edit. The override is the feature.
+#
+# It is logged rather than silent, because "which model actually ran and why"
+# should not need archaeology through a result record to answer.
+if [[ -n "$LABEL_WORKER" && -n "$SPEC_WORKER" && "$LABEL_WORKER" != "$SPEC_WORKER" ]]; then
+  warn "label '$LABEL_WORKER' overrides spec proposal '$SPEC_WORKER' for #$ISSUE"
+fi
+
+ROUTE="$LABEL_WORKER"
+[[ -n "$ROUTE" ]] || die "#$ISSUE has no 'worker:*' label — routing is undefined.
+    Add one of:
+      worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
+      worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
+      worker:glm       pricier. Multi-step reasoning / per-case judgement.
+      worker:codex     most capable, most expensive. Architecture-weight work:
+                       anything where a WRONG answer costs more than the run.
+                       On #1988 it found 2 P1s that two local gates missed while
+                       both returned approve; on #1967 every load-bearing claim
+                       in its analysis survived independent verification. glm
+                       produced ZERO code in 186 turns on #1747."
+
+# Validated against the ROUTABLE set, not just the label vocabulary: #2046's spec
+# says `worker: claude`, which is not a transport this script has. Unroutable
+# values must fail here, loudly, rather than later or silently.
+case "$ROUTE" in
+  local)    NAME="velo-local"; LOGTAG="velo-local" ;;
+  deepseek) NAME="velo-deepseek"; LOGTAG="deepseek" ;;
+  glm)      NAME="velo-glm"; LOGTAG="glm" ;;
+  codex)    NAME="codex"; LOGTAG="codex" ;;
+  *) die "unroutable worker '$ROUTE' (from ${LABEL_WORKER:+label}${LABEL_WORKER:-spec}).
+    Routable: local, deepseek, glm, codex. See #2062 for opus/fable." ;;
 esac
-ok "routed to $NAME"
+ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 
 # ---- 3a. fetch, so `origin/master` is current ------------------------------
 #

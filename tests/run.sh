@@ -71,6 +71,12 @@ echo
 echo "── merge gate staleness ───────────────────────────────"
 bash "$HERE/test_merge_gates.sh" || RC=1
 echo
+echo "── routing: label vs spec ─────────────────────────────"
+bash "$HERE/test_routing.sh" || RC=1
+echo
+echo "── policy single source ───────────────────────────────"
+bash "$HERE/test_policy_single_source.sh" || RC=1
+echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
 

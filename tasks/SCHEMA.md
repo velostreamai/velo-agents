@@ -15,7 +15,12 @@ REFUSES to launch a worker when a claim no longer holds.
 
 ```yaml
 issue: 1898
-worker: deepseek            # local | deepseek | glm  -> routing
+worker: deepseek            # local | deepseek | glm | codex.
+                            # The PROPOSAL, written before dispatch. Read by
+                            # velo-dispatch (#2085) and used when the issue has no
+                            # worker:* label. A label OVERRIDES it — the label is
+                            # the live control, changeable without editing a
+                            # versioned file — and the override is logged.
 design: pinned              # pinned | open. `open` => dispatch REFUSED.
                             # A worker never chooses between design options.
 
