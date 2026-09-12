@@ -15,8 +15,9 @@ That is worse than the defect it fixes. `__expr__` was at least obviously a
 placeholder; `EXPR$0` looks like a real, referenceable column name while nothing
 downstream can actually use it. So plan and execution are now ONE task.
 
-PR #2104 is superseded by the PR you will open, but its commits are reviewed and
-correct for bars 1–6 — treat them as a reference implementation, not as work to
+PR #2104 is superseded by the PR that will be opened from your branch **by the
+caller, not by you** — §8 forbids you opening one. Its commits are reviewed and
+correct for bars 1–6; treat them as a reference implementation, not as work to
 redo blindly:
 
     git -C <worktree> log --oneline origin/master..origin/fix/1918-expr-output-names
@@ -257,6 +258,26 @@ superseded PR already proved, and it is exactly what missed this defect.
 `emitted_record_field_name_matches_plan_schema_for_computed_select_item` is named
 in `fail_to_pass` for that reason. Cover the windowed, grouped, and interval-join
 shapes too.
+
+### The six tests you must write, by name
+
+`velo-dispatch` sends you this brief and nothing else — it does not inject the
+sidecar — so these names are listed here in full. The merge gate checks them
+against `.agents/tasks/1918.json`, and a name that differs by one word fails
+that gate no matter how good the test is. The previous attempt at this issue
+wrote all three of its tests under different names and would have failed the
+gate for that reason alone.
+
+| test | must assert |
+|---|---|
+| `unaliased_computed_items_get_positional_expr_names` | `SELECT price * quantity, price - fee FROM trades` names the Project outputs `EXPR$0`, `EXPR$1` |
+| `group_by_expression_key_gets_a_positional_name` | a computed GROUP BY key absent from SELECT is named positionally within the GROUP BY list |
+| `plan_schema_and_project_exprs_agree_on_unaliased_expression_names` | the two plan-side naming surfaces agree, driven from ONE parsed SELECT list; must NOT compare against `plan.schema`, whose `Project` arm clones the builder's name and so cannot detect divergence |
+| `select_field_column_is_named_identically_by_both_surfaces` | `SelectField::Column("t.amount")` yields `amount` from BOTH `select_fields_to_project_exprs` and `schema_from_select_fields` |
+| `emitted_record_field_name_matches_plan_schema_for_computed_select_item` | the EMITTED RECORD's field name equals the propagated schema's, through a real engine consumer (§7a) |
+| `group_by_expression_also_in_select_keeps_the_positional_name` | `SELECT price * quantity, COUNT(*) FROM trades GROUP BY price * quantity` names the key `EXPR$0` in the Aggregate schema, not `"expr"` |
+
+Use these names exactly. Add more tests freely under any name you like.
 
 ### Red-first is REQUIRED, and must be recorded
 

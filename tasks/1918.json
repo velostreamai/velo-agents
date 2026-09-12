@@ -7,6 +7,7 @@
   "audit": "n/a",
   "depends_on": [],
   "_scope_note": "REVISED 2026-09-12 after the velo-pr-gate run on PR #2104 found that plan-side renaming alone leaves plan and record disagreeing. Absorbs #2108 (execution-side namers) so the two land atomically: shipping EXPR$<n> in the plan while execution still emits Multiply_price_quantity replaces an obvious placeholder (__expr__) with a plausible-looking wrong name, which is worse than the defect. One defect, one landing. PR #2104 is superseded by the PR this spec produces; its two commits (plan side + SelectField::Column) are reviewed and may be used as a reference implementation of bars 1-6.",
+  "_why": "Unaliased computed SELECT items were all named __expr__ and unaliased GROUP BY keys __group__, so two computed items in one query produced duplicate, unreferenceable output names. A first attempt fixed the PLAN only (PR #2104, closed); the gate showed that leaves the plan and the emitted record disagreeing \u2014 schema EXPR$0 vs record Multiply_price_quantity \u2014 which is worse than the defect, because __expr__ was visibly a placeholder while EXPR$0 looks like a real referenceable name nothing downstream can use. Three generators name the same expression three ways and are coupled through PlanNode::Aggregate::alias_keys, which is also the runtime aggregate lookup key: changing the plan side alone failed 48 tests. So plan and execution naming are one task, and this spec absorbs #2108.",
   "anchors": [
     {
       "file": "src/velostream/sql/plan/builder.rs",
@@ -123,5 +124,13 @@
     "by": null,
     "at": null,
     "brief_sha256": null
-  }
+  },
+  "stop_conditions": [
+    "The shared helper cannot be reached from execution without changing a public signature whose callers live outside plan/ and execution/.",
+    "Preserving the alias_keys write/read contract and shipping EXPR$<n> at execution turn out to be mutually exclusive.",
+    "Any of the 48 coupled tests requires a CHANGED EXPECTATION rather than passing unmodified \u2014 report it with the argument for why the old behaviour was wrong, per correctness-over-parity; do not change it unilaterally.",
+    "Any of the six fail_to_pass tests PASSES against unfixed code \u2014 you cannot record a RED-FIRST line for a test that was never red, and must not loosen it until it fails. Either the test does not reach the path it claims, or the bar's premise is wrong; a human decides which.",
+    "The __group__ fix cannot be made without changing the output name of a SelectField::AliasedColumn, or of a GROUP BY key carrying an explicit AS alias.",
+    "The scope tripwire fires: a file under src/ that neither names an expression nor reads one of the three generators needs editing."
+  ]
 }
