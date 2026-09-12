@@ -19,6 +19,7 @@ from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 
 # Runtime corrections to the SDK, applied before any tool can run (#2010).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from velo_zg_tool import ZgQueryTool
 from velo_runner_lib import salvage_on_failure  # noqa: E402
 from velo_sdk_patches import (  # noqa: E402
     LEDGER,
@@ -878,7 +879,12 @@ async def run_agent(
         base_url=base_url,
         cwd=str(root),
         system_prompt=system_prompt,
-        allowed_tools=["Read", "Glob", "Grep", "Bash", "Edit", "Write"],
+        # ZgQuery FIRST in the list, and declared as a tool rather than left as
+        # prose in the policy: measured over 24 runs, a worker told about `zg`
+        # in velo-impl.md used it 0 times, while an arm that DECLARED the same
+        # capability as a tool used it on every run (#2075).
+        allowed_tools=["ZgQuery", "Read", "Glob", "Grep", "Bash", "Edit", "Write"],
+        tools=[ZgQueryTool()],
         permission_mode="bypassPermissions",
         env=worker_env(bash_timeout_ms),
         max_turns=max_turns,

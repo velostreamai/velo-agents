@@ -65,6 +65,9 @@ echo
 echo "── runner path resolution ─────────────────────────────"
 bash "$HERE/test_runner_path.sh" || RC=1
 echo
+echo "── zg discovery tool ──────────────────────────────────"
+"$PY" "$HERE/test_zg_tool.py" || RC=1
+echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
 
