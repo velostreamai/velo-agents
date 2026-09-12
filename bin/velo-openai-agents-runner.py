@@ -59,6 +59,9 @@ import velo_oai_tools as T  # noqa: E402
 # `open_agent_sdk`, which is not installed on this runtime's venv, and would
 # couple the supported runner to the one being retired.
 from velo_skills import apply_skills  # noqa: E402
+# Salvage is SDK-agnostic — pure git plus a transcript dump — so both runtimes
+# share ONE implementation rather than each growing its own half-working copy.
+from velo_runner_lib import salvage_on_failure  # noqa: E402
 
 set_tracing_disabled(True)
 
@@ -148,6 +151,18 @@ class Logger:
             self.fh.write(line + "\n"); self.fh.flush()
 
 
+class BudgetExceeded(Exception):
+    """Raised from the usage hook to stop a run that has spent its budget.
+
+    Raised rather than flagged, because there is no cooperative stopping point:
+    `Runner.run` owns the loop, and a flag would only be noticed after however
+    many further turns it chose to take. The incumbent checks
+    `self._total_cost >= config.max_budget_usd` at the top of each of its own
+    turns (engine.py:207) and returns ERROR_MAX_BUDGET; this is the equivalent at
+    the only point this runtime hands control back.
+    """
+
+
 class Hooks(RunHooks):
     """Emits the incumbent's log lines, and accumulates usage per LLM call.
 
@@ -156,10 +171,17 @@ class Hooks(RunHooks):
     return value loses every token for exactly the runs that burned the most.
     """
 
-    def __init__(self, logger: Logger, label: str):
+    def __init__(self, logger: Logger, label: str, max_budget_usd: float | None = None):
         self.log, self.label = logger, label
+        self.max_budget_usd = max_budget_usd
         self.inp = self.out = self.cached = self.turns = 0
         self.cost = 0.0
+        # Accumulated here because `Runner.run` RAISES on max_turns and on a
+        # model error, and the conversation goes with it — there is no result
+        # object to read afterwards. The incumbent could reach
+        # `agent._engine.messages` in memory at the moment it was killed; this
+        # is the equivalent, and the only chance anyone gets at these turns.
+        self.transcript: list[dict] = []
 
     async def on_llm_end(self, context, agent, response) -> None:
         self.turns += 1
@@ -170,6 +192,14 @@ class Hooks(RunHooks):
             d = getattr(u, "input_tokens_details", None)
             if d:
                 self.cached += getattr(d, "cached_tokens", 0) or 0
+        for item in (getattr(response, "output", None) or []):
+            self.transcript.append({
+                "turn": self.turns,
+                "type": getattr(item, "type", "?"),
+                "name": getattr(item, "name", None),
+                "arguments": getattr(item, "arguments", None),
+                "text": getattr(item, "content", None) and str(item.content)[:4000],
+            })
         calls = [o for o in (getattr(response, "output", None) or [])
                  if getattr(o, "type", "") == "function_call"]
         if calls:
@@ -181,8 +211,28 @@ class Hooks(RunHooks):
         else:
             self.log.emit(f"[{self.label}] sdk assistant text_len=0")
 
+        # LAST, deliberately. Raising before the usage and transcript are
+        # recorded threw away the very turn salvage exists to preserve: the first
+        # live test reported `no in-memory transcript to dump` and
+        # `input_tokens=0` on a run that had plainly spent money. A stop that
+        # discards the evidence of why it stopped is worse than no stop.
+        #
+        # Checked after a call that is already billed, so the budget is a ceiling
+        # on what gets STARTED, not a guarantee of the final total — one turn's
+        # spend can cross it. Stated plainly so nobody reads it as a hard cap.
+        spent = hooks_ref["cost"]
+        if self.max_budget_usd is not None and spent >= self.max_budget_usd:
+            self.log.emit(f"[{self.label}] BUDGET EXHAUSTED spent=${spent:.6f} "
+                          f"limit=${self.max_budget_usd:.6f} — stopping")
+            raise BudgetExceeded(f"spent ${spent:.6f} of ${self.max_budget_usd:.6f}")
+
     async def on_tool_end(self, context, agent, tool, result) -> None:
         body = result if isinstance(result, str) else str(result)
+        self.transcript.append({
+            "turn": self.turns, "type": "tool_result",
+            "name": getattr(tool, "name", "unknown"),
+            "text": body[:4000],
+        })
         # Our tools report failure in the RESULT TEXT rather than by raising, so
         # outcome must be derived from it — otherwise every call reads as ok and
         # the error rate, which is what an audit is looking for, is invisible.
@@ -210,6 +260,9 @@ async def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     ap.add_argument("--bash-timeout-ms", type=int, default=2_400_000)
     ap.add_argument("--log-file", default=None)
+    ap.add_argument("--max-budget-usd", type=float, default=None,
+                    help="Stop the run once billed spend reaches this. Unattended "
+                         "runs had NO ceiling on this runtime.")
     ap.add_argument("--base-url", default="https://openrouter.ai/api/v1")
     ap.add_argument("--skill", action="append", default=[],
                     help="Inline a skill definition ahead of the task (repeatable).")
@@ -287,7 +340,10 @@ async def main() -> int:
                          "usage": {"include": True}} if is_gateway else {})),
     )
 
-    hooks = Hooks(log, "prompt 1")
+    if a.max_budget_usd is not None and a.max_budget_usd <= 0:
+        print("ERROR: --max-budget-usd must be > 0", file=sys.stderr)
+        return 1
+    hooks = Hooks(log, "prompt 1", max_budget_usd=a.max_budget_usd)
     hooks_ref["obj"] = hooks
     log.emit("[prompt 1] sdk system event=init")
     log.emit(f"[prompt 1] start timeout_seconds={a.prompt_timeout:.0f} "
@@ -308,6 +364,8 @@ async def main() -> int:
         text = str(res.final_output or "")
     except MaxTurnsExceeded:
         status = "error_max_turns"
+    except BudgetExceeded as exc:
+        status, text = "error_max_budget", str(exc)
     except asyncio.TimeoutError:
         status = "error_timeout"
     except Exception as exc:  # surfaced, never swallowed
@@ -324,6 +382,36 @@ async def main() -> int:
         log.emit(f"[prompt 1] ERROR {status}: {text}")
 
     wall = time.time() - t0
+
+    # Salvage on ANY non-success exit. Two runs have lost all their work to a
+    # wall-clock timeout, and the defence until now was velo-dispatch refusing a
+    # brief that lacked an incremental-commit instruction — the harness ASKING
+    # the model to checkpoint. A property you need should be enforced by the
+    # system, not requested of it.
+    #
+    # Demonstrated on this very runtime: a task that completed but was never told
+    # to commit left 223 lines of finished work untracked in a worktree, one
+    # `worktree remove` away from gone.
+    #
+    # The adapter exists because salvage reads `agent._engine.messages` — the
+    # incumbent's in-memory conversation. openai-agents has no equivalent to
+    # reach for after Runner.run has raised, so the hook's accumulated transcript
+    # is presented in the same shape. One salvage implementation, two runtimes.
+    if status != "success":
+        class _TranscriptAdapter:
+            class _Engine:
+                def __init__(self, messages): self.messages = messages
+            def __init__(self, messages): self._engine = self._Engine(messages)
+
+        salvage_on_failure(
+            root=a.cwd,
+            agent=_TranscriptAdapter(hooks.transcript),
+            log_path=a.log_file or f"/tmp/velo-oai-{os.getpid()}.log",
+            reason=status,
+            read_only=read_only,
+            logger=log,
+        )
+
     if text:
         print(text.strip())
     log.emit(f"[prompt 1] sdk result status={status} turns={hooks.turns} text_len={len(text)}")

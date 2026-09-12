@@ -33,6 +33,14 @@ MIN_DISK_GB=40
 LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://192.168.1.193:1234/v1}"
 MAX_TURNS=250
 PROMPT_TIMEOUT=14400
+# A spend ceiling for every dispatch. MAX_TURNS and PROMPT_TIMEOUT bound the run
+# in turns and wall clock; neither bounds MONEY, and a worker looping on a cheap
+# model inside its turn budget can still spend without limit. Real runs land at
+# $0.006-$0.06; $5 is ~80x the dearest observed, so it stops a runaway without
+# tripping on an ordinary expensive task.
+#
+# Override per dispatch with VELO_MAX_BUDGET_USD.
+MAX_BUDGET_USD="${VELO_MAX_BUDGET_USD:-5.00}"
 
 # Every decision this script makes goes through ok/warn/die and NOWHERE else, so
 # teeing these three is a complete audit trail without touching stdout wiring.
@@ -1007,18 +1015,21 @@ case "$NAME" in
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent"
           --model "$MODEL_ID" --base-url "$LMSTUDIO_URL"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --max-budget-usd "$MAX_BUDGET_USD"
           --cwd "$WT" --task "$TASK" )
     ;;
   velo-deepseek)
     MODEL_ID='deepseek/deepseek-v4-flash-0731'
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --max-budget-usd "$MAX_BUDGET_USD"
           --cwd "$WT" --task "$TASK" )
     ;;
   velo-glm)
     MODEL_ID='z-ai/glm-5.3-flash'
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --max-budget-usd "$MAX_BUDGET_USD"
           --cwd "$WT" --task "$TASK" )
     ;;
 esac

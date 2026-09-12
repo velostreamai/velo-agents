@@ -379,7 +379,7 @@ fork, and do not assume its behaviour when reading this document.
 | `VELO_AGENT_BACKEND` | runner | interpreter | status |
 |---|---|---|---|
 | `openai-agents` *(default)* | `velo-openai-agents-runner.py` | `~/.venvs/velo-openai-agents` | **supported** |
-| `open-agent` | `velo-openrouter-agent-sdk.py` | `~/.venvs/velo-agent-sdk` | rollback only, to be deleted |
+| `open-agent` | `velo-openrouter-agent-sdk.py` | `~/.venvs/velo-agent-sdk` | **rollback only — delete after 2026-10-13** |
 
 ```bash
 VELO_AGENT_BACKEND=open-agent velo-dispatch 1234 brief.md   # back to the incumbent
@@ -395,8 +395,22 @@ too short for a transcript to accumulate.
 Both runners take the **same flags** and emit the **same log lines**, so
 `velo-record`, the gates and the tests read either one unchanged.
 
-Two runners is deliberate and TEMPORARY. Whichever loses gets deleted — a
-permanent dual path is exactly what the no-silent-fallback rule forbids.
+Two runners is deliberate and TEMPORARY, with a DATE: **delete the rollback on
+2026-10-13** — one month after the switch (2026-09-12), tracked on #2088.
+
+The date exists because "temporary" without one is how a dual path becomes
+permanent, and this repo has the receipts: a `VELO_AGENT_IMPL=legacy` escape
+hatch survived long enough to rot into a `ModuleNotFoundError`, documented as
+forbidden AND broken if used. A fallback nobody exercises is not a safety net.
+
+Deleting it means: `velo-openrouter-agent-sdk.py`, `velo-lmstudio-agent-sdk.py`,
+`velo_worker_runner.py`, `velo_sdk_patches.py`, the `open-agent` branch of this
+wrapper, and the `~/.venvs/velo-agent-sdk` venv. `velo_skills.py` and
+`velo_runner_lib.py` STAY — both runtimes share them.
+
+Extend the date only by editing this line with a reason. If the rollback has been
+used in that month, that is the reason; if it has not, the month was the test and
+it passed.
 
 **Output budget is per model and must be generous.** A reasoning model spends
 most of its budget thinking: GLM emitted 318 visible tokens out of 8,000 and the

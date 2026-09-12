@@ -21,7 +21,7 @@ RC=0
 
 ok()   { echo "  PASS  $1"; }
 bad()  { echo "  FAIL  $1"; RC=1; }
-has()  { if grep -qE "$2" <<<"$3"; then ok "$1"; else bad "$1 (no match for /$2/)"; fi; }
+has()  { if grep -qE -- "$2" <<<"$3"; then ok "$1"; else bad "$1 (no match for /$2/)"; fi; }
 
 PY=$(command -v python3)
 
@@ -110,6 +110,78 @@ has "gateway detected from the base url"      'is_gateway = "openrouter.ai" in' 
 has "provider/usage body sent ONLY to the gateway" 'if is_gateway else {}' "$SRC"
 has "a local endpoint does not require an OpenRouter key" 'LM_STUDIO_API_KEY' "$SRC"
 has "skills come from the shared module"      'from velo_skills import apply_skills' "$SRC"
+
+echo
+echo "salvage — a dying run must not lose the work it did"
+# Two runs have lost everything to a wall-clock timeout. The defence was
+# velo-dispatch refusing a brief with no incremental-commit instruction — the
+# harness ASKING the model to checkpoint. Demonstrated on this runtime: a task
+# that finished but was never told to commit left 223 lines of completed work
+# untracked, one `worktree remove` from gone.
+has "salvage is wired, not reimplemented"     'from velo_runner_lib import salvage_on_failure' "$SRC"
+has "it fires on any non-success exit"        'if status != "success"' "$SRC"
+has "read_only is passed through"             'read_only=read_only' "$SRC"
+has "a transcript is accumulated for it"      'self\.transcript' "$SRC"
+has "tool results are in the transcript"      '"type": "tool_result"' "$SRC"
+
+# The real behaviour, not just its wiring: dirty tree + failure => commit.
+STD=$(mktemp -d)/r; mkdir -p "$STD"
+git init -q "$STD"
+git -C "$STD" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+echo "work a worker produced" > "$STD/unsaved.txt"
+"$PY" - "$BIN" "$STD" >/dev/null 2>&1 <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from velo_runner_lib import salvage_on_failure
+class E: messages = [{"turn": 1, "type": "tool_result", "name": "bash"}]
+class A: _engine = E()
+salvage_on_failure(root=sys.argv[2], agent=A(), log_path="/tmp/velo-salv-test.log",
+                   reason="error_timeout", read_only=False)
+PYEOF
+if [[ "$(git -C "$STD" rev-list --count HEAD)" == "2" ]]; then ok "uncommitted work IS checkpointed on failure"
+else bad "uncommitted work was NOT checkpointed"; fi
+if [[ -z "$(git -C "$STD" status --porcelain)" ]]; then ok "the tree is clean after salvage"
+else bad "salvage left the tree dirty"; fi
+
+# A REVIEW must never be committed on its behalf: a gate that dirties the tree it
+# is reviewing is the failure READ_ONLY_DECLARATION exists to prevent.
+RTD=$(mktemp -d)/r; mkdir -p "$RTD"
+git init -q "$RTD"
+git -C "$RTD" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+echo "a review should not commit this" > "$RTD/stray.txt"
+"$PY" - "$BIN" "$RTD" >/dev/null 2>&1 <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from velo_runner_lib import salvage_on_failure
+class A: _engine = None
+salvage_on_failure(root=sys.argv[2], agent=A(), log_path="/tmp/velo-salv-ro.log",
+                   reason="error_timeout", read_only=True)
+PYEOF
+if [[ "$(git -C "$RTD" rev-list --count HEAD)" == "1" ]]; then ok "a READ-ONLY run is never committed for"
+else bad "salvage committed on behalf of a read-only run"; fi
+
+echo
+echo "budget ceiling — an unattended run had NO spend limit on this runtime"
+has "the flag exists"                       '--max-budget-usd' "$SRC"
+has "non-positive is refused"               'max_budget_usd <= 0' "$SRC"
+has "it raises rather than flagging"        'raise BudgetExceeded' "$SRC"
+has "reported as its own status"            'error_max_budget' "$SRC"
+# The ORDER is the bug this caught: raising before usage and transcript were
+# recorded threw away the turn salvage exists to preserve — the first live test
+# reported `no in-memory transcript to dump` and `input_tokens=0` on a run that
+# had plainly spent money. A stop that discards the evidence of why it stopped is
+# worse than no stop.
+if "$PY" - "$RUNNER" <<'PYEOF'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1]).read_text()
+body = src[src.index("async def on_llm_end"):src.index("async def on_tool_end")]
+usage = body.index("self.inp +=")
+trans = body.index("self.transcript.append")
+budget = body.index("BUDGET EXHAUSTED")
+sys.exit(0 if budget > usage and budget > trans else 1)
+PYEOF
+then ok "the budget check runs AFTER usage and transcript are recorded"
+else bad "the budget check runs BEFORE recording — the dying turn is lost"; fi
 
 echo
 echo "accounting conventions match the incumbent"
