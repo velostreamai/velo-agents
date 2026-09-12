@@ -1,7 +1,29 @@
 #!/bin/zsh
 set -euo pipefail
 
-SDK_PY="/Users/neilavery/.venvs/velo-openrouter-agent/bin/python"
+# The vendored SDK, not the abandoned upstream.
+#
+# Until now this pointed at ~/.venvs/velo-openrouter-agent, which installs
+# codeany-ai/open-agent-sdk-python from git at ab068156 — a repository that was
+# pushed twice, on 2026-04-01 and 04-03, and abandoned. There is no upgrade path:
+# PyPI's `open-agent-sdk` is a DIFFERENT project (slb350/open-agent-sdk) sharing
+# the name and the 0.1.0 version string, so `pip install -U` would silently swap
+# a full agent runtime for an unrelated five-file client.
+#
+# ~/.venvs/velo-agent-sdk installs velostreamai/velo-agent-sdk: the same code,
+# vendored with its history and MIT licence intact, plus the #2010 crash fixed at
+# SOURCE rather than monkey-patched. The patch fixed it by wrapping
+# _convert_response and returned False + CONTINUED if it could not apply, so a
+# change underneath it would have silently restored the crash.
+#
+# ROLLBACK: set this back to
+#   /Users/neilavery/.venvs/velo-openrouter-agent/bin/python
+# and re-run .agents/install.sh. The old venv is left in place untouched, and the
+# monkey-patches are still applied by velo_worker_runner, so the old path is
+# still fully patched. That rollback stays available ONLY while
+# install_tool_input_normalisation remains in velo_sdk_patches.py — deleting it
+# is what makes this switch one-way.
+SDK_PY="/Users/neilavery/.venvs/velo-agent-sdk/bin/python"
 SDK_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent-sdk.py"
 
 # The `VELO_AGENT_IMPL=legacy` escape hatch was REMOVED — it could not work.
