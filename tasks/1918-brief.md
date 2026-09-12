@@ -162,10 +162,22 @@ Measured at `7edba1761` across `src/`, `tests/`, `examples/`:
 `__velostream_variant`. Those are legitimate internal sentinels, **not**
 output-name placeholders. Leave all of them alone.
 
-This is a larger change than the superseded plan-only version. There is no
-5-file tripwire. **But**: if you find yourself editing a file that neither names
-an expression nor reads one of the three generators, STOP and report — that is
-the signal you are unifying more than naming.
+This is a larger change than the superseded plan-only version, so there is no
+5-file tripwire.
+
+**The scope tripwire applies to `src/` only.** If you find yourself editing a
+file under `src/` that neither names an expression nor reads one of the three
+generators, STOP and report — that is the signal you are unifying more than
+naming.
+
+It explicitly does NOT apply to work this brief REQUIRES:
+
+- anything under `tests/`, including new test files
+- the parent `mod.rs` registrations those new files need (§7)
+- `docs/sql/PARSER_GRAMMAR.md` (§7b)
+- `agent.log`
+
+Editing those is the job, not scope creep.
 
 ## 5. STOP conditions
 
@@ -178,6 +190,14 @@ STOP and report, without pushing, if:
 - any of the 48 tests in §3e requires a **changed expectation** rather than
   passing unmodified — report it with the argument for why the old behaviour was
   wrong, per the correctness-over-parity rule, and do not change it unilaterally
+- **any of the six `fail_to_pass` tests PASSES against unfixed code.** You cannot
+  record the required `RED-FIRST` line (§7a) for a test that was never red, and
+  you must not "fix" it by loosening the test until it fails. One of two things
+  is true and only a human should decide which: the test does not reach the code
+  path it claims to (the exact defect §7a describes — the prior attempt's
+  group-by test built `Aggregate` with empty `select_exprs`/`alias_keys` and so
+  tested nothing), or the behaviour already holds and the spec's premise is
+  wrong for that bar. Report which you believe, with the test and its output.
 - the `__group__` fix cannot be made without changing the output name of a
   `SelectField::AliasedColumn`, or of a GROUP BY key that carries an explicit
   `AS` alias — those two names must come out of this change byte-identical

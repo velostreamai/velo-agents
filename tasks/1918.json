@@ -103,7 +103,8 @@
     "New tests are registered in the parent mod.rs",
     "docs/sql/PARSER_GRAMMAR.md documents the generated-name rule alongside the select_item production (issue #1918 acceptance bar 4) \u2014 this is a REQUIRED doc change, distinct from the forbidden corpus-editing below. It must describe the SHIPPED behaviour, including that the name holds at execution.",
     "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed",
-    "Each of the six fail_to_pass tests was written BEFORE the fix, run red, and its failure recorded in agent.log as a RED-FIRST line carrying the actual assertion message. None of the six exists on master, so a test written after the fix proves only that the code does what it does. The earlier attempt at this issue shipped a group-by test that passed both before and after the change because it constructed Aggregate with empty select_exprs/alias_keys and never reached the path it claimed to cover."
+    "Each of the six fail_to_pass tests was written BEFORE the fix, run red, and its failure recorded in agent.log as a RED-FIRST line carrying the actual assertion message. None of the six exists on master, so a test written after the fix proves only that the code does what it does. The earlier attempt at this issue shipped a group-by test that passed both before and after the change because it constructed Aggregate with empty select_exprs/alias_keys and never reached the path it claimed to cover.",
+    "If any of the six fail_to_pass tests passes against unfixed code, STOP and report rather than loosening the test until it fails. Either the test does not reach the path it claims to cover, or the bar's premise is wrong \u2014 a human decides which."
   ],
   "forbidden": [
     "No collision handling: the naming helper and its callers must not consult any collection of already-used names \u2014 no HashSet/HashMap/Vec::contains of prior names, no numeric suffix appended to a generated name, no retry loop on a name. EXPR$<n> derives from position ALONE. #1919 owns duplicate detection.",
@@ -115,7 +116,8 @@
     "Do not change the EXPR$ prefix or the $<n> form.",
     "If the diff touches build_plan_alias_keys it must also touch the runtime readers in the same commit \u2014 select.rs::get_expression_name, accumulator.rs::generate_field_name, or their call sites in processors/select/group_by.rs and processors/group_by_columnar.rs. Producer-alone is the one-sided edit that failed 48 tests.",
     "Preserve explicit-alias behaviour exactly: the output name of a SelectField::AliasedColumn, and of a GROUP BY expression that select_alias_for_group_expr matches to an AS-aliased SELECT item, must be unchanged. Those two cases are the WHOLE of what this entry covers; no wider notion of adjacent alias defects is implied. group_by_aliased_key_schema_carries_alias_not_raw_name and two_stage_aggregate_resolves_aliased_group_by_key are in pass_to_stay as the check. STOP and report if fixing __group__ appears to require changing alias behaviour.",
-    "Do not change a public signature with callers outside plan/ and execution/ \u2014 STOP and report instead."
+    "Do not change a public signature with callers outside plan/ and execution/ \u2014 STOP and report instead.",
+    "Do not apply the scope tripwire to required work: edits under tests/, the parent mod.rs registrations, docs/sql/PARSER_GRAMMAR.md, and agent.log are mandatory, not scope creep. The tripwire covers src/ only."
   ],
   "reviewed": {
     "by": null,
