@@ -24,7 +24,31 @@ set -euo pipefail
 # install_tool_input_normalisation remains in velo_sdk_patches.py — deleting it
 # is what makes this switch one-way.
 SDK_PY="/Users/neilavery/.venvs/velo-agent-sdk/bin/python"
-SDK_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent-sdk.py"
+
+# #2079: resolve the runner NEXT TO THIS SCRIPT, not at an absolute installed
+# path. This line used to read
+#     SDK_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent-sdk.py"
+# which meant a worktree copy of .agents/bin still exec'd the INSTALLED runner —
+# so every `.agents/bin` change tested through this wrapper from a worktree was
+# silently testing the wrong file. Verifying the tool-argument logging in #2074,
+# the first live run printed `names=Grep` with no arguments and looked exactly
+# like a feature that did not work. It worked; the run was old code. That
+# failure mode invites debugging the wrong thing.
+#
+# VELO_AGENTS_BIN overrides it for the deliberate "run the installed one" case.
+# $0, not ${BASH_SOURCE[0]} — this script is #!/bin/zsh, where BASH_SOURCE does
+# not exist. Under `set -u` the first cut died on it; without `set -u` it would
+# have expanded to empty and resolved the runner against the CURRENT DIRECTORY,
+# silently exec'ing whatever happened to sit there. That is the same
+# silent-wrong-resolution class this fix exists to remove, so the test pins it.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SDK_AGENT="${VELO_AGENTS_BIN:-$HERE}/velo-openrouter-agent-sdk.py"
+
+if [ ! -f "$SDK_AGENT" ]; then
+    echo "[velo-openrouter-agent] runner not found: $SDK_AGENT" >&2
+    echo "[velo-openrouter-agent] set VELO_AGENTS_BIN to the directory holding it" >&2
+    exit 1
+fi
 
 # The `VELO_AGENT_IMPL=legacy` escape hatch was REMOVED — it could not work.
 #
@@ -38,5 +62,7 @@ SDK_AGENT="/Users/neilavery/.agents/bin/velo-openrouter-agent-sdk.py"
 # someone hitting an SDK problem would set it expecting relief and get a
 # confusing import error instead. A fallback that cannot run is worse than no
 # fallback. One path, per the project's no-silent-fallback rule.
-echo "[velo-openrouter-agent] implementation=sdk" >&2
+# Which runner ran is part of the run's evidence (#2076): an operator debugging
+# "my change didn't take" must be able to see which file was executed.
+echo "[velo-openrouter-agent] implementation=sdk runner=$SDK_AGENT" >&2
 exec "$SDK_PY" "$SDK_AGENT" "$@"
