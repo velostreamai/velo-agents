@@ -213,6 +213,20 @@ stops complaining is forbidden; writing prose that **documents** the new
 behaviour is the job. If you find yourself changing a ```sql fence, stop and
 re-read this paragraph.
 
+## 7b. Commit incrementally
+
+Commit after each logical step, not once at the end. A timeout or crash must
+never lose completed work. Small commits are expected and will be squashed at
+merge; do NOT wait until everything is done and validated. If you are about to
+start a long step — a full gate run, a multi-file edit — commit what you already
+have FIRST.
+
+Two prior runs died on a prompt timeout with all their work uncommitted in the
+worktree, and restarted from zero.
+
+This does not loosen §8: commit freely on your own branch, but do not push, open
+a PR, or merge.
+
 ## 8. Forbidden
 
 - Do not add a suffix-bump or any collision workaround (§3d).
