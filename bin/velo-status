@@ -206,7 +206,38 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
   # One directory per issue, so this no longer enumerates worker tags. The old
   # glob hardcoded {deepseek,glm,velo-local} and would silently miss any worker
   # added later — it returned nothing for worker:codex runs.
-  LOG=$(ls -t "$VELO_STATE/dispatch/$ISSUE"/*.log 2>/dev/null | head -1)
+  #
+  # The directory holds TWO kinds of file and only one of them is a runner log
+  # (#2112). `velo-dispatch` writes its own `dispatch-<UTC>.log` bookkeeping —
+  # after the runner starts, and again at exit — plus `zg-index.log`. Taking the
+  # newest `*.log` therefore picked a dispatch log most of the time, and every
+  # signal below is derived from whatever this returns:
+  #
+  #   exit_record_for could never match  — the record names the RUNNER log, so
+  #     the #2101 backstop was dead and the state fell out of a dispatch log's
+  #     mtime
+  #   the LEAKED / failed greps ran over a file that cannot contain their
+  #     markers, so a genuinely leaked or crashed run read as clean
+  #   the age column measured dispatch's last write, not the worker's
+  #
+  # It showed as worker `dispatch` in the table — a name no worker has. The
+  # three things this tool exists to report were all being read off the wrong
+  # file, and it looked fine.
+  #
+  # Excluding by name rather than selecting by a worker whitelist keeps the
+  # #2101 property above: a worker tag nobody has added yet still matches.
+  #
+  # The exclusion is the dispatcher's EXACT filename shape, not the `dispatch-`
+  # prefix (#2113 review). `dispatch-[^/]*` would also swallow a runner log from
+  # any future LOGTAG beginning with those letters, leaving the worktree `idle`
+  # despite a live worker — which is the forward-compatibility this whole
+  # selection was written to preserve, defeated by the fix for it.
+  #
+  # The shapes differ reliably: bookkeeping is `dispatch-<UTC>.log`, a runner log
+  # is `<tag>-<UTC>-<pid>.log` since #2101, so the trailing `-<pid>` keeps even a
+  # literal `dispatch` LOGTAG distinguishable.
+  LOG=$(ls -t "$VELO_STATE/dispatch/$ISSUE"/*.log 2>/dev/null \
+        | grep -vE '/(dispatch-[0-9]{8}T[0-9]{6}Z|zg-index)\.log$' | head -1)
   WORKER="-"
   if [[ -n "$PID" ]]; then
     # A worker IS running: name it from the live process, not from a log glob.
