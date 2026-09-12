@@ -973,7 +973,15 @@ gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1
 # `>`, so a re-dispatch truncated the log the PREVIOUS record cites — and
 # velo-record derives turns, status, leaked calls and the whole cost block from
 # it, so a post-mortem silently read the newer run's numbers (#2012 M3).
-LOG="$VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-$(date -u +%Y%m%dT%H%M%SZ).log"
+#
+# The pid suffix makes the name collision-free (#2102 review). The timestamp is
+# second-resolution and there is no launch lock, so two dispatches of one issue
+# starting in the same second produced the SAME filename — and `velo-status`
+# identifies a run BY its log, so the first run's exit record would mark the
+# still-live second run as `done`. That is the same class of confident-wrong-state
+# bug as #2101 itself, reached by a different route. Fixed at the source: a run
+# identity that can collide cannot be disambiguated by any consumer downstream.
+LOG="$VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 # Tell the worker whether the index EXISTS for this run.
 #
 # Without this the worker learns by failing: it runs `zg query`, gets

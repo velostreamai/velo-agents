@@ -38,17 +38,130 @@ RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m
 
 # Map a running worker process -> the issue number in its --cwd.
 #
-# The supervisor wrapper (#1992) carries the runner's whole argv in its own
-# command line, so a bare pgrep now matches BOTH it and the runner — and the
-# supervisor, forked first, has the lower pid and won `head -1`. That mislabels
-# nothing today, but the pid printed by velo-dispatch is the one a human reaches
-# for with `kill`, and killing the supervisor orphans the runner AND guarantees
-# no record is ever written. Exclude the wrapper explicitly.
+# EVERY worker transport must appear in the pattern below. It listed only the
+# Python runners, so `worker:codex` never matched and PID came back empty —
+# which the STATE logic further down read as "not running" and reported as
+# `done` with 0 commits one minute into a live 800s run (#2101). codex is not a
+# velo-*-agent-sdk.py and spells the flag `--cd`, not `--cwd`: two independent
+# misses, either one enough to lose the run. The LOG glob below already carries
+# a comment about exactly this omission — that fix was applied there, not here.
+#
+# Wrappers must be shed so the pid returned is the one a human can `kill`:
+# killing a wrapper orphans the runner AND guarantees no record is ever written.
+# Each transport nests differently — the Python runners sit under the #1992
+# `bash -c` supervisor, codex adds a `timeout <n> codex exec` frame carrying the
+# same argv — and every wrapper is forked before the runner, so it holds the
+# lower pid and would win `head -1`.
+#
+# Reads a `ps` snapshot rather than `pgrep -af`, because on macOS `pgrep -a` is
+# a no-op: it prints bare pids with no command text, so the exclusions filtered
+# nothing and #1992's supervisor shedding has in fact never worked on this
+# platform. `-ww` defeats ps's terminal-width truncation, which would otherwise
+# cut the argv before `--cd` on a narrow terminal and lose the match.
+#
+# The snapshot lands in a variable rather than piping straight into grep: in a
+# pipeline both processes start together, so grep's own argv — which contains
+# this very pattern, worktree path and all — can appear in the snapshot and
+# match itself.
+#
+# The worktree path is ERE-ESCAPED before interpolation (#2102 review). It was
+# spliced in raw, and a path is DATA, not pattern: under a home directory like
+# `/Users/a+b/...` the `+` made the preceding character optional-repeat, so the
+# helper did not match its own literal runner path but DID match `/Users/ab/...`.
+# Either way the result is a confident wrong answer — an empty PID reads as
+# "not running" and reports a live worker as done, which is the whole bug this
+# helper was fixed for. `$HOME` is outside our control, so escaping is the fix
+# rather than assuming worktree names stay tame.
+ere_escape() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|\/]/\\&/g'; }
+
 running_pid_for() {
-  local wt="$1"
-  pgrep -af "velo-(openrouter-agent-sdk|lmstudio-agent-sdk)\.py.*--cwd $wt( |$)" 2>/dev/null \
-    | grep -v '^[0-9]\{1,\} bash -c' \
+  local wt snap
+  wt=$(ere_escape "$1")
+  snap=$(ps -axww -o pid=,command= 2>/dev/null)
+  printf '%s\n' "$snap" \
+    | grep -E "velo-(openrouter-agent-sdk|lmstudio-agent-sdk)\.py.*--cwd $wt( |$)|codex exec .*--cd $wt( |$)" \
+    | grep -vE '^[[:space:]]*[0-9]+[[:space:]]+(bash -c|timeout )' \
     | awk '{print $1}' | head -1
+}
+
+# Did THIS run exit? The supervisor writes one record row per exit — including
+# crash and timeout — carrying the runner log it ran against, so the row naming
+# this log is positive proof the run is over. Matched on the log, not just the
+# issue, so a re-dispatch cannot inherit the previous run's record and report a
+# fresh run as finished. Empty output = no exit recorded for this log.
+#
+# Compares the DECODED `log` field, not a substring of the raw line (#2102
+# review, both rounds). Two separate defects sit on the naive approaches:
+#
+#   basename substring — unanchored, so a log name that is a prefix of another
+#   cross-matches, and a false match here reports a LIVE run as finished.
+#
+#   raw `"log":"<path>"` grep — `velo-record` serialises with `json.dumps`,
+#   whose default `ensure_ascii` renders any non-ASCII path as `\uXXXX`, and
+#   which escapes `\` and `"`. So the string on disk is not the string we hold.
+#   An accented character anywhere in $HOME — hardly exotic — makes the grep
+#   never match, and a FINISHED run then reports as live forever.
+#
+# Parsing is the only approach that does not depend on a guess about escaping.
+# It costs one interpreter start per worktree on a branch of the state logic
+# that is already the uncommon case; a status tool that lies is worth more than
+# 50ms.
+#
+# This is only sound because the log name is collision-free per run: two
+# dispatches of one issue starting in the same second used to produce the SAME
+# second-resolution filename, so the first run's exit record would suppress
+# `live?` on the still-running second one. `velo-dispatch` now appends its pid
+# — fixed there rather than papered over here, since no amount of matching can
+# separate two runs that share an identity.
+exit_record_for() {
+  # Separate `local` statements: bash declares every name in a single `local`
+  # before assigning any, so a later RHS referencing an earlier name on the same
+  # line reads the shadowing-but-unset local and trips `set -u`.
+  local issue="$1" log="$2"
+  local res="$ROOT/.agents/tasks/${issue}.result.jsonl"
+  local out rc
+  [[ -f "$res" ]] || return 0
+  # Return code is LOAD-BEARING and distinct from the output (#2102 review):
+  #
+  #   0 + output  a record exists — the run has exited
+  #   0 + empty   no record — determined, not guessed
+  #   2           COULD NOT DETERMINE
+  #
+  # The third case used to be indistinguishable from the second. `2>/dev/null`
+  # plus an empty stdout meant an absent python3 (rc 127) or an unreadable
+  # record file read as "no record", which the caller renders as `live?` — a
+  # finished run shown as running, on evidence that never existed. That is the
+  # error-swallowing this repo's policy forbids, and it defeats the purpose of a
+  # tool whose whole job is not lying about liveness.
+  #
+  # stderr is deliberately NOT redirected: the interpreter's own message is the
+  # diagnostic, and it belongs in front of whoever is reading the table.
+  #
+  # A malformed ROW is different, and is still skipped rather than fatal: the
+  # record file is append-only and a crashed writer can leave a partial last
+  # line. Skipping errs toward `live?` over a false `done`, which is the safe
+  # direction for a row we can genuinely not parse.
+  out=$(python3 -c '
+import json, sys
+path, want = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (row.get("runner") or {}).get("log") == want:
+            print(line)
+            break
+' "$res" "$log"); rc=$?
+  if (( rc != 0 )); then
+    printf '%s\n' "velo-status: cannot read $res (python3 exit $rc) — liveness for issue $issue is UNKNOWN, not live" >&2
+    return 2
+  fi
+  printf '%s' "$out"
 }
 
 # Issue titles, fetched ONCE and in PARALLEL before the table is drawn.
@@ -104,6 +217,7 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
       *deepseek/deepseek*)  WORKER="deepseek" ;;
       *z-ai/glm*)           WORKER="glm" ;;
       *lmstudio-agent-sdk*) WORKER="velo-local" ;;
+      *"codex exec"*)       WORKER="codex" ;;
       *)                    WORKER="running?" ;;
     esac
   elif [[ -n "$LOG" ]]; then
@@ -115,9 +229,22 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
     # "-<issue>" onward, which was right when logs were /tmp/deepseek-1898.log
     # and became a NO-OP the moment they moved: nothing matched, so the entire
     # filename became the worker name and velo-status printed "codex-20260" for
-    # a codex run. Take everything before the LAST hyphen instead — that keeps
-    # multi-hyphen names like velo-local intact.
-    BN=$(basename "$LOG" .log); WORKER="${BN%-*}"
+    # a codex run.
+    #
+    # Now strips the SHAPE of the suffix rather than counting hyphens. `${BN%-*}`
+    # took everything before the last hyphen, which was correct for exactly one
+    # log-name format — and this same commit adds a `-$$` disambiguator, so the
+    # count changed and `glm-20260101T000000Z-1234` would have rendered as the
+    # worker `glm-20260101T000000Z`. That is the identical regression the
+    # paragraph above describes, reintroduced by a change two files away, which
+    # is precisely why positional parsing does not belong here.
+    #
+    # An anchored pattern also FAILS VISIBLY: a name that does not end in
+    # `-<UTC>-<pid>` is left whole rather than silently truncated at the wrong
+    # place, so the table shows something obviously odd instead of something
+    # plausibly wrong. Multi-hyphen worker names like velo-local survive.
+    BN=$(basename "$LOG" .log)
+    WORKER=$(sed -E 's/-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$//' <<<"$BN")
   fi
 
   if [[ -n "$PID" ]]; then
@@ -129,6 +256,27 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
       STATE_W=LEAKED; STATE_C="$RED"
     elif grep -qE "^ERROR:|exceeded [0-9]+s|Traceback" <<<"$TAIL"; then
       STATE_W=failed; STATE_C="$RED"
+    elif REC=$(exit_record_for "$ISSUE" "$LOG"); (( $? == 2 )); then
+      # The record check itself failed — python3 missing, file unreadable. We do
+      # not know whether this run is alive, and `live?`/`done` both assert
+      # something we cannot support. A separate state keeps the tool honest;
+      # exit_record_for has already printed the reason to stderr.
+      STATE_W='?'; STATE_C="$RED"
+    elif [[ -z "$REC" && -n "$(find "$LOG" -mmin -10 2>/dev/null)" ]]; then
+      # Backstop for the NEXT transport nobody adds above (#2101).
+      #
+      # `done` here is an inference from the absence of a crash marker, and a
+      # live mid-write log has no crash marker either — so an unrecognised
+      # worker reads as cleanly finished. Two facts separate the cases: the
+      # supervisor writes an exit record on EVERY exit including crash and
+      # timeout, and a finished run's log stops growing. No record AND a log
+      # touched in the last 10 minutes means something is still writing it.
+      #
+      # Deliberately NOT "no record => not done": most historical logs predate
+      # the record (#1992) or belong to runs killed outside the supervisor, and
+      # measured over the current dispatch dirs that rule would repaint 8 of 12
+      # rows. The recency clause confines this to the one ambiguous case.
+      STATE_W='live?'; STATE_C="$YEL"
     else
       STATE_W=done; STATE_C="$DIM"
     fi
@@ -265,6 +413,8 @@ fi
 
 echo
 echo "${YEL}n!${OFF} = commits not yet pushed   ${RED}LEAKED${OFF} = tool calls emitted as text, never ran"
+echo "${YEL}live?${OFF} = no exit record and the log is still moving — a worker this build cannot see"
+echo "${RED}?${OFF}     = liveness UNKNOWN: the record check itself failed (reason on stderr)"
 echo "AGENT-LOG = lines, age of last entry, flags: S=STOP  F=FINDING  C=CORRECTION  ${RED}!${OFF}=SECURITY/DATA-LOSS"
 echo "${YEL}yellow age${OFF} = running, but no log entry for 10m+ — wedged, OR not writing the"
 echo "             heartbeats the policy requires. Both mean the report will be thin."
