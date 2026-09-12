@@ -311,6 +311,25 @@ stops complaining is forbidden; writing prose that **documents** the new
 behaviour is the job. If you find yourself changing a ```sql fence, stop and
 re-read this paragraph.
 
+## 7b-bis. How to hand conclusions back — you do not open the PR
+
+Two acceptance bars require you to STATE a conclusion, and §8 forbids you opening
+a PR. `agent.log` and your final report are the handoff; the caller copies them
+into the PR body.
+
+Write both of these as their own lines in `agent.log`, and repeat them verbatim
+in your final report:
+
+    <UTC> ALIAS-KEYS | mode=<preserve|migrate> | verified-by=<test names or command>
+    <UTC> CHANGED-EXPECTATION | test=<name> | why-old-was-wrong=<one line>
+
+The second appears once per test whose expectation you changed — and per §5 you
+should be reporting rather than changing most of them. Zero
+`CHANGED-EXPECTATION` lines is the expected outcome.
+
+A conclusion that exists only in your head, or only in a commit message body, is
+lost: the caller writes the PR from `agent.log` and your report.
+
 ## 7c. Commit incrementally — and why this does not violate CLAUDE.md
 
 Root `CLAUDE.md` opens with "DO NOT commit changes unless the user has explicitly
