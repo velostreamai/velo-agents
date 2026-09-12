@@ -1,0 +1,82 @@
+{
+  "issue": 1918,
+  "worker": "codex",
+  "design": "pinned",
+  "verified_against": "1126b36a4",
+  "evidence": "code",
+  "audit": "n/a",
+  "depends_on": [],
+  "anchors": [
+    {
+      "file": "src/velostream/sql/plan/builder.rs",
+      "symbol": "FieldName::from(\"__expr__\")",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/builder.rs",
+      "symbol": "fn select_fields_to_project_exprs",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/schema_propagation.rs",
+      "symbol": "FieldName::from(\"__expr__\")",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/schema_propagation.rs",
+      "symbol": "FieldName::from(\"__group__\")",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/schema_propagation.rs",
+      "symbol": "pub fn schema_from_select_fields",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/plan/schema_propagation.rs",
+      "symbol": "fn expr_output_name",
+      "expect": 1
+    }
+  ],
+  "blast_radius": {
+    "pattern": "__expr__",
+    "files": 2,
+    "refs": 2
+  },
+  "tests": {
+    "fail_to_pass": [
+      "unaliased_computed_items_get_positional_expr_names",
+      "group_by_expression_key_gets_a_positional_name",
+      "plan_schema_and_project_exprs_agree_on_unaliased_expression_names"
+    ],
+    "pass_to_stay": [
+      "group_by_aliased_key_schema_carries_alias_not_raw_name",
+      "two_stage_aggregate_resolves_aliased_group_by_key"
+    ],
+    "known_red": []
+  },
+  "acceptance": [
+    "No occurrence of the string __expr__ or __group__ remains in src/",
+    "An unaliased SELECT item whose expression is not a column reference is named EXPR$<n>, n = zero-based position in the select list",
+    "A GROUP BY key that is not a column reference is named by the same generator, positionally within the GROUP BY list",
+    "builder.rs::select_fields_to_project_exprs and schema_propagation.rs::schema_from_select_fields call ONE shared naming helper; neither has a private copy of the match arm",
+    "An unaliased SelectField::Expression holding a plain column reference resolves to its bare column name at BOTH sites (today schema_propagation.rs returns __expr__ for this case and builder.rs does not)",
+    "No collision handling is added: no suffix bump, no rename, no duplicate detection \u2014 a comment at the generator records that #1919 owns that check",
+    "New tests are registered in the parent mod.rs",
+    "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed"
+  ],
+  "forbidden": [
+    "do not add a suffix-bumping or any other collision workaround",
+    "do not implement NB-005 duplicate-output-name detection \u2014 that is #1919",
+    "do not touch __exists__, __raw__, or __velostream_variant \u2014 legitimate sentinels, not output-name placeholders",
+    "do not edit any file under docs/ or demo/ to make a gate pass",
+    "do not add #[cfg(test)] or #[test] inside src/",
+    "do not delete, skip, #[ignore] or narrow any existing test",
+    "do not change a public signature with callers outside plan/ \u2014 STOP and report instead"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-12T17:16:30Z",
+    "brief_sha256": "221993c8410fd0fe9cdb5fa4334759c12499fa400aefd93512542ef8b01f52c4"
+  }
+}
