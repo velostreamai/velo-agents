@@ -59,6 +59,9 @@ echo
 echo "── runner accounting ──────────────────────────────────"
 "$PY" "$HERE/test_runner_accounting.py" || RC=1
 echo
+echo "── tool-input logging ─────────────────────────────────"
+"$PY" "$HERE/test_tool_input_log.py" || RC=1
+echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
 

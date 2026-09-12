@@ -513,6 +513,84 @@ def result_succeeded(result: PromptOutcome) -> bool:
     return result.saw_result and result.status == SDKResultStatus.SUCCESS
 
 
+# Tool-input logging: what a worker SEARCHED FOR, not just how often.
+#
+# The log recorded `tool start names=Grep,Grep` and discarded the arguments, so a
+# worker could grep twelve times and the log would say only that it grepped
+# twelve times. That is the "verify from evidence, not the self-report" rule
+# failing at the one layer where a worker actually acts — and it made two agent
+# runtimes impossible to compare like for like, because only one of them had
+# instrumented tools.
+#
+# Three rules, because a tool input is not a safe thing to log verbatim:
+#
+#   1. BULK CONTENT IS ELIDED, never printed. A Write carries a whole file and an
+#      Edit carries both sides of a replacement; those would bury the log and
+#      could dump source into it. Rendered as `[N chars]`, after curl's
+#      `[N bytes data]` — the size is the useful part, the body is not.
+#   2. IDENTIFYING PARAMS ARE KEPT, truncated. `pattern`, `path`, `command`,
+#      `file_path` are the audit trail; they are what makes a run reviewable.
+#   3. ANYTHING THAT LOOKS LIKE A SECRET IS REDACTED. A worker can read a .env or
+#      echo a token, and that value must not be copied into a log that is kept,
+#      shipped to velo-record, and read by a human later.
+_TOOL_INPUT_ELIDE_KEYS = frozenset({
+    "content", "new_string", "old_string", "file_text", "replacement", "text",
+})
+_TOOL_INPUT_SECRET_KEYS = ("key", "token", "secret", "password", "passwd", "auth", "credential")
+_TOOL_INPUT_SECRET_VALUE = re.compile(
+    r"(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{12,}|xox[abpsr]-[A-Za-z0-9-]{10,})"
+)
+_TOOL_INPUT_MAX_VALUE = 160
+_TOOL_INPUT_MAX_LINE = 400
+
+
+def summarise_tool_input(raw: Any) -> str:
+    """One line describing a tool call's arguments, safe to keep.
+
+    Grep(pattern="merge_left_with_nulls", path="src/")
+    Write(file_path="x.rs", content=[4096 chars])
+    Bash(command="export TOKEN=[redacted]")
+    """
+    if not isinstance(raw, dict) or not raw:
+        return ""
+    parts: list[str] = []
+    for key, value in raw.items():
+        lowered = str(key).lower()
+        if lowered in _TOOL_INPUT_ELIDE_KEYS and isinstance(value, str):
+            parts.append(f"{key}=[{len(value)} chars]")
+            continue
+        if any(s in lowered for s in _TOOL_INPUT_SECRET_KEYS):
+            parts.append(f"{key}=[redacted]")
+            continue
+        rendered = value if isinstance(value, str) else repr(value)
+        rendered = _TOOL_INPUT_SECRET_VALUE.sub("[redacted]", rendered)
+        # A newline would break the one-event-per-line contract every reader of
+        # these logs relies on, including velo-record's greps.
+        rendered = rendered.replace("\n", "\\n").replace("\r", "")
+        if len(rendered) > _TOOL_INPUT_MAX_VALUE:
+            rendered = rendered[:_TOOL_INPUT_MAX_VALUE] + f"…[+{len(rendered) - _TOOL_INPUT_MAX_VALUE} chars]"
+        parts.append(f'{key}="{rendered}"' if isinstance(value, str) else f"{key}={rendered}")
+    line = ", ".join(parts)
+    if len(line) > _TOOL_INPUT_MAX_LINE:
+        line = line[:_TOOL_INPUT_MAX_LINE] + "…"
+    return line
+
+
+def assistant_tool_calls(event) -> list[tuple[str, str]]:
+    """(name, summarised input) for each tool_use block on an assistant event."""
+    message = getattr(event, "message", None)
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        return []
+    return [
+        (block["name"], summarise_tool_input(block.get("input")))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str)
+    ]
+
+
 def assistant_tool_names(event) -> list[str]:
     message = getattr(event, "message", None)
     if not isinstance(message, dict):
@@ -536,7 +614,10 @@ def log_sdk_event(logger: WorkerLogger, label: str, event) -> None:
         tool_names = assistant_tool_names(event)
         text_length = len(getattr(event, "text", "") or "")
         if tool_names:
-            logger.emit(f"[{label}] tool start names={','.join(tool_names)}")
+            calls = assistant_tool_calls(event)
+            detail = "  ".join(f"{n}({a})" if a else f"{n}()" for n, a in calls)
+            logger.emit(f"[{label}] tool start names={','.join(tool_names)}"
+                        + (f" | {detail}" if detail else ""))
         else:
             logger.emit(f"[{label}] sdk assistant text_len={text_length}")
     elif event.type == SDKMessageType.TOOL_RESULT:
