@@ -178,7 +178,9 @@ STOP and report, without pushing, if:
 - any of the 48 tests in §3e requires a **changed expectation** rather than
   passing unmodified — report it with the argument for why the old behaviour was
   wrong, per the correctness-over-parity rule, and do not change it unilaterally
-- the `__group__` fix cannot be made without touching a `#1469`-class alias defect
+- the `__group__` fix cannot be made without changing the output name of a
+  `SelectField::AliasedColumn`, or of a GROUP BY key that carries an explicit
+  `AS` alias — those two names must come out of this change byte-identical
 
 ## 6. SQL syntax
 
@@ -236,6 +238,27 @@ superseded PR already proved, and it is exactly what missed this defect.
 in `fail_to_pass` for that reason. Cover the windowed, grouped, and interval-join
 shapes too.
 
+### Red-first is REQUIRED, and must be recorded
+
+None of the six `fail_to_pass` tests exists on `origin/master` — you are writing
+all of them. A test written after the fix proves only that the code does what it
+does. So for **each** of the six:
+
+1. Write the test FIRST, against unfixed code.
+2. Run it and capture the failure — the assertion message, not just "it failed".
+3. Append to `agent.log`:
+
+       <UTC> RED-FIRST | test=<name> | failed-with=<one-line assertion message>
+
+4. Make the change, re-run, confirm green.
+
+A `fail_to_pass` name with no `RED-FIRST` line in `agent.log` is a brief
+violation. This is not ceremony: the earlier attempt at this issue had a
+group-by test that passed both before AND after the change, because it
+constructed `Aggregate` with empty `select_exprs`/`alias_keys` and so never
+reached the code path it claimed to cover. Red-first is what exposes that class
+of test, and nothing else does.
+
 ## 7b. Required documentation
 
 `docs/sql/PARSER_GRAMMAR.md` must document the generated-name rule alongside the
@@ -247,7 +270,23 @@ stops complaining is forbidden; writing prose that **documents** the new
 behaviour is the job. If you find yourself changing a ```sql fence, stop and
 re-read this paragraph.
 
-## 7c. Commit incrementally
+## 7c. Commit incrementally — and why this does not violate CLAUDE.md
+
+Root `CLAUDE.md` opens with "DO NOT commit changes unless the user has explicitly
+reviewed them first." **This section IS that explicit authorisation**, and it is
+the narrower, task-specific rule, so it governs. The implementation policy states
+the same precedence from the other side: "NEVER commit unless the caller's brief
+explicitly authorizes it" — a brief that authorises is the condition being met,
+not an exception being carved.
+
+The authorisation is scoped, and the scope is the whole point:
+
+- **Authorised**: `git commit` on your own dispatch branch, in your own worktree.
+- **NOT authorised**: `git push`, opening a PR, merging, committing on `master`,
+  or committing in any worktree that is not yours.
+
+So: commit freely, publish nothing. A human reviews the branch before it becomes
+a PR, which is the review `CLAUDE.md` is protecting.
 
 Commit after each logical step, not once at the end. A timeout or crash must
 never lose completed work. Small commits are expected and will be squashed at
@@ -263,22 +302,41 @@ a PR, or merge.
 
 ## 8. Forbidden
 
-- do not add a suffix-bumping or any other collision workaround
-- do not implement NB-005 duplicate-output-name detection — that is #1919
-- do not touch `__exists__`, `__raw__`, or `__velostream_variant` — legitimate
-  sentinels, not output-name placeholders
-- do not treat `__agg__` as an output-name placeholder — it surfaced alongside
-  `"expr"` in aggregate schemas during investigation and is out of scope
-- do not edit a SQL EXAMPLE under `docs/` or `demo/` to make a gate pass.
-  Updating `PARSER_GRAMMAR.md` prose to DOCUMENT the new rule is required, not
-  forbidden; the two are different acts
-- do not add `#[cfg(test)]` or `#[test]` inside `src/`
-- do not delete, skip, `#[ignore]` or narrow any existing test. The 48 tests in
-  §3e are the gate for this work, not an obstacle to it — a naming change that
-  requires silencing them has not been made correctly
-- do not change `EXPR$<n>` itself — the form is pinned and documented
-- do not route `build_plan_alias_keys` through the positional helper WITHOUT
-  migrating the runtime readers in the same change (§3e)
-- do not resolve #1469-class alias defects while sweeping `__group__`
-- do not change a public signature with callers outside `plan/` and `execution/`
-  — STOP and report instead
+Each entry names what a reviewer can check in the diff, not an intent to infer.
+
+- **No collision handling.** The naming helper and its callers must not consult
+  any collection of already-used names: no `HashSet`/`HashMap`/`Vec::contains`
+  of prior names, no numeric suffix appended to a generated name, no retry loop
+  on a name. `EXPR$<n>` derives from position ALONE. #1919 owns duplicate
+  detection.
+- **Do not implement NB-005 duplicate-output-name detection** — no new error
+  variant, no new check in `sql/validation/name_binding.rs`. That is #1919.
+- **Do not touch `__exists__`, `__raw__`, `__velostream_variant`, or `__agg__`**
+  — zero diff lines containing those four strings.
+- **Do not change a line inside a ```sql fence under `docs/` or `demo/`.**
+  Checkable: no changed line in those trees lies within a ```sql fence. Prose
+  changes to `docs/sql/PARSER_GRAMMAR.md` OUTSIDE such a fence are required work
+  (§7b). Editing an example so a validator stops complaining is the escape hatch
+  this closes; documenting the rule is the job.
+- **Do not add `#[cfg(test)]` or `#[test]` inside `src/`** — zero such lines
+  added under `src/`.
+- **Do not weaken an existing test.** Checkable: the diff removes no `#[test]`,
+  adds no `#[ignore]`, and deletes no `assert*!` line from a pre-existing test.
+  The 48 tests in §3e are the gate for this work, not an obstacle — a naming
+  change that requires silencing them has not been made correctly.
+- **Do not change the `EXPR$` prefix or the `$<n>` form.**
+- **If the diff touches `build_plan_alias_keys`, it must also touch the runtime
+  readers in the same commit** — `select.rs::get_expression_name`,
+  `accumulator.rs::generate_field_name`, or their call sites in
+  `processors/select/group_by.rs` and `processors/group_by_columnar.rs`. A diff
+  changing the producer alone is the one-sided edit that failed 48 tests (§3e).
+- **Preserve explicit-alias behaviour exactly.** The output name of a
+  `SelectField::AliasedColumn`, and of a GROUP BY expression that
+  `select_alias_for_group_expr` matches to an `AS`-aliased SELECT item, must be
+  unchanged — `group_by_aliased_key_schema_carries_alias_not_raw_name` and
+  `two_stage_aggregate_resolves_aliased_group_by_key` are in `pass_to_stay` as
+  the check. Those two cases are the WHOLE of what this entry covers; no wider
+  notion of adjacent alias defects is implied or forbidden. STOP and report if
+  fixing `__group__` appears to require changing either.
+- **Do not change a public signature with callers outside `plan/` and
+  `execution/`** — STOP and report instead.
