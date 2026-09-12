@@ -121,9 +121,9 @@
     "Do not apply the scope tripwire to required work: edits under tests/, the parent mod.rs registrations, docs/sql/PARSER_GRAMMAR.md, and agent.log are mandatory, not scope creep. The tripwire covers src/ only."
   ],
   "reviewed": {
-    "by": null,
-    "at": null,
-    "brief_sha256": null
+    "by": "neilavery",
+    "at": "2026-09-12T19:57:42Z",
+    "brief_sha256": "764c7762fe59da7de61d80e63ceeb4f1f5d51d0ac02032eb6580b950fec6dda3"
   },
   "stop_conditions": [
     "The shared helper cannot be reached from execution without changing a public signature whose callers live outside plan/ and execution/.",

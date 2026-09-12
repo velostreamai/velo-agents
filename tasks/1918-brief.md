@@ -26,8 +26,14 @@ redo blindly:
 
 ## 1. Target and isolation
 
-Worktree and branch are created for you by `velo-dispatch` off current
-`origin/master`. The worktree is clean and carries no prior commits.
+Worktree: `/Users/neilavery/RustroverProjects/velostream-1918`
+Branch: `fix/1918-unify-output-names`
+
+Both are created for you by `velo-dispatch` off current `origin/master`. The
+worktree is clean and carries no prior commits.
+
+The branch is NOT `fix/1918-expr-output-names` — that name is taken by the
+superseded PR #2104, kept on origin as the reference implementation named in §0.
 
 **Do NOT `cd` into the worktree except for `gh` commands (gh has no `-C`).**
 Use `git -C <worktree>`, `cargo --manifest-path <worktree>/Cargo.toml`, and
