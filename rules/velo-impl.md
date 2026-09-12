@@ -151,8 +151,17 @@ decided?"* is a real question with no greppable answer. `rg "null.?pad" src/`
 returns 13 unranked files; ast-grep needs the name you are trying to find.
 
 `velo-dispatch` builds a local search index in your worktree before you start
-(#2032). Use it for that phase:
+(#2032). Use it for that phase — **via whichever of these you actually have**:
 
+- **Delegated workers** have a first-class **`ZgQuery`** tool. Call it with a
+  plain-English `question`. Prefer it over `Bash` — it reports a missing index,
+  a missing binary and a timeout as distinct errors, where a shell call just
+  looks like it found nothing.
+- **Native Claude Code agents** have no `ZgQuery` tool; run `zg` through `Bash`.
+
+```
+ZgQuery(question="where the null-padded column set for an unmatched outer join row is decided")
+```
 ```bash
 zg query "where the null-padded column set for an unmatched outer join row is decided"
 zg query --fts "JoinCoordinator"          # lexical, when you DO know the term
@@ -175,8 +184,9 @@ merge_left_with_nulls_batch` as its second hit. That is the phase it is for.
    `zg` returns nothing is correct; concluding "there is no such code" is not.
 
 **If there is no index, do NOT build one and do NOT ask.** The dispatch states
-the index state at the end of your brief. When it is unavailable, `zg query`
-fails with:
+the index state at the end of your brief. `ZgQuery` says so in the result, in
+words, and tells you it is not a claim about whether the code exists. Through
+`Bash`, the same condition surfaces as:
 
 ```
 Error: No zvec-grep index found for this workspace
