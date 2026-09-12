@@ -84,6 +84,28 @@ printf '## Branches\nnot-a-branch\n' > "$TMP"
 check "plural heading does NOT match" "$(brief_heading_branch)" ""
 rm -f "$TMP"
 
+# The label is matched case-insensitively, so it must be STRIPPED that way too.
+# It was not: grep -i accepted `Branch:` while the sed stripped only literal
+# `BRANCH:`, so the value came back as "Branch: fix/x" and never equalled the
+# branch being cut — every ordinary-markdown brief undispatchable, with a
+# refusal that printed the two sides looking identical.
+#
+# This suite did not catch it because every case above writes the label in the
+# one casing the sed happened to expect. Found in the field, on #1918.
+echo "label casing (#1918)"
+TMP=$(mktemp)
+printf 'Branch: `fix/1918-expr-output-names`\nWorktree: `/tmp/velostream-1918`\n' > "$TMP"
+BRIEF="$TMP"; export BRIEF
+check "Mixed-case Branch: strips its label"   "$(brief_field BRANCH)"   "fix/1918-expr-output-names"
+check "Mixed-case Worktree: strips its label" "$(brief_field WORKTREE)" "/tmp/velostream-1918"
+printf 'branch: fix/all-lower\nworktree: /tmp/wt-lower\n' > "$TMP"
+check "all-lower branch: strips its label"    "$(brief_field BRANCH)"   "fix/all-lower"
+check "all-lower worktree: strips its label"  "$(brief_field WORKTREE)" "/tmp/wt-lower"
+# A value may legitimately contain a colon; splitting on the FIRST one only.
+printf 'WORKTREE: C:/src/velostream-9\n' > "$TMP"
+check "a colon inside the value survives"     "$(brief_field WORKTREE)" "C:/src/velostream-9"
+rm -f "$TMP"
+
 echo
 [[ $FAILURES -gt 0 ]] && { echo "FAILED: $FAILURES"; exit 1; }
 echo "all brief-field checks passed"

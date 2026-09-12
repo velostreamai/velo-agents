@@ -510,9 +510,24 @@ WT="$WORKTREE_BASE/velostream-$ISSUE"
 # Two declaration forms exist in this repo: `BRANCH: x` and a `## Branch`
 # heading with the value on a following line. Read both (#2027 P1).
 brief_field() {   # $1 = field name -> its declared value, or empty
+  # The label is matched case-INSENSITIVELY and must be stripped the same way.
+  # It was not: `grep -i` accepted `Branch:` while the `sed` stripped only the
+  # literal uppercase `BRANCH:`, so a brief written in ordinary markdown case
+  # yielded "Branch: fix/x" as the VALUE. That never equals the branch being
+  # cut, making every such brief undispatchable — and the refusal printed
+  #     brief says : Branch: fix/1918-expr-output-names
+  #     will cut   : fix/1918-expr-output-names
+  # which reads as identical, so the message argued against itself. Found on
+  # #1918, whose brief uses `Branch:` / `Worktree:` as §1 of velo-brief-spec
+  # shows them. Both fields go through here, so both were affected.
+  #
+  # `cut` rather than a case-insensitive sed: BSD sed has no `I` flag, and
+  # spelling out [Bb][Rr]… does not generalise to an arbitrary $f. The label
+  # never contains a colon, so field 2-onward is exactly the value — and a
+  # value that DOES contain one (a URL, a Windows path) survives intact.
   local f="$1"
-  grep -iE "^[[:space:]]*${f}:" "$BRIEF" | head -1 \
-    | sed -E "s/^[[:space:]]*${f}:[[:space:]]*//; s/[[:space:]]*\(.*//; s/[[:space:]]*\$//" | tr -d '`'
+  grep -iE "^[[:space:]]*${f}:" "$BRIEF" | head -1 | cut -d: -f2- \
+    | sed -E "s/^[[:space:]]*//; s/[[:space:]]*\(.*//; s/[[:space:]]*\$//" | tr -d '`'
   }
 brief_heading_line() {   # $1 = heading name -> first non-empty line beneath it
   awk -v f="$1" 'BEGIN{IGNORECASE=1}
