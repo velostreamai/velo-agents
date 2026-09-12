@@ -168,22 +168,57 @@ $PLAN_OUT"
   described as ready."
   fi
 
-  # The stale-gate check: a gate result is only valid for the commit it ran on.
-  GSHA=$(gh pr view "$PR" --repo "$REPO" --json comments \
-          --jq '[.comments[].body | capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
-  [[ "$GSHA" == "null" ]] && GSHA=""
-  if [[ -z "$GSHA" ]]; then
+  # The stale-gate check: a gate result is only valid for the commit it ran on,
+  # and EVERY gate must be valid — not just the most recent comment.
+  #
+  # This used to end `| last | .s`, validating only the newest gate comment. So:
+  #
+  #     gate: check-code  @ H1        <- posted
+  #     (commits pushed, head becomes H2)
+  #     gate: code-review @ H2        <- posted
+  #
+  # passed, because only the code-review line was ever compared to HEAD. The PR
+  # merged carrying a check-code result for a commit that no longer existed —
+  # the exact failure `gate: <name> @ <sha>` exists to prevent, and the shape
+  # that once let a PR look green against code already replaced.
+  GATES=$(gh pr view "$PR" --repo "$REPO" --json comments \
+          --jq '[.comments[].body | capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})")]
+                | .[] | "\(.n) \(.s)"' 2>/dev/null)
+
+  if [[ -z "$GATES" ]]; then
     [[ $FORCE -eq 1 ]] || die "no 'gate: <name> @ <sha>' comment on #$PR.
   Gate comments must name the commit they ran against, else staleness is
   unverifiable."
-  elif [[ "$HEAD" != "$GSHA"* ]]; then
-    [[ $FORCE -eq 1 ]] || die "STALE GATE — reviewed at $GSHA, head is now $SHORT.
-  Commits landed after the review. Re-gate against the current head:
+  else
+    # Keep the FRESHEST sha per gate name. A gate that was re-run posts a second
+    # comment, and the old line must not condemn it — otherwise re-gating could
+    # never clear a PR. Comments arrive oldest-first, so a later line for the
+    # same name replaces the earlier.
+    FRESH=""
+    while read -r GNAME GS; do
+      [[ -z "$GNAME" ]] && continue
+      FRESH=$(printf '%s\n' "$FRESH" | grep -v "^$GNAME " || true)
+      FRESH=$(printf '%s\n%s %s' "$FRESH" "$GNAME" "$GS")
+    done <<< "$GATES"
+
+    STALE=""
+    NGATES=0
+    while read -r GNAME GS; do
+      [[ -z "$GNAME" ]] && continue
+      NGATES=$((NGATES + 1))
+      [[ "$HEAD" == "$GS"* ]] || STALE="$STALE
+    $GNAME ran at $GS"
+    done <<< "$FRESH"
+
+    if [[ -n "$STALE" ]]; then
+      [[ $FORCE -eq 1 ]] || die "STALE GATE — head is now $SHORT, but:$STALE
+  Commits landed after those gates ran. Re-gate against the current head:
     velo-gate $PR --running   # then re-run the reviewers
   This is the exact case where a PR looked green against code that had
   already been replaced."
-  else
-    ok "gate ran against current head ($GSHA)"
+    else
+      ok "all $NGATES gate(s) ran against current head ($SHORT)"
+    fi
   fi
 fi
 

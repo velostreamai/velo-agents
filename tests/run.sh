@@ -68,6 +68,9 @@ echo
 echo "── zg discovery tool ──────────────────────────────────"
 "$PY" "$HERE/test_zg_tool.py" || RC=1
 echo
+echo "── merge gate staleness ───────────────────────────────"
+bash "$HERE/test_merge_gates.sh" || RC=1
+echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
 
