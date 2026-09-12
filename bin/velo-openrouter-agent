@@ -42,7 +42,55 @@ SDK_PY="/Users/neilavery/.venvs/velo-agent-sdk/bin/python"
 # silently exec'ing whatever happened to sit there. That is the same
 # silent-wrong-resolution class this fix exists to remove, so the test pins it.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SDK_AGENT="${VELO_AGENTS_BIN:-$HERE}/velo-openrouter-agent-sdk.py"
+BIN="${VELO_AGENTS_BIN:-$HERE}"
+
+# VELO_AGENT_BACKEND picks the runtime. Default is `openai-agents`; set it to
+# `open-agent` to go back to the incumbent. One variable, both directions.
+#
+# Why a second runner rather than one runner behind an abstraction: measured on
+# an 18-turn audit, 3 rounds each, same model/gateway/pin/tools — correctness
+# 3/3 both, but openai-agents was 1.73x cheaper and 4.2x faster in wall clock.
+# That is worth acting on, and is NOT worth refactoring 1,260 working lines at 9
+# coupling points to find out. Both runners take the same flags and emit the same
+# log lines, so velo-record, the gates and the tests read either one unchanged.
+#
+# Two runners is the deliberate, temporary cost of that choice. Whichever loses
+# gets DELETED, not maintained — a permanent dual path is the thing this repo's
+# no-silent-fallback rule exists to prevent.
+case "${VELO_AGENT_BACKEND:-openai-agents}" in
+    open-agent)
+        SDK_AGENT="$BIN/velo-openrouter-agent-sdk.py"
+        ;;
+    openai-agents)
+        SDK_AGENT="$BIN/velo-openai-agents-runner.py"
+        # Its OWN venv. The incumbent's interpreter has no `agents` module, so
+        # reusing SDK_PY would exec the new runner with a Python that cannot
+        # import its SDK — a ModuleNotFoundError mid-dispatch, after the worktree
+        # is cut and the issue assigned.
+        SDK_PY="${VELO_OAI_PY:-$HOME/.venvs/velo-openai-agents/bin/python}"
+        if [ ! -x "$SDK_PY" ]; then
+            echo "[velo-openrouter-agent] no interpreter at $SDK_PY" >&2
+            echo "[velo-openrouter-agent] create it:" >&2
+            echo "    uv venv --python 3.13 ~/.venvs/velo-openai-agents" >&2
+            echo "    VIRTUAL_ENV=~/.venvs/velo-openai-agents uv pip install 'openai-agents==0.22.2'" >&2
+            echo "[velo-openrouter-agent] or: VELO_AGENT_BACKEND=open-agent to use the incumbent" >&2
+            exit 1
+        fi
+        # Checked, not assumed: an interpreter can exist with the SDK missing,
+        # and that failure would otherwise appear as a traceback from the runner
+        # rather than as a setup problem the operator can act on.
+        if ! "$SDK_PY" -c 'import agents' 2>/dev/null; then
+            echo "[velo-openrouter-agent] $SDK_PY cannot import 'agents'" >&2
+            echo "[velo-openrouter-agent] VIRTUAL_ENV=~/.venvs/velo-openai-agents uv pip install 'openai-agents==0.22.2'" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "[velo-openrouter-agent] unknown VELO_AGENT_BACKEND='$VELO_AGENT_BACKEND'" >&2
+        echo "[velo-openrouter-agent] expected: open-agent | openai-agents" >&2
+        exit 1
+        ;;
+esac
 
 if [ ! -f "$SDK_AGENT" ]; then
     echo "[velo-openrouter-agent] runner not found: $SDK_AGENT" >&2
@@ -64,5 +112,5 @@ fi
 # fallback. One path, per the project's no-silent-fallback rule.
 # Which runner ran is part of the run's evidence (#2076): an operator debugging
 # "my change didn't take" must be able to see which file was executed.
-echo "[velo-openrouter-agent] implementation=sdk runner=$SDK_AGENT" >&2
+echo "[velo-openrouter-agent] backend=${VELO_AGENT_BACKEND:-openai-agents} runner=$SDK_AGENT" >&2
 exec "$SDK_PY" "$SDK_AGENT" "$@"

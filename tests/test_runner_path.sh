@@ -24,19 +24,21 @@ mkdir -p "$FAKE/bin"
 sed 's|^SDK_PY=.*|SDK_PY="/bin/echo"|' "$WRAPPER" > "$FAKE/bin/velo-openrouter-agent"
 chmod +x "$FAKE/bin/velo-openrouter-agent"
 echo "#!/bin/sh" > "$FAKE/bin/velo-openrouter-agent-sdk.py"
+echo "#!/bin/sh" > "$FAKE/bin/velo-openai-agents-runner.py"
 
 OUT=$("$FAKE/bin/velo-openrouter-agent" --probe 2>&1)
-check "execs the runner beside the wrapper" "$OUT" "$FAKE/bin/velo-openrouter-agent-sdk.py"
+check "execs the runner beside the wrapper" "$OUT" "$FAKE/bin/velo-openai-agents-runner.py"
 check "announces which runner ran"          "$OUT" "runner="
 
 # VELO_AGENTS_BIN wins, for the deliberate run-the-installed-one case.
 mkdir -p "$FAKE/other"
 echo "#!/bin/sh" > "$FAKE/other/velo-openrouter-agent-sdk.py"
+echo "#!/bin/sh" > "$FAKE/other/velo-openai-agents-runner.py"
 OUT=$(VELO_AGENTS_BIN="$FAKE/other" "$FAKE/bin/velo-openrouter-agent" --probe 2>&1)
-check "VELO_AGENTS_BIN overrides" "$OUT" "$FAKE/other/velo-openrouter-agent-sdk.py"
+check "VELO_AGENTS_BIN overrides" "$OUT" "$FAKE/other/velo-openai-agents-runner.py"
 
 # A missing runner must fail LOUDLY, not exec something surprising.
-rm "$FAKE/bin/velo-openrouter-agent-sdk.py"
+rm "$FAKE/bin/velo-openrouter-agent-sdk.py" "$FAKE/bin/velo-openai-agents-runner.py"
 OUT=$("$FAKE/bin/velo-openrouter-agent" --probe 2>&1); EXIT=$?
 check "missing runner is reported"   "$OUT"  "runner not found"
 check "missing runner is non-zero"   "$EXIT" "1"

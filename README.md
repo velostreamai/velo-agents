@@ -29,10 +29,12 @@ and the tests** — never from the worker's self-report.
     velo-worktree-lib.sh           worktree derivations shared by velo-status + velo-record
     zg                             discovery-search shim — the `zg` the policy tells workers to run
     velo_worker_runner.py          the one worker runner, two provider profiles
-    velo_sdk_patches.py            corrections applied to open-agent-sdk at import
+    velo_sdk_patches.py            corrections to the ROLLBACK sdk, applied at import
     velo_runner_lib.py             salvage-on-failure and other runner-side helpers
-    velo-openrouter-agent          wrapper -> the SDK worker (DeepSeek / GLM)
-    velo-openrouter-agent-sdk.py   OpenRouter-backed worker runner
+    velo-openrouter-agent          wrapper -> picks the worker RUNTIME (see below)
+    velo-openrouter-agent-sdk.py   worker runner on open-agent-sdk  (ROLLBACK ONLY)
+    velo-openai-agents-runner.py   worker runner on openai-agents   (SUPPORTED)
+    velo_oai_tools.py              local tools openai-agents does not ship
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
   tests/
     run.sh                         every suite — run when touching .agents/
@@ -318,10 +320,11 @@ indistinguishable from "not ready yet" — the ambiguity that made a stale langu
 server silently degrade an agent to grep-based rewriting. `VELO_SKIP_INDEX=1`
 opts out; a failed build warns and the dispatch continues.
 
-**Reached through Bash, not a tool call.** A worker's `allowed_tools` is fixed at
-`Read, Glob, Grep, Bash, Edit, Write`, and the SDK's own LSP tool is a stub that
-errors on every call. `zg` is a CLI on `PATH` (`.agents/bin/zg`), invoked like
-`cargo` — no SDK change, no `allowed_tools` change. The worker knows it exists
+**Also a first-class tool.** On `openai-agents` a worker has `zg_query`, `grep`,
+`glob_files`, `read_file`, `bash`, `edit_file`, `write_file` (read-only tasks drop
+the last two). On the rollback runtime the equivalents are `ZgQuery, Read, Glob,
+Grep, Bash, Edit, Write`. Either way `zg` is ALSO a CLI on `PATH`
+(`.agents/bin/zg`), invoked like `cargo`. The worker knows it exists
 because `velo-impl.md` says so, and that file is spliced into every system
 prompt.
 
@@ -364,10 +367,48 @@ way a brief goes stale, and no code-based check can see it.
 Two runtimes, three roles. Getting these confused is how a gate ends up reported
 as run when nothing ran.
 
+### Worker runtime — `openai-agents`
+
+**Delegated workers run on `openai-agents`. The vendored `velo-agent-sdk` fork is
+NO LONGER THE SUPPORTED RUNTIME** — it is retained only as a rollback while the
+switch beds in, and is scheduled for deletion.
+
+Write new worker code against `openai-agents`. Do not add capabilities to the
+fork, and do not assume its behaviour when reading this document.
+
+| `VELO_AGENT_BACKEND` | runner | interpreter | status |
+|---|---|---|---|
+| `openai-agents` *(default)* | `velo-openai-agents-runner.py` | `~/.venvs/velo-openai-agents` | **supported** |
+| `open-agent` | `velo-openrouter-agent-sdk.py` | `~/.venvs/velo-agent-sdk` | rollback only, to be deleted |
+
+```bash
+VELO_AGENT_BACKEND=open-agent velo-dispatch 1234 brief.md   # back to the incumbent
+```
+
+Measured on an 18-turn audit, 3 rounds each, same model / gateway / provider pin
+/ tools: **correctness 3/3 both**, `openai-agents` **1.73x cheaper** and **4.2x
+faster** in wall clock. 94-99% of the incumbent's wall clock was model wait, not
+tool execution, so it was never a tools problem. Earlier 4-turn benchmarks said
+2.13x cost and a tool-call edge to the incumbent; both were artifacts of a task
+too short for a transcript to accumulate.
+
+Both runners take the **same flags** and emit the **same log lines**, so
+`velo-record`, the gates and the tests read either one unchanged.
+
+Two runners is deliberate and TEMPORARY. Whichever loses gets deleted — a
+permanent dual path is exactly what the no-silent-fallback rule forbids.
+
+**Output budget is per model and must be generous.** A reasoning model spends
+most of its budget thinking: GLM emitted 318 visible tokens out of 8,000 and the
+run DIED — `openai-agents` raises on `finish_reason='length'` where the incumbent
+recovers with "Continue from where you left off." `max_tokens` is a ceiling, not
+a reservation, so too high costs nothing and too low loses the whole run after
+arbitrary spend. GLM is set to 131,072; the default is 65,536.
+
 | role | who | what it can do |
 |---|---|---|
 | **orchestrator** | a Claude Code session (usually), or Codex | runs `velo-dispatch` / `velo-status` / `velo-pr-gate`; writes briefs and specs; never writes the feature code itself |
-| **delegated worker** | `velo-local`, `velo-deepseek`, `velo-glm` via the SDK runner; `worker:codex` via `codex exec` | implements one scoped task in its own worktree, unattended |
+| **delegated worker** | `velo-local`, `velo-deepseek`, `velo-glm` via the worker runner (`VELO_AGENT_BACKEND`); `worker:codex` via `codex exec` | implements one scoped task in its own worktree, unattended |
 | **review gate** | `codex review` for `code-review`; `velo-local` for `check-code` / `check-spec` | reads a diff read-only and returns findings |
 
 Codex appears in **two** of those roles and they are not interchangeable:
@@ -377,8 +418,8 @@ subcommand, different brief, different failure modes.
 
 **Capability differs by runtime, and the policy accounts for it.** A Claude Code
 orchestrator has the LSP tool, the Skill tool and MCP servers. A delegated worker
-has exactly `Read, Glob, Grep, Bash, Edit, Write` — no LSP (the SDK ships a stub
-that errors on every call), no Skill tool (review skills are inlined into the
+has exactly `zg_query, grep, glob_files, read_file, bash, edit_file, write_file`
+— no LSP, no Skill tool (review skills are inlined into the
 prompt by `--skill` instead). `rules/velo-impl.md` forks its type-aware refactor
 section on precisely this: LSP-first for agents that have LSP, `ast-grep` plus
 `cargo check` for everyone else.
