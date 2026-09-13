@@ -484,6 +484,43 @@ for t in (v if isinstance(v,list) else [v]):
        test that already passes: that gates nothing and this check cannot see it."
     fi
     ok "fail_to_pass: $FTP_COUNT name(s) declared, $((FTP_COUNT - ${#FTP_MISSING[@]})) already defined at ${BASE_SHA:0:9}"
+
+  # Brief-vs-sidecar name drift. WARN, not refuse.
+  #
+  # Since the SPEC CONTRACT is injected, every declared test name reaches the
+  # worker whether or not the brief mentions it, so this is no longer a
+  # correctness hole — which is exactly why it needs saying out loud. A brief
+  # whose own test table has gone stale misleads the human who reads it and
+  # quietly disagrees with the contract appended below it. That drift happened
+  # twice on #1918: once before injection existed (five of six names visible
+  # only here, and the worker duly invented its own), and once after, when a
+  # respec added three names to the sidecar alone.
+  #
+  # Refusing would be wrong: the brief is prose, the names are data, and a prose
+  # document is allowed to discuss them in its own words. Silence would also be
+  # wrong. So: name what drifted and let the caller judge.
+  BRIEF_TEXT=$(cat "$BRIEF")
+  DRIFTED=()
+  while IFS= read -r tname; do
+    [[ -z "$tname" ]] && continue
+    grep -qF "$tname" <<<"$BRIEF_TEXT" || DRIFTED+=("$tname")
+  done < <(SPEC_FILE="$SPEC" python3 -c "
+import json, os, sys
+d = json.load(open(os.environ['SPEC_FILE']))
+t = d.get('tests') or {}
+for key in ('fail_to_pass', 'pass_to_stay'):
+    for n in (t.get(key) or []):
+        print(n)
+")
+  if (( ${#DRIFTED[@]} > 0 )); then
+    warn "${#DRIFTED[@]} declared test name(s) appear in the sidecar but NOT in the brief:
+       ${DRIFTED[*]}
+       They still reach the worker in the injected SPEC CONTRACT, so this is not
+       a correctness hole — but the brief's own prose has drifted from the spec it
+       serves, and a human reading it gets a stale list."
+  else
+    ok "brief prose names every declared test"
+  fi
   fi
   # <<< velo-fail-to-pass
 
