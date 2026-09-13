@@ -29,29 +29,37 @@ redo blindly:
 Worktree: `/Users/neilavery/RustroverProjects/velostream-1918`
 Branch: `fix/1918-unify-output-names`
 
-**The worktree already exists and carries two commits of your own prior work.**
-It was dispatched with `--resume`, so nothing was reset:
+**The worktree already exists and carries prior work of your own.** It was
+dispatched with `--resume`, so nothing was reset.
 
-    1f7769908  test: pin unified computed output names
-    257756ad1  fix: unify computed output names across plan and records
-    2d343fe81  fix: unify grouped runtime output names
-    17bda2298  style: cargo fmt, and commit the in-flight reader-migration edits
+**Derive the current state; do not trust any commit list in this brief.** Earlier
+versions enumerated the commits and went stale the moment you committed again,
+which had a reviewer flagging obsolete "remaining work" on every round. So, first
+three commands of the run:
 
-All four `READER-MIGRATED` lines are already logged — `select.rs` and
-`accumulator.rs` as `lookup-key`, `group_by.rs` and `group_by_columnar.rs` as
-`delegate`. That part of §3d is DONE; do not redo it. What remains is §3a's
-aggregate rule and the expectation updates it implies.
+    git -C <worktree> log --oneline origin/master..HEAD
+    git -C <worktree> status --porcelain
+    grep -E 'RED-FIRST|READER-MIGRATED|ALIAS-KEYS|CHANGED-EXPECTATION|STOP' <worktree>/agent.log
 
-Both are pushed to origin, so they cannot be lost. Read them FIRST — the six
-red-first tests are already written and their failures already recorded in
-`agent.log`, so do not rewrite them. Your remaining work is §3d's reader list.
+Everything is pushed to origin, so nothing can be lost. Those three outputs are
+the authority on what is done: the commits, the working tree, and your own log.
+Read them before planning, and do not redo what a `READER-MIGRATED` or `RED-FIRST`
+line already records.
 
-The branch is NOT `fix/1918-expr-output-names` — that name is taken by the
-superseded PR #2104, kept on origin as the reference implementation named in §0.
+**Do NOT `cd` into the worktree.** Use `git -C <worktree>`, `cargo
+--manifest-path <worktree>/Cargo.toml`, and absolute paths with Read/Edit/Write.
 
-**Do NOT `cd` into the worktree except for `gh` commands (gh has no `-C`).**
-Use `git -C <worktree>`, `cargo --manifest-path <worktree>/Cargo.toml`, and
-absolute paths with Read/Edit/Write.
+Two exceptions:
+
+- `gh` commands — `gh` has no `-C`.
+- `zg query` — it resolves `.zvec-grep` from the cwd and has no `--workspace`
+  flag, so running it from anywhere else silently answers from THAT tree's index.
+  The master checkout has its own index, so a query run from the wrong place
+  returns plausible results about the wrong code rather than an error (#2128).
+  `cd` into the worktree for `zg`, or use `rg`/`ast-grep`, which need no index.
+
+Everything else stays path-prefixed. A worker that cd's and then commits can end
+up committing in the wrong tree — that happened during this issue's own spec work.
 
 ## 2. Fresh line numbers
 
@@ -131,7 +139,38 @@ positionally within the GROUP BY list.
 
 **Except** when the same expression also appears in the SELECT list. Then it
 carries its **SELECT-list** position, because the output column IS the SELECT
-item. `output_schema`'s `Aggregate` arm already prefers
+item.
+
+#### A computed key NOT in SELECT gets `GROUP$<n>`, not `EXPR$<n>`
+
+Separate namespace, deliberately. Two independent positional counters in one
+namespace collide:
+
+    SELECT COUNT(*) FROM t GROUP BY price * quantity
+
+The group slot would be `EXPR$0` (GROUP BY index 0) and `COUNT(*)` would be
+`EXPR$0` (SELECT index 0) — and `output_schema` appends group fields **before**
+aggregate fields, so the schema would carry two `EXPR$0` fields. That is the exact
+duplicate-name defect this issue exists to remove, reintroduced, with collision
+handling forbidden and no way out.
+
+`GROUP$<n>` cannot collide with `EXPR$<n>` by construction, needs no dedup, and is
+honest about what that slot is: it exists so `HAVING` can resolve against the key,
+not as a user-visible output column.
+
+`unselected_computed_group_key_does_not_collide_with_select_positional_name`
+pins exactly this query.
+
+**Single-quote these names in every shell context.** `EXPR$<n>` and `GROUP$<n>`
+contain `$`, so an unquoted shell expands them — `GROUP$0` becomes `GROUPbash`,
+because `$0` is the shell's own name. That already happened during this issue's
+work and put a corrupted expectation into `agent.log`:
+
+    failed-with=left: "__group__" right: "GROUPbash"
+
+So: `-E 'test(...)'`, `grep -F 'EXPR$0'`, `"GROUP\$0"` in double quotes, or
+single quotes throughout. A test asserting `EXPRbash` or `GROUPbash` is corruption,
+not a finding. `output_schema`'s `Aggregate` arm already prefers
 `select_alias_for_group_expr` (`schema_propagation.rs:461`) over
 `expr_output_name`, so this is the existing preference, now made coherent. The
 GROUP BY index applies only to keys absent from SELECT.
@@ -279,10 +318,23 @@ STOP and report, without pushing, if:
   signature whose callers live outside `plan/` and `execution/`
 - preserving the `alias_keys` write/read contract and shipping `EXPR$<n>` at
   execution turn out to be mutually exclusive
-- any of the coupled tests in §3e requires a **changed expectation** rather than
-  passing unmodified — report it with the argument for why the old behaviour was
-  wrong, per the correctness-over-parity rule, and do not change it unilaterally
-- **any of the six `fail_to_pass` tests PASSES against unfixed code.** You cannot
+- a coupled test requires a changed expectation that is **not** a legacy generated
+  name on an unaliased item — i.e. it pins an explicit `AS` alias, or a non-naming
+  property (row counts, values, ordering, watermarks)
+
+**Updating a legacy generated name on an unaliased item is EXPECTED WORK, not a
+stop.** There are ~54 such tests across ~11 modules — schema-inference,
+interval-join, window/group-by differential. Log one `CHANGED-EXPECTATION` line
+per test and keep going to a green sweep.
+
+An earlier version of this brief listed that as a STOP condition while the
+acceptance bars required it, and a run that was doing exactly the right thing
+halted on `scope-expansion-and-unvalidated-partial-migration` after enumerating
+54 of them. Stopping on these one at a time cannot converge. The volume is the
+task, not a signal that the scope grew.
+- **any of the eight `fail_to_pass` tests PASSES against unfixed code** — the
+  guard `explicit_alias_survives_positional_naming` is NOT one of them and is
+  exempt, so never report it here. You cannot
   record the required `RED-FIRST` line (§7a) for a test that was never red, and
   you must not "fix" it by loosening the test until it fails. One of two things
   is true and only a human should decide which: the test does not reach the code
@@ -350,7 +402,7 @@ superseded PR already proved, and it is exactly what missed this defect.
 in `fail_to_pass` for that reason. Cover the windowed, grouped, and interval-join
 shapes too.
 
-### The six tests you must write, by name
+### The nine tests, by name
 
 `velo-dispatch` sends you this brief and nothing else — it does not inject the
 sidecar — so these names are listed here in full. The merge gate checks them
@@ -369,7 +421,8 @@ gate for that reason alone.
 | `group_by_expression_also_in_select_keeps_the_positional_name` | `SELECT price * quantity, COUNT(*) FROM trades GROUP BY price * quantity` names the key `EXPR$0` in the Aggregate schema, not `"expr"` |
 | `unaliased_aggregate_gets_a_positional_name` | `SELECT SUM(value) FROM trades` names the output `EXPR$0`, NOT `SUM(value)` — plan and emitted record alike (§3a) |
 | `two_unaliased_computed_aggregates_get_distinct_positional_names` | `SELECT SUM(a * b), SUM(c * d)` names them `EXPR$0` and `EXPR$1`, never `SUM(expr)` twice |
-| `explicit_alias_survives_positional_naming` | `SELECT SUM(value) AS total` still emits `total` — the escape hatch is intact |
+| `unselected_computed_group_key_does_not_collide_with_select_positional_name` | `SELECT COUNT(*) FROM t GROUP BY price * quantity` — group slot is `GROUP$0`, `COUNT(*)` is `EXPR$0`; the schema holds no duplicate generated name |
+| `explicit_alias_survives_positional_naming` | `SELECT SUM(value) AS total` still emits `total`. **A GUARD, not a regression test** — explicit aliases already work on master, so it passes before AND after and can never be run red. It is deliberately NOT in `fail_to_pass`, is exempt from red-first, and must NOT be reported under stop condition 4. The first resume to reach it correctly proved it green at `origin/master` and stopped; that stop was the spec's fault, not the test's. |
 
 Use these names exactly. Add more tests freely under any name you like.
 
@@ -381,9 +434,33 @@ Use these names exactly. Add more tests freely under any name you like.
 
 ### Red-first is REQUIRED, and must be recorded
 
-None of the six `fail_to_pass` tests exists on `origin/master` — you are writing
-all of them. A test written after the fix proves only that the code does what it
-does. So for **each** of the six:
+**Which tests still owe red-first evidence: derive it, do not read it here.**
+
+    grep -o 'test=[a-z_]*' <worktree>/agent.log | sort -u
+
+Every name in `fail_to_pass` that does NOT appear in that output still owes a
+`RED-FIRST` line. Any name that does appear is done — its line IS the evidence,
+so do not re-run it.
+
+`explicit_alias_survives_positional_naming` is the one exception and owes nothing:
+it is a guard, exempt from red-first, and must never be reported under stop
+condition 4 (see its row in the table above).
+
+
+
+**Demonstrating red for the last three is harder, because your branch already
+carries the fix.** A test written now will pass immediately, which proves nothing.
+Use a throwaway worktree pinned at the pre-fix baseline:
+
+    git -C <worktree> worktree add /tmp/1918-baseline origin/master
+    # copy the new test in, run it there, capture the failure
+    cargo nextest run --no-default-features --profile unit --manifest-path /tmp/1918-baseline/Cargo.toml -E 'test(<name>)'
+    git -C <worktree> worktree remove /tmp/1918-baseline --force
+
+If a test passes at `origin/master`, that is stop condition 4 — report it rather
+than loosening the test.
+
+So for **each** of the three:
 
 1. Write the test FIRST, against unfixed code.
 2. Run it and capture the failure — the assertion message, not just "it failed".
@@ -423,9 +500,57 @@ in your final report:
     <UTC> ALIAS-KEYS | mode=<preserve|migrate> | verified-by=<test names or command>
     <UTC> CHANGED-EXPECTATION | test=<name> | why-old-was-wrong=<one line>
 
-The second appears once per test whose expectation you changed — and per §5 you
-should be reporting rather than changing most of them. Zero
-`CHANGED-EXPECTATION` lines is the expected outcome.
+**These lines must reconcile against the diff.** Count the pre-existing test
+functions whose assertion lines you modified; it must equal your
+`CHANGED-EXPECTATION` line count, and both numbers go in the final report. A
+modified assertion with no line is a silently weakened test; a line with no diff
+hunk is a rationale for a change you did not make. Either mismatch is a STOP —
+report the discrepancy, do not add lines to make the totals agree. This is what
+makes an otherwise unverifiable prohibition checkable.
+
+### The hunk audit — the SHAPE of a permitted edit
+
+Counting lines is not enough on its own, so the edits themselves are constrained.
+Inside a **pre-existing** test, the only change you may make is:
+
+    -  collect_scalar(&outputs, "SUM(value)")
+    +  collect_scalar(&outputs, "EXPR$0")
+
+A legacy generated-name literal becomes the corresponding `EXPR$<n>` literal.
+
+The second permitted shape is the **qualifier strip**, which bars 4 and 5 require
+now that `SelectField::Column` routes through the shared helper:
+
+    -  assert!(joined.to_field_map().contains_key("orders.order_id"));
+    +  assert!(joined.to_field_map().contains_key("order_id"));
+
+Reformatting a multi-line `assert!` onto one line because the literal got shorter
+is shape-preserving and fine.
+
+**On such a line, nothing else may change** — no numbers, no comparison operators,
+no expected counts — and you may not add or delete an assertion in the test body.
+
+Three shapes a reviewer will reject mechanically, so do not produce them:
+
+| shape | why |
+|---|---|
+| a numeric expectation edited alongside the name | a real value regression papered over by a rename |
+| an `assert*!` line deleted | the test got weaker, not renamed |
+| the literal replaced by something other than `EXPR$<n>` | not the migration this issue authorises |
+
+If a test genuinely cannot be fixed by a name substitution alone, that is
+stop condition 3 — it is telling you a non-naming property moved. Report the hunk;
+do not reshape the test to fit.
+
+The second appears once per test whose expectation you changed. **Expect many** —
+roughly 54 legacy generated names across ~11 modules. That is the task, not a
+warning sign.
+
+(An earlier version of this paragraph said zero was expected and that most should
+be reported rather than changed. That was written before the aggregate rule was
+pinned, it contradicted the acceptance bars, and it is exactly the contradiction
+that halted a run. The only changed expectation that is NOT expected is one on an
+`AS` alias or a non-naming property — that is stop condition 3.)
 
 A conclusion that exists only in your head, or only in a commit message body, is
 lost: the caller writes the PR from `agent.log` and your report.
