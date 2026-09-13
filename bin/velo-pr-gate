@@ -15,15 +15,25 @@
 #   code-review  -> Codex      adversarial; found a real defect in EVERY round it
 #                              ran, including against designs the orchestrator had
 #                              pinned and code the orchestrator wrote
-#   check-code   -> Codex      src/ correctness needs the reviewer that finds
-#                              things. On #1988 the local model APPROVED a diff
-#                              carrying two P1s and asserted the OPPOSITE of one
-#                              of them ("no fourth ingest path found" — there
-#                              were five, two uncaptured), plus claimed four
-#                              contract tests were absent when they were present
-#                              and passing. Three false statements, one approve.
-#                              A gate that manufactures confidence is worse than
-#                              no gate.
+#   check-code   -> opus:high  src/ correctness needs a reviewer that finds
+#                              things, and EFFORT is the knob that buys it —
+#                              coverage, edge cases and hot-path cost are what
+#                              this pass reasons about. `--effort` exists on the
+#                              claude CLI and NOT on the Agent tool, which is why
+#                              it is dispatched from here.
+#                              Emphatically NOT a local model: on #1988 the local
+#                              one APPROVED a diff carrying two P1s and asserted
+#                              the OPPOSITE of one ("no fourth ingest path found"
+#                              — there were five, two uncaptured), plus claimed
+#                              four contract tests were absent when they were
+#                              present and passing. Three false statements, one
+#                              approve. A gate that manufactures confidence is
+#                              worse than no gate.
+#                              Read-only BY CONSTRUCTION: --disallowed-tools
+#                              removes Edit/Write/NotebookEdit, so the brief's
+#                              "do not write" is a guarantee rather than a
+#                              request. velo-glm committed on 2 of its 3
+#                              read-only dispatches (#1987, #1994).
 #   check-spec   -> velo-local free; bar-by-bar verification against EXPLICIT
 #                              criteria, plus deletion-greps — both mechanical.
 #                              Its judgement calls are still unreliable (it also
@@ -115,7 +125,7 @@ fi
 
 if [[ "$SCOPE" == "--plan" ]]; then
   echo "would dispatch:"
-  [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> codex review (needs the brief's ATTACK section filled in)"
+  [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> opus:high via claude CLI (needs the brief's ATTACK section filled in)"
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
   [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
   [[ $NEEDS_REVIEW -eq 1 && $EXEC -eq 1 ]] && echo "                 --exec: sandbox BYPASSED, reviewer can compile and run tests"
@@ -194,7 +204,7 @@ GATE_RUNNING_PENDING=1
 #
 # Quota/auth death is seconds; a real review is minutes. So watch briefly, and
 # judge the RUN rather than the binary.
-CODEX_FAILED=0
+GATE_FAILED=0
 # Owned by THIS process, never inherited (#2027 round 8, P2). The check-code
 # watch guards on `[[ -n "${CODE_PID:-}" ]]`, so an exported CODE_PID in the
 # caller's environment would make a code-review-only run watch a PID it never
@@ -203,13 +213,13 @@ CODEX_FAILED=0
 CODE_PID=""
 # Did ANY gate actually get dispatched? (#2005 acceptance criterion 1)
 #
-# CODEX_FAILED only distinguishes "dispatched and died" from "dispatched and
+# GATE_FAILED only distinguishes "dispatched and died" from "dispatched and
 # lived". It says nothing about "never dispatched at all", which is what happens
 # when the codex CLI is missing: both blocks warn and fall through, nothing runs,
 # and the script went on to print `ok gate:running`. Same failure #2005 was filed
 # for — the gate says it ran — in the branch the original fix did not cover.
 GATE_DISPATCHED=0
-codex_health_check() {   # $1 = pid, $2 = log, $3 = gate name
+gate_health_check() {   # $1 = pid, $2 = log, $3 = gate name
   local pid="$1" log="$2" name="$3" i
   for i in 1 2 3 4 5 6 7 8 9 10; do
     kill -0 "$pid" 2>/dev/null || break
@@ -227,9 +237,14 @@ codex_health_check() {   # $1 = pid, $2 = log, $3 = gate name
   # scanning our own prompt.
   local tail_only; tail_only=$(tail -25 "$log" 2>/dev/null)
   local why="exited in under 10s"
-  grep -qiE "usage limit|quota exceeded|rate.?limit|Upgrade to Pro" <<<"$tail_only" && why="OUT OF QUOTA"
+  # Phrases from BOTH CLIs. This watches `codex review` and `claude -p` since
+  # check-code moved to opus:high, and a quota message that only matches one of
+  # them reports a real out-of-quota exit as a generic "exited in under 10s".
+  # Codex's usage limit ended a review mid-run on #2123, so this is not a
+  # hypothetical failure mode.
+  grep -qiE "usage limit|quota exceeded|rate.?limit|Upgrade to Pro|limit reached|out of credit|insufficient credit" <<<"$tail_only" && why="OUT OF QUOTA"
   grep -qiE "not logged in|unauthorized|invalid api key|authentication failed|401" <<<"$tail_only" && why="AUTH FAILURE"
-  CODEX_FAILED=1
+  GATE_FAILED=1
   warn "FAIL: $name did NOT run — $why"
   warn "  log: $log"
   sed -n '$p' "$log" 2>/dev/null | sed 's/^/  last line: /' >&2
@@ -522,7 +537,7 @@ EOF
   # on its own.
   CODE_LOG="$GATE_DIR/code.log"
   CODE_BRIEF="$GATE_DIR/code-brief.md"
-  if [[ $NEEDS_CODE -eq 1 ]] && command -v codex >/dev/null 2>&1; then
+  if [[ $NEEDS_CODE -eq 1 ]] && command -v claude >/dev/null 2>&1; then
     {
       echo "You are running the CHECK-CODE gate, not the code review."
       echo
@@ -539,16 +554,40 @@ EOF
       echo
       cat "$OUT"
     } > "$CODE_BRIEF"
-    if [[ $EXEC -eq 1 ]]; then
-      nohup sh -c "cd '$WTPATH' && codex review --dangerously-bypass-approvals-and-sandbox - < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
-    else
-      nohup sh -c "cd '$WTPATH' && codex review - < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
-    fi
+    # check-code goes to opus at HIGH effort, via the `claude` CLI.
+    #
+    # The routing had drifted three ways at once: CLAUDE.md said `check-code ->
+    # velo-local`, this script's own header and dispatch said Codex, and the
+    # intended routing was neither. The script is what actually dispatches, so it
+    # is the definition; CLAUDE.md is corrected to match it rather than the other
+    # way round.
+    #
+    # `claude -p` is non-interactive and takes the brief on stdin, exactly like
+    # `codex review -` — so this is a symmetric transport, not a special case.
+    # `--effort high` is the reason this route exists: check-code is the pass that
+    # has to reason about coverage, edge cases and hot-path cost, and effort is
+    # the knob that buys that. It is available on the CLI and NOT on the Agent
+    # tool, which is why dispatching from here beats an orchestrator Agent call.
+    #
+    # READ-ONLY BY CONSTRUCTION, not by instruction. `--disallowed-tools` removes
+    # Edit/Write/NotebookEdit entirely, so a gate cannot modify the worktree it is
+    # reviewing even if the brief's "do NOT write" line is ignored. That matters:
+    # velo-glm committed on 2 of its 3 read-only dispatches (#1987, #1994), and a
+    # brief is only an instruction. `--permission-mode dontAsk` is required
+    # because this runs under nohup with no tty to answer a prompt.
+    #
+    # `--exec` deliberately changes nothing here. For Codex it dropped the
+    # sandbox so the reviewer could compile and run tests; the equivalent for this
+    # route would be restoring the write tools, which defeats the guarantee above.
+    # A check-code pass that needs to run the test suite should say so in its
+    # report and let a human run it.
+    nohup sh -c "cd '$WTPATH' && claude -p --model opus --effort high --permission-mode dontAsk --disallowed-tools 'Edit Write NotebookEdit' < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
     CODE_PID=$!
     GATE_DISPATCHED=1
-    ok "check-code -> codex (pid $CODE_PID)  log: $CODE_LOG"
+    ok "check-code -> opus:high (pid $CODE_PID)  log: $CODE_LOG"
+    [[ $EXEC -eq 1 ]] && warn "--exec does not apply to check-code: it stays read-only by construction."
   elif [[ $NEEDS_CODE -eq 1 ]]; then
-    warn "codex CLI not found on PATH — check-code NOT dispatched."
+    warn "claude CLI not found on PATH — check-code NOT dispatched."
     warn "Do NOT substitute a local model: on #1988 it approved a diff carrying"
     warn "two P1s and asserted the opposite of one of them."
   fi
@@ -560,7 +599,7 @@ EOF
       CODEX_PID=$!
       GATE_DISPATCHED=1
       ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
-      codex_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
+      gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
       warn "--exec: sandbox BYPASSED — the reviewer can compile, run tests, AND write."
       warn "The brief still says do-not-write, but nothing now enforces it."
       warn "Check \`git -C $WTPATH status\` when the review finishes."
@@ -569,7 +608,7 @@ EOF
       CODEX_PID=$!
       GATE_DISPATCHED=1
       ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
-      codex_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
+      gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
     fi
     echo "     brief: $OUT   (diff range: $RANGE)"
     echo "     Codex writes its report to the log; read the tail, not the whole file."
@@ -582,7 +621,7 @@ EOF
 
   # check-code is dispatched FIRST and, until round 7 of this PR, was the ONE
   # dispatch nothing watched. `$!` was read straight into the `ok` message and
-  # discarded, so a check-code that died on quota left CODEX_FAILED=0 and the
+  # discarded, so a check-code that died on quota left GATE_FAILED=0 and the
   # script went on to print `ok gate:running` — the exact failure #2005 exists to
   # prevent, still live in the other gate. The health check was written, and then
   # wired to one of the two things that needed it.
@@ -590,7 +629,7 @@ EOF
   # It runs AFTER the code-review dispatch on purpose: both processes are then in
   # flight, so watching them is concurrent rather than serialised.
   if [[ -n "${CODE_PID:-}" ]]; then
-    codex_health_check "$CODE_PID" "$CODE_LOG" "check-code"
+    gate_health_check "$CODE_PID" "$CODE_LOG" "check-code"
   fi
 
   echo
@@ -604,7 +643,7 @@ fi
 
 # ---- #2005: only claim the gate is running if something actually is ---------
 if [[ "${GATE_RUNNING_PENDING:-0}" -eq 1 ]]; then
-  if [[ "${CODEX_FAILED:-0}" -eq 1 ]]; then
+  if [[ "${GATE_FAILED:-0}" -eq 1 ]]; then
     warn "NOT setting gate:running — a dispatched gate died before doing any work."
     warn "Re-run when quota resets, or dispatch a DECLARED substitute and say so"
     warn "in the gate comment. A gate that reports itself dispatched and produced"

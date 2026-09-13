@@ -37,6 +37,7 @@ bash "$HERE/test_index_exclude.sh" || RC=1
 echo
 echo "── gate health (end-to-end) ───────────────────────────"
 bash "$HERE/test_gate_health.sh" || RC=1
+bash "$HERE/test_gate_routing.sh" || RC=1
 echo
 echo "── dispatch preflight (end-to-end) ────────────────────"
 bash "$HERE/test_dispatch_preflight.sh" || RC=1
