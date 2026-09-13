@@ -86,6 +86,7 @@ bash "$HERE/test_oai_backend.sh" || RC=1
 echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
+bash "$HERE/test_history_routing.sh" || RC=1
 
 echo
 [[ $RC -eq 0 ]] && echo "✅ .agents tests passed" || echo "❌ .agents tests FAILED"

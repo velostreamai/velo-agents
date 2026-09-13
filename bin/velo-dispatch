@@ -61,18 +61,25 @@ warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
 ISSUE="${1:-}"; BRIEF="${2:-}"; shift 2 2>/dev/null || true
-BRANCH=""; DRY=0; FORCE=0; RESUME=0
+BRANCH=""; DRY=0; FORCE=0; RESUME=0; SAME_TIER_REASON=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --force) FORCE=1; shift ;;
     --resume) RESUME=1; shift ;;
+    # Deliberately takes a REASON rather than being a bare flag (#2120). A bare
+    # --same-tier would be typed reflexively the second time anyone hit the
+    # guard; having to state why this attempt differs from the one that failed
+    # is the entire value of the check. The reason is recorded by _audit.
+    --same-tier)
+      [[ -n "${2:-}" && "$2" != --* ]] || die "--same-tier needs a reason: --same-tier 'brief now pins the schema'"
+      SAME_TIER_REASON="$2"; shift 2 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 
-[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force] [--resume]"
+[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force] [--resume] [--same-tier <reason>]"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "issue must be a number, got '$ISSUE'"
 
 # Open the audit log now: the issue number is validated, so the path is safe to
@@ -84,7 +91,7 @@ DLOG="$VELO_STATE/dispatch/${ISSUE}/dispatch-$(date -u +%Y%m%dT%H%M%SZ).log"
 # the PARSED mode instead, which is what an audit actually wants: --force is the
 # flag that bypasses the triage-needed guard, and a dry run explains why no
 # worktree or worker followed.
-_audit "START issue=$ISSUE brief=$BRIEF dry_run=$DRY force=$FORCE branch=${BRANCH:-<auto>}"
+_audit "START issue=$ISSUE brief=$BRIEF dry_run=$DRY force=$FORCE branch=${BRANCH:-<auto>} same_tier=${SAME_TIER_REASON:-<none>}"
 [[ -f "$BRIEF" ]] || die "brief file not found: $BRIEF"
 [[ -s "$BRIEF" ]] || die "brief file is empty: $BRIEF"
 
@@ -199,6 +206,258 @@ case "$ROUTE" in
     Routable: local, deepseek, glm, codex. See #2062 for opus/fable." ;;
 esac
 ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
+
+# ---- 2b. the rework history this script has always written and never read ---
+#
+# #1992 made every dispatch append an outcome row to
+# `.agents/tasks/<issue>.result.jsonl`, including on crash and timeout. Until
+# #2120 the only mentions of that file in this script were a comment and the
+# line telling you where it would be written. Every dispatch launched blind to
+# what had already happened on the same issue.
+#
+# What the record showed when it was finally read — 18 dispatches, 7 landed:
+#
+#   #2000  deepseek failed -> deepseek AGAIN, read-only-violation, 253 turns
+#   #1918  codex stopped -> codex stopped
+#   #1987  glm read-only-violation -> codex landed (escalation worked, by hand)
+#   #1994  glm read-only-violation -> codex stopped (escalation did not help)
+#
+# Re-dispatching into the same tier after a failure is the pattern this catches.
+# It is not a judgement about the task — it is a fact about a prior run, which
+# is the only kind of escalation trigger we can actually evaluate.
+TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-glm) echo 2 ;; codex) echo 3 ;; *) echo -1 ;; esac; }
+
+# The decision is a FUNCTION so the test can execute this code rather than a
+# copy of it. An earlier draft of the test re-implemented the comparison and
+# asserted against its own re-implementation, which proves the test agrees with
+# itself and nothing about the script — the same shape as the #2102 defect where
+# assertions scored green against a script missing the function entirely.
+#
+#   allow             proceed
+#   allow-with-reason proceed, override was given
+#   refuse            same-or-lower tier after an UNSUCCESSFUL attempt
+#   unknown           a tier could not be determined — cannot compare
+#
+# "Unsuccessful" is `failed` or `abandoned`, NOT merely "not landed". The first
+# version of this guard treated every non-`landed` outcome as a failure, and two
+# of the six outcomes in the ladder are successes — README:717,719:
+#
+#   reported   read-only task, wrote nothing — the CORRECT result for a review gate
+#   stopped    hit a STOP trigger and reported — a success of the policy
+#
+# Scored against the record, that mistake was expensive. #1918 was re-dispatched
+# to codex seven times with commits climbing 0,2,3,4,5,5,6 and then 9 — resumed
+# iterative work, every run ending `stopped`, which is the policy working. The
+# guard refused all seven, plus the deliberate codex->velo-glm move on the
+# eighth. Three of ten transitions in the record were judged correctly.
+#
+# `read-only-violation` is deliberately NOT a trigger either: it is inferred from
+# brief prose (velo-record:124-136) and #2006 is a known false positive, so it
+# cannot justify refusing a dispatch.
+_zg_unsuccessful() { [[ "$1" == "failed" || "$1" == "abandoned" ]]; }
+
+history_verdict() { # <last_worker> <last_outcome> <new_worker> <reason>
+  local lr nr
+  lr=$(TIER_RANK "$1"); nr=$(TIER_RANK "$3")
+  _zg_unsuccessful "$2" || { echo allow; return; }
+  [[ -n "${4:-}" ]] && { echo allow-with-reason; return; }
+  # An UNKNOWN tier is not a low one (#2123 review, P1). TIER_RANK returns -1 for
+  # any name it does not route, and the parser maps a missing or null `worker`
+  # field to the sentinel `?` — which also ranks -1. Comparing that numerically
+  # made -1 sort BELOW every real tier, so `nr > lr` always held and the verdict
+  # was always `allow`:
+  #
+  #   $ history_verdict '?' failed velo-local ''
+  #   allow          <- a re-dispatch to the LOWEST tier, after a failure
+  #
+  # The guard silently did nothing for that row shape, and printed an
+  # "escalating ... after 'failed'" line as though it had. That is the same
+  # silent fail-open this PR exists to close, reached through a valid-but-unknown
+  # VALUE rather than a bad container type.
+  #
+  # It is reachable rather than theoretical: velo-record writes
+  # `"worker": s("VR_WORKER")`, and `s()` returns None when the variable is unset
+  # or empty (velo-record:188-190, :275).
+  [[ "$lr" -lt 0 || "$nr" -lt 0 ]] && { echo unknown; return; }
+  [[ "$nr" -le "$lr" ]] && { echo refuse; return; }
+  echo allow
+}
+
+RESULT_FILE="$ROOT/.agents/tasks/${ISSUE}.result.jsonl"
+if [[ -f "$RESULT_FILE" ]]; then
+  # Parsed, not grepped: the file is JSON and the fields we need are nested.
+  # A malformed row is skipped rather than fatal — it is append-only and a
+  # crashed writer can leave a partial last line. Skipping errs toward allowing
+  # the dispatch, which is the safe direction for a guard that refuses.
+  HIST=$(python3 -c '
+import json, sys
+rows = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        rows.append(r)
+def as_int(v):
+    # Anything not cleanly an integer becomes 0. A JSON row can be structurally
+    # valid and still carry `"commits": "garbage"`, and bash arithmetic under
+    # `set -u` treats a non-numeric string as a VARIABLE NAME — an undefined one,
+    # which aborts the script. That wedged the issue permanently and `--same-tier`
+    # could not rescue it, because the arithmetic ran while composing the advice,
+    # before the override was consulted. Coercing here means bash only ever sees
+    # digits. (#2123 review, P1.)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+def as_field(v):
+    # The output is TAB-separated and read by `cut -f`, so a tab or newline in a
+    # worker name would shift every field after it — `landed` could land in the
+    # commits column and reach the same arithmetic. Strip the delimiters rather
+    # than trusting the writer.
+    return str(v if v not in (None, "") else "?").replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+def as_dict(v):
+    # `or {}` is NOT enough, and the first fix for the arithmetic wedge assumed
+    # it was. A JSON scalar is TRUTHY, so `"runner": "notadict"` survives
+    # `or {}` and then `.get` raises AttributeError on a str — the parser exits
+    # non-zero, `|| HIST=""` swallows it, and the guard silently does not run.
+    # That traded a loud fail-closed for a silent fail-open, which is worse:
+    # a guard that is quietly absent is exactly how #2000 happened. (#2123
+    # re-gate, P1.)
+    return v if isinstance(v, dict) else {}
+
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    runner = as_dict(r.get("runner"))
+    work = as_dict(r.get("work"))
+    print("\t".join((
+        as_field(r.get("worker")),
+        as_field(r.get("outcome")),
+        str(as_int(work.get("commits"))),
+        str(as_int(runner.get("turns"))),
+    )))
+' "$RESULT_FILE" 2>/dev/null); HIST_RC=$?
+  # A parser failure must be LOUD. `|| HIST=""` alone meant any unhandled shape
+  # disabled the guard with no output at all — the dispatch simply proceeded as
+  # though the issue had no history, which is indistinguishable from a first
+  # attempt. Proceeding is still the right direction (a guard that refuses must
+  # not wedge an issue), but silence is not: it hides that the check did not run.
+  if [[ $HIST_RC -ne 0 ]]; then
+    warn "could not read $RESULT_FILE (python3 exit $HIST_RC) — the re-dispatch guard did NOT run.
+    This dispatch proceeds UNCHECKED against prior attempts on #$ISSUE."
+    HIST=""
+  fi
+
+  if [[ -n "$HIST" ]]; then
+    echo
+    echo "  prior attempts on #$ISSUE:"
+    printf '%s\n' "$HIST" | while IFS=$'\t' read -r h_w h_o h_c h_t; do
+      printf '    %-14s %-22s commits=%-3s turns=%s\n' "$h_w" "$h_o" "$h_c" "$h_t"
+    done
+    echo
+
+    LAST=$(printf '%s\n' "$HIST" | tail -1)
+    L_WORKER=$(cut -f1 <<<"$LAST"); L_OUTCOME=$(cut -f2 <<<"$LAST")
+    L_COMMITS=$(cut -f3 <<<"$LAST"); L_TURNS=$(cut -f4 <<<"$LAST")
+
+    # Same predicate as history_verdict, so the advice block and the decision
+    # cannot disagree about what counts as unsuccessful.
+    if _zg_unsuccessful "$L_OUTCOME"; then
+      NEW_RANK=$(TIER_RANK "$NAME"); OLD_RANK=$(TIER_RANK "$L_WORKER")
+
+      # The FAILURE MODE decides what the right response is, and escalation is
+      # frequently the WRONG one. 5 of the 11 non-landed outcomes in the record
+      # are `read-only-violation` — a worker doing what the brief forbade, not a
+      # worker that was not capable enough. Paying for a stronger model there
+      # buys a better answer to a question nobody asked.
+      case "$L_OUTCOME" in
+        read-only-violation)
+          # Hedged deliberately (#2123 review, P2). This outcome is INFERRED by
+          # velo-record from grepping the brief's prose for read-only markers,
+          # and velo-record's own comment calls that inference "the actual
+          # defect": #2006 followed a brief that said "read-only to src, commit
+          # your analysis", and its two required commits were recorded as a
+          # violation. That row is immutable and sits in the count that motivated
+          # this rule. So the guard may NOT assert a discipline failure — an
+          # operator told "a stronger model cannot help" would be steered away
+          # from the right response whenever the classification is wrong.
+          ADVICE="that outcome is INFERRED from the brief's prose, not observed (see velo-record:124-136),
+    and is known to misfire — #2006's required analysis commits were recorded as a violation.
+    CHECK IT before concluding anything. If the worker genuinely broke a read-only constraint,
+    that is a discipline problem a stronger model will not fix: repair the brief and re-dispatch
+    with --same-tier '<reason>'. If it was misclassified, treat it as the outcome it really was." ;;
+        *)
+          if [[ "$L_COMMITS" -gt 0 || "$L_TURNS" -ge 20 ]]; then
+            ADVICE="it failed AFTER producing work (commits=$L_COMMITS turns=$L_TURNS), which is a
+    capability signal. Escalate to a higher tier: local < deepseek < glm < codex."
+          else
+            ADVICE="it failed WITHOUT producing work (commits=$L_COMMITS turns=$L_TURNS), so the brief is
+    the more likely problem than the model. Fix the brief, then --same-tier '<reason>'."
+          fi ;;
+      esac
+
+      # The ACTION, not just the refusal.
+      #
+      # The worker is chosen at SPEC time — the `worker:*` label and the spec's
+      # `worker` field — and then never revisited. That is the whole of #2000:
+      # the label said deepseek, the run failed, and the re-dispatch used
+      # deepseek again because nobody went back and changed the label. Refusing
+      # without naming the fix leaves the stale decision in place and invites
+      # `--same-tier` as the path of least resistance.
+      #
+      # Both sources are named because velo-dispatch reads BOTH and the label
+      # overrides (#2085/#2087). Updating only the label would leave the spec
+      # permanently disagreeing — the exact drift #2085 was filed about.
+      NEXT_TIER=""
+      case "$L_WORKER" in
+        velo-local)    NEXT_TIER="worker:deepseek" ;;
+        velo-deepseek) NEXT_TIER="worker:glm" ;;
+        velo-glm)      NEXT_TIER="worker:codex" ;;
+      esac
+      if [[ -n "$NEXT_TIER" ]]; then
+        FIXUP="    Escalate the decision where it is actually made:
+      gh issue edit $ISSUE --repo $REPO --remove-label worker:${L_WORKER#velo-} --add-label $NEXT_TIER
+    and set \"worker\": \"${NEXT_TIER#worker:}\" in .agents/tasks/${ISSUE}.json if that spec exists —
+    the label overrides the spec, so changing one leaves them disagreeing (#2085)."
+      else
+        FIXUP="    $L_WORKER is the top tier — there is nowhere to escalate. Either the brief is the
+    problem, or this work needs splitting. --same-tier is not a substitute for either."
+      fi
+
+      case "$(history_verdict "$L_WORKER" "$L_OUTCOME" "$NAME" "$SAME_TIER_REASON")" in
+        refuse)
+          die "#$ISSUE last ran on $L_WORKER and ended '$L_OUTCOME'.
+    You are dispatching to $NAME, which is the same tier or lower.
+
+    $ADVICE
+
+$FIXUP
+
+    To proceed anyway: --same-tier '<why this time is different>'" ;;
+        unknown)
+          # Proceed, but LOUDLY. Refusing here could wedge an issue whose record
+          # carries one bad row, and the established rule is that a guard which
+          # refuses must never wedge. Silence is the other failure though — that
+          # is the bug this branch exists to fix — so the dispatch says plainly
+          # that no comparison happened.
+          warn "cannot compare tiers for #$ISSUE: last worker '$L_WORKER', dispatching '$NAME'.
+    One of them is not a routable tier, so the re-dispatch guard did NOT run.
+    This dispatch proceeds UNCHECKED against the '$L_OUTCOME' outcome above." ;;
+        allow-with-reason)
+          warn "same-tier re-dispatch after '$L_OUTCOME' — reason: $SAME_TIER_REASON" ;;
+        allow)
+          ok "escalating $L_WORKER ($OLD_RANK) -> $NAME ($NEW_RANK) after '$L_OUTCOME'" ;;
+      esac
+    fi
+  fi
+fi
 
 # ---- 3a. fetch, so `origin/master` is current ------------------------------
 #

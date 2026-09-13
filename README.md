@@ -46,6 +46,7 @@ and the tests** — never from the worker's self-report.
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_status.sh                 velo-status worker naming
     test_zg_hidden.sh              zg can see .agents/ — both routes, and the index
+    test_history_routing.sh        the re-dispatch guard: tiers, failure modes, bad records
     test_worker_env.py             the worker can run the tools its policy names
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
@@ -719,6 +720,68 @@ Token counts are always real; only the dollars are suspect.
 | `abandoned` | no commits, no STOP, no error |
 | `failed` | non-zero exit, or a leaked tool call (an intended action never ran) |
 
+### 7. Re-dispatching — the record now decides whether you may
+
+For a long time the record was written and never read. The only mentions of it
+in `velo-dispatch` were a comment and the line telling you where it would be
+written, so every dispatch launched blind to what had already happened on the
+same issue. Reading it back showed why that mattered — 18 dispatches, 7 landed:
+
+| issue | sequence | |
+|---|---|---|
+| #2000 | deepseek `failed` → **deepseek again** `read-only-violation`, 253 turns | same tier after a failure |
+| #1918 | codex `stopped` → codex `stopped` | same tier twice |
+| #1987 | glm `read-only-violation` → codex `landed`, 8 commits | escalation worked, by hand |
+| #1994 | glm `read-only-violation` → codex `stopped` | escalation did not help |
+
+So `velo-dispatch` now prints prior attempts before launching, and **refuses a
+same-or-lower tier after a non-landed outcome**:
+
+```
+  prior attempts on #2000:
+    velo-deepseek  failed                 commits=0   turns=0
+    velo-deepseek  read-only-violation    commits=3   turns=253
+
+NOT READY: #2000 last ran on velo-deepseek and ended 'read-only-violation'.
+    You are dispatching to velo-deepseek, which is the same tier or lower.
+    …
+    Escalate the decision where it is actually made:
+      gh issue edit 2000 --repo … --remove-label worker:deepseek --add-label worker:glm
+```
+
+Tier order is `local < deepseek < glm < codex`.
+
+**The refusal names the label change because that is where the decision lives.**
+The worker is chosen at spec/label time and then never revisited — which is the
+whole of #2000: the label said deepseek, the run failed, and the re-dispatch used
+deepseek again because nobody went back and changed it. A refusal that only says
+"no" leaves the stale decision in place. Change the spec's `worker` field too:
+the label overrides the spec, so changing one leaves them disagreeing (#2085).
+
+To repeat a tier deliberately:
+
+```bash
+velo-dispatch 2000 .agents/tasks/2000-brief.md --same-tier 'brief now pins the schema'
+```
+
+It takes a **reason**, not a bare flag, and the reason is recorded by the audit
+log. A bare flag gets typed reflexively the second time anyone hits the guard,
+which removes the only thing the guard is for.
+
+**Escalation is often the wrong response, so the advice depends on the failure
+mode.** A run that failed *after producing work* is a capability signal. A run
+that produced nothing points at the brief. And `read-only-violation` is treated
+as neither: `velo-record` infers it by grepping the brief's prose, and its own
+comment calls that inference "the actual defect" — #2006 followed a brief saying
+"read-only to src, commit your analysis" and had its two required commits
+recorded as a violation. The guard says the outcome is inferred and asks you to
+check, rather than asserting a discipline failure it cannot establish.
+
+If the record cannot be parsed the dispatch **proceeds and says so loudly**. A
+guard that refuses must never wedge an issue — but a guard that vanishes quietly
+is how #2000 happened, so "no history" and "history we could not read" are
+reported differently.
+
 ---
 
 ## One gate per PR, and one spec review loop
@@ -973,12 +1036,28 @@ the `triage-needed` guard, and that is exactly what an audit wants to see.
 here, commit, then re-run the install step. A change made only in `~/.agents/`
 is lost on the next sync.
 
-**Run the tests.** `.agents/tests/run.sh` drives the real scripts — not
-re-implementations of them — under stubbed `gh`, `codex` and `velo-gate`:
+**Run the tests before every push.** `.agents/tests/run.sh` drives the real
+scripts — not re-implementations of them — under stubbed `gh`, `codex` and
+`velo-gate`:
 
 ```bash
 .agents/tests/run.sh
 ```
+
+**Nothing else will run it for you, and that has already cost a day.**
+`run-commit.sh --fast` covers Rust. CI runs nothing at all when a diff touches no
+Rust — `Build & Test` reports success against a change it never examined.
+`velo-merge` checks the gate label, not this suite. And a `/code-review` gate will
+not run it unless the brief says to; four Codex rounds across #2102 and #2113
+missed a red suite because none of them were asked.
+
+That is how it happened: #2102 changed `velo-status`'s worker-name rule,
+`test_status.sh`'s wiring assertion went red — *"the rule under test must still
+be the rule in the script"*, which is precisely what it exists to catch — and
+#2102 and #2113 both merged anyway, leaving master red for a day. The check
+worked. Nobody ran it.
+
+If you changed anything under `.agents/`, this suite is the gate.
 
 Two suites need more than the repo to run, and **skip loudly** rather than
 passing quietly when they cannot:
