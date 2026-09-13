@@ -3,6 +3,8 @@
 #
 #   velo-spec-review <issue> <brief-file> [--by <name>]   attest (as before)
 #   velo-spec-review <issue> --check                      review the SPEC (Codex)
+#   velo-spec-review <issue> --check --worktree <path>    review the spec IN that
+#                                                         worktree (branch, not master)
 #
 # --check is the loop: Codex reads the spec adversarially against the issue and
 # the repo, reports findings, and exits non-zero. You fix the spec and re-run.
@@ -23,7 +25,7 @@ set -uo pipefail
 REPO="velostreamai/velostream"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 
-ISSUE="${1:-}"; BRIEF=""; BY="${USER:-unknown}"; CHECK=0
+ISSUE="${1:-}"; BRIEF=""; BY="${USER:-unknown}"; CHECK=0; REVIEW_WT=""
 STATE="${VELO_STATE:-$HOME/.agents/state}"
 SPEC_TIMEOUT="${VELO_SPEC_TIMEOUT:-900}"
 SPEC_CLEAN_ROUNDS="${VELO_SPEC_CLEAN_ROUNDS:-2}"
@@ -32,6 +34,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --check) CHECK=1; shift ;;
     --by)    BY="$2"; shift 2 ;;
+    --worktree) REVIEW_WT="$2"; shift 2 ;;
     -*)      die "unknown flag: $1" ;;
     *)       [[ -z "$BRIEF" ]] && BRIEF="$1"; shift ;;
   esac
@@ -39,6 +42,11 @@ done
 
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "usage: velo-spec-review <issue> <brief-file> [--by <name>]
        velo-spec-review <issue> --check"
+# Checked BEFORE the brief requirement, so `--worktree` without `--check` reports
+# the flag misuse rather than "attest mode needs a brief file", which sends the
+# reader looking for the wrong mistake.
+[[ -z "$REVIEW_WT" || $CHECK -eq 1 ]] || die "--worktree is only valid with --check
+       Attest mode must write the canonical spec that velo-dispatch reads."
 if [[ $CHECK -eq 0 ]]; then
   [[ -n "$BRIEF" ]] || die "attest mode needs a brief file (or pass --check to review the spec)"
   [[ -f "$BRIEF" ]] || die "brief not found: $BRIEF"
@@ -52,6 +60,23 @@ fi
 ROOT="$HOME/RustroverProjects/velostream"
 SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
 [[ -f "$SPEC" ]] || die "no task spec: $SPEC"
+
+# --check may review a spec that is not on master yet. Attest mode may NOT: the
+# paragraph above is why, and it still holds.
+#
+# Without this, `--check` always read the canonical worktree while spec fixes sat
+# on a branch, so round after round re-reviewed the SAME merged content. Two
+# rounds were spent that way on #1918 before anyone noticed, and the finding
+# count moved 5 -> 1 -> 3 on reviewer nondeterminism alone, which reads exactly
+# like progress. A loop that cannot see your edits is worse than no loop: it
+# manufactures the feeling of convergence.
+REVIEW_ROOT="$ROOT"
+if [[ -n "$REVIEW_WT" ]]; then
+  [[ -d "$REVIEW_WT" ]] || die "--worktree not found: $REVIEW_WT"
+  REVIEW_ROOT=$(cd "$REVIEW_WT" && pwd)
+  SPEC="$REVIEW_ROOT/.agents/tasks/${ISSUE}.json"
+  [[ -f "$SPEC" ]] || die "no task spec in that worktree: $SPEC"
+fi
 
 # ---- --check: have Codex review the SPEC, and loop until it stops finding ----
 #
@@ -148,7 +173,19 @@ spec_check() {
   } > "$brief"
 
   printf '  .. spec review round for #%s (codex, up to %ss)\n' "$ISSUE" "$SPEC_TIMEOUT"
-  ( cd "$ROOT" && timeout "$SPEC_TIMEOUT" codex review - < "$brief" ) > "$round_log" 2>&1
+  # Name the tree under review, its HEAD, and whether it is dirty or ahead of
+  # master. A round that silently reviewed stale content is indistinguishable
+  # from a round that found nothing, so this line is the difference between a
+  # verdict you can trust and one you cannot.
+  R_HEAD=$(git -C "$REVIEW_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')
+  R_AHEAD=$(git -C "$REVIEW_ROOT" rev-list --count origin/master..HEAD 2>/dev/null || echo '?')
+  R_DIRTY=$(git -C "$REVIEW_ROOT" status --porcelain -- .agents/tasks 2>/dev/null | wc -l | tr -d ' ')
+  printf '  reviewing %s (HEAD %s, %s commit(s) ahead of origin/master, %s uncommitted spec file(s))\n' \
+    "$REVIEW_ROOT" "$R_HEAD" "$R_AHEAD" "$R_DIRTY"
+  if [[ "$REVIEW_ROOT" == "$ROOT" && "$R_AHEAD" == "0" && "$R_DIRTY" == "0" ]]; then
+    printf '  \033[2m(spec content equals origin/master — if you just edited it on a branch, pass --worktree <path>)\033[0m\n'
+  fi
+  ( cd "$REVIEW_ROOT" && timeout "$SPEC_TIMEOUT" codex review - < "$brief" ) > "$round_log" 2>&1
   local rc=$?
 
   local verdict findings

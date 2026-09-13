@@ -74,8 +74,16 @@ forbidden:                  # things a worker must NOT do, from prior review
 | `evidence` | if not `code`, `audit` must be `done:<sha>` | refuse — needs audit |
 | `verified_against` | reported as commits-behind (informational) | warn only |
 
-`acceptance`, `forbidden`, `tests` and the resolved anchor line numbers are
-written into the generated brief, so nothing is hand-transcribed.
+`acceptance`, `forbidden`, `tests` and `stop_conditions` are injected verbatim
+into the task the worker receives, under a `## SPEC CONTRACT` heading, so nothing
+is hand-transcribed.
+
+This was aspirational for a long time and the injection did not exist: the worker
+got `cat <brief>` and nothing else, so anything in the sidecar and not ALSO typed
+into the brief never reached it. Because `tests.fail_to_pass` is checked at
+MERGE, the failure mode was a worker satisfying every word of its visible brief
+and then failing a gate on names it had never been shown — which is what happened
+on #1918, where five of six required test names lived only here.
 
 ## Gate comments
 

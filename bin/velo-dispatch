@@ -995,7 +995,59 @@ if [[ "${INDEX_READY:-0}" == "1" ]]; then
 else
   INDEX_NOTE="Discovery index: NOT AVAILABLE for this run. \`zg query\` will fail with WORKSPACE_INDEX_NOT_FOUND. Do NOT run \`zg index\` and do NOT ask anyone whether to build one — there is nobody to ask. Use \`zg query --rg\`, \`rg\` and \`ast-grep\`, which is the documented fallback and is sufficient."
 fi
+# The sidecar CONTRACT, injected verbatim.
+#
+# SCHEMA.md has always said "acceptance, forbidden, tests and the resolved anchor
+# line numbers are written into the generated brief, so nothing is hand-transcribed."
+# That was not true: this built TASK from the brief file alone, so anything in the
+# sidecar and not also typed into the brief never reached the worker.
+#
+# The gap is not cosmetic, because `tests.fail_to_pass` is checked at MERGE. On
+# #1918 five of six required test names existed only in the sidecar, so a worker
+# could satisfy every word of its visible brief and still fail the gate on names
+# it was never shown — and the previous attempt did exactly that, writing all
+# three of its tests under names of its own choosing.
+#
+# Injected rather than reconciled-by-hand because hand-transcription is the thing
+# SCHEMA.md was promising to remove. The brief may still discuss these items in
+# prose; duplication is harmless, silence was not.
+CONTRACT=$(SPEC_FILE="$SPEC" python3 <<'PYEOF'
+import json, os
+d = json.load(open(os.environ["SPEC_FILE"]))
+out = ["## SPEC CONTRACT — injected from the task sidecar, authoritative",
+       "",
+       "This section is machine-generated from `.agents/tasks/<issue>.json`. Where it",
+       "and the brief prose disagree, THIS governs — the merge gate reads the sidecar.",
+       ""]
+def block(title, items, note=None):
+    if not items:
+        return
+    out.append(f"### {title}")
+    if note:
+        out.append(note)
+    out.append("")
+    for i in items:
+        out.append(f"- {i}")
+    out.append("")
+t = d.get("tests") or {}
+ftp = t.get("fail_to_pass") or []
+if ftp:
+    block("Tests that MUST fail before your change and pass after (`fail_to_pass`)",
+          ftp,
+          "Use these names EXACTLY. The merge gate matches them literally; a name that\ndiffers by one word fails the gate however good the test is.")
+block("Tests that MUST stay green (`pass_to_stay`)", t.get("pass_to_stay") or [])
+block("Known-red before you start (not yours to fix)", t.get("known_red") or [])
+block("Acceptance — every bar must hold", d.get("acceptance") or [])
+block("Forbidden", d.get("forbidden") or [])
+block("STOP and report if", d.get("stop_conditions") or [])
+print("\n".join(out).rstrip())
+PYEOF
+) || die "could not render the spec contract from $SPEC"
+
 TASK="$(cat "$BRIEF")
+
+---
+$CONTRACT
 
 ---
 $INDEX_NOTE"
