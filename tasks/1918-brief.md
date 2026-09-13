@@ -34,6 +34,13 @@ It was dispatched with `--resume`, so nothing was reset:
 
     1f7769908  test: pin unified computed output names
     257756ad1  fix: unify computed output names across plan and records
+    2d343fe81  fix: unify grouped runtime output names
+    17bda2298  style: cargo fmt, and commit the in-flight reader-migration edits
+
+All four `READER-MIGRATED` lines are already logged — `select.rs` and
+`accumulator.rs` as `lookup-key`, `group_by.rs` and `group_by_columnar.rs` as
+`delegate`. That part of §3d is DONE; do not redo it. What remains is §3a's
+aggregate rule and the expectation updates it implies.
 
 Both are pushed to origin, so they cannot be lost. Read them FIRST — the six
 red-first tests are already written and their failures already recorded in
@@ -77,6 +84,45 @@ any qualifier stripped: `SELECT t.amount` outputs `amount`.
 **`EXPR$<n>` is the name everywhere — plan schema and emitted record alike.**
 This is the pinned decision; do not propose the descriptive
 `Multiply_price_quantity` form instead.
+
+#### It applies to aggregates too — `SUM(value)` becomes `EXPR$0`
+
+The first resume stopped here, correctly, because
+`differential_sliding_computed_group_by_parity` reads a field named `SUM(value)`.
+The answer is that the test's expectation changes, not that aggregates are carved
+out.
+
+Flink and ksqlDB — the streaming-SQL family this engine follows, and the prior art
+the issue cites — apply `EXPR$0` / `KSQL_COL_0` to EVERY unaliased non-column
+item, aggregates included. Positional uniqueness is the property the issue says
+`__expr__` lacks, and it is not a property you can have selectively.
+
+A mixed rule (conventional `NAME(args)` for functions, positional for everything
+else) was considered and **REJECTED**: `SUM(price * qty)` renders `SUM(expr)`
+today, because `expr_to_string`'s catch-all is reachable inside a function
+argument. Two such items collide exactly as two `__expr__` items did. A carve-out
+for functions would keep the bug in aggregate clothing.
+
+#### The escape hatch is AS, and it must keep working
+
+`SELECT SUM(value) AS total` emits `total`. That is what makes renaming unaliased
+items safe, and it is the line between an expectation that legitimately changes
+and a regression:
+
+| a test pins… | then |
+|---|---|
+| a legacy generated name for an UNALIASED item — `SUM(...)`, `SUM(expr)`, `__expr__`, `__group__`, `price_Multiply_quantity` | its expectation MAY change; log one `CHANGED-EXPECTATION` line per test saying the old name was non-positional or colliding |
+| an EXPLICIT `AS` alias | it must pass UNCHANGED — changing it is a regression |
+| a non-naming property — row counts, values, ordering, watermarks | it must pass UNCHANGED — **STOP** if it fails |
+
+`pass_to_stay` is now the three alias-focused tests, because those are the
+property that must not move. The two computed-group-by parity tests moved out:
+they pinned legacy generated names for unaliased items, which is precisely what
+this issue replaces.
+
+Expect a substantial number of `CHANGED-EXPECTATION` lines this time — that is
+the correct outcome here, not a warning sign. What would be a warning sign is a
+changed expectation on an aliased item.
 
 ### 3b. Sweep the class: `__group__` too
 
@@ -126,7 +172,12 @@ Either the other two delegate to the shared helper, or they are demoted to a
 documented runtime **lookup key** that is never an output name and never reaches
 a `Schema`. Pick one and record it per §7b-bis.
 
-#### The readers you MUST migrate — this list is the completion gate
+#### The readers you MUST migrate — ALREADY DONE, do not redo
+
+All four `READER-MIGRATED` lines are logged on your branch (`select.rs` and
+`accumulator.rs` as `lookup-key`, `group_by.rs` and `group_by_columnar.rs` as
+`delegate`). This table is kept for reference only. Re-read these files to follow
+their pattern; do not migrate them again.
 
 The first attempt at this section picked `mode=migrate`, moved the plan side plus
 `interval_join.rs` and `rows_window.rs`, and stopped with 53 failing tests. The
@@ -161,7 +212,7 @@ says so explicitly: the alias "matches the key the runtime evaluator uses for
 lookup, so write and read sides agree."
 
 Routing `build_plan_alias_keys` (`builder.rs:1661`) through the positional helper
-**on its own** was attempted and **failed 48 unit tests**:
+**on its own** was attempted and **failed 48 unit tests** (53 once the plan side was fully migrated):
 
     window_v2::differential_test                              15
     server::v2::partition_receiver_schema_inference_test       17
@@ -228,7 +279,7 @@ STOP and report, without pushing, if:
   signature whose callers live outside `plan/` and `execution/`
 - preserving the `alias_keys` write/read contract and shipping `EXPR$<n>` at
   execution turn out to be mutually exclusive
-- any of the 48 tests in §3e requires a **changed expectation** rather than
+- any of the coupled tests in §3e requires a **changed expectation** rather than
   passing unmodified — report it with the argument for why the old behaviour was
   wrong, per the correctness-over-parity rule, and do not change it unilaterally
 - **any of the six `fail_to_pass` tests PASSES against unfixed code.** You cannot
@@ -316,8 +367,17 @@ gate for that reason alone.
 | `select_field_column_is_named_identically_by_both_surfaces` | `SelectField::Column("t.amount")` yields `amount` from BOTH `select_fields_to_project_exprs` and `schema_from_select_fields` |
 | `emitted_record_field_name_matches_plan_schema_for_computed_select_item` | the EMITTED RECORD's field name equals the propagated schema's, through a real engine consumer (§7a) |
 | `group_by_expression_also_in_select_keeps_the_positional_name` | `SELECT price * quantity, COUNT(*) FROM trades GROUP BY price * quantity` names the key `EXPR$0` in the Aggregate schema, not `"expr"` |
+| `unaliased_aggregate_gets_a_positional_name` | `SELECT SUM(value) FROM trades` names the output `EXPR$0`, NOT `SUM(value)` — plan and emitted record alike (§3a) |
+| `two_unaliased_computed_aggregates_get_distinct_positional_names` | `SELECT SUM(a * b), SUM(c * d)` names them `EXPR$0` and `EXPR$1`, never `SUM(expr)` twice |
+| `explicit_alias_survives_positional_naming` | `SELECT SUM(value) AS total` still emits `total` — the escape hatch is intact |
 
 Use these names exactly. Add more tests freely under any name you like.
+
+`pass_to_stay` — must pass UNCHANGED, these are the alias canaries:
+
+    group_by_aliased_key_schema_carries_alias_not_raw_name
+    two_stage_aggregate_resolves_aliased_group_by_key
+    t27_sliding_aliased_group_by_parity
 
 ### Red-first is REQUIRED, and must be recorded
 
@@ -369,6 +429,20 @@ should be reporting rather than changing most of them. Zero
 
 A conclusion that exists only in your head, or only in a commit message body, is
 lost: the caller writes the PR from `agent.log` and your report.
+
+## 7b-ter. Run `cargo fmt --all` BEFORE you stop
+
+Unconditionally, and commit the result — not only when you reach the gate.
+
+Both prior runs hit a STOP before reaching `run-commit.sh`, so neither ever
+formatted, and CI on the draft PR failed at `cargo fmt --all -- --check` before
+running a single test. 14 diffs across 9 files. A dispatch that stops early ships
+unformatted code by construction unless fmt is unconditional.
+
+So: the last two actions before writing a STOP line are always
+
+    cargo fmt --all --manifest-path <worktree>/Cargo.toml
+    git -C <worktree> add -A && git -C <worktree> commit
 
 ## 7c. Commit incrementally — and why this does not violate CLAUDE.md
 
@@ -422,7 +496,7 @@ Each entry names what a reviewer can check in the diff, not an intent to infer.
   added under `src/`.
 - **Do not weaken an existing test.** Checkable: the diff removes no `#[test]`,
   adds no `#[ignore]`, and deletes no `assert*!` line from a pre-existing test.
-  The 48 tests in §3e are the gate for this work, not an obstacle — a naming
+  The coupled tests in §3e are the gate for this work, not an obstacle — a naming
   change that requires silencing them has not been made correctly.
 - **Do not change the `EXPR$` prefix or the `$<n>` form.**
 - **If the diff touches `build_plan_alias_keys`, it must also touch the runtime

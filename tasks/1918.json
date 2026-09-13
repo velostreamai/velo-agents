@@ -77,21 +77,21 @@
       "plan_schema_and_project_exprs_agree_on_unaliased_expression_names",
       "select_field_column_is_named_identically_by_both_surfaces",
       "emitted_record_field_name_matches_plan_schema_for_computed_select_item",
-      "group_by_expression_also_in_select_keeps_the_positional_name"
+      "group_by_expression_also_in_select_keeps_the_positional_name",
+      "unaliased_aggregate_gets_a_positional_name",
+      "two_unaliased_computed_aggregates_get_distinct_positional_names",
+      "explicit_alias_survives_positional_naming"
     ],
     "pass_to_stay": [
       "group_by_aliased_key_schema_carries_alias_not_raw_name",
       "two_stage_aggregate_resolves_aliased_group_by_key",
-      "differential_sliding_computed_group_by_parity",
-      "differential_mixed_int_float_computed_group_by_parity",
-      "t27_sliding_aliased_group_by_parity",
-      "inferred_schema_chunked_output_matches_hand_computed_expected_sums"
+      "t27_sliding_aliased_group_by_parity"
     ],
     "known_red": []
   },
   "acceptance": [
     "No occurrence of the string __expr__ or __group__ remains in src/",
-    "An unaliased SELECT item whose expression is not a column reference is named EXPR$<n>, n = zero-based position in the select list, and that is the name in BOTH the propagated plan schema AND the emitted record. A test asserts equality of the two through a real engine consumer, not by comparing two plan-side helpers.",
+    "An unaliased SELECT item whose expression is not a column reference is named EXPR$<n>, n = zero-based position in the select list, and that is the name in BOTH the propagated plan schema AND the emitted record. This INCLUDES function calls and aggregates: SELECT SUM(value) yields EXPR$0, not SUM(value). That is Flink and ksqlDB behaviour (EXPR$0 / KSQL_COL_0) and the positional uniqueness is the property the issue's prior-art section identifies as the whole point. A mixed rule \u2014 conventional names for functions, positional for everything else \u2014 was considered and REJECTED: it re-admits the defect through SUM(price * qty), which renders SUM(expr) today, so two such items collide exactly as two __expr__ items did. A test asserts equality of the two through a real engine consumer, not by comparing two plan-side helpers.",
     "A GROUP BY key that is not a column reference is named by the same generator, positionally within the GROUP BY list. A computed key that also appears in the SELECT list carries its SELECT-list position, because the output column IS the SELECT item; the GROUP BY index applies only to keys absent from SELECT.",
     "builder.rs::select_fields_to_project_exprs and schema_propagation.rs::schema_from_select_fields call ONE shared naming helper for EVERY SelectField variant \u2014 Expression, Column, AliasedColumn, Wildcard. Neither holds a private copy of any arm. SelectField::Column must strip its qualifier at both sites via the shared helper: the parser never emits this variant, so no parsed query exercises it, which is exactly how it drifted.",
     "An unaliased SelectField::Expression holding a plain column reference resolves to its bare column name at BOTH sites (before this change schema_propagation.rs returns __expr__ for this case and builder.rs does not)",
@@ -105,7 +105,11 @@
     "docs/sql/PARSER_GRAMMAR.md documents the generated-name rule alongside the select_item production (issue #1918 acceptance bar 4) \u2014 this is a REQUIRED doc change, distinct from the forbidden corpus-editing below. It must describe the SHIPPED behaviour, including that the name holds at execution.",
     "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed",
     "Each of the six fail_to_pass tests was written BEFORE the fix, run red, and its failure recorded in agent.log as a RED-FIRST line carrying the actual assertion message. None of the six exists on master, so a test written after the fix proves only that the code does what it does. The earlier attempt at this issue shipped a group-by test that passed both before and after the change because it constructed Aggregate with empty select_exprs/alias_keys and never reached the path it claimed to cover.",
-    "If any of the six fail_to_pass tests passes against unfixed code, STOP and report rather than loosening the test until it fails. Either the test does not reach the path it claims to cover, or the bar's premise is wrong \u2014 a human decides which."
+    "If any of the six fail_to_pass tests passes against unfixed code, STOP and report rather than loosening the test until it fails. Either the test does not reach the path it claims to cover, or the bar's premise is wrong \u2014 a human decides which.",
+    "An explicit AS alias always wins and is never replaced by a generated name: SELECT SUM(value) AS total emits total. This is the user's escape hatch from positional names and the reason renaming unaliased items is safe; a test pinning an AS alias must therefore keep passing unchanged.",
+    "Two unaliased computed aggregates get DISTINCT names: SELECT SUM(a * b), SUM(c * d) emits EXPR$0 and EXPR$1, never SUM(expr) twice. This shape is the aggregate form of the issue's defect and is pinned by its own test.",
+    "A test that pins a LEGACY GENERATED name for an UNALIASED item \u2014 SUM(...), SUM(expr), __expr__, __group__, price_Multiply_quantity \u2014 may have its expectation updated, with a CHANGED-EXPECTATION line per test stating that the old name was wrong because it was either non-positional or colliding. A test that pins an EXPLICIT AS alias, or any non-naming property (row counts, values, ordering, watermarks), must NOT be updated; if such a test fails, that is a real regression and a STOP.",
+    "cargo fmt --all is run and its result committed BEFORE any STOP, not only at the gate. Both prior runs stopped before reaching run-commit.sh, so neither ever formatted, and CI failed at cargo fmt --all -- --check before reaching a single test. A dispatch that stops early ships unformatted code unless fmt is unconditional."
   ],
   "forbidden": [
     "No collision handling: the naming helper and its callers must not consult any collection of already-used names \u2014 no HashSet/HashMap/Vec::contains of prior names, no numeric suffix appended to a generated name, no retry loop on a name. EXPR$<n> derives from position ALONE. #1919 owns duplicate detection.",
@@ -116,14 +120,14 @@
     "Do not weaken an existing test: the diff removes no #[test], adds no #[ignore], and deletes no assert*! line from a pre-existing test. The 48 coupled tests are the gate for this work, not an obstacle.",
     "Do not change the EXPR$ prefix or the $<n> form.",
     "If the diff touches build_plan_alias_keys it must also touch the runtime readers in the same commit \u2014 select.rs::get_expression_name, accumulator.rs::generate_field_name, or their call sites in processors/select/group_by.rs and processors/group_by_columnar.rs. Producer-alone is the one-sided edit that failed 48 tests.",
-    "Preserve explicit-alias behaviour exactly: the output name of a SelectField::AliasedColumn, and of a GROUP BY expression that select_alias_for_group_expr matches to an AS-aliased SELECT item, must be unchanged. Those two cases are the WHOLE of what this entry covers; no wider notion of adjacent alias defects is implied. group_by_aliased_key_schema_carries_alias_not_raw_name and two_stage_aggregate_resolves_aliased_group_by_key are in pass_to_stay as the check. STOP and report if fixing __group__ appears to require changing alias behaviour.",
     "Do not change a public signature with callers outside plan/ and execution/ \u2014 STOP and report instead.",
-    "Do not apply the scope tripwire to required work: edits under tests/, the parent mod.rs registrations, docs/sql/PARSER_GRAMMAR.md, and agent.log are mandatory, not scope creep. The tripwire covers src/ only."
+    "Do not apply the scope tripwire to required work: edits under tests/, the parent mod.rs registrations, docs/sql/PARSER_GRAMMAR.md, and agent.log are mandatory, not scope creep. The tripwire covers src/ only.",
+    "Do not change the output name of an item carrying an explicit AS alias, and do not change any non-naming behaviour (row counts, values, ordering, watermarks). The three pass_to_stay tests are the canaries; they must pass UNCHANGED."
   ],
   "reviewed": {
     "by": "neilavery",
     "at": "2026-09-12T19:57:42Z",
-    "brief_sha256": "55755dc4a94f6832ce1d5eb2925138792cd4c6bd667899b3bc980dd8bbb36af4"
+    "brief_sha256": "c9496a7a2139cf760592951d7787a24db493f0db323e5caba4228dd3bd8e8789"
   },
   "stop_conditions": [
     "The shared helper cannot be reached from execution without changing a public signature whose callers live outside plan/ and execution/.",
@@ -132,6 +136,7 @@
     "Any of the six fail_to_pass tests PASSES against unfixed code \u2014 you cannot record a RED-FIRST line for a test that was never red, and must not loosen it until it fails. Either the test does not reach the path it claims, or the bar's premise is wrong; a human decides which.",
     "The __group__ fix cannot be made without changing the output name of a SelectField::AliasedColumn, or of a GROUP BY key carrying an explicit AS alias.",
     "The scope tripwire fires: a file under src/ that neither names an expression nor reads one of the three generators needs editing.",
-    "The work produces any ALIAS-KEYS or CHANGED-EXPECTATION conclusion that cannot be recorded in agent.log \u2014 the worker does not open the PR, so agent.log plus the final report are the only handoff channels to the caller."
+    "The work produces any ALIAS-KEYS or CHANGED-EXPECTATION conclusion that cannot be recorded in agent.log \u2014 the worker does not open the PR, so agent.log plus the final report are the only handoff channels to the caller.",
+    "A test pinning an EXPLICIT AS alias fails, or a non-naming property fails (row counts, values, ordering, watermarks). Those are real regressions, not expectation drift, and must not be 'fixed' by editing the expectation."
   ]
 }
