@@ -24,13 +24,20 @@ redo blindly:
     c157ded33  plan-side EXPR$<n> + shared helper
     e15d7bac8  route SelectField::Column through the shared helper
 
-## 1. Target and isolation
+## 1. Target and isolation — THIS IS A RESUME
 
 Worktree: `/Users/neilavery/RustroverProjects/velostream-1918`
 Branch: `fix/1918-unify-output-names`
 
-Both are created for you by `velo-dispatch` off current `origin/master`. The
-worktree is clean and carries no prior commits.
+**The worktree already exists and carries two commits of your own prior work.**
+It was dispatched with `--resume`, so nothing was reset:
+
+    1f7769908  test: pin unified computed output names
+    257756ad1  fix: unify computed output names across plan and records
+
+Both are pushed to origin, so they cannot be lost. Read them FIRST — the six
+red-first tests are already written and their failures already recorded in
+`agent.log`, so do not rewrite them. Your remaining work is §3d's reader list.
 
 The branch is NOT `fix/1918-expr-output-names` — that name is taken by the
 superseded PR #2104, kept on origin as the reference implementation named in §0.
@@ -117,7 +124,34 @@ at execution.
 **Your job: exactly one code path decides what an output column is called.**
 Either the other two delegate to the shared helper, or they are demoted to a
 documented runtime **lookup key** that is never an output name and never reaches
-a `Schema`. Pick one and state which in the PR body.
+a `Schema`. Pick one and record it per §7b-bis.
+
+#### The readers you MUST migrate — this list is the completion gate
+
+The first attempt at this section picked `mode=migrate`, moved the plan side plus
+`interval_join.rs` and `rows_window.rs`, and stopped with 53 failing tests. The
+four files below had a ZERO-line diff. They are where the remaining failures
+live, and no sweep will go green until they move:
+
+| file | what is still unmigrated |
+|---|---|
+| `execution/processors/select.rs` | `SelectProcessor::get_expression_name` — the `{op:?}_{left}_{right}` namer that produces `Multiply_price_quantity` |
+| `execution/aggregation/accumulator.rs` | `AccumulatorManager::generate_field_name`, and `expr_to_string`'s `_ => "expr"` catch-all at **:1091** |
+| `execution/processors/select/group_by.rs` | three `get_expression_name` call sites (~:992, :1114, :1201) |
+| `execution/processors/group_by_columnar.rs` | one `get_expression_name` call site (~:2242) |
+
+Check them off explicitly in `agent.log` as you go:
+
+    <UTC> READER-MIGRATED | file=<path> | symbol=<fn> | mode=<delegate|lookup-key>
+
+Four `READER-MIGRATED` lines are expected. Fewer than four with a green sweep
+means you found a reason one did not need it — say which and why. The sweep going
+green while a file here is untouched is the shape to distrust: it usually means a
+test was weakened rather than a reader moved, which §8 forbids.
+
+`interval_join.rs` and `rows_window.rs` are already migrated on your branch —
+don't redo them, but do re-read them, because the pattern they use is the one to
+follow.
 
 ### 3e. The coupling that will bite you — read before touching `alias_keys`
 

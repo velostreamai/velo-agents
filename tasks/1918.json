@@ -123,7 +123,7 @@
   "reviewed": {
     "by": "neilavery",
     "at": "2026-09-12T19:57:42Z",
-    "brief_sha256": "764c7762fe59da7de61d80e63ceeb4f1f5d51d0ac02032eb6580b950fec6dda3"
+    "brief_sha256": "55755dc4a94f6832ce1d5eb2925138792cd4c6bd667899b3bc980dd8bbb36af4"
   },
   "stop_conditions": [
     "The shared helper cannot be reached from execution without changing a public signature whose callers live outside plan/ and execution/.",
