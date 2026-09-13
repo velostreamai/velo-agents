@@ -27,6 +27,7 @@ bash "$HERE/test_fail_to_pass.sh" || RC=1
 echo
 echo "── velo-status ────────────────────────────────────────"
 bash "$HERE/test_status.sh" || RC=1
+bash "$HERE/test_zg_hidden.sh" || RC=1
 echo
 echo "── spec review loop ───────────────────────────────────"
 bash "$HERE/test_spec_review.sh" || RC=1

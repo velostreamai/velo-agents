@@ -216,6 +216,19 @@ ast-grep run --pattern '...' --lang rust src/
 heading/symbol for each hit, so it is strictly better than bare `rg` for the
 locating phase. Nothing in this policy depends on the semantic index.
 
+**The index binds to your CURRENT DIRECTORY, and there is no flag to override
+it** (#2128 A). `zg query` resolves its workspace from cwd — `--workspace` does
+not exist on the indexed route; only `--rg` takes a path. Your cwd is your
+worktree, so this is normally invisible. It matters when it is not: an agent
+whose cwd is the master checkout, querying about a branch, gets **master's**
+snapshot — missing whatever the branch added, still holding whatever it removed,
+and silent about the difference. If you need to search a tree that is not your
+cwd, use `zg query --rg -F "<term>" <path>`, which takes one.
+
+Hits carry `status: possibly_stale`, but that is one line among many and does not
+distinguish "slightly behind" from "another branch entirely". **Never use the
+index to verify your own edits** — it is a snapshot taken before you started.
+
 ### Without LSP — what a delegated worker must do instead
 
 You have `ast-grep` (via Bash — verified present) and `cargo check`. `ast-grep`

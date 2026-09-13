@@ -987,7 +987,22 @@ INDEX_READY=0
 if [[ "$INDEX_SAFE" == "1" ]] \
    && [[ "${VELO_SKIP_INDEX:-0}" != "1" ]] && [[ -x "$HOME/.agents/bin/zg" ]]; then
   printf '  .. building discovery index (~35s, skip with VELO_SKIP_INDEX=1)\n'
-  if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index \
+  # `--hidden` so the index contains `.agents/`, `.github/` and `.config/`
+  # (#2128 C). Without it the indexer skips every dot-directory, and the index
+  # does not merely miss them — it answers anyway:
+  #
+  #   PROD-WIRING-BEFORE appears in exactly ONE file in the repo,
+  #   .agents/rules/velo-impl.md, and in zero files under docs/.
+  #   `zg query --fts "PROD-WIRING-BEFORE"` returned FOUR ranked docs/ hits,
+  #   none of which contain the string.
+  #
+  # Four plausible answers for a term it cannot see is worse than none, and a
+  # worker has no way to tell it from a real result. Tooling work — which is a
+  # large share of what gets dispatched — is almost entirely under dot-dirs.
+  #
+  # zvec-grep's own `--hidden` still excludes `.git` and `.zvec-grep`, so this
+  # does not index the object store or the index itself.
+  if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index --hidden \
          --embedding local/potion-code-16m-v2 ) >"$VELO_STATE/dispatch/${ISSUE}/zg-index.log" 2>&1; then
     INDEX_READY=1
     INDEX_STATE="built"

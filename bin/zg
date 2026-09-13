@@ -15,12 +15,94 @@
 # global install still works, just slower (npx re-resolves per call).
 set -uo pipefail
 
-for real in /opt/homebrew/bin/zg /usr/local/bin/zg "$HOME/.npm-global/bin/zg"; do
-  [[ -x "$real" ]] && exec "$real" "$@"
+# `--rg` gets `--hidden`, because without it the documented fallback cannot see
+# `.agents/`, `.github/` or `.config/` — and says "No matches" rather than
+# erroring (#2128 B).
+#
+#   $ zg query --rg -F "history_verdict" ~/RustroverProjects/velostream-2120
+#   No matches.
+#   $ grep -c history_verdict ~/…/velostream-2120/.agents/bin/velo-dispatch
+#   2
+#
+# ripgrep skips hidden paths by default and zvec-grep's managed invocation does
+# not add the flag. velo-impl.md and velo-dispatch both name `zg query --rg` as
+# THE fallback when no index exists, so on any tooling change that fallback
+# silently returns nothing on files that plainly contain the term. A worker
+# cannot tell that from a real empty result.
+#
+# That is a plausible mechanism for #2075 (zg going unused) but NOT evidence for
+# it: the #2091 runner log records zero zg invocations by any route, so that
+# worker never reached this fallback at all. Stated as mechanism, not cause.
+#
+# Injected here rather than fixed upstream because rg-options pass through
+# verbatim, so this is a fix we own. `.git` and `.zvec-grep` stay excluded —
+# zvec-grep already globs those out, and --hidden does not override an explicit
+# --glob.
+#
+# Only for the `--rg` route, and only when the caller did not ask themselves:
+# the indexed route rejects unknown flags, and repeating --hidden is harmless but
+# noisy in the debug output that shows the exact rg command.
+#
+# FLAGS ARE PARSED, NOT SCANNED (#2129 review, P2). A naive `for a in "$@"` that
+# matched any argument equal to `--rg` treated option VALUES as flags:
+#
+#   zg query --fts --rg        # the FTS query is literally the string "--rg";
+#                              # injected --hidden, which the indexed route rejects
+#   zg query --rg -F -- --rg   # a post-`--` literal got a stray --hidden as a path
+#   zg query --rg -F -- --hidden   # a --hidden PATTERN suppressed the injection
+#
+# Attempt 2 parsed properly but against a HARDCODED list of value-taking options,
+# and the list was incomplete: `-g`, `-t`, `-T`, `--glob`, `--iglob`, `--type`,
+# `--type-not` were missing, so `zg query -g --rg` injected again. Completing the
+# list only defers it — the list has to be re-verified every time zvec-grep gains
+# an option, and nothing here would notice when it drifts.
+#
+# So: no list, no scan. POSITIONAL. Inject only for the documented shape that
+# `zg query --help` gives and that our own policy prescribes:
+#
+#   zg query --rg [rg-options] <pattern> [path...]
+#
+# `--rg` selects the route, so it is the first token after the subcommand. If
+# argv is not exactly `query --rg …`, leave it completely alone.
+#
+# That failure direction is the correct one: a missed injection means the old
+# blind search, which is what we had. A WRONG injection breaks a query that was
+# working — `--hidden` is not valid on the indexed route, so the first two
+# attempts turned valid commands into errors. Refusing to guess is worth more
+# than covering every phrasing.
+zg_rewrite_args() {   # sets ARGS from "$@"
+  ARGS=("$@")
+  [[ "${1:-}" == "query" && "${2:-}" == "--rg" ]] || return 0
+  [[ "${3:-}" == "--hidden" ]] && return 0
+  shift 2
+  ARGS=(query --rg --hidden ${1+"$@"})
+}
+
+ARGS=()
+zg_rewrite_args "$@"
+
+# ONE exec site, not four (#2129 review, P2).
+#
+# The rewritten args previously had to be threaded through three install-location
+# execs plus two npx branches, and a review pointed out that a test grepping for
+# `"$@"` cannot prove each path passes the array correctly — only that the string
+# is absent. Whichever route happens to exist on the test machine is the only one
+# exercised, so a broken path ships and fails on someone else's install.
+#
+# Resolving the command first and exec'ing once removes the category: there is no
+# per-path argv handling left to get wrong.
+REAL=""
+for cand in /opt/homebrew/bin/zg /usr/local/bin/zg "$HOME/.npm-global/bin/zg"; do
+  [[ -x "$cand" ]] && { REAL="$cand"; break; }
 done
-# A global install found via PATH, but not this shim (avoid exec'ing ourselves).
-GLOBAL=$(PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v "$(dirname "${BASH_SOURCE[0]}")" | paste -sd: -) command -v zg 2>/dev/null || true)
-[[ -n "$GLOBAL" && "$GLOBAL" != "${BASH_SOURCE[0]}" ]] && exec "$GLOBAL" "$@"
+if [[ -z "$REAL" ]]; then
+  # A global install found via PATH, but not this shim (avoid exec'ing ourselves).
+  GLOBAL=$(PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v "$(dirname "${BASH_SOURCE[0]}")" | paste -sd: -) command -v zg 2>/dev/null || true)
+  [[ -n "$GLOBAL" && "$GLOBAL" != "${BASH_SOURCE[0]}" ]] && REAL="$GLOBAL"
+fi
+if [[ -n "$REAL" ]]; then
+  exec "$REAL" ${ARGS[@]+"${ARGS[@]}"}
+fi
 
 command -v npx >/dev/null 2>&1 || {
   echo "zg: neither a global install nor npx is available." >&2
@@ -38,7 +120,7 @@ command -v npx >/dev/null 2>&1 || {
 # index build in velo-dispatch exists to avoid. Failing loudly and fast is the
 # only useful answer here, because rg and ast-grep are right there.
 if command -v timeout >/dev/null 2>&1; then
-  timeout 120 npx --yes @zvec/zvec-grep@latest "$@"
+  timeout 120 npx --yes @zvec/zvec-grep@latest ${ARGS[@]+"${ARGS[@]}"}
   RC=$?
   if [[ $RC -eq 124 ]]; then
     echo "zg: npx fallback timed out after 120s (no global install, npm unreachable)." >&2
@@ -48,4 +130,4 @@ if command -v timeout >/dev/null 2>&1; then
   fi
   exit $RC
 fi
-exec npx --yes @zvec/zvec-grep@latest "$@"
+exec npx --yes @zvec/zvec-grep@latest ${ARGS[@]+"${ARGS[@]}"}

@@ -45,6 +45,7 @@ and the tests** — never from the worker's self-report.
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_status.sh                 velo-status worker naming
+    test_zg_hidden.sh              zg can see .agents/ — both routes, and the index
     test_worker_env.py             the worker can run the tools its policy names
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
