@@ -80,7 +80,11 @@
       "group_by_expression_also_in_select_keeps_the_positional_name",
       "unaliased_aggregate_gets_a_positional_name",
       "two_unaliased_computed_aggregates_get_distinct_positional_names",
-      "unselected_computed_group_key_does_not_collide_with_select_positional_name"
+      "unselected_computed_group_key_does_not_collide_with_select_positional_name",
+      "lifted_aggregate_slot_is_not_named_by_its_internal_lookup_key",
+      "left_join_derived_table_null_fill_includes_unaliased_computed_item",
+      "join_group_by_dedup_uses_the_group_expr_namespace",
+      "two_lifted_aggregates_in_one_select_item_do_not_leak_internal_keys"
     ],
     "pass_to_stay": [
       "group_by_aliased_key_schema_carries_alias_not_raw_name",
@@ -117,7 +121,14 @@
     "No output schema contains two fields with the same generated name. A test covers SELECT COUNT(*) FROM t GROUP BY price * quantity specifically, asserting the group slot and the aggregate do not collide.",
     "RESIDUAL RISK, stated rather than prohibited: that no UNCOVERED row-count, ordering, watermark or value behaviour moved cannot be established by any check available here, so the spec does not claim it. What IS established: the hunk audit constrains every expectation edit to a name-literal substitution, the unit sweep is green, and the three alias canaries pass unchanged. A prohibition the spec cannot verify would be theatre; naming the gap lets velo-pr-gate decide whether to sample further.",
     "__agg__ (UNNAMED_AGGREGATE_PLACEHOLDER) no longer appears as an output name in any plan schema: an unaliased top-level aggregate slot carries the same EXPR$<n> the runtime emits. It was initially scoped out, which contradicted bar 2 \u2014 a plan that says __agg__ while the record says EXPR$0 is exactly the plan/record divergence this issue exists to close.",
-    "SHELL HAZARD \u2014 EXPR$<n> and GROUP$<n> contain '$', so an unquoted shell context expands them: GROUP$0 becomes GROUPbash because $0 is the shell name. That already corrupted one recorded expectation during this issue's own work (failed-with=... right: \"GROUPbash\"). Always SINGLE-quote these names in shell commands, -E filters and log lines. A test asserting GROUPbash or EXPRbash is a corrupted expectation, not a finding."
+    "SHELL HAZARD \u2014 EXPR$<n> and GROUP$<n> contain '$', so an unquoted shell context expands them: GROUP$0 becomes GROUPbash because $0 is the shell name. That already corrupted one recorded expectation during this issue's own work (failed-with=... right: \"GROUPbash\"). Always SINGLE-quote these names in shell commands, -E filters and log lines. A test asserting GROUPbash or EXPRbash is a corrupted expectation, not a finding.",
+    "R1 \u2014 a LIFTED (nested) aggregate's internal lookup key never reaches a plan schema. schema_propagation.rs's Aggregate arm falls back to Arc::clone(&agg.alias) when no SELECT field owns the slot, and a wrapper expression is classified Computed, so no field owns it: SELECT symbol, SUM(amount) * 2 FROM t GROUP BY symbol propagates [\"symbol\", \"SUM(amount)\"] while the record carries [\"symbol\", \"EXPR$1\"]. A HAVING above the Aggregate, or a CTAS second stage resolving against the registered schema, then binds a column that never exists in the data. Both review gates found this independently; it is the one shape the first pass left open, and no test covers it because every existing SUM(x)*2 test uses AS.",
+    "R2 \u2014 join.rs's derived-table null-fill column set routes through the shared helper. Today its Expression arm is alias.as_deref().map(FieldName::from), which yields None for an unaliased computed item and DROPS the column, so a matched row carries EXPR$<n> and an unmatched row does not \u2014 the schema desync that function's own doc says must not happen.",
+    "R3 \u2014 the JOIN+GROUP BY dedup at select.rs:755 uses output_name_for_group_expr (GROUP$<n>), not output_name_for_select_expr (EXPR$<n>). It currently indexes a GROUP BY position into the SELECT-list namespace. The designated helper already exists at schema_propagation.rs:517. Two names for one concept is the drift this issue removes.",
+    "R4 \u2014 SelectProcessor::get_expression_name has ZERO production callers but remains pub with a complete parallel naming algorithm. Delete it, or make it pub(crate) and document why it must survive. legacy_expr_fname was correctly deleted; this one was not, and a reachable second naming algorithm is the re-drift vector this issue exists to close.",
+    "R5 \u2014 the comments at operator_pipeline.rs:870-875 and window_v2/operator.rs:1092-1100 assert that build_plan_alias_keys stores the UNSTRIPPED table.col form and that stripping 'would silently disagree'. After this change it strips, and both sides move together. Correct the comments: as written they instruct a future reader to reintroduce the defect.",
+    "Coverage \u2014 tests exist for the shapes the naming rule reaches that none currently exercise: a lifted aggregate (R1), the interval-join unaliased-computed arm that interval_join.rs rewrote, and SELECT * beside a computed item (asserting the wildcard consumes a position, so SELECT *, price * qty yields EXPR$1). A user column literally named EXPR$0 stays deferred to #1919, but confirm the tokenizer admits $ in an identifier and say so.",
+    "R6 (PINNED DESIGN) \u2014 the Aggregate output schema carries ONE FIELD PER SELECT ITEM, not one per agg slot. A LIFTED (internal) aggregate slot gets NO schema field at all; the wrapper SELECT field that consumes it gets the field, named by its alias key. R1's fix paired slots to wrappers greedily one-to-one, which leaves SELECT SUM(a) + SUM(b) FROM t GROUP BY k broken: walk_expr_for_aggs recurses into both BinaryOp sides and pushes TWO slots for ONE Computed wrapper, so slot 0 claims the wrapper and slot 1 falls back to Arc::clone(&agg.alias), leaking \"SUM(b)\" into the schema. Widening the pairing to many-to-one does NOT fix it \u2014 both slots would then take the same wrapper's EXPR$0 and the schema would carry two identically-named fields, which is the original defect. The bug class exists because agg_exprs entries are EXECUTION slots while a schema field is an OUTPUT column, and one SELECT item can own several slots. Emitting per-item removes the class instead of patching pairings. Direct (non-lifted) aggregates are unaffected: their owning field already names them."
   ],
   "forbidden": [
     "No NEW collision handling: do not make the shared naming helper consult any collection of already-used names. This does NOT forbid code that already does so \u2014 group_by_columnar.rs::expr_fname_collision already scans the SELECT list via legacy_expr_fname/get_expression_name, and that pre-existing fallback stays. The rule is that EXPR$<n> itself derives from position alone and gains no dedup logic \u2014 no HashSet/HashMap/Vec::contains of prior names, no numeric suffix appended to a generated name, no retry loop on a name. EXPR$<n> derives from position ALONE. #1919 owns duplicate detection.",
@@ -136,7 +147,7 @@
   "reviewed": {
     "by": "neilavery",
     "at": "2026-09-13T14:14:25Z",
-    "brief_sha256": "6274802cd558dadb7bf84a84f91a619144a57e3308d8aa9ed69b8a2be18ce1ed"
+    "brief_sha256": "dee77715aed7cf568ddb4d6e964063582aaad6e0835736e63a33a3f9ac6ecbef"
   },
   "stop_conditions": [
     "The shared helper cannot be reached from execution without changing a public signature whose callers live outside plan/ and execution/.",
@@ -148,6 +159,8 @@
     "The work produces any ALIAS-KEYS or CHANGED-EXPECTATION conclusion that cannot be recorded in agent.log \u2014 the worker does not open the PR, so agent.log plus the final report are the only handoff channels to the caller.",
     "A test pinning an EXPLICIT AS alias fails, or a non-naming property fails (row counts, values, ordering, watermarks). Those are real regressions, not expectation drift, and must not be 'fixed' by editing the expectation.",
     "The CHANGED-EXPECTATION line count does not equal the number of pre-existing tests whose assertion lines the diff modifies. Report both counts and the discrepancy rather than adding lines to make the totals agree.",
-    "A test expectation edit changes anything other than a legacy generated-name literal becoming EXPR$<n> \u2014 a count, an operator, an added or deleted assertion. Report the hunk; do not reshape the test to fit."
+    "A test expectation edit changes anything other than a legacy generated-name literal becoming EXPR$<n> \u2014 a count, an operator, an added or deleted assertion. Report the hunk; do not reshape the test to fit.",
+    "A fix for R1 requires changing how field_sources classifies a wrapper expression (Computed vs Aggregate). That is a plan-shape change with consumers beyond naming \u2014 report the design question rather than changing the classification.",
+    "R6 turns out to require changing the Aggregate schema's field ORDER or COUNT in a way a consumer outside naming depends on \u2014 HAVING resolution, ColumnResolution index assignment, two-stage CTAS schema registration, or the columnar byte-parity contract. Report which consumer and what it assumes; do not reshape the schema unilaterally."
   ]
 }

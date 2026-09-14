@@ -639,3 +639,181 @@ Each entry names what a reviewer can check in the diff, not an intent to infer.
   fixing `__group__` appears to require changing either.
 - **Do not change a public signature with callers outside `plan/` and
   `execution/`** — STOP and report instead.
+
+
+---
+
+## 9. FIX ROUND — velo-pr-gate findings on PR #2121
+
+The sweep is green (11778/11778, independently re-run) and the PR is **still
+blocked**. Two review gates ran: `code-review` and `check-code`. They converged
+independently on one P1, which is the shape your first pass left open.
+
+Green sweep was never proof. Both gates found real defects in paths no test
+covers, which is exactly how the earlier attempts looked green on subsets and were
+wrong.
+
+### R1 (P1) — a lifted aggregate leaks its internal lookup key into the plan schema
+
+`schema_propagation.rs`'s Aggregate arm builds `owner_alias_by_slot` from
+`FieldSourceKind::Aggregate(slot)` entries only. A wrapper expression is
+classified `Computed` (`builder.rs:1310-1320`), its inner aggregate is lifted by
+`walk_expr_for_aggs` with `alias = generate_field_name(expr)`, and **no SELECT
+field owns that slot** — so `unwrap_or_else(|| Arc::clone(&agg.alias))` fires.
+
+    SELECT symbol, SUM(amount) * 2 FROM t GROUP BY symbol
+
+    propagated schema : ["symbol", "SUM(amount)"]
+    emitted record    : ["symbol", "EXPR$1"]
+
+A `HAVING` above the Aggregate, or a CTAS second stage resolving against the
+registered schema, binds `SUM(amount)` — a column that never exists in the data —
+and cannot bind `EXPR$1`. That is bar 2 unmet, in the exact class this issue
+exists to remove.
+
+The comment above that fallback currently *asserts* the slot "is never emitted".
+Verify that claim before trusting it; the gate's reading is that the record emits
+the SELECT item as `EXPR$1` while the schema advertises the lookup key.
+
+**No test covers it** — every existing `SUM(x) * 2` test uses `AS`. That absence
+is the finding as much as the code is.
+
+New test: `lifted_aggregate_slot_is_not_named_by_its_internal_lookup_key`.
+
+**If the only fix is to change how `field_sources` classifies a wrapper
+expression, STOP and report.** That is a plan-shape change with consumers beyond
+naming, and it is a design question, not an implementation detail.
+
+### R2 (P2) — `join.rs` derived-table null-fill is an unmigrated naming site
+
+`join.rs:849-864`, the `StreamSource::Subquery` arm:
+
+    SelectField::Expression { alias, .. } => alias.as_deref().map(FieldName::from)
+
+`None` for an unaliased computed item, so the column is **dropped** from the
+null-fill set. Post-#1918 its real output name is `EXPR$<n>`.
+
+    SELECT o.total FROM probe p
+      LEFT JOIN (SELECT id, price * qty FROM orders) o ON p.id = o.id
+
+A matched row carries `EXPR$1`; an unmatched row carries only `id`. That is the
+schema desync this function's own doc (lines 884-890) says must not happen, and
+`pack_join_results`/`from_rows` then sees two shapes in one batch.
+
+New test: `left_join_derived_table_null_fill_includes_unaliased_computed_item`.
+
+### R3 (P2) — the dedup at `select.rs:755` uses the wrong namespace
+
+    output_name_for_select_expr(expr, None, position)   // EXPR$<n>
+
+`position` here is a **GROUP BY** index being indexed into the **SELECT-list**
+namespace. The designated helper already exists:
+`schema_propagation.rs:517::output_name_for_group_expr` → `GROUP$<n>`.
+
+This PR touched this exact line and used the wrong one. Two names for one concept
+is the drift this issue removes.
+
+New test: `join_group_by_dedup_uses_the_group_expr_namespace`.
+
+### R4 (P3) — `get_expression_name` has zero callers but is still `pub`
+
+A complete parallel naming algorithm, reachable as public API, with no production
+caller left. `legacy_expr_fname` was correctly deleted; this one was not. Delete
+it, or make it `pub(crate)` and document why it must survive. A reachable second
+naming algorithm is the re-drift vector this issue exists to close.
+
+### R5 (P3) — two comments now instruct the opposite of the code
+
+`operator_pipeline.rs:870-875` and `window_v2/operator.rs:1092-1100` both state
+that `build_plan_alias_keys` stores the UNSTRIPPED `table.col` form and that a
+qualifier-strip "would silently disagree". After this change it strips, and both
+sides move together — `test_qualified_column_names_in_group_by` proves it. The
+behaviour is right; the comments now tell a future reader to reintroduce the
+defect.
+
+### Not a defect — do not "fix" this one
+
+`window_projection_operator.rs:207-216` computes `slot_lookup_name` from
+`generate_field_name` while `output_name` comes from `alias_keys`. `code-review`
+called that a P1 write/read mismatch. `check-code` traced
+`walk_expr_for_aggs → agg.alias → materialize_typed_states → resolve_aggregate_key`
+and established that the aggregate read key derives from the **AST alias, never
+`alias_keys`**, so both sides still use the legacy key and agree.
+`differential_test` asserting `EXPR$1`/`EXPR$2` across ten group-key shapes
+corroborates it.
+
+What IS true there is a **P2 efficiency defect**: `slot_lookup_name` is computed
+unconditionally for every `SelectField::Expression` on every row, including a
+recursive `format!` per nesting level, and is consumed only inside the
+`Aggregate(_)` arm. Move it into that arm. Do not restructure the read key.
+
+### Red-first applies to all three new tests
+
+Each needs a `RED-FIRST` line proved at `origin/master` via the baseline-worktree
+recipe in §7a. For R1 especially: if the test passes on unfixed code, the test
+does not reach the path — that is stop condition 4, not a green light.
+
+
+---
+
+## 10. R6 — PINNED DESIGN: one schema field per SELECT item, not per agg slot
+
+R1's fix is incomplete, and patching it further makes it worse. This is the design
+decision its own stop condition anticipated, now made.
+
+### The residual defect
+
+R1 pairs a lifted slot to a consuming wrapper field **greedily, one-to-one** —
+each slot claims the first available `Computed` wrapper and `remove`s it from
+`available_wrappers`. But `walk_expr_for_aggs` recurses into BOTH sides of a
+`BinaryOp` and pushes one slot **per aggregate call**:
+
+    SELECT SUM(a) + SUM(b) FROM t GROUP BY k     -- 2 lifted slots, 1 wrapper field
+
+Slot 0 claims the wrapper. Slot 1 finds nothing, hits
+`None => Arc::clone(&agg.alias)`, and leaks `"SUM(b)"` into the schema. R1,
+unfixed, for a shape no test covers — the only `SUM(a) + SUM(b)` occurrences in
+the suite are inside `HAVING` clauses with no name assertions.
+
+**Do not "fix" this by widening the pairing to many-to-one.** Both slots would
+then take the same wrapper's `EXPR$0`, and the schema would carry two
+identically-named fields — the original defect, in a new place.
+
+### Why the class exists
+
+`agg_exprs` entries are **execution slots**. A schema field is an **output
+column**. One SELECT item can own several slots, so any per-slot naming scheme
+generates this bug in some shape. The Aggregate arm currently emits one field per
+slot, which is the root.
+
+### The pin
+
+**The Aggregate output schema carries one field per SELECT item.**
+
+- A **lifted** (internal) aggregate slot gets **no schema field at all**.
+- The **wrapper** SELECT field that consumes it gets the field, named by its alias
+  key (`EXPR$<n>`, or its `AS` alias).
+- **Direct** (non-lifted) aggregates are unaffected — their owning SELECT field
+  already names them, via `owner_alias_by_slot`.
+
+This removes the class rather than patching pairings, and it needs no
+slot→wrapper matching at all: iterate SELECT fields, not `agg_exprs`.
+
+Note `check-code` already observed the other half of this: "The `Computed` field
+itself gets **no** schema slot at all (the Aggregate arm emits group fields + agg
+fields only)." So today a wrapper item is missing from the schema while its
+internal slot is present under the wrong name. One change fixes both.
+
+New test: `two_lifted_aggregates_in_one_select_item_do_not_leak_internal_keys`
+— `SELECT SUM(a) + SUM(b) FROM t GROUP BY k`, asserting the schema carries exactly
+one field for that item, named `EXPR$0`, and no field named `SUM(a)` or `SUM(b)`.
+Red-first at `origin/master` per §7a.
+
+### STOP if it cascades
+
+If R6 requires changing the Aggregate schema's field **order** or **count** in a
+way a consumer outside naming depends on — `HAVING` resolution,
+`ColumnResolution` index assignment, two-stage CTAS schema registration, or the
+columnar byte-parity contract — **report which consumer and what it assumes.** Do
+not reshape the schema unilaterally. That is a second design question and it is
+the caller's, not yours.
