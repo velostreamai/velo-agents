@@ -64,7 +64,7 @@ name set. Leave `collect_output_names` alone.
 |---|---|
 | `AliasedColumn { alias, .. }` | `alias` |
 | `Expression { alias: Some(a), .. }` | `a` |
-| `Expression { alias: None, expr }` | bare column name if `expr` is a column ref; otherwise #1918's generated `EXPR$<n>` |
+| `Expression { alias: None, expr }` | bare column name if `expr` is a column ref; otherwise #1918's generated `EXPR_<n>` |
 | `Column(name)` | `name` with the qualifier stripped (everything after the last `.`) |
 | `Wildcard` | **skipped — see §3d** |
 
@@ -124,10 +124,10 @@ NB-003's shape — state the rule, then the remedy. Per the issue:
 ```
 
 The generated-name case needs **different** guidance, because the user wrote no
-name at all and telling them to "disambiguate `EXPR$0`" is nonsense:
+name at all and telling them to "disambiguate `EXPR_0`" is nonsense:
 
 ```
-[NB-005] output column name 'EXPR$0' is produced by more than one SELECT item
+[NB-005] output column name 'EXPR_0' is produced by more than one SELECT item
   item 2: price * qty
   item 4: price - fee
   Unaliased computed items are named by position; one of these collides with an
@@ -266,3 +266,25 @@ a PR, or merge.
 - Do not add `#[cfg(test)]` or `#[test]` inside `src/`.
 - Do not delete, skip, `#[ignore]` or narrow any existing test.
 - Do not commit or push until the gate is green; do not open a PR or merge.
+
+
+---
+
+## Note from #1918 (R16): the generated-name spelling changed, and your input space grew
+
+#1918 shipped `EXPR_<n>` / `GROUP_<n>` with an **underscore**, not `EXPR$<n>`. The
+`$` form was superseded because `parser/tokenizer.rs:392-395` continues an
+identifier only while `is_alphanumeric() || '_'`, so `$` terminates one and
+`SELECT EXPR$0 FROM t` could not tokenize — the generated name was unique but still
+unreferenceable, which is the defect #1918 exists to close.
+
+**This enlarges NB-005's input space.** `EXPR$0` was unconstructible via the
+parser, so a user column could never collide with a generated name. `EXPR_0` IS
+constructible, so
+
+    SELECT price * qty, some_col AS EXPR_0 FROM t
+
+is now a real collision NB-005 must report. #1918 deliberately added no collision
+handling and pinned only that the collision is VISIBLE at the plan surfaces; the
+record level still merges byte-identical duplicates
+(`rows_window.rs:703/736/769/793` are `FxHashMap::insert`). Closing that is yours.
