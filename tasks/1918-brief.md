@@ -817,3 +817,161 @@ way a consumer outside naming depends on — `HAVING` resolution,
 columnar byte-parity contract — **report which consumer and what it assumes.** Do
 not reshape the schema unilaterally. That is a second design question and it is
 the caller's, not yours.
+
+
+---
+
+## 11. ROUND-2 GATE FINDINGS — R7-R10
+
+Round 2: `code-review` (Codex) **approve, no findings**; `check-code` (opus:high)
+**approve-with-findings** — 1 P2, 2 P3. **Zero P1s**, the first round on this PR
+with none. Sweep 11784/11784, re-verified by the orchestrator.
+
+A2 and A3 from the review brief were both answered with evidence and cleared: no
+consumer depended on the old per-slot schema count (R6 strictly improves —
+`SELECT k, SUM(a)+SUM(b) AS total` previously propagated
+`[k, "SUM(a)", "SUM(b)"]` and never carried `total`, so HAVING-on-alias and CTAS
+stage 2 were already broken), and the orphan-slot path is not parser-reachable.
+
+None of the four below blocks correctness today. Fix them and this is done.
+
+### R7 (P2) — a duplicate-name guard left comparing against the old name
+
+`flush_group_by.rs:415` now emits `output_name_for_group_expr(group_expr, slot)`
+for each group column — `GROUP$<n>` for a computed key. But the #1323 duplicate
+guard at `:458` still compares:
+
+    let is_duplicate_name = expr_name.as_ref() == col_name.as_str();
+
+`col_name` is the raw column name. For a bare-column key the two coincide and the
+guard works; for a **computed** key they diverge, so the guard never fires and
+#1323's duplicate emission reopens for that shape.
+
+Compare against the name the loop actually emits.
+
+New test: `computed_group_key_duplicate_name_guard_fires_on_the_emitted_name`.
+
+### R8 (P3) — a third copy of the traversal, with a false claim about itself
+
+`schema_propagation.rs:34-79` carries its own aggregate traversal and comments
+that it "mirrors `walk_expr_for_aggs`". It does not:
+`expr_contains_aggregate_call_matching` returns on a match **without** recursing
+into the call's args, while `walk_expr_for_aggs` pushes **and falls through** to
+recurse.
+
+Either make it genuinely share the traversal, or correct the comment to state the
+difference and why it is safe here. A false "mirrors" claim is worse than no
+comment — it tells the next reader these two cannot drift, which is exactly how
+the three naming generators drifted in the first place.
+
+### R9 (P3) — a doc naming a caller that does not call it
+
+`select_list_contains_group_expr` (`schema_propagation.rs:653`) documents itself as
+the shared matcher for the SELECT-contains-group-expr question, and
+`select.rs:722-760` — the site it names — does not call it. Route that site
+through it, or correct the doc.
+
+### R10 (coverage) — the mixed owned+lifted shape has no test
+
+    SELECT SUM(a), SUM(b) + SUM(c) FROM t GROUP BY k
+
+Field 0 is `Aggregate(slot 0)` — owned. Field 1 is `Computed`, lifting slots 1 AND
+2. This is the only shape that exercises the owned and lifted paths **in one
+query**, and it is where a partial fix looks correct on both isolated cases and
+still breaks — it is precisely what defeated R1's greedy pairing.
+
+R6 handles it by construction (iterate `field_sources`, so slots 1 and 2 are never
+visited). The orchestrator verified that by code read and `code-review` agreed. But
+nothing pins it, so a regression would be silent.
+
+Assert: one schema field per SELECT item — `EXPR$0`, `EXPR$1` — and NO field named
+`SUM(a)`, `SUM(b)` or `SUM(c)`.
+
+New test: `mixed_direct_and_lifted_aggregates_in_one_query_name_one_field_each`.
+Red-first at `origin/master` per §7a — master leaks the lifted keys, so it will be
+red there.
+
+### Then stop
+
+After R7-R10 this PR is done. Do not look for more work; if you believe something
+else is wrong, report it rather than changing it.
+
+
+---
+
+## 12. R11-R13 — coverage audit gaps
+
+Round 2 closed with zero P1s and the sweep at 11786/11786. A test-level coverage
+audit then found six shapes the naming rule reaches that no test exercises.
+
+Method note, because it changed the answer: the audit extracted each test
+**function body** and required the SQL shape AND a generated-name assertion in the
+**same** function. A file-level grep had reported five shapes as covered; only two
+were. One was an outright false positive — the apparent CASE-with-lifted-aggregate
+test is `SUM(POWER(qty,2) + CASE WHEN ...)`, a **direct** aggregate with a CASE in
+its *argument*, which is a different path entirely.
+
+Already genuinely covered, do not re-add:
+`builder_test.rs::wildcard_consumes_a_position_beside_a_computed_item` and
+`partition_receiver_schema_inference_test.rs::window_function_nested_in_general_row_eval_strips_column_ref_indices`.
+
+### R11 (do this first) — CTAS registers the schema others resolve against
+
+    CREATE TABLE t2 AS SELECT symbol, price * qty FROM trades GROUP BY symbol
+
+Assert the **registered** schema carries `EXPR$<n>` for the unaliased computed
+item, and that a second-stage query resolving against that registered schema binds
+it.
+
+This is the only gap whose wrong answer **persists beyond the query that produced
+it** — every later query against `t2` inherits it. Two-stage CTAS was named as a
+consumer of the schema R6 reshaped. If the registered schema still carries a legacy
+or internal name, that is a **P1 regardless of the sweep**.
+
+Test: `ctas_registers_positional_names_for_unaliased_computed_items`.
+
+### R12 — HAVING over an unaliased computed aggregate
+
+`evaluate_having_with_accumulator(having_expr, accumulator, fields, &result_fields)`
+takes BOTH the accumulator and the built record. So the aggregate path binds via
+accumulator keys (**unchanged** by R6) while any name path uses `result_fields`
+(**renamed** by R6).
+
+Round-2 `check-code` found R6 *improves* this: `SELECT k, SUM(a)+SUM(b) AS total`
+previously propagated `[k, "SUM(a)", "SUM(b)"]` and never carried `total`, so
+HAVING-on-alias could not bind. The behaviour changed in the improving direction
+and **nothing observes it**.
+
+Pin it: a HAVING over such a query filters on the right value.
+
+Test: `having_binds_over_an_unaliased_computed_aggregate`.
+
+### R13 — four pinning tests for shapes that are correct-by-construction
+
+Each is verified correct by reading under R6, so a regression would be **silent**.
+Assert one schema field per SELECT item carrying the positional name, and no field
+carrying a legacy or internal name.
+
+| shape | why it is its own path |
+|---|---|
+| `ABS(SUM(a))`, `CAST(...)`, `UPPER(...)` | `walk_expr_for_aggs` recurses into non-aggregate `Function` args — its own comment says so — producing a lifted slot inside a `Computed` field |
+| `SELECT CASE WHEN AVG(price) > 100 THEN 'x' ELSE 'y' END ... GROUP BY k` | recursion into `when_clauses`/`else_clause`; NOT the same as a direct aggregate with a CASE in its argument |
+| `ORDER BY` an unaliased computed item | unexamined — reason about it before writing the test, and report if it is broken rather than adapting the test |
+| `SELECT SUM(DISTINCT x) ... GROUP BY k` | unexamined, same instruction |
+
+Tests: `aggregate_wrapped_in_non_aggregate_function_names_one_field`,
+`lifted_aggregate_inside_case_with_group_by_names_one_field`,
+`order_by_an_unaliased_computed_item_resolves`,
+`unaliased_distinct_aggregate_gets_a_positional_name`.
+
+### Red-first, and what to do if a shape is actually broken
+
+Each test needs a `RED-FIRST` line per §7a. Two of these (ORDER BY, DISTINCT) have
+NOT been reasoned about — if one turns out to be genuinely broken rather than merely
+unpinned, **STOP and report it**. Do not reshape the test to match whatever the code
+currently does; that converts a defect into a pinned expectation.
+
+### Then stop
+
+After R11-R13 this issue is complete. Report anything else you notice rather than
+fixing it.
