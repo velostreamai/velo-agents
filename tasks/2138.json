@@ -1,0 +1,88 @@
+{
+  "issue": 2138,
+  "worker": "codex",
+  "design": "pinned",
+  "verified_against": "ce56ad5be",
+  "evidence": "code",
+  "audit": "n/a",
+  "depends_on": [],
+  "_why": "Four join record-construction sites build an ORDERED JoinLayout and then pour it into an FxHashMap, letting hash iteration decide the emitted column order. Two carry docs promising a specific physical layout. from_explicit's own contract says 'Pass a Vec (not FxHashMap) at call sites where column order is meaningful' \u2014 these sites have a schema (layout.entries() IS it) and discard it. None is broken today: they agree because FxHash is seed-free and all four share a key set, so the order is stable BY ACCIDENT. That accident already broke once \u2014 columnar/adapter.rs::batch_to_records had the identical defect, its doc promising schema order while a map decided it, and #1918's EXPR$<n> -> EXPR_<n> rename perturbed the hashes and surfaced it. It was found by an ad-hoc flake probe, NOT by the 11,797-test suite. These four are the same latent defect awaiting the next rename. #2121 already generified project_into over IntoIterator, which was the signature forcing callers to erase order, so this is now a per-site change with no API work.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/processors/join.rs",
+      "symbol": "for entry in layout.entries()",
+      "expect": 5
+    },
+    {
+      "file": "src/velostream/sql/execution/stream_record/mod.rs",
+      "symbol": "fn build_batch",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/stream_record/builder.rs",
+      "symbol": "pub fn project_into",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/algorithms/hash_join.rs",
+      "symbol": "first.keys().cloned().collect()",
+      "expect": 1
+    }
+  ],
+  "blast_radius": {
+    "pattern": "project_into",
+    "files": 8,
+    "refs": 16,
+    "scope": "src/ tests/ examples/ (velo-dispatch's own scope). Repo-wide is 9/18; the extra file is docs/architecture/issue-303-vec-fieldvalue-audit.md, a design note, not a call site."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "join_emits_columns_in_layout_order_under_adverse_hash_order"
+    ],
+    "pass_to_stay": [
+      "parity_multi_col_key",
+      "parity_computed_key"
+    ],
+    "known_red": []
+  },
+  "acceptance": [
+    "The FOUR in-scope join.rs sites pass a LAZY ITERATOR to project_into / from_explicit \u2014 no intermediate FxHashMap and no intermediate Vec. build_batch (stream_record/mod.rs) consumes impl IntoIterator in a single for loop and sizes its Vecs from a fixed TYPICAL_DATA_COLS hint, never from the input's length, so it needs neither len() nor a second pass. Before: N hash computations plus a bucket allocation per record, for a map whose only purpose is to be iterated once and dropped. A Vec would still pay one allocation. The lazy iterator pays none.",
+    "The four sites are at origin/master join.rs lines 651, 712, 933 and 965 (symbol anchor: 'for entry in layout.entries()', 5 occurrences; re-measured at ce56ad5be \u2014 an earlier draft of this spec carried 650/711/922/954/1382, read from a stale origin/master in another worktree). Line 1393 is the FIFTH occurrence and is NOT in scope: it iterates layout.entries() to compute column INDICES, not to build a field map. Leave it untouched and say so in the report.",
+    "Emitted column order equals layout.entries() order BY CONSTRUCTION at all four sites, not by hash accident.",
+    "A fail_to_pass test proves the defect is observable: join_emits_columns_in_layout_order_under_adverse_hash_order constructs a join whose column NAMES hash such that FxHashMap iteration order differs from layout order, and asserts the emitted record's column order matches the layout. It must FAIL at the pinned base ce56ad5be (hash order wins) and pass after. PINNED LOCATION: create tests/unit/sql/execution/processors/join/join_layout_order_test.rs and register it in that directory's mod.rs as 'pub mod join_layout_order_test;' with a '// #2138:' comment, matching the convention every other entry there follows. Registration is not optional bookkeeping \u2014 an unregistered test file is never compiled, so it cannot fail, and the \u00a77a baseline run would record a RED-FIRST line for an assertion that never executed. Copy BOTH the file and the mod.rs edit into the baseline worktree. This is the whole proof that the defect is real rather than theoretical \u2014 the class was previously only ever surfaced by accident.",
+    "The columnar byte-parity suite stays green \u2014 parity_multi_col_key and parity_computed_key in particular. They compare columns POSITIONALLY (assert_eq! on a Vec of column names), which makes them the canary for any ordering change.",
+    "New tests are registered in the parent mod.rs",
+    "The FULL ./run-commit.sh is green \u2014 not --fast, because root CLAUDE.md requires the full gate before completion. But do NOT read that green as benchmark evidence: NEITHER gate runs \u00a76's benchmark. run-commit.sh invokes nextest with --profile unit at BOTH line 317 (fast) and line 400 (full), and that profile's default-filter excludes performance:: from execution. The benchmark is an INDEPENDENT command you must run and report separately; the gate will never tell you that you skipped it. Two earlier drafts of this bar got the mechanism wrong in opposite directions \u2014 one claimed --fast does not compile the microbench (it does; it is a module of the 'mod' target), the other implied the full gate runs it (it does not). Any cargo fmt rewrite the gate applies is committed. Committing on your own dispatch branch IS authorised \u2014 root CLAUDE.md's 'do not commit until the user has reviewed' is satisfied by this brief being that authorisation, and the implementation policy states the same from the other side ('NEVER commit unless the caller's brief explicitly authorizes it'). What is NOT authorised: push, PR, merge, or committing on master or in another worktree.",
+    "The fail_to_pass test's RED is proved against the PINNED BASE (ce56ad5be), not merely asserted. It cannot fail at master by simply existing \u2014 it does not exist there. Use the throwaway baseline worktree recipe in brief \u00a77a: cut /tmp/2138-baseline at the PINNED SHA ce56ad5be (not the symbolic origin/master, which advances during your run \u2014 a red recorded against a moved master proves nothing about the base this spec was verified on), copy the test in, run it, capture the assertion message, then remove the worktree. Log one RED-FIRST line carrying the actual failure text. A fail_to_pass name with no RED-FIRST line is a brief violation.",
+    "URGENCY, stated so nobody over-reads this issue: three of the four sites fire only on unmatched rows in outer joins, so the per-record cost lands on outer-join misses rather than on every joined record. The earlier framing 'all four are per-record join paths' is true but misleading. The CORRECTNESS half \u2014 hash order deciding emitted column order where a doc promises a layout \u2014 applies to all four equally and is the reason this issue exists.",
+    "Each of the four sites is converted in its OWN commit, with cargo check --no-default-features --tests passing before the next begins. Four commits each touching one site is the audit trail, and unlike a rule about editing technique it is visible in git history \u2014 agent.log is gitignored, so evidence that lives only there is not auditable by a reviewer reading the PR.",
+    "The constructor docs are updated to match the pinned design. from_explicit and project_into currently say 'Pass a Vec (not FxHashMap) at call sites where column order is meaningful' \u2014 after this change the preferred form is a LAZY ORDERED ITERATOR, which allocates nothing, and a Vec is merely acceptable. Leaving those docs as-is would ship a false contract telling the next caller to allocate, which is precisely the doc-contradicts-code defect this whole issue chain exists to remove. Reword to name any ordered iterator as preferred, Vec as fine, and FxHashMap as valid only for genuinely schemaless merges.",
+    "EVERY REACHABLE site gets a behavioural assertion \u2014 reporting is the fallback for unreachable ones only. A test constructing 'a join' can prove one route while leaving combine_records_with_nulls_for_probe (batch probe NULL) and combine_records_with_nulls_for_right_join (RIGHT-join NULL-left) untouched, so name which site each assertion drives. A site may be left unasserted ONLY if no public execution path reaches it, and then the reachability bar's evidence is what justifies it. Note the two pass_to_stay canaries cannot substitute: both are GROUP BY shapes that never route through JoinProcessor, so they guard against a regression elsewhere, not coverage here. This issue exists because a defect of exactly this class sat unnoticed behind tests covering a sibling path \u2014 'covered one of four, reported three' reproduces that failure.",
+    "MEASUREMENT \u2014 THREE vehicles, each with a different job. Report all three; none substitutes for another. (1) DELTA: extend tests/performance/unit/from_explicit_microbench.rs, which already measures per-call from_explicit cost on a 4-column row shape, states it is the 'JoinProcessor / SelectProcessor hot path', and emits MICROBENCH_RESULT lines. Add a mode comparing the two feeds \u2014 an FxHashMap built from an ordered layout (today) versus the lazy ordered iterator (pinned) \u2014 at 4 and 8 columns. RUN AS: cargo test --profile bench --no-default-features --test mod performance::unit::from_explicit_microbench -- --nocapture. This is the ONLY vehicle that reaches the changed constructor, so it is the only one that can size the delta. The file's OWN header documents '--test from_explicit_microbench', which is INVALID \u2014 the file is 'pub mod from_explicit_microbench;' in tests/performance/unit/mod.rs, hence part of the 'mod' target. Fix that stale header as part of this change. (2) NEXMARK, system-level: cargo test --release --no-default-features --test mod nexmark_q3_local_item_suggestion -- --nocapture --test-threads=1, and the same for nexmark_q8_monitor_new_users. Before and after. (3) TIER BENCHMARKS, the join-bearing ones: scripts/benchmark.sh --tier1 stream_table_join, --tier2 timebased_join, --tier3 interval_stream_join and stream_table_join_advanced. Before and after. WHY 2 AND 3 MATTER EVEN THOUGH THEY DO NOT REACH THE FOUR SITES: code reading says q3 runs on the vectorized take path (JoinOperator::execute_take_path, #1552), q8 dispatches via dispatch_interval_join_record to IntervalJoinProcessor, and the tier join tests route to StreamTableJoinProcessor / IntervalJoinProcessor \u2014 all outside this change. That is a PREDICTION, and these runs test it. Flat results confirm the scope analysis. A MOVEMENT REFUTES IT \u2014 it would mean the change reaches further than the spec claims, which is a finding to STOP and report, not a number to average away. Either outcome is information; skipping them leaves the scope boundary asserted rather than checked. If any delta is within run-to-run noise, SAY SO explicitly rather than reporting a direction.",
+    "REACHABILITY is reported per site. For each of the four, state whether a public execution path reaches it and name the route or the reason there is none. A site nothing outside src/ can reach is a coverage fact worth recording. Do not guess a route \u2014 establish it from the dispatch code."
+  ],
+  "forbidden": [
+    "Do not touch join.rs line 1393 \u2014 it computes column indices, not a field map.",
+    "Do not change hash_join.rs's col_names (first.keys().cloned().collect()). It is genuinely schemaless: `first` is a FieldMap from a build-side table load with no schema to honour, and from_explicit explicitly sanctions hash order for that case. #2121 documented it so stability is not mistaken for a guarantee. Leave the behaviour alone.",
+    "Do not convert stream_table_join.rs (4 sites), update.rs, or show.rs. Same shape, but their docs promise no order, so there is no correctness claim to honour. Convert them only if the benchmark shows the allocation matters, and then in a separate change.",
+    "Do not introduce an intermediate Vec as the 'fix'. It is better than the map but still one allocation per record; the lazy iterator is the pinned form.",
+    "Do not add #[cfg(test)] or #[test] inside src/",
+    "Do not delete, skip, #[ignore] or narrow any existing test",
+    "Do not change a public signature \u2014 project_into is already generic over IntoIterator as of #2121, which is what makes this a per-site change",
+    "Do not convert more than one site per commit. VERIFIED FROM HISTORY, NOT THE DIFF \u2014 'git log --oneline ce56ad5be..HEAD -- src/velostream/sql/execution/processors/join.rs' must list FOUR commits, each naming its site; the final diff is identical either way, so a diff check cannot see this and the git log is the only evidence. The four sites have FOUR DIFFERENT SHAPES (differing capacity hints, type annotations, variable names, value expressions), and a regex attempt during #1918 DELETED a function (combine_records_with_nulls \u2014 one of these very four), caught only by the compiler. A single commit converting several sites is a brief violation even if the result compiles."
+  ],
+  "stop_conditions": [
+    "No key set can be found for which FxHashMap iteration order differs from layout order at a realistic column count (2-6 columns). That would mean the defect is not observable from a test, and the correctness half of this issue rests on the doc contradiction alone \u2014 report it rather than shipping a test that passes before and after and proves nothing.",
+    "The benchmark shows a REGRESSION rather than an improvement. Stop and report the numbers; a lazy iterator should strictly reduce work, so a regression means something else changed.",
+    "parity_multi_col_key or parity_computed_key fails. They compare positionally, so a failure means the emitted order genuinely moved for a shape that is byte-pinned \u2014 report which shape.",
+    "Any of the four sites cannot take a lazy iterator because of a borrow conflict (the closure borrows a record that project_into also borrows). Report the site and the exact borrow error rather than falling back to a Vec silently.",
+    "Updating from_explicit / project_into's doc wording turns out to require changing their behaviour or signature rather than just the prose. Report it \u2014 the signatures are already generic over IntoIterator as of #2121, so this should be prose only.",
+    "No public execution path reaches a given site at all. Report which, with the dispatch code that proves it \u2014 a site no test or benchmark can reach is a coverage fact worth recording, not a reason to invent a route.",
+    "The fail_to_pass test does NOT fail when run on the pinned baseline (/tmp/2138-baseline at ce56ad5be). Do not read a green baseline as 'the adverse key set was wrong, try another' and continue: the far likelier cause is that the test routed through a NON-TARGET path \u2014 StreamTableJoinProcessor, IntervalJoinProcessor, or JoinCoordinator \u2014 and never reached the four sites at all. Three specified measurement routes already failed exactly that way. Report the green baseline with the route you believe it took; proceeding without a proved red means shipping a test that pins nothing, which is the defect class this issue exists to close."
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-16T06:41:42Z",
+    "brief_sha256": "230638f38ed52254e4d3f2b156c4e119d67ba8d77e2259b38b34357ed9eec0f9"
+  }
+}
