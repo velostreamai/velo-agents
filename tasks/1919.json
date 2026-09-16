@@ -1,6 +1,6 @@
 {
   "issue": 1919,
-  "worker": "codex",
+  "worker": "glm",
   "design": "pinned",
   "verified_against": "c9addf057",
   "evidence": "code",
@@ -37,8 +37,8 @@
   ],
   "blast_radius": {
     "pattern": "check_duplicate_relation_names",
-    "files": 4,
-    "refs": 10
+    "files": 7,
+    "refs": 12
   },
   "tests": {
     "fail_to_pass": [
@@ -46,13 +46,15 @@
       "nb005_qualifier_strip_collision_across_relations_rejected",
       "nb005_generated_name_colliding_with_explicit_alias_rejected",
       "nb005_names_both_items_and_the_remedy",
-      "nb005_wildcard_is_skipped_but_siblings_still_checked"
+      "nb005_wildcard_is_skipped_but_siblings_still_checked",
+      "nb005_earlier_alias_exempts_but_output_names_still_collide"
     ],
     "pass_to_stay": [
       "nb003_names_relation_and_distinct_alias_remedy",
       "duplicate_relation_name_alias_collides_with_bare_source_rejected_nb003",
       "duplicate_relation_name_two_bare_unaliased_sources_rejected_nb003",
-      "duplicate_name_preempts_ambiguous_qualifier_nb003"
+      "duplicate_name_preempts_ambiguous_qualifier_nb003",
+      "output_alias_later_does_not_exempt_earlier_bare_ref_nb001"
     ],
     "known_red": []
   },
@@ -67,7 +69,9 @@
     "NB-005 is an error, never a warning",
     "The doc-example corpus gate stays green; if it reddens that is reported, not fixed by editing example SQL",
     "New tests extend the existing name_binding_validation_test.rs and name_binding_error_message_test.rs; any new file is registered in the parent mod.rs",
-    "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed"
+    "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed",
+    "ORCHESTRATOR RULING (brief \u00a74z) on the 2026-09-16T06:01:41Z STOP is applied EXACTLY, and to those three tests only. NB-001 resolution validation runs BEFORE NB-005 output-name validation, reporting whichever fires first. output_alias_later_does_not_exempt_earlier_bare_ref_nb001 is UNCHANGED and still passes \u2014 if it is red the ordering is wrong, fix the ordering not the test. output_alias_earlier_exempts_later_bare_ref has item 1 aliased AS amount_ref, preserving the exemption it pins while dropping an incidental output collision, and the original shape gains a new NB-005 test. duplicate_alias_spelling_does_not_strip_earlier_exemption keeps its query VERBATIM and converts its assertion to rejected with [NB-005] and explicitly NOT [NB-001] \u2014 strictly stronger than the old .expect(), which could pass for the wrong reason. If a FOURTH existing test reddens, STOP again; do not reason by analogy.",
+    "ORCHESTRATOR RULING 2 (brief \u00a74y) on the 2026-09-16T07:56:41Z STOP is applied exactly, to those 13 and nothing else. NB-005 stays UNIVERSAL \u2014 narrowing it to CTAS/CSAS was considered and rejected. That is a deliberate divergence from Postgres/MySQL/DuckDB/Flink, which permit duplicate output names in a plain SELECT: in a streaming engine a SELECT's output is a materialised stream bound by name downstream, so a duplicate is unreferenceable with or without a CREATE wrapper. Class A (3) flip to asserting NB-005 rejection; user_column_named_like_a_generated_name_is_not_silently_merged is the COMPLETION of #1918's visible-not-merged contract, not a weakening of it, and duplicate_output_aliases_are_not_admitted_to_the_join_batch_path must note that its batch-path guard is now unreachable from SQL. Class B (8) get distinct aliases with every existing assertion unchanged, plus the two wrinkles in \u00a74y (the SELECT * case must still pass; the PRIMARY KEY test gains a sibling for the colliding form). Class C (medium1_same_name_no_alias_collision_build_wins) is re-expressed via SELECT *, and if that does not reach the same merge path, STOP \u2014 NB-005 has then made a real behaviour untestable. Class D: editing docs/sql/functions/SELECT-ALIAS-REUSE.md:148 is authorised FOR THAT BLOCK ONLY, renaming the second alias to amount_with_markup so the alias-shadowing lesson survives; \u00a73d's corpus scan claimed zero instances of this case and was wrong, which must be reported. A FOURTEENTH red test is a STOP, not an extension by analogy."
   ],
   "forbidden": [
     "do not reuse or modify collect_output_names \u2014 it is the alias-reuse exemption helper, not an output-name helper",
@@ -82,7 +86,9 @@
   ],
   "reviewed": {
     "by": "neilavery",
-    "at": "2026-09-12T17:48:13Z",
-    "brief_sha256": "e8f75120b7b3f1c42f56b90f925cd0587a2ca32e32bed956c10ba8083a15d745"
-  }
+    "at": "2026-09-16T08:05:00Z",
+    "brief_sha256": "6b1341af31d3745c46fc5b7c1df9a5e7b8b7778b71b9e45c441a22cfca72954c",
+    "note": "bumped 2026-09-16T08:05Z for orchestrator ruling 2 (brief 4y). The issue comment at 08:04Z is that ruling, posted by me; there is no third-party edit to reconcile."
+  },
+  "_blast_note": "Re-measured at origin/master ce56ad5be after #1918 landed (#2121). Was files=4/refs=10; #1918's R14 case-insensitive duplicate-guard work added references in flush_group_by.rs, group_by_test.rs and identifier_case_fold_test.rs. The declared count is enforced by velo-dispatch, so a stale one refuses the dispatch \u2014 which is what happened."
 }

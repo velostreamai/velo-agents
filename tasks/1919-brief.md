@@ -171,6 +171,196 @@ Expected touch: **1 source file + 2 test files** (extend the existing
 both already hold NB-003's cases).
 **Tripwire: if you pass 5 files, STOP — you have taken the wrong approach.**
 
+## 4z. ORCHESTRATOR RULING — the three NB-001 exemption tests
+
+You stopped on 2026-09-16T06:01:41Z because NB-005 reddened three pinned tests in
+`tests/unit/sql/validation/name_binding_validation_test.rs`. That was the correct
+call. Here is the ruling; apply it exactly and do not extend it to any other test.
+
+The collision is real, not a bug in your implementation. NB-001 governs whether a
+bare reference **resolves on the input side**; NB-005 governs whether the
+**emitted output names** are unique. Those are different questions, and a query can
+fail one while passing the other. All three tests were written before NB-005
+existed, so each silently assumed the output-name question was never asked.
+
+**Ordering — decide this first, the rest follows.** Run NB-001 resolution
+validation BEFORE NB-005 output-name validation, and report the first that fires.
+A query whose inputs cannot bind should say so; complaining about the output name
+of a query that cannot resolve its own columns buries the real error.
+
+**1. `output_alias_later_does_not_exempt_earlier_bare_ref_nb001` — DO NOT TOUCH.**
+
+    SELECT amount, a.p * 2 AS amount FROM ta a JOIN tb b ON a.x = b.x
+
+Rejected either way: NB-001 fires on item 0 (bare `amount`, ambiguous at arity 2,
+no earlier alias), NB-005 would fire on item 1. Under the ordering above NB-001
+wins and the existing `assert_rejected_with_code(&result, "[NB-001]")` still
+passes. If this test is red, your ordering is wrong — fix the ordering, not the
+test.
+
+**2. `output_alias_earlier_exempts_later_bare_ref` — EDIT THE QUERY, keep the test.**
+
+    -- from
+    SELECT a.p * 2 AS amount, amount            FROM ta a JOIN tb b ON a.x = b.x
+    -- to
+    SELECT a.p * 2 AS amount, amount AS amount_ref FROM ta a JOIN tb b ON a.x = b.x
+
+The test exists to pin the **exemption**: item 1's bare `amount` resolves via item
+0's alias. Aliasing item 1 leaves that exercised identically — the body is still a
+bare `amount`, still resolved through the same path — while removing an output
+collision that was incidental to what the test was written to prove. Update the
+comment to say the alias keeps the output names distinct so NB-005 stays out of the
+way, and that the exemption is still the assertion.
+
+Then **add** a new `fail_to_pass` test, `nb005_earlier_alias_exempts_but_output_names_still_collide`,
+pinning the ORIGINAL shape as rejected with `[NB-005]`. The exemption holding and
+the output names colliding are both true of that query, and after this change each
+has its own test. Nothing is lost.
+
+**3. `duplicate_alias_spelling_does_not_strip_earlier_exemption` — CONVERT THE
+ASSERTION, keep the query verbatim.**
+
+    SELECT a.p AS amount, amount AS total, total AS amount FROM ta a JOIN tb b ON a.x = b.x
+
+Here the duplicate spelling **is** the test, so §2's trick is unavailable — remove
+the collision and there is no test left. Instead keep the query exactly as it is and
+change the assertion from `.expect(...)` to: rejected with `[NB-005]`, **and
+explicitly NOT `[NB-001]`**.
+
+That preserves the original guard precisely. The regression it was written for was
+item 2's alias wrongly stripping item 1's legitimate earlier exemption, which would
+surface as an NB-001 rejection. Asserting "NB-005 and not NB-001" proves both that
+the exemption still holds and that only the output-name rule fired — a strictly
+stronger assertion than the old `.expect()`, which could have passed for the wrong
+reason. Rewrite the comment to say so, keeping the existing explanation of the
+original regression, and note that the shape is now rejected for an unrelated
+reason while the exemption it guards remains intact.
+
+**Scope of this ruling.** It covers these three tests only. If a FOURTH existing
+test reddens, STOP again and report it — do not reason by analogy from the above.
+
+## 4y. ORCHESTRATOR RULING 2 — NB-005 stays UNIVERSAL; the 13 reds
+
+You stopped again at 2026-09-16T07:56:41Z with 13 tests red, all carrying
+`[NB-005]`. That was the correct call — ruling 1 told you to stop rather than
+reason by analogy past the three it covered.
+
+**The scope question, decided.** All 13 reds are plain `SELECT`s, and the
+dominant shape is `SELECT a.id, b.id FROM a JOIN b`, which Postgres, MySQL,
+DuckDB and Flink all accept — they reject duplicate output names only for
+`CREATE VIEW` / `CREATE TABLE AS`. Narrowing NB-005 to schema-registering
+selects was considered and **rejected**. NB-005 fires on **every** select,
+as the issue specifies.
+
+This is a deliberate divergence from those engines, so the reasoning is recorded
+rather than left to be rediscovered and re-argued: in a streaming engine the
+output of a `SELECT` is a materialised stream that downstream queries bind
+against by name. A duplicate output name is unreferenceable downstream whether
+or not a `CREATE` wrapper happens to be present, which is the defect #1918 is
+named for. The permissive ad-hoc-`SELECT` case that justifies the standard
+behaviour in an interactive database does not exist here in the same way.
+
+So the tests get fixed, not the rule. Each of the 13 is classified below. Apply
+the classification given; do not reclassify one because its fix is awkward.
+
+### Class A — the duplicate IS the subject: flip the assertion to NB-005
+
+These three were written to pin the behaviour of a duplicate output name. That
+behaviour is now "rejected at validation", so they assert that.
+
+| test | query |
+|---|---|
+| `duplicate_output_aliases_are_not_admitted_to_the_join_batch_path` | `SELECT a.auction_id AS x, r.tier AS x` |
+| `join_same_bare_column_both_sides_produces_duplicate_plan_output_names` | `SELECT a.id, b.id FROM a JOIN b ON a.id = b.id` |
+| `user_column_named_like_a_generated_name_is_not_silently_merged` | `SELECT price * qty, some_col AS EXPR_0 FROM t` |
+
+The third is the natural completion of #1918, not a casualty of it: #1918 pinned
+that the collision must be **visible rather than silently merged**, and a hard
+NB-005 error is the strongest available form of visible. Rewrite its comment to
+say that, citing #1918, so the next reader does not mistake the change for a
+weakening.
+
+For the first: note in the test comment that the join-batch-path guard it was
+written for is **no longer reachable from SQL**, because validation now rejects
+the query before the batch path sees it. The guard should stay — defence in
+depth — but the coverage note matters, and silently losing the fact that a guard
+became unreachable is how dead code accumulates.
+
+### Class B — the duplicate is incidental scaffolding: alias it, keep the assertion
+
+Eight tests use a colliding pair only as a convenient fixture for testing
+something else — resolution to the correct relation, interval-join lowering,
+round-trip, PRIMARY KEY marking. Give the colliding items distinct aliases
+(`SELECT a.id AS a_id, b.id AS b_id`) and **leave every existing assertion
+exactly as it is**. Aliasing changes the output names; it does not change which
+relation each item resolves to, which is what these tests actually assert.
+
+    selected_system_columns_are_output_columns_over_a_join    a._OFFSET, _OFFSET
+    accept_qualified_reference_disambiguates_collision        a.amount, p.amount
+    accept_qualified_reference_in_self_join                   l.id, r.id
+    test_mirrored_probe_on_left_flips_and_swaps_bounds        a.id, b.id
+    test_source_name_qualifiers_without_aliases               trades.id, quotes.id
+    accept_a_every_valid_spelling_of_a_real_column            amount, a.amount
+    accept_g_same_bare_name_both_sides_disambiguated          a.id, p.id
+    test_primary_key_marks_at_most_one_field_on_bare_name_collision
+                                                              a.symbol PRIMARY KEY, b.symbol
+
+Two carry a wrinkle:
+
+- `accept_qualified_reference_disambiguates_collision` also asserts
+  `SELECT * FROM auction a JOIN person p ...` passes. That must **still** pass —
+  wildcards are skipped per §3d. Do not alias inside it.
+- `test_primary_key_marks_at_most_one_field_on_bare_name_collision` loses its
+  literal "bare name collision" scenario once aliased. Keep the PRIMARY KEY
+  assertion under aliases, and **add** a sibling asserting the colliding form is
+  now rejected with `[NB-005]`. The PK question and the collision question then
+  each have a test, and neither is lost.
+
+### Class C — `medium1_same_name_no_alias_collision_build_wins`
+
+    SELECT l.id, r.tier, l.status, r.status FROM left_stream l ...
+
+This one is about which side wins when both contribute `status` to the merged
+record, so aliasing would delete the subject and flipping to NB-005 would delete
+the merge-semantics coverage. Neither is acceptable.
+
+Re-express it through `SELECT *`, which NB-005 skips (§3d) and which still
+produces the same-name merge this test exists to pin. If `SELECT *` does not
+reach the same merge path — verify, do not assume — **STOP and report**, because
+then NB-005 has made a real behaviour untestable and that is a finding, not a
+detail to work around.
+
+### Class D — the doc, `docs/sql/functions/SELECT-ALIAS-REUSE.md:148`
+
+    SELECT amount AS amount, amount * 1.1 AS amount FROM transactions;
+
+§8 forbids editing the corpus to make the gate green, and that prohibition
+stands for its intended case: a red corpus is normally evidence the validator is
+wrong. Here the validator has been ruled correct, so this example genuinely
+teaches a shape that is now invalid — fixing it is a real fix, and it is
+**authorised, for this one block only**.
+
+Note also that §3d's corpus scan claimed **zero** instances of this case across
+the 72 enforced doc files. It found one. Record that in your report: the scan
+that justified the scope boundary was wrong, which is worth knowing for the next
+spec that leans on a corpus scan.
+
+Preserve the lesson. The block teaches alias shadowing — that `amount * 1.1`
+reads the *aliased* value, not the original column — and that lesson survives
+intact if only the second output name changes:
+
+    SELECT amount AS amount, amount * 1.1 AS amount_with_markup FROM transactions;
+
+Keep the surrounding prose and both inline comments. Do not touch any other
+block in that file or any other doc.
+
+### Scope of this ruling
+
+These 13 and nothing else. A **fourteenth** red test stops you again — report
+it, do not extend the classification by analogy. Two stops on this issue have
+each surfaced something the spec had genuinely got wrong, which is the system
+working; a third would too.
+
 ## 5. STOP conditions, and what success looks like
 
 STOP and report, without pushing, if:
