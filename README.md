@@ -42,6 +42,8 @@ and the tests** — never from the worker's self-report.
     test_record.sh                 STOP detection, outcome ladder, record writing
     test_dispatch_preflight.sh     brief-vs-reality refusals, driving the real script
     test_gate_health.sh            gate liveness, brief reuse, the per-PR lock
+    test_gate_post_sha.sh          the gate stamp: never claim a sha the gate did not see
+    test_spec_review_worker.sh     reviewer substitution is allowed, never silent
     test_gate_routing.sh            the routing table: one definition, three readers
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer

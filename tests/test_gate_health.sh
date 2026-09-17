@@ -116,6 +116,28 @@ cat >/dev/null; exec -a MARKERTOKEN sleep 400
 EOF
   fi
   chmod +x "$TMPD/bin/codex"
+
+  # check-code runs on `claude`, not `codex`, since #2134 routed it to
+  # opus --effort high. This suite stubbed only codex, so `command -v claude`
+  # failed inside the sandboxed PATH, check-code never dispatched, and the
+  # all-healthy case could not set its flag — reported as "healthy gates were
+  # refused — the check is now over-broad", which named the wrong cause.
+  #
+  # It went unnoticed because this suite SKIPs from the master checkout (it
+  # needs a commit ahead of origin/master for velo-pr-gate's diff range), so
+  # #2134 shipped green without this file ever executing. A SKIP is not a pass.
+  if [[ "$1" == "kill-check-code" ]]; then
+    sed "s/MARKERTOKEN/$MARKER/" > "$TMPD/bin/claude" <<'EOF'
+#!/bin/bash
+cat >/dev/null; echo "quota exceeded"; exit 1
+EOF
+  else
+    sed "s/MARKERTOKEN/$MARKER/" > "$TMPD/bin/claude" <<'EOF'
+#!/bin/bash
+cat >/dev/null; exec -a MARKERTOKEN sleep 400
+EOF
+  fi
+  chmod +x "$TMPD/bin/claude"
 }
 
 SCOPE="$TMPD/scope.md"
@@ -221,7 +243,13 @@ invoke                       # regenerate template
 # PATH must contain the stubs and the system utilities and NOTHING ELSE. With
 # "$TMPD/bin:$PATH" the REAL codex is still reachable, so this case dispatched a
 # real review — nondeterministic, quota-burning, and testing the opposite branch.
-rm -f "$FLAG" "$TMPD/bin/codex"
+# BOTH reviewer CLIs must go, not just codex. Since #2134 the two gates run on
+# different binaries — code-review on `codex`, check-code on `claude` — so
+# removing codex alone no longer means "nothing is dispatched": check-code still
+# runs, GATE_DISPATCHED is set, and gate:running is claimed correctly. The
+# assertion below is about the NOTHING-dispatched branch, so the fixture has to
+# actually produce nothing.
+rm -f "$FLAG" "$TMPD/bin/codex" "$TMPD/bin/claude"
 HOME="$TMPD/home" PATH="$TMPD/bin:/usr/bin:/bin" \
   bash "$GATE" "$TPR" "$SCOPE" >"$TMPD/out.txt" 2>&1
 if command -v codex >/dev/null 2>&1 && PATH="$TMPD/bin:/usr/bin:/bin" command -v codex >/dev/null 2>&1; then

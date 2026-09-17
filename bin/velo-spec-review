@@ -29,12 +29,17 @@ ISSUE="${1:-}"; BRIEF=""; BY="${USER:-unknown}"; CHECK=0; REVIEW_WT=""
 STATE="${VELO_STATE:-$HOME/.agents/state}"
 SPEC_TIMEOUT="${VELO_SPEC_TIMEOUT:-900}"
 SPEC_CLEAN_ROUNDS="${VELO_SPEC_CLEAN_ROUNDS:-2}"
+# Which reviewer runs a round. codex is the default and the one the clean-round
+# bar was calibrated on; see the refusal in spec_check() for what a substitute
+# must clear before it is allowed here.
+SPEC_WORKER="${VELO_SPEC_WORKER:-codex}"
 shift 1 2>/dev/null || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check) CHECK=1; shift ;;
     --by)    BY="$2"; shift 2 ;;
     --worktree) REVIEW_WT="$2"; shift 2 ;;
+    --worker) SPEC_WORKER="$2"; shift 2 ;;
     -*)      die "unknown flag: $1" ;;
     *)       [[ -z "$BRIEF" ]] && BRIEF="$1"; shift ;;
   esac
@@ -58,8 +63,6 @@ fi
 # the gate refused a spec that had in fact been reviewed. Caught by testing the
 # two together; it would have looked like a flaky gate.
 ROOT="$HOME/RustroverProjects/velostream"
-SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
-[[ -f "$SPEC" ]] || die "no task spec: $SPEC"
 
 # --check may review a spec that is not on master yet. Attest mode may NOT: the
 # paragraph above is why, and it still holds.
@@ -70,12 +73,28 @@ SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
 # count moved 5 -> 1 -> 3 on reviewer nondeterminism alone, which reads exactly
 # like progress. A loop that cannot see your edits is worse than no loop: it
 # manufactures the feeling of convergence.
+#
+# RESOLVE THE ROOT BEFORE CHECKING THE SPEC EXISTS. It used to check
+# `$ROOT/.agents/tasks/<issue>.json` unconditionally first, and only then apply
+# --worktree — so a spec that existed ONLY on the branch was rejected before the
+# override ran, with "no task spec: <canonical path>". That made --worktree
+# usable only for specs already on master, which is the precise opposite of what
+# the paragraph above says it is for. Nothing caught it because reaching this
+# code needs a spec, and every hand-run had one in both places.
 REVIEW_ROOT="$ROOT"
 if [[ -n "$REVIEW_WT" ]]; then
   [[ -d "$REVIEW_WT" ]] || die "--worktree not found: $REVIEW_WT"
   REVIEW_ROOT=$(cd "$REVIEW_WT" && pwd)
-  SPEC="$REVIEW_ROOT/.agents/tasks/${ISSUE}.json"
-  [[ -f "$SPEC" ]] || die "no task spec in that worktree: $SPEC"
+fi
+SPEC="$REVIEW_ROOT/.agents/tasks/${ISSUE}.json"
+# Name which tree was searched: with --worktree the canonical path is not the
+# one that mattered, and reporting it sends the reader to the wrong file.
+if [[ ! -f "$SPEC" ]]; then
+  if [[ -n "$REVIEW_WT" ]]; then
+    die "no task spec in that worktree: $SPEC"
+  else
+    die "no task spec: $SPEC"
+  fi
 fi
 
 # ---- --check: have Codex review the SPEC, and loop until it stops finding ----
@@ -111,9 +130,30 @@ spec_check() {
   mkdir -p "$STATE/spec/$ISSUE"
   spec_now=$(shasum -a 256 "$SPEC" | cut -d' ' -f1)
 
-  command -v codex >/dev/null 2>&1 || die "codex CLI not on PATH — cannot run the spec review.
-  Do NOT substitute a local model here: on #1988 one approved a diff carrying two
-  P1s and asserted the opposite of one of them."
+  # Substitution is ALLOWED but never SILENT. The rule this encodes: on #1988 a
+  # local model approved a diff carrying two P1s and asserted the opposite of
+  # one of them, so a quiet fallback to whatever is on PATH is forbidden. That
+  # is an argument about model CAPABILITY, not about the string "codex" — so a
+  # frontier model may run a round, provided the run says so everywhere the
+  # verdict is read: stdout, the round log, and the ledger.
+  case "$SPEC_WORKER" in
+    codex)
+      command -v codex >/dev/null 2>&1 || die "codex CLI not on PATH — cannot run the spec review.
+  Do NOT silently substitute a weaker model: on #1988 a local one approved a diff
+  carrying two P1s and asserted the opposite of one of them.
+  To use a declared substitute: --worker opus"
+      ;;
+    opus)
+      command -v claude >/dev/null 2>&1 || die "claude CLI not on PATH — cannot run --worker opus."
+      printf '\033[33m  SUBSTITUTE\033[0m spec review running on OPUS (effort high), not codex.\n'
+      printf '             Recorded in the ledger and the round log. The clean-round bar was\n'
+      printf '             calibrated on codex; a CLEAN from a substitute is evidence, not proof.\n'
+      ;;
+    *)
+      die "unknown --worker '$SPEC_WORKER'. Allowed: codex (default), opus.
+  Anything weaker is refused outright — see #1988."
+      ;;
+  esac
 
   round_log="$STATE/spec/$ISSUE/review-$(date -u +%Y%m%dT%H%M%SZ).log"
   local brief="$STATE/spec/$ISSUE/brief.md"
@@ -172,7 +212,7 @@ spec_check() {
     echo "  VERDICT: FINDINGS <n>"
   } > "$brief"
 
-  printf '  .. spec review round for #%s (codex, up to %ss)\n' "$ISSUE" "$SPEC_TIMEOUT"
+  printf '  .. spec review round for #%s (%s, up to %ss)\n' "$ISSUE" "$SPEC_WORKER" "$SPEC_TIMEOUT"
   # Name the tree under review, its HEAD, and whether it is dirty or ahead of
   # master. A round that silently reviewed stale content is indistinguishable
   # from a round that found nothing, so this line is the difference between a
@@ -185,7 +225,19 @@ spec_check() {
   if [[ "$REVIEW_ROOT" == "$ROOT" && "$R_AHEAD" == "0" && "$R_DIRTY" == "0" ]]; then
     printf '  \033[2m(spec content equals origin/master — if you just edited it on a branch, pass --worktree <path>)\033[0m\n'
   fi
-  ( cd "$REVIEW_ROOT" && timeout "$SPEC_TIMEOUT" codex review - < "$brief" ) > "$round_log" 2>&1
+  case "$SPEC_WORKER" in
+    codex)
+      ( cd "$REVIEW_ROOT" && timeout "$SPEC_TIMEOUT" codex review - < "$brief" ) > "$round_log" 2>&1
+      ;;
+    opus)
+      # Same brief, same cwd, same read-only contract. Edit/Write/NotebookEdit are
+      # disallowed because a reviewer that can edit the artefact under review
+      # converges on something nobody chose (see this function's header).
+      ( cd "$REVIEW_ROOT" && timeout "$SPEC_TIMEOUT" claude -p --model opus --effort high \
+          --permission-mode dontAsk --disallowed-tools Edit Write NotebookEdit \
+          < "$brief" ) > "$round_log" 2>&1
+      ;;
+  esac
   local rc=$?
 
   local verdict findings
@@ -208,9 +260,9 @@ spec_check() {
   # happens is worthless precisely when it matters.
   findings=$(sed -nE 's/^VERDICT: FINDINGS ([0-9]+).*/\1/p' "$round_log" | tail -1 | tr -cd '0-9')
 
-  python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" "$verdict" "${findings:-0}" "$round_log" <<'PY'
+  python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" "$verdict" "${findings:-0}" "$round_log" "$SPEC_WORKER" <<'PY'
 import json, sys, os, datetime
-path, spec_sha, verdict, findings, log = sys.argv[1:6]
+path, spec_sha, verdict, findings, log, worker = sys.argv[1:7]
 # Nothing here may raise. The round HAPPENED; a value we cannot parse is a
 # reason to record it as unparseable, never a reason to lose the entry.
 try:
@@ -220,7 +272,7 @@ except (TypeError, ValueError):
 rec = {
     "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "spec_sha256": spec_sha, "verdict": verdict or "UNPARSEABLE",
-    "findings": n, "log": log,
+    "findings": n, "log": log, "worker": worker,
 }
 if findings and not findings.isdigit():
     rec["findings_raw"] = findings
@@ -231,9 +283,9 @@ except Exception as exc:
     print(f"WARNING: could not append to the spec-review ledger: {exc}", file=sys.stderr)
 PY
 
-  streak=$(python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" <<'PY'
+  streak=$(python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" "$SPEC_WORKER" <<'PY'
 import json, sys
-path, spec_sha = sys.argv[1:3]
+path, spec_sha, worker = sys.argv[1:4]
 n = 0
 try:
     rows = [json.loads(l) for l in open(path) if l.strip()]
@@ -241,8 +293,14 @@ except FileNotFoundError:
     rows = []
 # Count trailing CLEAN rounds against THIS spec content. An edit resets the
 # streak because the artefact under review changed.
+# Also require the SAME worker across the streak. Two CLEAN rounds from two
+# different reviewers is weaker evidence than two from one: it can mean each
+# stopped finding things the other would have found. Rows written before the
+# worker field existed are treated as codex, which is what they were.
 for r in reversed(rows):
-    if r.get("spec_sha256") != spec_sha or r.get("verdict") != "CLEAN":
+    if (r.get("spec_sha256") != spec_sha
+            or r.get("verdict") != "CLEAN"
+            or r.get("worker", "codex") != worker):
         break
     n += 1
 print(n)

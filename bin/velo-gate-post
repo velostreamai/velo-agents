@@ -41,6 +41,33 @@ HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev
   || die "PR #$PR not found"
 
 if [[ -z "$SHA" ]]; then
+  # Defaulting to HEAD is right only if the gate ran against HEAD. When the
+  # report predates the current head — the usual case after fixing findings and
+  # committing before posting — this default silently stamps coverage the gate
+  # never had, which is the exact failure the `gate: <name> @ <sha>` convention
+  # exists to prevent. Caught on PR #2141, where a code-review that ran at
+  # bb1a36fba was stamped @ 206aa76f6, two commits later.
+  #
+  # So: if the report file is OLDER than the head commit, refuse and make the
+  # caller say which sha it reviewed. Comparing mtimes is crude but it fails
+  # closed, and the fix is one flag.
+  if [[ "$FILE" != "-" && -f "$FILE" ]]; then
+    HEAD_CT=$(git log -1 --format=%ct "$HEAD" 2>/dev/null || echo 0)
+    FILE_MT=$(stat -f %m "$FILE" 2>/dev/null || stat -c %Y "$FILE" 2>/dev/null || echo 0)
+    if [[ "$HEAD_CT" -gt 0 && "$FILE_MT" -gt 0 && "$FILE_MT" -lt "$HEAD_CT" ]]; then
+      die "refusing to stamp this report against HEAD (${HEAD:0:9}).
+
+  The report file is OLDER than the head commit, so the gate ran against an
+  earlier one and stamping HEAD would claim coverage it does not have. A gate
+  result is only valid for the commit it ran against.
+
+    report mtime : $(date -u -r "$FILE_MT" +%FT%TZ 2>/dev/null || echo "$FILE_MT")
+    HEAD commit  : $(date -u -r "$HEAD_CT" +%FT%TZ 2>/dev/null || echo "$HEAD_CT")
+
+  Pass the sha the gate actually reviewed:
+    velo-gate-post $PR $NAME $FILE --sha <sha>"
+    fi
+  fi
   SHA="$HEAD"
 else
   # An explicit --sha is how you record a review of an OLDER head honestly,
