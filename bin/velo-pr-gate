@@ -634,9 +634,25 @@ EOF
 
   echo
   echo "  Then relay every report and record the verdict:"
-  [[ $NEEDS_CODE  -eq 1 ]] && echo "    velo-gate-post $PR check-code  <report>"
-  [[ $NEEDS_SPEC  -eq 1 ]] && echo "    velo-gate-post $PR check-spec  <report>"
-  echo "    velo-gate-post $PR code-review <report>"
+  # Print the sha the gates ACTUALLY ran against (#2110).
+  #
+  # This script knows it — $HEAD is resolved at :360 to build the diff range —
+  # and then printed a command without it, so every operator followed an
+  # instruction that defaults to stamping whatever HEAD is at POSTING time. By
+  # then the findings have usually been fixed and committed, so the stamp claims
+  # coverage the gate never had. That is what happened on #2141 (a review at
+  # bb1a36fba stamped @206aa76f6) and on #2123, where the same default collapsed
+  # the next review's range to empty and three reviews went out-of-band.
+  #
+  # velo-gate-post now REFUSES that case rather than stamping it, so the failure
+  # is loud either way. This makes it not happen: the affordance and the guard
+  # are the two halves, and a guard you only meet by tripping over it is a worse
+  # tool than one you are steered past.
+  GPS="${HEAD:-}"
+  [[ -n "$GPS" ]] && GPS=" --sha $GPS"
+  [[ $NEEDS_CODE  -eq 1 ]] && echo "    velo-gate-post $PR check-code  <report>$GPS"
+  [[ $NEEDS_SPEC  -eq 1 ]] && echo "    velo-gate-post $PR check-spec  <report>$GPS"
+  echo "    velo-gate-post $PR code-review <report>$GPS"
   echo "    velo-gate $PR --pass | --block"
 fi
 

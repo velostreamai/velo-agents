@@ -122,6 +122,23 @@ else
   fail "code-review dispatches unwatched"
 fi
 
+# ── the follow-up command must carry the reviewed sha (#2110) ──────────────
+# velo-pr-gate resolves $HEAD to build the diff range, then printed the
+# velo-gate-post command WITHOUT it — so every operator followed an instruction
+# that stamps whatever HEAD is at posting time, which is not what the gate saw.
+# #2141: a review at bb1a36fba stamped @206aa76f6. velo-gate-post now refuses
+# that case; this stops it arising.
+if grep -q 'velo-gate-post \$PR code-review <report>\$GPS' "$GATE"; then
+  ok "the printed velo-gate-post command carries --sha"
+else
+  fail "the follow-up command omits --sha — operators will stamp HEAD (#2110)"
+fi
+if grep -q 'GPS=" --sha \$GPS"' "$GATE"; then
+  ok "the sha printed is the one the gate ran against"
+else
+  fail "no --sha is composed from the resolved head"
+fi
+
 echo
 [[ $FAILED -eq 0 ]] && echo "all gate-routing checks passed" || echo "FAILURES"
 exit $FAILED
