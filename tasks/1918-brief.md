@@ -332,7 +332,7 @@ acceptance bars required it, and a run that was doing exactly the right thing
 halted on `scope-expansion-and-unvalidated-partial-migration` after enumerating
 54 of them. Stopping on these one at a time cannot converge. The volume is the
 task, not a signal that the scope grew.
-- **any of the eight `fail_to_pass` tests PASSES against unfixed code** — the
+- **any of the `fail_to_pass` tests PASSES against unfixed code** — the
   guard `explicit_alias_survives_positional_naming` is NOT one of them and is
   exempt, so never report it here. You cannot
   record the required `RED-FIRST` line (§7a) for a test that was never red, and
@@ -975,3 +975,170 @@ currently does; that converts a defect into a pinned expectation.
 
 After R11-R13 this issue is complete. Report anything else you notice rather than
 fixing it.
+
+
+---
+
+## 13. R14-R15 — round-3 code-review findings
+
+Round 3 `code-review` (Codex) on the R7-R13 delta: **2 P2, zero P1.** CI on #2121
+is green (`Build & Test pass`, 16m) now that the rustls advisory (#2137) is
+cleared. Sweep 11792/11792.
+
+Both findings were verified from the code by the orchestrator, not accepted as
+reasoning-only.
+
+### R14 — the duplicate-name guard is case-sensitive
+
+`flush_group_by.rs:476-480` compares exactly:
+
+    expr_name.as_ref() == output_name_for_group_expr(group_expr, slot).as_ref()
+
+With a schema-declared `Symbol` and unquoted SQL:
+
+    SELECT symbol, COUNT(*) FROM t GROUP BY symbol
+
+column resolution makes the group loop emit `Symbol` while the SELECT-field helper
+emits `symbol`. The comparison is false, so the flush re-adds the duplicate — the
+#1323 defect, reopened for case-differing bare identifiers.
+
+R7 fixed the computed-key half of this guard and left this half. Use
+`eq_ignore_ascii_case`: it is the established idiom here (8 uses in `ast.rs`
+alone) and it is what `check_duplicate_relation_names` does.
+
+New test: `duplicate_group_name_guard_is_case_insensitive`, pinning a
+case-differing schema/SQL pair.
+
+### R15 — the HAVING test does not test HAVING
+
+`having_binds_over_an_unaliased_computed_aggregate` lives in `builder_test.rs`, a
+**plan** test file, and its assertions bottom out at `binds_or_keeps_aggregates` —
+a plan-level predicate. It never executes a record, and never asserts that
+`HAVING total > 5` retains the right group and value.
+
+R12 required: "HAVING over such a query must filter on the right value." The test
+as written does not establish that. A regression in
+`evaluate_having_with_accumulator` or its `result_fields` lookup would leave it
+green.
+
+Replace it with an **execution** test that feeds records through the engine and
+asserts the filtered output. If the plan-level assertion has independent value,
+keep it as well — move or add, but the execution assertion must exist.
+
+This is the exact class that let two P1s through a green sweep earlier on this
+issue: a test that passes while pinning nothing. It was found because the review
+brief asked specifically whether this test asserts the filtered value or merely
+that a name binds.
+
+New test: `having_filters_on_an_unaliased_computed_aggregate_through_the_engine`.
+
+### Then stop — this is the last round
+
+After R14-R15, #2121 merges. Report anything else you notice rather than fixing
+it.
+
+
+## Correction — three spec-hygiene defects, found by the spec-review loop
+
+Recorded because each came from appending requirements without re-reading what was
+already there:
+
+1. **`__agg__` was in two contradictory lists.** A forbidden entry demanded "zero
+   diff lines" containing it while another required migrating it. When the
+   out-of-scope error was fixed, the new entry was ADDED and `__agg__` was never
+   removed from the do-not-touch list. No worker could satisfy both. `__agg__` is
+   IN SCOPE; `__exists__`, `__raw__` and `__velostream_variant` are not.
+2. **The red-first count drifted.** Tests were appended repeatedly while the
+   acceptance text still said "8" and "None of the six exists". The count now
+   tracks the list, and the prose says "none of them" so it cannot drift again.
+3. **R4's claim was unscoped.** "ZERO production callers" is true of
+   `get_expression_name` only AFTER this change's migrations — `origin/master` has
+   7 non-recursive call sites and 4 remained mid-branch. Stated as a bare fact it
+   reads as false to anyone checking master.
+
+
+---
+
+## 14. R16 — PINNED: the generated name is `EXPR_<n>`, not `EXPR$<n>`
+
+**This supersedes §3a's form.** Everything else about the naming rule stands —
+positional, one per SELECT item, `AS` alias always wins, separate namespace for a
+computed GROUP BY key absent from SELECT. Only the spelling changes: underscore,
+not `$`.
+
+### Why — the issue's goal was not actually met
+
+`parser/tokenizer.rs:392-395` starts an identifier on `is_alphabetic() || '_'` and
+continues only while `is_alphanumeric() || '_'`. So `$` **terminates** an
+identifier, and
+
+    SELECT EXPR$0 FROM t2
+
+cannot tokenize as a column reference. The issue is titled *"duplicate output field
+names, **unreferenceable downstream**"* — and `EXPR$<n>` fixed the duplicate half
+while leaving the referenceable half exactly as broken. A unique unreferenceable
+name replaced a duplicated unreferenceable one.
+
+`EXPR$<n>` is Flink/ksqlDB's form and the issue's prior art pinned it, but their
+referenceability rests on quoted identifiers this parser does not support. The
+parity was cosmetic.
+
+This was in front of us earlier and read backwards: when a round reported that `$`
+is not admitted in bare identifiers, it was recorded as GOOD news — a user column
+named `EXPR$0` is unconstructible, so no collision with #1919. Nobody asked the
+converse: if nobody can write it, nobody can reference it.
+
+### R16a — prove referenceability end to end
+
+The headline claim has never been tested. Do it:
+
+    CREATE TABLE t2 AS SELECT price * qty FROM trades;
+    SELECT EXPR_0 FROM t2;
+
+must parse, resolve against the **registered** schema, and return the right value.
+
+**If this cannot be made to work, STOP and report.** That would mean the issue's
+premise is wrong, not its implementation, and it is the caller's call.
+
+Test: `generated_output_name_is_referenceable_by_a_downstream_query`.
+
+### R16b — the collision risk genuinely increases; make it visible
+
+`EXPR$0` was unconstructible, so a user column could never collide with a
+generated name. **`EXPR_0` is constructible.** So
+
+    SELECT price * qty, some_col AS EXPR_0 FROM t
+
+can now collide.
+
+#1918 still adds **no** collision handling — #1919 owns that. But pin the current
+behaviour so the change is visible rather than silent, and note in #1919 that its
+input space just grew.
+
+Test: `user_column_named_like_a_generated_name_is_not_silently_merged`.
+
+### R16c — mechanical rename, scripted not hand-edited
+
+Measured before the rename: **14** refs in 5 `src/` files, **118** in 15 `tests/`
+files, **22** `GROUP$` refs across 11 files, **9** in `docs/`. Update
+`docs/sql/PARSER_GRAMMAR.md` and every test literal. Use `ast-grep` or a scripted
+rewrite and state the count changed — a hand sweep of 150+ literals will miss some,
+and a missed literal is a test asserting a name nothing produces.
+
+### R16d — the shell hazard retires with the `$`
+
+`GROUP$0` expanded to `GROUPbash` in an unquoted shell and corrupted a recorded
+expectation during this issue's own work. `EXPR_<n>` has no shell metacharacter, so
+single-quoting becomes advisory. Drop the "load-bearing" framing from that warning
+but keep the incident recorded — it is why the rule existed.
+
+### Also fix, while here: `__agg__` disagreed in three places
+
+The sidecar's do-not-touch list included `__agg__` while another entry required
+migrating it; the brief still forbids it; the issue body still says out of scope.
+The sidecar list is now corrected. Make the brief and the issue body agree:
+**`__agg__` is IN SCOPE**; `__exists__`, `__raw__`, `__velostream_variant` are not.
+
+### Then stop
+
+After R16 this issue is complete.
