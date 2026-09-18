@@ -1,0 +1,85 @@
+{
+  "issue": 2000,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "8daed48e1",
+  "evidence": "code",
+  "audit": "done:8daed48e1",
+  "depends_on": [],
+  "_why": "RESCOPED 2026-09-06 after the filer's own correction (first comment on #2000). The issue body is OVERSTATED: both null-pad batch merges consult a plan-time `output_layout` FIRST (coordinator/mod.rs:3962, :3992) and only fall back to `seen_*_fields`. That fallback is deliberate and documented, not an overlooked sampling bug. MEASURED reachability (the thing the correction said was missing): `output_layout` is set only by `with_output_schema`, and is None in exactly two shapes \u2014 (1) SELF-JOIN, where it returns early at :503 to preserve the byte-identity invariant, and (2) `cache_inputs` absent at engine/interval_join.rs:270. So the sampled fallback IS reachable, and a self-join is the cheapest shape that reaches it. Because self-joins REQUIRE the fallback, failing loudly there is wrong; the fix is to widen the remembered set rather than freeze row 0's. Part B (field_names_for_source's fabricated [id,name,value,amount,timestamp]) is uncontested and independent of the layout path \u2014 the correction calls it 'arguably worse'. Attempt 1 (glm) was briefed WITHOUT the layout-first branch and stalled 38 minutes trying to construct a failing test for a path it was never told how to reach; it produced nothing and was killed.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/join/coordinator/mod.rs",
+      "symbol": "fn remember_side_fields",
+      "expect": 1,
+      "_note": "the first-record-only capture; `if slot.is_none()` must become a union-extend"
+    },
+    {
+      "file": "src/velostream/sql/execution/join/coordinator/mod.rs",
+      "symbol": "fn build_from_pair",
+      "expect": 1,
+      "_note": "samples one record per side \u2014 same correction as remember_side_fields"
+    },
+    {
+      "file": "src/velostream/sql/execution/processors/join.rs",
+      "symbol": "fn field_names_for_source",
+      "expect": 1,
+      "_note": "returns five FABRICATED column names when a relation has no schema and no sample row. Delete the guess, fail loud."
+    }
+  ],
+  "blast_radius": {
+    "pattern": "field_names_for_source",
+    "files": 1,
+    "refs": 3,
+    "_note": "Both production changes are confined to two files: coordinator/mod.rs (seen_*_fields is 10 refs, all in that one file) and processors/join.rs. Tests add a third. Tripwire in the brief at >4 files."
+  },
+  "grammar_reference": {
+    "files": [
+      "docs/architecture/name-binding.md",
+      "src/velostream/sql/CLAUDE.md"
+    ],
+    "_note": "\u00a73 defines the four physical join layouts; \u00a71b defines what a qualified miss does. The defect is only legible against \u00a71b: absence yields Null OR a hard error depending on bare-name collision across the two sides."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "left_outer_expiry_pads_a_heterogeneous_side_from_the_column_union",
+      "full_outer_expiry_pads_a_heterogeneous_side_from_the_column_union",
+      "heterogeneous_pad_with_a_bare_name_collision_does_not_error_the_row"
+    ],
+    "pass_to_stay": [
+      "regression_left_join_nullfill_preserves_per_row_identity_non_contiguous"
+    ],
+    "known_red": [],
+    "_note": "fail_to_pass names are INDICATIVE \u2014 what is required is a heterogeneous side (rows beyond the first carrying extra columns) across LEFT and FULL OUTER expiry, in BOTH the bare-name-collision and no-collision variants; they fail differently (hard error vs silent Null) and one passing does not imply the other. Each MUST be verified to FAIL against unmodified master BEFORE the production change. If none can be made to fail, that is a SUCCESSFUL run: report the negative result and stop. pass_to_stay is the existing homogeneous-shape nullfill regression in tests/unit/sql/execution/processors/join/left_join_nullfill_row_identity_test.rs \u2014 do not modify it."
+  },
+  "stop_conditions": [
+    "the heterogeneous test does not fail against unmodified master \u2014 report the negative result, do NOT change production code to fix an undemonstrated defect",
+    "existing tests depend on the five fabricated column names (id/name/value/amount/timestamp) \u2014 report which and what they assert; do NOT edit them to keep the guess alive",
+    "the union change requires altering the LogicalPlan node shape or the coordinator's public API \u2014 structural decision, not the worker's",
+    "editing more than 4 files",
+    "full-suite failures rise above 0 (baseline 12378 passed / 0 failed)",
+    "deleting, #[ignore]-ing, or narrowing any existing test",
+    "the fix appears to require also fixing #1987 or #1994 \u2014 both out of scope, separate dispatches"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-06T11:11:19Z",
+    "brief_sha256": "ea921d3850879a13b71abbaabcc1c526775504e4f4bf23b85263d625043347e7"
+  },
+  "acceptance": [
+    "the coordinator's null-pad FALLBACK column set widens across observed records instead of freezing the first \u2014 remember_side_fields no longer captures under `if slot.is_none()`, and build_from_pair does the same. The plan-time `output_layout` path is UNCHANGED and still takes precedence.",
+    "a code comment states the residual limit: a pad emitted BEFORE a wider record arrives still cannot contain that record's columns; a running union fixes heterogeneity going forward, it cannot see the future",
+    "field_names_for_source no longer returns the fabricated [id,name,value,amount,timestamp] set \u2014 it fails loudly, naming the relation whose schema is unknown",
+    "a heterogeneous-side regression test exists that actually REACHES the fallback \u2014 i.e. uses a SELF-JOIN or a cache_inputs-absent shape, not an ordinary two-relation join with a layout wired \u2014 covering LEFT and FULL OUTER expiry in both the bare-name-collision and no-collision variants, and at least one was demonstrated to FAIL against unmodified master",
+    "full suite stays at 0 failures (baseline 12378 passed / 0 failed)"
+  ],
+  "forbidden": [
+    "do not return an empty column set silently from field_names_for_source, and do not keep the fabricated five names behind a flag or env var",
+    "do not modify regression_left_join_nullfill_preserves_per_row_identity_non_contiguous or any existing test to accommodate the change",
+    "do not change MergedRowSchema's public signature or the LogicalPlan node shape",
+    "do not fix #1987 or #1994 \u2014 out of scope, separate issues",
+    "do not create a branch: the worktree is already on the branch velo-dispatch cut for you (#2004)",
+    "do not make the seen_*_fields fallback fail loudly \u2014 self-joins deliberately have output_layout=None (byte-identity invariant, coordinator/mod.rs:503) and would break",
+    "do not change the plan-time output_layout path or build_null_pad_envelope \u2014 the layout branch is correct and takes precedence"
+  ]
+}

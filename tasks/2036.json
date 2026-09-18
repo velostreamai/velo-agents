@@ -1,0 +1,77 @@
+{
+  "issue": 2036,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "8fbf731a1",
+  "evidence": "code",
+  "audit": "done:8fbf731a1",
+  "depends_on": [],
+  "_why": "UnifiedTable::column_names() is used by callers as 'the RELATION's column set' — notably the OUTER-join null-pad paths in stream_table_join.rs (the pre-existing LEFT-join no-match pad, and the EmitWithNulls arm after #2025). But OptimizedTableImpl::column_names() (unified_table.rs:2844) reads ONLY self.column_indexes — the union of columns OBSERVED in ingested rows. It never consults self.schema, which set_schema populates (unified_table.rs:1829) and which schema() already returns (:2836). A table created WITH a schema but which has not yet loaded any rows therefore returns []. An unmatched OUTER row against such a table is padded with NO table columns, and a legal t.col reference fails to resolve even though the declared schema says col exists. The default trait impl (:307) has the same hole: it unions iter_records() keys and likewise ignores an attached schema. Before #2025 the EmitWithNulls arm papered over this by fabricating id/name/value — for a table that genuinely had id/name, two were accidentally right. #2025 removed the fabrication (correctly — that is the class #2000 deleted), which makes this root cause VISIBLE rather than masked. This fix also improves the pre-existing LEFT-join pad, which is why it is not #2025's to make.",
+  "anchors": [
+    {
+      "file": "src/velostream/table/unified_table.rs",
+      "symbol": "fn column_names(&self) -> Vec<String>",
+      "expect": 2,
+      "_note": "TWO in this file: the DEFAULT trait impl (:307, unions iter_records keys) and the OptimizedTableImpl override (:2844, reads column_indexes). BOTH ignore an attached schema; both are in scope."
+    },
+    {
+      "file": "src/velostream/table/unified_table.rs",
+      "symbol": "fn schema(&self) -> Option<Arc<Schema>>",
+      "expect": 2,
+      "_note": "TWO: the trait declaration and the OptimizedTableImpl impl at unified_table.rs:2836 — the accessor that already exposes what column_names must union in. It is a TRAIT method, so the default impl can consult it generically."
+    },
+    {
+      "file": "src/velostream/sql/execution/processors/stream_table_join.rs",
+      "symbol": "column_names",
+      "expect": 6,
+      "_note": "the consumer that motivates the fix: the LEFT-join no-match pad and the EmitWithNulls arm. Its own comment already states the contract — 'the RELATION's full column union, not one sampled row'."
+    }
+  ],
+  "blast_radius": {
+    "pattern": "column_names()",
+    "files": 11,
+    "refs": 31,
+    "_note": "31 refs / 11 files across src/ tests/ examples/. Only unified_table.rs is EDITED; every other file is a call site or an existing test whose behaviour must not regress."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "column_names_includes_declared_schema_columns_before_any_rows_load"
+    ],
+    "pass_to_stay": [
+      "unified_table",
+      "stream_table_join"
+    ],
+    "known_red": [],
+    "_note": "fail_to_pass name indicative. REQUIRED and DISCRIMINATING: construct an OptimizedTableImpl, call set_schema with a schema declaring a column, ingest NO rows, assert column_names() contains that column. It MUST be verified to FAIL against master (which returns []). A second test covering the observed-plus-declared UNION (a row carrying a column the schema does not declare, plus a declared column no row carries) is required — a fix that REPLACES observed with declared instead of unioning would pass the first test and be wrong."
+  },
+  "acceptance": [
+    "OptimizedTableImpl::column_names() returns the UNION of column_indexes keys and the attached schema's field names, sorted and deduplicated",
+    "the DEFAULT trait impl (unified_table.rs:307) unions the attached schema's field names too — Table and CompactTable use it and have the identical hole",
+    "when NO schema is attached, behaviour is unchanged: observed-only is correct in that case",
+    "the union is a union, not a replacement — a column present in ingested rows but absent from the schema is still reported",
+    "the doc comments on both impls are updated to state that the result is observed-union-declared, not observed-only; the existing default-impl doc block explicitly promises correlated-subquery callers a complete set and must not now be misleading",
+    "decorrelated_index.rs's two overrides are ASSESSED and the finding reported: they return statically-known index columns and have no attached schema, so they are expected to be out of scope — say so explicitly rather than silently skipping them",
+    "sql.rs:271 delegates to the inner OptimizedTableImpl and needs no change — confirm, do not edit",
+    "full suite returns to 0 failures"
+  ],
+  "forbidden": [
+    "do not invent, fabricate, or default any column name — that is exactly the class #2000 and #2025 deleted. If there is no schema and no observed row, the honest answer is the empty set",
+    "do not make column_names() replace observed columns with declared ones — a table can legitimately carry columns the schema does not declare",
+    "do not change the trait method's signature",
+    "do not 'fix' the default impl's iter_records() cost in this PR — the CompactTable decompress-per-call concern is real and noted on the issue, but caching or a signature change is a separate design decision. Report it; do not implement it",
+    "do not touch stream_table_join.rs — it is the CONSUMER; if the fix requires changing it, that means the fix is in the wrong place",
+    "do not create a branch: the worktree is already on the branch velo-dispatch cut for you"
+  ],
+  "stop_conditions": [
+    "the reproduction does NOT return [] for a schema-attached, row-empty OptimizedTableImpl on current master — STOP and report; that is the premise of the issue",
+    "unioning the schema into the default impl breaks correlated-subquery inner-vs-outer classification (correlated_subquery_decorrelate.rs, select/subquery.rs) — STOP and report; that classification is what the default impl's doc block is about and a behaviour change there is a separate decision",
+    "more than ~10 pre-existing tests fail — STOP and report the list before changing any",
+    "you would need to delete or #[ignore] a test"
+  ],
+  "reviewed": {
+    "by": "claude-opus-5 (agent)",
+    "at": "2026-09-07T14:58:19Z",
+    "brief_sha256": "eb254589d7eaa42a78456b79a4d63b3c17a7bc736b0a41a9697c7a5a664476a9",
+    "_attestation_correction": "Originally stamped `neilavery` because velo-spec-review records $USER. No human read this spec; the orchestrating agent wrote and attested it. Corrected 2026-09-08 — the tool's own header warns a wrong attestation is worse than none because it looks like diligence."
+  }
+}

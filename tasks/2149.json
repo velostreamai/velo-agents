@@ -1,0 +1,78 @@
+{
+  "issue": 2149,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "8a5a2e6e7",
+  "evidence": "code",
+  "audit": "n/a",
+  "depends_on": [],
+  "_why": "JoinLayout::from_existing_multi_source_fields copies its seed VERBATIM \u2014 no name_pos, no dedup (layout.rs:209-224) \u2014 and the branch selecting it tests a heuristic (any name contains '.') that stands in for a provenance claim nothing enforces. StreamRecord::from_rows does not enforce unique names and FieldName is an unrestricted Arc<str>. Consumers that iterate layout.entries() into a Vec therefore emit two columns where one was intended. #2145 fixed the three JoinProcessor sites that had just been converted from an FxHashMap (the map was collapsing duplicates; removing it created a regression, hence that P1). The remaining callers NEVER had a map, so the same defect is pre-existing there rather than newly introduced \u2014 which is why it is a separate issue and not a #2145 blocker.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/join/layout.rs",
+      "symbol": "pub fn from_existing_multi_source_fields",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/processors/join.rs",
+      "symbol": "fn dedup_seed_fields",
+      "expect": 1
+    },
+    {
+      "file": "src/velostream/sql/execution/processors/join.rs",
+      "symbol": "from_existing_multi_source_fields(",
+      "expect": 4
+    },
+    {
+      "file": "src/velostream/sql/execution/algorithms/hash_join.rs",
+      "symbol": "from_existing_multi_source_fields(",
+      "expect": 2
+    }
+  ],
+  "blast_radius": {
+    "pattern": "from_existing_multi_source_fields",
+    "files": 7,
+    "refs": 15,
+    "scope": "7 files / 15 refs over src/ tests/ examples/ at 8a5a2e6e7. Callers: processors/join.rs 4 (3 already guarded by dedup_seed_fields, plus :1410 un-guarded), algorithms/hash_join.rs 2, join/coordinator/mod.rs 2, processors/stream_table_join.rs 2, plan/schema.rs 1, layout.rs 1 (the definition). The EDIT surface depends on the design choice in acceptance bar 1 \u2014 fixing inside the constructor touches one file; guarding each caller touches five."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "duplicate_seed_fields_do_not_double_columns_at_every_layout_consumer"
+    ],
+    "pass_to_stay": [
+      "combine_records_with_nulls_dedups_duplicate_seed_fields",
+      "merge_join_records_with_aliases_dedups_duplicate_seed_fields",
+      "combine_records_with_nulls_for_probe_dedups_duplicate_seed_fields",
+      "join_emits_columns_in_layout_order_under_adverse_hash_order",
+      "three_way_inner_join_chains_through_engine",
+      "pack_join_results_mixed_schemas_normalises_with_nulls"
+    ],
+    "known_red": []
+  },
+  "acceptance": [
+    "PINNED DESIGN \u2014 dedup INSIDE from_existing_multi_source_fields (layout.rs:209-224). Not a choice; do not implement per-caller guards instead. The reason is decisive rather than aesthetic: a fix that depends on a COMPLETE caller list has already failed twice on this exact function \u2014 #2138's retracted _dedup_derivation assumed a provenance premise nothing enforces, and the review of its fix declared placement settled after checking the sibling constructors instead of the callers. Per-caller guards would make correctness depend on the same enumeration that was wrong both times. A fix at the constructor cannot be missed at a call site. The constructor's doc says it seeds 'an already-canonical left subtree': deduping inside it ENFORCES that contract rather than assuming it \u2014 state that in the doc. Cost is one extra scan on a path that already clones every name; reuse dedup_seed_fields' Cow approach so the all-unique case does not allocate. If this breaks an existing test, that is stop_condition 1 \u2014 report it, do NOT silently fall back to per-caller guards.",
+    "CONFIRM THE CONSUMER SHAPE AT EACH CALLER BEFORE CHANGING IT. processors/join.rs:1410, algorithms/hash_join.rs:402 and :859 were verified to iterate layout.entries() into out_fields/out_arrays Vecs (duplicate-preserving). join/coordinator/mod.rs:6323 and :6474, processors/stream_table_join.rs:610 and :765, and plan/schema.rs:359 are UNVERIFIED \u2014 check each rather than assuming the pattern. A site that funnels through a map, or builds a schema never used for gathering, may need nothing; say so per site.",
+    "ONE mechanism, not N call sites kept in step. If dedup_seed_fields must move to be shared, MOVE it \u2014 do not copy it. #2146 spent seven review rounds where every single finding was 'fixed one site, missed its sibling', and #2138's P1 plus this issue are both instances of the same habit.",
+    "A regression test per genuinely-affected site, each MUTATION-PROVED: disable the dedup, show the test FAILS, restore, show it PASSES. Put both commands and their output in the report. Tests that pass while covering nothing have already cost two P1s in this issue family.",
+    "./run-commit.sh --fast is green and any cargo fmt rewrite it applies is committed. Committing on your dispatch branch IS authorised. NOT authorised: push, PR, merge, or committing on master or in another worktree.",
+    "Do NOT claim a performance change. These sites profile at 0.00% inclusive in a 200k-record stream-table workload (#2138's measurement); this is correctness only."
+  ],
+  "forbidden": [
+    "Do not revert or alter the three sites #2145 already fixed (processors/join.rs:680/735/956) beyond what sharing the helper requires.",
+    "Do not widen into #2148's arrow take-kernel work \u2014 that is ~26% of the workload and a separate architectural question.",
+    "Do not delete, skip, #[ignore] or narrow any existing test.",
+    "Do not add #[cfg(test)] or #[test] inside src/.",
+    "Do not change from_existing_multi_source_fields' SIGNATURE \u2014 a dedup can be internal; a signature change would touch all 11 call sites for no gain."
+  ],
+  "stop_conditions": [
+    "Deduping inside from_existing_multi_source_fields breaks an existing test. That is informative, not a dead end: it means some caller RELIES on duplicate entries surviving. Report which test and which caller rather than switching to option B silently \u2014 a caller that needs duplicates is a finding about the layout contract.",
+    "A caller's seed provenance cannot be established \u2014 you cannot tell whether its field list came from a prior JoinLayout level or from raw record data. Report it. This is exactly the premise #2138's retracted derivation assumed without checking, and assuming it again would repeat the P1.",
+    "A new test cannot be made to fail with the dedup disabled. It does not reach the defect; report it rather than counting it as coverage.",
+    "The number of affected callers turns out to be larger than the eight named. Report the full list \u2014 the enumeration being wrong is the defect class this issue exists to close."
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-17T18:13:13Z",
+    "brief_sha256": "ae57a44f027df02fff5f167da742db9f8f194246b44eac0ce9c3d45f47db5b86"
+  }
+}

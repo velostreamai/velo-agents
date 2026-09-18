@@ -1,0 +1,77 @@
+{
+  "issue": 2025,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "6ba2fa40b",
+  "evidence": "code",
+  "audit": "done:6ba2fa40b",
+  "depends_on": [],
+  "_why": "stream_table_join.rs:1187-1190's TableMissingDataStrategy::EmitWithNulls arm FABRICATES three column names (id/name/value) with the comment 'for now, just add a few common fields'. It is the last surviving instance of the invented-column class #2000 removed from field_names_for_source. A fabricated name is worse than absence: it can COLLIDE with a real column on the stream side and make a genuinely-invalid reference resolve to NULL instead of erroring. The async sibling graceful_degradation.rs::add_null_fields has ALWAYS taken expected_table_fields; this sync copy simply never threaded it, so the fix is mechanical. Reachability is ESTABLISHED, not assumed: emitting an empty FieldMap from this arm turns test_batch_processing_with_graceful_degradation red with u.id absent, so the batch path reaches this handler and this handler produces the u.* columns.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/processors/stream_table_join.rs",
+      "symbol": "fn handle_missing_table_data_sync",
+      "expect": 1,
+      "_note": "add expected_table_fields: &[String]; three call sites at :1022, :1153, :1160, all inside functions that already hold a table handle (optimized_table: &OptimizedTableImpl at :961, table: &Arc<dyn UnifiedTable> at :1116)"
+    },
+    {
+      "file": "src/velostream/server/graceful_degradation.rs",
+      "symbol": "fn add_null_fields",
+      "expect": 1,
+      "_note": "the ASYNC sibling that already takes expected_table_fields \u2014 mirror it, do not invent a second shape"
+    },
+    {
+      "file": "src/velostream/table/unified_table.rs",
+      "symbol": "fn column_names",
+      "expect": 2,
+      "_note": "the authoritative column set. NOTE the default impl derives from RECORDS, so an empty table reports NO columns \u2014 that is exactly why the test fixture must declare its own (see tests)"
+    }
+  ],
+  "blast_radius": {
+    "pattern": "handle_missing_table_data_sync",
+    "files": 1,
+    "refs": 4,
+    "_note": "4 refs in ONE file: the definition plus three call sites. Genuinely small \u2014 the work is the test fixture and the discriminating assertion, not the threading."
+  },
+  "grammar_reference": {
+    "files": [],
+    "_note": "No SQL is written or edited."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "test_batch_processing_with_graceful_degradation"
+    ],
+    "pass_to_stay": [
+      "test_fail_fast_strategy",
+      "test_graceful_degradation_config_update"
+    ],
+    "known_red": [],
+    "_note": "test_batch_processing_with_graceful_degradation is the ONLY test that reaches this handler, and today it CANNOT detect the defect: it asserts u.id and u.name, which are both plausible real columns AND members of the fabricated [id,name,value] set, so it passes either way. Restoring the fabrication would leave the suite green. It must gain a DISCRIMINATING pair \u2014 a column declared-but-never-fabricated (must be NULL) and one fabricated-but-not-declared, i.e. `value` (must be ABSENT) \u2014 and be verified to FAIL against master."
+  },
+  "acceptance": [
+    "handle_missing_table_data_sync takes the expected field set and NULL-fills from it; the hardcoded id/name/value literals are gone from src/",
+    "all three call sites pass the table's own column_names()",
+    "MockEmptyTable overrides column_names() \u2014 a table with no ROWS still has a SCHEMA, and the missing override is why the fabrication was never caught",
+    "test_batch_processing_with_graceful_degradation asserts a declared-but-not-fabricated column is NULL and that `u.value` is ABSENT, and was verified to FAIL against master",
+    "the sync and async paths now agree on where the column set comes from",
+    "full suite returns to 0 failures"
+  ],
+  "forbidden": [
+    "do not delete the EmitWithNulls arm or change what strategy is selected \u2014 the defect is the invented NAMES, not the strategy",
+    "do not weaken test_batch_processing_with_graceful_degradation's existing u.id/u.name assertions; ADD to them",
+    "do not invent a second shape for the field set \u2014 mirror graceful_degradation.rs::add_null_fields",
+    "do not run a revert-check before COMMITTING the production change: `git checkout HEAD -- <path>` on an uncommitted edit destroys it, and on a fresh branch HEAD is master. This destroyed the fix twice during the scoping spike.",
+    "do not create a branch: the worktree is already on the branch velo-dispatch cut for you"
+  ],
+  "stop_conditions": [
+    "you cannot make test_batch_processing_with_graceful_degradation FAIL against master with the discriminating assertions \u2014 report it rather than shipping a test that cannot detect the defect",
+    "threading the parameter requires changing a PUBLIC signature outside stream_table_join.rs \u2014 report it, that is wider than this spec pins",
+    "more than ~5 tests fail \u2014 report the list before changing any",
+    "you would delete, #[ignore] or narrow any existing test"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-07T05:52:28Z",
+    "brief_sha256": "0bda38056ec543cad39c65485b09e3f429af1da359d5493038f657a4abec0858"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "issue": 2046,
+  "worker": "claude",
+  "design": "pinned",
+  "_why": "Stream-stream JOIN's SELECT-shape eligibility predicate looks like fast-path routing but is a CLIFF: there is no per-row fallback, because JoinContext refuses inline stream sources outright. An ineligible shape returned Ok with ZERO rows and one row-error per row, so the caller saw success. Measured on a 2-row probe with a matching build side: `l.id AS renamed`, `a._OFFSET`, `a._WINDOW_END` and `a.auction_id + 1` all produced 0 rows / 2 row-errors. Two of those REGRESSED at #1987 (they previously returned rows with the wrong columns); the computed-expression case is pre-existing. The fix has two halves: widen what the projection can serve (renames and canonical system columns are both representable) and stop demoting a query-shape impossibility to a per-row data error.",
+  "acceptance": [
+    "a RENAMING alias returns rows, and the projected column carries the ALIAS name — implemented by returning the output name alongside each index and rebuilding the schema over the SAME Arrow arrays (metadata only, no copy)",
+    "a canonical system column (`SystemCol::NAMES`, e.g. `_OFFSET`) returns rows, resolved from the packed batch's SYSTEM TAIL rather than reported absent from the data section",
+    "`is_window_bound_col` is split out of `is_system_col_or_window_bound`: the canonical columns are IN the tail, the window bounds are in NEITHER section, and conflating them is what made `_OFFSET` unreachable",
+    "a SELECT shape that genuinely cannot be served FAILS the query instead of returning Ok with no rows. The inline-stream refusal is a query-shape impossibility — identical for every row, whatever the data — so it is raised as PlanValidation and PROPAGATED by the batch fan-out, not recorded per row",
+    "no blanket plan-time gate: one was tried and reverted after over-firing on 18 tests, because SET_HEADER-style projections over stream-stream joins DO work via other paths. 'Ineligible implies zero rows' is specific to this fan-out",
+    "every superseded test is updated with the REASON its premise no longer holds, never silently flipped",
+    "full unit sweep clean"
+  ],
+  "forbidden": [
+    "do NOT weaken the eligibility predicate to admit shapes the resolver cannot then serve — the gate and the resolver must agree, which is what #2031/#2039 were about",
+    "do NOT copy Arrow arrays to perform a rename; it is a schema rebuild over the same buffers",
+    "do NOT convert a genuine per-row DATA error into a query failure — only the query-shape refusal propagates"
+  ],
+  "tests": {
+    "fail_to_pass": [
+      "renaming_alias_over_stream_stream_join_returns_rows",
+      "stream_stream_batch_renaming_alias_is_batch_eligible_and_returns_rows",
+      "stream_stream_batch_system_column_is_eligible_and_returns_rows",
+      "unprojectable_stream_stream_join_fails_instead_of_returning_no_rows"
+    ],
+    "pass_to_stay": ["test(/join/)", "test(/eligib/)", "test(/columnref_schema_guard/)"],
+    "_note": "Each fail_to_pass was verified to fail before its fix. The floor is the full unit sweep: 12454 tests."
+  },
+  "stop_conditions": [
+    "a fix makes the eligibility predicate and the resolver disagree in either direction",
+    "a test's assertion must be inverted without a stated reason its premise was superseded"
+  ]
+}

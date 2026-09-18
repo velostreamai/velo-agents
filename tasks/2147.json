@@ -1,0 +1,75 @@
+{
+  "issue": 2147,
+  "worker": "glm",
+  "design": "pinned",
+  "verified_against": "284084986",
+  "evidence": "code",
+  "audit": "n/a",
+  "depends_on": [],
+  "_why": "PR #2146 caches a JoinLayout beside the joined schema. That caching is what removes the accidental staleness detector: before it, the per-probe layout rebuild disagreed with any stale cache and RecordBatch::try_new raised SqlError. Two invalidation triggers have been added across two review rounds, and EACH ROUND FIXED ONE TRIGGER AND MISSED ITS SIBLING. Codex (independent model, after three opus rounds missed both) found the third and fourth instances: the probe-schema miss does not clear projection_layout, and invalidation is not atomic with repopulation. Both are silent wrong data.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/execution/physical_operator/join_operator.rs",
+      "symbol": "ensure_joined_schema",
+      "expect": 9
+    },
+    {
+      "file": "src/velostream/sql/execution/physical_operator/join_operator.rs",
+      "symbol": "fn ensure_build_side",
+      "expect": 2
+    },
+    {
+      "file": "src/velostream/sql/execution/physical_operator/join_operator.rs",
+      "symbol": "pub fn invalidate_build_side",
+      "expect": 1
+    }
+  ],
+  "blast_radius": {
+    "pattern": "joined_schema",
+    "files": 3,
+    "refs": 70,
+    "scope": "3 files / 70 refs over src/ tests/ examples/ at origin/master 8ae6b9d62 \u2014 the scope velo-dispatch checks. They are join_operator.rs (the cache slot, its readers and docs), hash_join.rs (the local binding in take_combine_stream_table_with_left), and take_path_schema_cache_test.rs. The EDIT surface is far smaller than the ref count: the two P1s live in join_operator.rs alone. A previous revision declared 20 and tripped the gate."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "probe_schema_miss_also_clears_the_projection_layout",
+      "invalidation_cannot_be_repopulated_from_a_superseded_generation"
+    ],
+    "pass_to_stay": [
+      "generation_bump_clears_the_derived_schema_cache_not_just_build_side",
+      "p2146_probe_schema_change_is_not_served_from_the_cached_pair",
+      "p936_invalidate_build_side_also_clears_joined_schema_cache",
+      "p936_joined_schema_alloc_once_across_n_probes",
+      "cache_rebuilds_after_table_insert"
+    ],
+    "known_red": []
+  },
+  "acceptance": [
+    "P1(a): the probe-schema cache miss at join_operator.rs:338 clears projection_layout before storing the new pair. PREFER ONE invalidation routine that both triggers call over two call sites kept in step by hand \u2014 the recurring defect on this PR is precisely a second trigger not doing what the first does. Three rounds have now each fixed one trigger and missed its sibling.",
+    "P1(b): repopulation cannot install a pair derived from a superseded generation. An in-flight old-generation probe can currently store a stale triple at :338 after joined_schema is cleared and before build_side is replaced, and a later probe with the same probe schema reads it (:312-315). State the mechanism that makes this impossible; do NOT reorder locks and assert it is fixed. A previous round cleared this window by analogy to invalidate_build_side and was WRONG \u2014 a thread repopulating INTO the window is not the same as a thread holding a stale clone.",
+    "Regression tests that REACH the defects. The two existing tests pass and cover neither: generation_bump_clears_the_derived_schema_cache_not_just_build_side only checks joined_schema_populated() at rest, and p2146_probe_schema_change_is_not_served_from_the_cached_pair discards the layout and never exercises the cached take/projection path.",
+    "MUTATION-PROVE each new test: disable the fix, show the test FAILS, restore it, show it passes. Put both observations in the report with the command you ran. A test that passes for the wrong reason is worse than none, and that has already happened twice on this PR.",
+    "./run-commit.sh --fast is green, and any cargo fmt rewrite it applies is committed. Committing on the existing branch perf/join-layout-hoist IS authorised. NOT authorised: push to master, merge, or committing in another worktree.",
+    "Do NOT claim a performance change. The numbers are measured and already in the PR body; this is correctness work only."
+  ],
+  "forbidden": [
+    "Do not widen scope to the arrow take kernels. They are ~26% of this workload and the real optimisation target, but that is a separate architectural question (late materialisation vs eager gather) and is NOT this issue.",
+    "Do not revert the hoist.",
+    "Do not touch #2138's four JoinProcessor sites \u2014 different PR, and they profile at 0.00% in this workload.",
+    "Do not re-investigate what the Codex gate confirmed clean: the cached JoinLayout matches the retained None arm exactly, and alias/source-name mutation is unreachable (metadata set at construction, private).",
+    "Do not delete, skip, #[ignore] or narrow any existing test.",
+    "Do not add #[cfg(test)] or #[test] inside src/."
+  ],
+  "stop_conditions": [
+    "Making the invalidation atomic requires changing the lock discipline in a way that risks deadlock, or holding a lock across the schema build. Report the design rather than shipping it \u2014 invalidate_build_side's doc explains the existing lock order and why it is most-derived-first.",
+    "A new test cannot be made to fail with the fix disabled. That means it does not reach the defect; report it rather than counting it as coverage.",
+    "You find a THIRD invalidation trigger that neither clears the derived caches nor keys on its inputs. Report it \u2014 the point of acceptance bar 1 is to stop this recurring, so a new instance is evidence the single-routine approach is needed rather than optional.",
+    "You find a production caller that makes the from_table_data row-0 hash-order vector reachable at equal generation. Codex marked it UNVERIFIED; a confirmed caller changes the scope and is an orchestrator decision."
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-17T07:17:49Z",
+    "brief_sha256": "2e76c2c7f51575fa3365fca15ad5941251763612e1307ee06bcb5659f6c354ca"
+  },
+  "_anchor_note": "Counts measured at origin/master 8ae6b9d62 with: git show origin/master:<file> | grep -c -F <symbol>. ensure_joined_schema=9 counts the fn, its doc references, the test hook and call sites; fn ensure_build_side=2 is the fn plus build_side_via_test. The branch this runs on (perf/join-layout-hoist) is AHEAD of master and these counts differ there \u2014 the gate checks master, which is the contract."
+}

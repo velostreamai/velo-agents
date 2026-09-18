@@ -1,0 +1,85 @@
+{
+  "issue": 1994,
+  "worker": "codex",
+  "design": "pinned",
+  "verified_against": "330412fcd",
+  "evidence": "code",
+  "audit": "done:330412fcd",
+  "depends_on": [],
+  "_why": "IMPLEMENTATION of #1994, following the Stage-1 analysis merged as PR #2021 (.agents/tasks/1994-analysis.md on master). HAVING's raw input columns inside aggregate arguments are never bound at plan time and fall to per-record name resolution. The mechanism to fix it ALREADY EXISTS \u2014 rewrite_having_aggregate_arguments draws the source/output schema boundary at exactly the right depth and covers the compound-CASE case \u2014 but it has exactly ONE caller, inside visit_node, on predicate.clone(), for the completeness gate's coverage derivation, and its result is DISCARDED. It never reaches the executed plan. That is precisely the gated-additive-helper-with-no-production-caller anti-pattern the repo's production-wiring discipline forbids. Promotion converts dead diagnostic work into the executed plan. The analysis left R1 (sequencing vs #1747's index divergence) and R2 (a coupled pre-existing defect) as maintainer decisions; both are now PINNED in the brief \u2014 R1 as promote-with-names, R2 as out-of-scope and already filed as #2026.",
+  "anchors": [
+    {
+      "file": "src/velostream/sql/plan/column_resolution.rs",
+      "symbol": "fn rewrite_having_aggregate_arguments",
+      "expect": 1,
+      "_note": "the two-schema rewrite to promote. Today: one caller, on a clone, result discarded."
+    },
+    {
+      "file": "src/velostream/sql/plan/column_resolution.rs",
+      "symbol": "fn having_aggregate_input",
+      "expect": 1,
+      "_note": "how the walker recognises a Filter as a HAVING and recovers the SOURCE schema + alias ctx. The main pass needs the same recognition \u2014 this is the reuse point, do not write a second one."
+    },
+    {
+      "file": "src/velostream/sql/plan/column_resolution.rs",
+      "symbol": "fn rewrite_node",
+      "expect": 1,
+      "_note": "the main rewriter. Its Filter arm rewrites the predicate against input.schema (= the Aggregate's OUTPUT schema for a HAVING). The promotion lands HERE, not in the Aggregate arm \u2014 PlanNode::Aggregate has no `having` field."
+    }
+  ],
+  "blast_radius": {
+    "pattern": "rewrite_having_aggregate_arguments",
+    "files": 3,
+    "refs": 20,
+    "_note": "20 refs / 3 files, but most are the function's own internal recursion through BinaryOp/UnaryOp/Case/Between/InList arms. The external surface is ONE call site."
+  },
+  "grammar_reference": {
+    "files": [
+      "docs/architecture/name-binding.md",
+      "docs/claude/SQL_GRAMMAR_RULES.md",
+      "docs/sql/PARSER_GRAMMAR.md",
+      "src/velostream/sql/CLAUDE.md"
+    ],
+    "_note": "\u00a71c condition 2 carves HAVING out explicitly and MUST be amended in this PR (R3). Clause order post-#1962: SELECT -> FROM -> JOIN -> WHERE -> WINDOW -> GROUP BY -> HAVING -> ORDER BY -> LIMIT."
+  },
+  "tests": {
+    "fail_to_pass": [
+      "having_case_argument_column_is_bound_at_plan_time"
+    ],
+    "pass_to_stay": [
+      "schema_rich_full_order_flow_imbalance_demo_query_resolves",
+      "schema_rich_windowed_having_reports_a_real_case_argument_mismatch"
+    ],
+    "known_red": [],
+    "_note": "fail_to_pass name is indicative \u2014 what is REQUIRED is a test proving a raw input column nested in a HAVING aggregate argument is bound at plan time after the change and was not before. Verify it FAILS pre-change. pass_to_stay includes the strict-gate test that proves the position is already consulted with the source schema \u2014 it must not regress."
+  },
+  "acceptance": [
+    "rewrite_having_aggregate_arguments (or its logic) runs in rewrite_node's Filter arm on the EXECUTED plan, not only on a diagnostic clone",
+    "aggregate-result references (HAVING COUNT(*) > 5) still resolve against the Aggregate's OUTPUT schema \u2014 the two-schema split is preserved, not collapsed",
+    "R1 honoured: the promoted rewrite must NOT stamp source-schema indices into anything the chunked window path reads by index (see the brief)",
+    "R3: column_resolution.rs's module-doc invariant is amended to be TRUE post-change, and name-binding.md \u00a71c condition 2's HAVING carve-out is updated to match the resulting coverage, in this same PR",
+    "visit_node(strict_gate) remains the SINGLE derivation point for \u00a71c condition 2 \u2014 no third scoping is introduced",
+    "no per-record cost added",
+    "full suite returns to 0 failures"
+  ],
+  "forbidden": [
+    "do not rewrite the whole HAVING predicate against the SOURCE schema \u2014 HAVING COUNT(*) > 5 exists only in the output schema; this breaks it",
+    "do not add a `having` field to PlanNode::Aggregate or change the plan shape \u2014 the Filter-over-Aggregate lowering is where this belongs",
+    "do not fix #2026 (two same-kind complex aggregate args both binding to the first slot) \u2014 filed, out of scope, and its premise differs from the analysis's description",
+    "do not fix #1747's index divergence \u2014 R1 is sequenced AROUND it, not through it",
+    "do not introduce a third HAVING scoping path \u2014 reuse having_aggregate_input",
+    "do not create a branch: the worktree is already on the branch velo-dispatch cut for you"
+  ],
+  "stop_conditions": [
+    "the promotion cannot avoid stamping indices the chunked path reads \u2014 STOP and report; that means R1's pinned option is not viable and the sequencing decision must be revisited",
+    "more than ~10 pre-existing tests fail \u2014 STOP and report the list before changing any of them",
+    "the fix appears to require touching find_slot_output_alias or the window_v2 chunked path \u2014 STOP, that is #2026/#1747 territory",
+    "you cannot make the fail_to_pass test fail before the change \u2014 report it rather than shipping a vacuous test",
+    "amending \u00a71c would require weakening the completeness gate rather than describing it \u2014 STOP; the gate must DESCRIBE resolver coverage, never compensate for it"
+  ],
+  "reviewed": {
+    "by": "neilavery",
+    "at": "2026-09-06T19:10:44Z",
+    "brief_sha256": "c17acc4c20c68baa3f7bca9399ccd6084eebd503672b0ded4a0b980271de4be7"
+  }
+}
