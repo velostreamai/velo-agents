@@ -67,9 +67,8 @@ OUT=$(run "worker:glm" "glm");       check "label+spec agree"   "$OUT" "OK: rout
 # UNROUTABLE value must still be refused. Adding a route widens the accepted set
 # by exactly one; if the validation is loosened instead, any typo becomes a
 # silent dispatch to the wrong model, which is #2000's failure.
-OUT=$(run "worker:deepseek41" "deepseek41"); check "deepseek41 routes"  "$OUT" "OK: routed to velo-deepseek41"
-OUT=$(run "worker:deepseek42" "");           check "a near-miss label is still refused" "$OUT" "unroutable worker"
-OUT=$(run "worker:codex" "codex");   check "codex routes"       "$OUT" "OK: routed to codex"
+OUT=$(run "worker:deepseek41" "");          check "a versioned label is refused — routes are unversioned" "$OUT" "unroutable worker"
+OUT=$(run "worker:codex" "codex");   check "codex routes"       "$OUT" "OK: routed to velo-codex"
 
 echo
 echo "the label is still required"
@@ -100,6 +99,31 @@ echo
 echo "two labels are still refused"
 OUT=$(run "worker:glm,worker:codex" "")
 check "two worker labels rejected" "$OUT" "at most one"
+
+# ── every NAME the router produces must have a dispatch arm ────────────────
+# The router sets NAME; a case 1200 lines later launches on it. Nothing tied the
+# two together, so renaming NAME from `codex` to `velo-codex` while leaving the
+# arm as `codex)` passed every test: the label was still accepted, TIER_RANK
+# still ranked it, and the dispatch silently did nothing. Caught only by
+# resolving route -> NAME -> MODEL_ID by hand.
+echo
+echo "every routed NAME has a dispatch arm"
+DISP="$(dirname "$0")/../bin/velo-dispatch"
+for N in velo-local velo-deepseek velo-glm velo-codex; do
+  if grep -qE "^  $N\\)" "$DISP"; then
+    echo "  PASS  $N has a dispatch arm"
+  else
+    echo "  FAIL  $N is routable but has NO dispatch arm — it would launch nothing"
+    FAILURES=$((FAILURES+1))
+  fi
+done
+# And an unmatched NAME must die rather than fall through with no command.
+if awk '/^case "\$NAME" in/{f=1} f && /^  \*\)/{found=1} f && /^esac/{exit} END{exit !found}' "$DISP"; then
+  echo "  PASS  an unknown NAME hits a catch-all"
+else
+  echo "  FAIL  no catch-all: an unmatched NAME would silently launch nothing"
+  FAILURES=$((FAILURES+1))
+fi
 
 echo
 [[ $RC -eq 0 ]] && echo "all routing checks passed" || echo "FAILED"

@@ -47,7 +47,7 @@ done
 # Renumbered when velo-deepseek41 was added between deepseek and glm. Ranks are
 # derived from the worker NAME on every call and never stored, so this cannot
 # invalidate a historical result.jsonl row.
-for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-deepseek41:2' 'velo-glm:3' 'codex:4'; do
+for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-glm:2' 'velo-codex:3'; do
   GOT=$(TIER_RANK "${PAIR%%:*}"); WANT="${PAIR##*:}"
   if [[ "$GOT" == "$WANT" ]]; then
     ok "tier rank ${PAIR%%:*} = $GOT"
@@ -183,28 +183,21 @@ else
   fail "the unknown verdict is not reported to the operator"
 fi
 
-# ── the new rung behaves like a rung ───────────────────────────────────────
-# Adding a worker to TIER_RANK is not enough — it has to order correctly against
-# its neighbours, or the guard silently treats a sideways move as an escalation.
-if [[ "$(decide velo-deepseek failed velo-deepseek41 '')" == "allow" ]]; then
-  ok "deepseek -> deepseek41 is an escalation"
+# ── the codex rename must not orphan 15 recorded dispatches ────────────────
+# NAME went codex -> velo-codex. TIER_RANK returns -1 for anything it does not
+# recognise, and history_verdict reports -1 as `unknown` — so without an alias
+# the guard would silently stop comparing tiers on every past codex run. That is
+# the sentinel failure this guard was already fixed for once; a rename is
+# exactly how it comes back.
+if [[ "$(TIER_RANK codex)" == "$(TIER_RANK velo-codex)" ]]; then
+  ok "legacy 'codex' ranks the same as 'velo-codex'"
 else
-  fail "escalating into the new rung was refused"
+  fail "the rename orphaned historical codex rows: codex=$(TIER_RANK codex) velo-codex=$(TIER_RANK velo-codex)"
 fi
-if [[ "$(decide velo-deepseek41 failed velo-glm '')" == "allow" ]]; then
-  ok "deepseek41 -> glm is an escalation"
+if [[ "$(decide codex failed velo-codex '')" == "refuse" ]]; then
+  ok "a legacy codex row still refuses a same-tier re-dispatch"
 else
-  fail "escalating out of the new rung was refused"
-fi
-if [[ "$(decide velo-glm failed velo-deepseek41 '')" == "refuse" ]]; then
-  ok "glm -> deepseek41 is a DOWNGRADE and is refused"
-else
-  fail "a downgrade into the new rung was allowed"
-fi
-if [[ "$(decide velo-deepseek41 failed velo-deepseek41 '')" == "refuse" ]]; then
-  ok "the new rung refuses a same-tier repeat like every other"
-else
-  fail "same-tier repeat allowed on the new rung"
+  fail "history written before the rename no longer triggers the guard"
 fi
 
 # The override works, and requires a reason to exist.

@@ -198,13 +198,23 @@ ROUTE="$LABEL_WORKER"
 # says `worker: claude`, which is not a transport this script has. Unroutable
 # values must fail here, loudly, rather than later or silently.
 case "$ROUTE" in
-  local)    NAME="velo-local"; LOGTAG="velo-local" ;;
-  deepseek) NAME="velo-deepseek"; LOGTAG="deepseek" ;;
-  deepseek41) NAME="velo-deepseek41"; LOGTAG="deepseek41" ;;
-  glm)      NAME="velo-glm"; LOGTAG="glm" ;;
-  codex)    NAME="codex"; LOGTAG="codex" ;;
+  # NAME is the worker IDENTITY — it keys result.jsonl and TIER_RANK, and is what
+  # velo-status displays. LOGTAG is only the log FILENAME prefix. Two different
+  # jobs, so two conventions, applied uniformly:
+  #
+  #   NAME    velo-<route>   for every route, without exception
+  #   LOGTAG  <route>        bare, for every route
+  #
+  # Both were inconsistent in exactly one place each, and the odd one out
+  # differed per column: codex was the only NAME without the prefix, and local
+  # was the only LOGTAG with it. A convention with an exception is not a
+  # convention, and the exception is what a reader has to memorise.
+  local)      NAME="velo-local";      LOGTAG="local" ;;
+  deepseek)   NAME="velo-deepseek";   LOGTAG="deepseek" ;;
+  glm)        NAME="velo-glm";        LOGTAG="glm" ;;
+  codex)      NAME="velo-codex";      LOGTAG="codex" ;;
   *) die "unroutable worker '$ROUTE' (from ${LABEL_WORKER:+label}${LABEL_WORKER:-spec}).
-    Routable: local, deepseek, deepseek41, glm, codex. See #2062 for opus/fable." ;;
+    Routable: local, deepseek, glm, codex. See #2062 for opus/fable." ;;
 esac
 ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 
@@ -226,16 +236,15 @@ ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 # Re-dispatching into the same tier after a failure is the pattern this catches.
 # It is not a judgement about the task — it is a fact about a prior run, which
 # is the only kind of escalation trigger we can actually evaluate.
-# velo-deepseek41 sits BETWEEN deepseek and glm. Its DeepSWE score (74.2) is
-# above glm's (63.4), which would argue for a higher rung — but that is
-# vendor-reported, independent testing of it was poor, and glm has landed work
-# HERE while deepseek41 has never run. Placing an unproven model above a proven
-# one would let the guard call a DOWNGRADE an escalation. Provisional: revisit
-# when a paired run against glm exists.
+# Routes are UNVERSIONED; the model is pinned in MODEL_ID. That is why there is
+# no deepseek41 rung: a versioned route name ages the moment v4.2 ships, and the
+# model a run used is already recorded per row in result.jsonl.
 #
-# Ranks are computed from the worker NAME on every call and never stored, so
-# renumbering cannot invalidate a historical result.jsonl row.
-TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-deepseek41) echo 2 ;; velo-glm) echo 3 ;; codex) echo 4 ;; *) echo -1 ;; esac; }
+# Accepts the LEGACY bare `codex` alongside `velo-codex`. 15 recorded dispatches
+# carry worker "codex", and an unrecognised name ranks -1, which history_verdict
+# reports as `unknown` — so without the alias the guard would quietly stop
+# comparing tiers on every past codex run.
+TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-glm) echo 2 ;; velo-codex|codex) echo 3 ;; *) echo -1 ;; esac; }
 
 # The decision is a FUNCTION so the test can execute this code rather than a
 # copy of it. An earlier draft of the test re-implemented the comparison and
@@ -1383,7 +1392,7 @@ RECORD_MAX_TURNS="$MAX_TURNS"
 # below must be identical for every worker. Four inline launches would be four
 # places for the outcome recording to be silently missing from one of them.
 case "$NAME" in
-  codex)
+  velo-codex)
     # `codex exec` takes the brief as its prompt argument and runs
     # non-interactively. --dangerously-bypass-approvals-and-sandbox is required
     # for an IMPLEMENTATION run: the worker must compile and run tests. A
@@ -1435,39 +1444,23 @@ case "$NAME" in
           --cwd "$WT" --task "$TASK" )
     ;;
   velo-deepseek)
-    MODEL_ID='deepseek/deepseek-v4-flash-0731'
-    CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
-          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
-          --max-budget-usd "$MAX_BUDGET_USD"
-          --cwd "$WT" --task "$TASK" )
-    ;;
-  velo-deepseek41)
-    # DeepSeek V4.1-Flash — a separate ROUTE, not a re-pin of velo-deepseek.
+    # Pinned at V4.1-Flash. The route is unversioned and the model is pinned
+    # here, which is the convention every other route follows.
     #
-    # Added to be compared against velo-glm, which is the incumbent for agentic
-    # work on this repo's own record (landed 4 of 17 against deepseek's 1 of 3)
-    # and on the two benchmarks that match the workload: Terminal-Bench 2.1 84.3
-    # and DeepSWE v1.1 63.4, against V4-Flash's 79-82.7 and 54.4.
+    # V4.1 supersedes V4-Flash-0731 outright on everything published: DeepSWE
+    # v1.1 74.2 against 54.4, for 23% more per run on our cache profile
+    # ($0.188 vs $0.153 across 14 measured runs). There is no workload here
+    # where the older pin is the right answer, so it is not kept selectable.
     #
-    # V4.1-Flash is the reason to look again: DeepSWE v1.1 74.2, which is 10.8
-    # points ABOVE glm. Both vendor-reported. Independent hands-on testing was
-    # markedly less flattering — "builds plausible-looking scaffolding quickly,
-    # but the underlying logic frequently breaks under scrutiny", with
-    # state-tracking failures across multi-step logic. That is the worst failure
-    # mode for a detached 40-minute dispatch, so the claim is worth TESTING, not
-    # adopting.
+    # Re-pinning is traceable rather than destructive: result.jsonl records the
+    # MODEL per row, so the three existing velo-deepseek rows remain readable as
+    # V4-Flash runs. That is true of every OpenRouter route and NOT of codex,
+    # which records "codex" as its model (#2107).
     #
-    # On cost it is counterintuitive and this is why the route exists at all.
-    # Priced against 14 real runs of ours (2.50M fresh in, 158.2M cached,
-    # 0.77M out):
-    #
-    #   deepseek-v4-flash-0731   $0.153/run
-    #   deepseek-v4.1-flash      $0.188/run
-    #   glm-5.3-flash            $0.236/run
-    #
-    # Cheaper than glm despite 3.3x the list input price, because our runs are
-    # 98% cached and its cache read is $0.006/M against glm's $0.018/M. List
-    # prices are actively misleading for this shape.
+    # Independent testing of V4.1 was less flattering than its benchmarks —
+    # "builds plausible-looking scaffolding quickly, but the underlying logic
+    # frequently breaks under scrutiny", with state-tracking failures across
+    # multi-step logic. Worth watching on long detached runs.
     MODEL_ID='deepseek/deepseek-v4.1-flash'
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
@@ -1481,6 +1474,18 @@ case "$NAME" in
           --max-budget-usd "$MAX_BUDGET_USD"
           --cwd "$WT" --task "$TASK" )
     ;;
+  *)
+    # A NAME with no arm produced NO CMD and fell straight through, because this
+    # case had no catch-all. That is how renaming NAME from `codex` to
+    # `velo-codex` while leaving the arm as `codex)` got past every test: the
+    # routing table still accepted the label, TIER_RANK still ranked it, and the
+    # dispatch simply did nothing.
+    #
+    # The two names are set 1200 lines apart and nothing tied them together.
+    # Failing loudly here is the cheap half; test_routing pins the pairing.
+    die "no dispatch arm for worker NAME '$NAME'.
+    The routing table accepted this worker but nothing knows how to launch it —
+    a NAME was added or renamed without its arm here." ;;
 esac
 
 # Supervisor: run the worker, then record the outcome (#1992 Phase 1).

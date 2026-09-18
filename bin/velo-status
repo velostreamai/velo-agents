@@ -74,6 +74,24 @@ RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m
 # rather than assuming worktree names stay tame.
 ere_escape() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|\/]/\\&/g'; }
 
+worker_from_cmd() {   # $1 = the process argv
+  # A FUNCTION so the test can execute this code instead of a copy of it. It was
+  # inline, the test re-implemented it, and the only thing catching a divergence
+  # was a grep for one literal arm — which proves the string exists, not that the
+  # logic matches. That is the same defect a reviewer found in this repo twice.
+  #
+  # One arm per ROUTE, not per model: routes are unversioned and the model is
+  # pinned in velo-dispatch. A per-model arm would need editing on every re-pin,
+  # and the model a run used is already recorded per row in result.jsonl.
+  case "$1" in
+    *deepseek/deepseek*)      echo "velo-deepseek" ;;
+    *z-ai/glm*)               echo "velo-glm" ;;
+    *lmstudio-agent-sdk*|*qwen3-coder*) echo "velo-local" ;;
+    *"codex exec"*)           echo "velo-codex" ;;
+    *)                        echo "running?" ;;
+  esac
+}
+
 running_pid_for() {
   local wt snap
   wt=$(ere_escape "$1")
@@ -244,13 +262,7 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
     # Logs are matched by mtime, so a stale log from an EARLIER worker on the
     # same issue would otherwise mislabel the one actually running.
     CMD=$(ps -o command= -p "$PID" 2>/dev/null)
-    case "$CMD" in
-      *deepseek/deepseek*)  WORKER="deepseek" ;;
-      *z-ai/glm*)           WORKER="glm" ;;
-      *lmstudio-agent-sdk*) WORKER="velo-local" ;;
-      *"codex exec"*)       WORKER="codex" ;;
-      *)                    WORKER="running?" ;;
-    esac
+    WORKER=$(worker_from_cmd "$CMD")
   elif [[ -n "$LOG" ]]; then
     # Not running: the most recent log is the best available evidence of who
     # ran last.

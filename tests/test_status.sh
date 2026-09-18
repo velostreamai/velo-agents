@@ -64,6 +64,37 @@ else
   FAILURES=$((FAILURES+1))
 fi
 
+# ── the worker name shown for a LIVE process ───────────────────────────────
+# Separate from the log-filename derivation above: when a worker is running,
+# velo-status names it from the process argv instead. Those arms had no coverage
+# and were wrong in two ways — they emitted bare names ("glm") while
+# result.jsonl stored prefixed ones ("velo-glm"), so the table and the history
+# disagreed about who ran; and there was no arm for deepseek41 at all, so a live
+# V4.1 run displayed as "running?".
+#
+# EXECUTED, not copied: worker_from_cmd is eval'd out of velo-status, so an edit
+# to the arms fails here rather than drifting. The first draft of this block
+# re-implemented the case statement and guarded it with a grep for one literal
+# arm — which proves a string exists, not that the logic matches. A reviewer
+# caught that same shape twice in this repo; writing it a third time and calling
+# it "extracted" in the comment was worse than the bug.
+eval "$(sed -n '/^worker_from_cmd() {/,/^}/p' "$BIN/velo-status")"
+if declare -F worker_from_cmd >/dev/null; then
+  echo "  PASS  extracted worker_from_cmd from velo-status"
+else
+  echo "  FAIL  worker_from_cmd NOT extracted — the checks below would test nothing"
+  FAILURES=$((FAILURES+1)); exit 1
+fi
+cmd_worker() { worker_from_cmd "$1"; }
+check "live glm names velo-glm"        "$(cmd_worker '--model z-ai/glm-5.3-flash')"          "velo-glm"
+check "live codex names velo-codex"    "$(cmd_worker 'codex exec --cd /x')"                  "velo-codex"
+check "live local names velo-local"    "$(cmd_worker '--model qwen3-coder-next-mlx@6bit')"   "velo-local"
+check "live deepseek names velo-deepseek" "$(cmd_worker '--model deepseek/deepseek-v4-flash-0731')" "velo-deepseek"
+# Any deepseek model maps to the one unversioned route — a re-pin must not need
+# a velo-status edit.
+check "a re-pinned deepseek model still names velo-deepseek" \
+      "$(cmd_worker '--model deepseek/deepseek-v4.1-flash')"                                 "velo-deepseek"
+
 # And the whole command must still run. It reads real worktrees, so assert only
 # that it succeeds and prints its header — not on the rows, which vary.
 OUT=$("$BIN/velo-status" 2>&1)
