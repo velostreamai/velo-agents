@@ -200,10 +200,11 @@ ROUTE="$LABEL_WORKER"
 case "$ROUTE" in
   local)    NAME="velo-local"; LOGTAG="velo-local" ;;
   deepseek) NAME="velo-deepseek"; LOGTAG="deepseek" ;;
+  deepseek41) NAME="velo-deepseek41"; LOGTAG="deepseek41" ;;
   glm)      NAME="velo-glm"; LOGTAG="glm" ;;
   codex)    NAME="codex"; LOGTAG="codex" ;;
   *) die "unroutable worker '$ROUTE' (from ${LABEL_WORKER:+label}${LABEL_WORKER:-spec}).
-    Routable: local, deepseek, glm, codex. See #2062 for opus/fable." ;;
+    Routable: local, deepseek, deepseek41, glm, codex. See #2062 for opus/fable." ;;
 esac
 ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 
@@ -225,7 +226,16 @@ ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 # Re-dispatching into the same tier after a failure is the pattern this catches.
 # It is not a judgement about the task — it is a fact about a prior run, which
 # is the only kind of escalation trigger we can actually evaluate.
-TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-glm) echo 2 ;; codex) echo 3 ;; *) echo -1 ;; esac; }
+# velo-deepseek41 sits BETWEEN deepseek and glm. Its DeepSWE score (74.2) is
+# above glm's (63.4), which would argue for a higher rung — but that is
+# vendor-reported, independent testing of it was poor, and glm has landed work
+# HERE while deepseek41 has never run. Placing an unproven model above a proven
+# one would let the guard call a DOWNGRADE an escalation. Provisional: revisit
+# when a paired run against glm exists.
+#
+# Ranks are computed from the worker NAME on every call and never stored, so
+# renumbering cannot invalidate a historical result.jsonl row.
+TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-deepseek41) echo 2 ;; velo-glm) echo 3 ;; codex) echo 4 ;; *) echo -1 ;; esac; }
 
 # The decision is a FUNCTION so the test can execute this code rather than a
 # copy of it. An earlier draft of the test re-implemented the comparison and
@@ -1426,6 +1436,39 @@ case "$NAME" in
     ;;
   velo-deepseek)
     MODEL_ID='deepseek/deepseek-v4-flash-0731'
+    CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
+          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --max-budget-usd "$MAX_BUDGET_USD"
+          --cwd "$WT" --task "$TASK" )
+    ;;
+  velo-deepseek41)
+    # DeepSeek V4.1-Flash — a separate ROUTE, not a re-pin of velo-deepseek.
+    #
+    # Added to be compared against velo-glm, which is the incumbent for agentic
+    # work on this repo's own record (landed 4 of 17 against deepseek's 1 of 3)
+    # and on the two benchmarks that match the workload: Terminal-Bench 2.1 84.3
+    # and DeepSWE v1.1 63.4, against V4-Flash's 79-82.7 and 54.4.
+    #
+    # V4.1-Flash is the reason to look again: DeepSWE v1.1 74.2, which is 10.8
+    # points ABOVE glm. Both vendor-reported. Independent hands-on testing was
+    # markedly less flattering — "builds plausible-looking scaffolding quickly,
+    # but the underlying logic frequently breaks under scrutiny", with
+    # state-tracking failures across multi-step logic. That is the worst failure
+    # mode for a detached 40-minute dispatch, so the claim is worth TESTING, not
+    # adopting.
+    #
+    # On cost it is counterintuitive and this is why the route exists at all.
+    # Priced against 14 real runs of ours (2.50M fresh in, 158.2M cached,
+    # 0.77M out):
+    #
+    #   deepseek-v4-flash-0731   $0.153/run
+    #   deepseek-v4.1-flash      $0.188/run
+    #   glm-5.3-flash            $0.236/run
+    #
+    # Cheaper than glm despite 3.3x the list input price, because our runs are
+    # 98% cached and its cache read is $0.006/M against glm's $0.018/M. List
+    # prices are actively misleading for this shape.
+    MODEL_ID='deepseek/deepseek-v4.1-flash'
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"

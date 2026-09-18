@@ -44,7 +44,10 @@ done
 
 # ── tier ordering ──────────────────────────────────────────────────────────
 # The whole guard reduces to this comparison, so pin it directly.
-for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-glm:2' 'codex:3'; do
+# Renumbered when velo-deepseek41 was added between deepseek and glm. Ranks are
+# derived from the worker NAME on every call and never stored, so this cannot
+# invalidate a historical result.jsonl row.
+for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-deepseek41:2' 'velo-glm:3' 'codex:4'; do
   GOT=$(TIER_RANK "${PAIR%%:*}"); WANT="${PAIR##*:}"
   if [[ "$GOT" == "$WANT" ]]; then
     ok "tier rank ${PAIR%%:*} = $GOT"
@@ -178,6 +181,30 @@ if grep -q 'the re-dispatch guard did NOT run' "$DISPATCH" \
   ok "the unknown branch warns rather than reporting a false escalation"
 else
   fail "the unknown verdict is not reported to the operator"
+fi
+
+# ── the new rung behaves like a rung ───────────────────────────────────────
+# Adding a worker to TIER_RANK is not enough — it has to order correctly against
+# its neighbours, or the guard silently treats a sideways move as an escalation.
+if [[ "$(decide velo-deepseek failed velo-deepseek41 '')" == "allow" ]]; then
+  ok "deepseek -> deepseek41 is an escalation"
+else
+  fail "escalating into the new rung was refused"
+fi
+if [[ "$(decide velo-deepseek41 failed velo-glm '')" == "allow" ]]; then
+  ok "deepseek41 -> glm is an escalation"
+else
+  fail "escalating out of the new rung was refused"
+fi
+if [[ "$(decide velo-glm failed velo-deepseek41 '')" == "refuse" ]]; then
+  ok "glm -> deepseek41 is a DOWNGRADE and is refused"
+else
+  fail "a downgrade into the new rung was allowed"
+fi
+if [[ "$(decide velo-deepseek41 failed velo-deepseek41 '')" == "refuse" ]]; then
+  ok "the new rung refuses a same-tier repeat like every other"
+else
+  fail "same-tier repeat allowed on the new rung"
 fi
 
 # The override works, and requires a reason to exist.

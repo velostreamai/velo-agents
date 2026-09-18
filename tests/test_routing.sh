@@ -62,6 +62,13 @@ check_not "does not refuse"             "$OUT" "DIE:"
 echo
 echo "agreement routes"
 OUT=$(run "worker:glm" "glm");       check "label+spec agree"   "$OUT" "OK: routed to velo-glm"
+
+# The new rung must route like any other label, and — more importantly — an
+# UNROUTABLE value must still be refused. Adding a route widens the accepted set
+# by exactly one; if the validation is loosened instead, any typo becomes a
+# silent dispatch to the wrong model, which is #2000's failure.
+OUT=$(run "worker:deepseek41" "deepseek41"); check "deepseek41 routes"  "$OUT" "OK: routed to velo-deepseek41"
+OUT=$(run "worker:deepseek42" "");           check "a near-miss label is still refused" "$OUT" "unroutable worker"
 OUT=$(run "worker:codex" "codex");   check "codex routes"       "$OUT" "OK: routed to codex"
 
 echo
