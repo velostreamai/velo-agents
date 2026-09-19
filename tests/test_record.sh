@@ -168,12 +168,6 @@ VELO_RECORD_ROOT="$TMP/root" "$BIN/velo-record" 100 --worktree /nonexistent-work
   --worker w --model m --log /nonexistent.log --started bogus --rc 0 >/dev/null 2>&1
 check "velo-record exits 0 on bad input" "$?" "0"
 
-echo
-if [[ $FAILURES -gt 0 ]]; then
-  echo "FAILED: $FAILURES check(s)"
-  exit 1
-fi
-echo "all record checks passed"
 
 # ── records live in $VELO_STATE, not the repo (#2107 follow-up) ────────────
 # They were in the repo AND gitignored, so a working-tree cleanup on 2026-09-19
@@ -198,3 +192,61 @@ if grep -q 'reading LEGACY record location' "$HERE/../bin/velo-dispatch"; then
 else
   echo "  FAIL  no legacy fallback — the move would orphan existing history"; FAILURES=$((FAILURES+1))
 fi
+
+# ── provenance: no field may assert what nobody established (#2107) ────────
+echo
+echo "cost / model / leak provenance"
+REC="$HERE/../bin/velo-record"; DISP="$HERE/../bin/velo-dispatch"
+RUN="$HERE/../bin/velo-openai-agents-runner.py"
+
+# 1. openrouter-billed had NO branch, so the gateway's real billed figure was
+#    dropped and every row recorded usd:null under billed provenance — 35 of 35.
+if grep -q 'if source == "openrouter-billed"' "$REC"; then
+  echo "  PASS  the billed figure is promoted to usd"
+else
+  echo "  FAIL  openrouter-billed still falls through to usd:null"; FAILURES=$((FAILURES+1))
+fi
+
+# 2. the leak counter was a hardcoded 0 — the SAFE value — on a runtime that
+#    never counts. Three consumers read it as measured.
+if grep -q 'leaked_tool_calls=unmeasured' "$RUN"; then
+  echo "  PASS  the runner reports unmeasured rather than a fabricated 0"
+else
+  echo "  FAIL  leaked_tool_calls is still asserted as 0"; FAILURES=$((FAILURES+1))
+fi
+if grep -q 'None if g("VR_LEAKED") == "unmeasured"' "$REC"; then
+  echo "  PASS  unmeasured is recorded as null, not 0"
+else
+  echo "  FAIL  unmeasured would be coerced to 0 in the record"; FAILURES=$((FAILURES+1))
+fi
+# ...and must not be mistaken for an actual leak, which would fail every run.
+if grep -q '!= "unmeasured"' "$REC"; then
+  echo "  PASS  unmeasured does not promote the outcome to failed"
+else
+  echo "  FAIL  an unmeasured count would be treated as a leak"; FAILURES=$((FAILURES+1))
+fi
+
+# 3. the codex route recorded its ROUTE LABEL as its model, so 15 rows cannot be
+#    attributed — on the most expensive tier.
+if grep -q "MODEL_ID='codex'" "$DISP"; then
+  echo "  FAIL  codex still records the route label as its model"; FAILURES=$((FAILURES+1))
+else
+  echo "  PASS  codex no longer records 'codex' as a model"
+fi
+if grep -q 'model_reasoning_effort' "$DISP"; then
+  echo "  PASS  reasoning effort is recorded with the model"
+else
+  echo "  FAIL  effort is not recorded — high vs low is load-bearing"; FAILURES=$((FAILURES+1))
+fi
+
+# Summary LAST. It used to sit mid-file, so every block appended after it ran
+# only when nothing earlier failed — and printed AFTER "all record checks
+# passed", which was therefore a claim about part of the file. Two blocks were
+# appended below it before anyone noticed (#2164's location checks and #2107's
+# provenance checks); on any earlier failure both were skipped silently.
+echo
+if [[ $FAILURES -gt 0 ]]; then
+  echo "FAILED: $FAILURES check(s)"
+  exit 1
+fi
+echo "all record checks passed"

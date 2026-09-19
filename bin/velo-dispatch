@@ -1414,7 +1414,26 @@ case "$NAME" in
       || die "worker:codex but the codex CLI is not on PATH.
   Do NOT silently substitute a local model — that is what produced a green
   report over two P1s on #1988. Install codex or relabel the issue."
-    MODEL_ID='codex'
+    # Read the model from codex's own config rather than recording the route
+    # label. "codex" is not a model, and 15 rows carry it — so no past codex run
+    # can be attributed, and the routing table's most expensive tier is the one
+    # tier with no evidence behind it.
+    #
+    # BEST-EFFORT and labelled as such: codex profiles and CLI flags can override
+    # the config, so this is "what the config said at dispatch", not "what ran".
+    # Recording it as ground truth would repeat the mistake being fixed.
+    # model_reasoning_effort is carried too — for a reasoning model, high vs low
+    # is as load-bearing as the model name.
+    _CODEX_CFG="$HOME/.codex/config.toml"
+    MODEL_ID=$(awk -F'"' '/^model[[:space:]]*=/{print $2; exit}' "$_CODEX_CFG" 2>/dev/null)
+    _CODEX_EFFORT=$(awk -F'"' '/^model_reasoning_effort[[:space:]]*=/{print $2; exit}' "$_CODEX_CFG" 2>/dev/null)
+    if [[ -n "$MODEL_ID" ]]; then
+      [[ -n "$_CODEX_EFFORT" ]] && MODEL_ID="$MODEL_ID (effort=$_CODEX_EFFORT, from config)"
+      MODEL_ID="$MODEL_ID"
+    else
+      # Do not fall back to "codex" — that is the defect. Say we do not know.
+      MODEL_ID='unknown (codex config unreadable)'
+    fi
     # codex writes no TOTALS line, so its record carries cost source
     # "unavailable" rather than a zero. A fabricated zero on the MOST expensive
     # worker would invert every cost comparison the record exists to support.

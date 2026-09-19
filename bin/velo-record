@@ -137,7 +137,9 @@ if [[ -z "$READ_ONLY" && -n "$BRIEF" && -f "$BRIEF" ]]; then
   fi
 fi
 
-if [[ "${LEAKED:-0}" != "0" ]]; then      OUTCOME="failed"
+# `unmeasured` is not a leak. Treating it as one would fail every run on the
+# openai-agents runtime; treating it as 0 is what this fixes. It is neither.
+if [[ "${LEAKED:-0}" != "0" && "${LEAKED:-0}" != "unmeasured" ]]; then OUTCOME="failed"
 elif [[ "$STOPPED" == true ]]; then       OUTCOME="stopped"
 elif [[ "$RC" != "0" ]]; then             OUTCOME="failed"
 # A read-only task that COMMITTED did the one thing it was forbidden to do. That
@@ -184,7 +186,7 @@ OUT="$RECORD_DIR/${ISSUE}.result.jsonl"
 VR_ISSUE="$ISSUE" VR_STARTED="$STARTED" VR_FINISHED="$FINISHED" \
 VR_WORKER="$WORKER" VR_MODEL="$MODEL" VR_BRIEF_SHA="$BRIEF_SHA" VR_BASE="$BASE" \
 VR_BRANCH="$BRANCH" VR_TURNS="$TURNS" VR_MAXTURNS="$MAXTURNS" VR_STATUS="$STATUS" \
-VR_LEAKED="${LEAKED:-0}" VR_TIMEDOUT="$TIMEDOUT" VR_RC="$RC" \
+VR_LEAKED="${LEAKED:-unmeasured}" VR_TIMEDOUT="$TIMEDOUT" VR_RC="$RC" \
 VR_IN="$IN_TOK" VR_OUT="$OUT_TOK" VR_CACHED="$CACHED_TOK" VR_COST="$COST" VR_USAGE_SRC="$USAGE_SRC" \
 VR_COMMITS="$COMMITS" VR_DIRTY="$DIRTY" VR_FILES="$FILES" VR_INS="$INS" VR_DELS="$DELS" \
 VR_PUSHED="$PUSHED" VR_OUTCOME="$OUTCOME" VR_LOG="$LOG" VR_SPECDIR="$ROOT/.agents/tasks" \
@@ -267,7 +269,17 @@ def _cost_block():
     # total is a floor, not a total, and averaging floors understates the very
     # runs that failed.
     partial = "partial" in source
-    if source == "sdk":
+    if source == "openrouter-billed":
+        # The GATEWAY's own billed figure, not an estimate. This branch did not
+        # exist, so every openrouter-billed run recorded `usd: null` while
+        # asserting billed provenance — 35 of 35 rows, the whole cost record.
+        #
+        # It is the only trustworthy price we get. Fitting $/token against 53
+        # billed observations gave a median error of 48% and a max of 80%, and
+        # list prices moved 40% in one day (glm-5.3-flash 0.15 -> 0.09), so
+        # anything derived rather than reported is wrong within hours.
+        block["usd"] = estimate
+    elif source == "sdk":
         block["usd"] = estimate
     elif "unpriced" in source:
         block["usd_sdk_estimate_invented_rate"] = estimate
@@ -300,7 +312,9 @@ record = {
         "max_turns": i("VR_MAXTURNS") or None,
         "status": s("VR_STATUS"),
         "exit_code": i("VR_RC"),
-        "leaked_tool_calls": i("VR_LEAKED"),
+        # null when the runtime did not count, so a reader cannot mistake
+        # "not checked" for "none found" (#2107).
+        "leaked_tool_calls": (None if g("VR_LEAKED") == "unmeasured" else i("VR_LEAKED")),
         "timed_out": b("VR_TIMEDOUT"),
         "log": s("VR_LOG"),
     },

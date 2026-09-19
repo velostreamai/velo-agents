@@ -421,7 +421,15 @@ async def main() -> int:
     # are compared directly, and mixing conventions made a 229k-token run read as 7k.
     fresh = max(hooks.inp - hooks.cached, 0)
     log.emit(
-        f"TOTALS prompts=1 leaked_tool_calls=0 "
+        # `unmeasured`, NOT 0. This runtime does not count leaked tool calls —
+        # a tool call emitted as plain text, which executes nothing while the run
+        # still reports success. It was a hardcoded 0, and three consumers read
+        # it as a measurement: velo-record parses it, ranks it above every other
+        # outcome ("the run may look clean"), and velo-status paints LEAKED red.
+        #
+        # A null is honest; a 0 is the SAFE value, so the absence of evidence was
+        # displayed as evidence of absence on every run since 2026-09-12.
+        f"TOTALS prompts=1 leaked_tool_calls=unmeasured "
         f"input_tokens={fresh} output_tokens={hooks.out} cached_tokens={hooks.cached} "
         # A local endpoint bills nothing and reports no cost. Labelling a
         # $0.000000 local run "openrouter-billed" would put a fabricated zero
