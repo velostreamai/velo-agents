@@ -302,7 +302,18 @@ history_verdict() { # <last_worker> <last_outcome> <new_worker> <reason>
   echo allow
 }
 
-RESULT_FILE="$ROOT/.agents/tasks/${ISSUE}.result.jsonl"
+# Canonical location is $VELO_STATE/records; the two legacy paths are still READ
+# so a migration cannot silently blind the guard. Reading an old row is always
+# safe — the guard only ever compares worker/outcome — and a missing file is
+# indistinguishable from "no history", which is precisely the failure that
+# motivated moving them.
+RESULT_FILE="${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl"
+if [[ ! -f "$RESULT_FILE" ]]; then
+  for _legacy in "$ROOT/.agents/tasks/${ISSUE}.result.jsonl" \
+                 "$HOME/.agents/tasks/${ISSUE}.result.jsonl"; do
+    [[ -f "$_legacy" ]] && { RESULT_FILE="$_legacy"; warn "reading LEGACY record location: $_legacy"; break; }
+  done
+fi
 if [[ -f "$RESULT_FILE" ]]; then
   # Parsed, not grepped: the file is JSON and the fields we need are nested.
   # A malformed row is skipped rather than fatal — it is append-only and a

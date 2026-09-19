@@ -163,7 +163,23 @@ fi
 # purpose is that re-dispatches ACCUMULATE. A single short line appended to an
 # O_APPEND fd is atomic on POSIX, so concurrent recorders interleave instead of
 # clobbering, and no reader can catch the file mid-rewrite.
-OUT="$ROOT/.agents/tasks/${ISSUE}.result.jsonl"
+# Records live in $VELO_STATE, NOT in the repo (#2107 follow-up).
+#
+# They were written to $ROOT/.agents/tasks/ and gitignored there — in the repo
+# AND unversioned, which is the quadrant that loses data. On 2026-09-19 an
+# unrelated cleanup of the working tree took every row with it; 17 survived only
+# because install.sh had copied them to ~/.agents/tasks, where nothing reads
+# them. This is the dispatch history the re-dispatch guard reads, so losing it
+# silently re-enables #2000's blind re-dispatch.
+#
+# $VELO_STATE already owns gate/, spec/ and dispatch/ state for exactly this
+# reason: it survives worktree removal, git clean, and branch switches.
+# VELO_RECORD_ROOT stays the test/override knob; it now names a directory that
+# CONTAINS records rather than a repo checkout.
+RECORD_DIR="${VELO_RECORD_ROOT:+$VELO_RECORD_ROOT/records}"
+RECORD_DIR="${RECORD_DIR:-${VELO_STATE:-$HOME/.agents/state}/records}"
+mkdir -p "$RECORD_DIR"
+OUT="$RECORD_DIR/${ISSUE}.result.jsonl"
 
 VR_ISSUE="$ISSUE" VR_STARTED="$STARTED" VR_FINISHED="$FINISHED" \
 VR_WORKER="$WORKER" VR_MODEL="$MODEL" VR_BRIEF_SHA="$BRIEF_SHA" VR_BASE="$BASE" \

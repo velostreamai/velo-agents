@@ -81,7 +81,7 @@ run_record() {  # <issue> <worktree> <log> <brief> <rc>
   VELO_RECORD_ROOT="$TMP/root" "$BIN/velo-record" "$1" --worktree "$2" \
     --worker w --model m --log "$3" --brief "$4" \
     --started 2020-01-01T00:00:00Z --rc "$5" --max-turns 10 >/dev/null 2>&1
-  outcome_of "$TMP/root/.agents/tasks/$1.result.jsonl"
+  outcome_of "$TMP/root/records/$1.result.jsonl"
 }
 
 totals true  > "$TMP/ro.log"
@@ -130,7 +130,7 @@ for st in built refused failed skipped; do
     --rc 0 --max-turns 10 --base abc >/dev/null 2>&1
   GOT=$(python3 -c "
 import json
-print(json.loads(open('$D/.agents/tasks/4242.result.jsonl').readline()).get('discovery_index'))
+print(json.loads(open('$D/records/4242.result.jsonl').readline()).get('discovery_index'))
 " 2>/dev/null)
   check "index state '$st' recorded" "$GOT" "$st"
   rm -rf "$D"
@@ -145,7 +145,7 @@ VELO_RECORD_ROOT="$D" "$BIN/velo-record" 4243 --worktree "$D" --worker w --model
   --brief "$D/b.md" --started "$(date -u +%FT%TZ)" --rc 0 --max-turns 10 --base abc >/dev/null 2>&1
 GOT=$(python3 -c "
 import json
-print(json.loads(open('$D/.agents/tasks/4243.result.jsonl').readline()).get('discovery_index'))
+print(json.loads(open('$D/records/4243.result.jsonl').readline()).get('discovery_index'))
 " 2>/dev/null)
 check "omitted --index is 'unknown', not a guess" "$GOT" "unknown"
 rm -rf "$D"
@@ -160,7 +160,7 @@ for i in 1 2 3 4 5 6; do
     --started 2020-01-01T00:00:00Z --rc 0 --max-turns 10 >/dev/null 2>&1 &
 done
 wait
-check "6 concurrent recorders keep 6 rows" "$(wc -l < "$TMP/root/.agents/tasks/99.result.jsonl" | tr -d ' ')" "6"
+check "6 concurrent recorders keep 6 rows" "$(wc -l < "$TMP/root/records/99.result.jsonl" | tr -d ' ')" "6"
 
 # Observational means observational: a dispatch that already finished must never
 # be failed by the act of recording it.
@@ -174,3 +174,27 @@ if [[ $FAILURES -gt 0 ]]; then
   exit 1
 fi
 echo "all record checks passed"
+
+# ── records live in $VELO_STATE, not the repo (#2107 follow-up) ────────────
+# They were in the repo AND gitignored, so a working-tree cleanup on 2026-09-19
+# destroyed every row; 17 survived only because install.sh had copied them to
+# ~/.agents/tasks, where nothing reads them. This is the history the re-dispatch
+# guard reads — losing it silently re-enables #2000's blind re-dispatch.
+echo
+echo "record location"
+if grep -q "VELO_STATE:-\$HOME/.agents/state}/records" "$HERE/../bin/velo-record"; then
+  echo "  PASS  velo-record writes under \$VELO_STATE"
+else
+  echo "  FAIL  velo-record still writes into the repo"; FAILURES=$((FAILURES+1))
+fi
+if grep -q 'records/\${ISSUE}.result.jsonl' "$HERE/../bin/velo-dispatch"; then
+  echo "  PASS  the guard reads the new location"
+else
+  echo "  FAIL  the guard does not read \$VELO_STATE/records"; FAILURES=$((FAILURES+1))
+fi
+# Legacy reads must survive, or the move blinds the guard for every existing row.
+if grep -q 'reading LEGACY record location' "$HERE/../bin/velo-dispatch"; then
+  echo "  PASS  legacy locations are still read, loudly"
+else
+  echo "  FAIL  no legacy fallback — the move would orphan existing history"; FAILURES=$((FAILURES+1))
+fi
