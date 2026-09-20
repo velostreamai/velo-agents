@@ -85,9 +85,33 @@ case "${VELO_AGENT_BACKEND:-openai-agents}" in
             exit 1
         fi
         ;;
+    vercel)
+        # SPIKE (#2075). Not a route anyone is dispatched to by default — it
+        # exists to answer one question the other two cannot: this SDK's
+        # `prepareStep` sets `activeTools` PER STEP, so a tool can be made
+        # ABSENT from the model's view for a step rather than merely
+        # discouraged. Everything we tried that only biases selection failed to
+        # replicate (bash 0-8 on identical conditions), so a by-construction
+        # guarantee is the only remaining lever worth testing.
+        SDK_AGENT="$BIN/velo-vercel-runner.mjs"
+        SDK_PY="${VELO_NODE:-$(command -v node)}"
+        if [ -z "$SDK_PY" ] || [ ! -x "$SDK_PY" ]; then
+            echo "[velo-openrouter-agent] node not found; needed for backend=vercel" >&2
+            exit 1
+        fi
+        # Same reasoning as the openai-agents arm: an interpreter present with
+        # its SDK missing would surface as a traceback mid-dispatch, after the
+        # worktree is cut and the issue assigned.
+        if ! "$SDK_PY" -e 'require(require("path").join(process.env.HOME,".agents/node/node_modules/ai/package.json"))' 2>/dev/null; then
+            echo "[velo-openrouter-agent] the 'ai' package is missing from ~/.agents/node" >&2
+            echo "[velo-openrouter-agent] mkdir -p ~/.agents/node && cd ~/.agents/node && npm init -y" >&2
+            echo "[velo-openrouter-agent] npm i ai @openrouter/ai-sdk-provider zod" >&2
+            exit 1
+        fi
+        ;;
     *)
         echo "[velo-openrouter-agent] unknown VELO_AGENT_BACKEND='$VELO_AGENT_BACKEND'" >&2
-        echo "[velo-openrouter-agent] expected: open-agent | openai-agents" >&2
+        echo "[velo-openrouter-agent] expected: open-agent | openai-agents | vercel" >&2
         exit 1
         ;;
 esac

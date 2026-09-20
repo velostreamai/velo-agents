@@ -42,6 +42,8 @@ import asyncio
 import json
 import os
 import pathlib
+import re
+import subprocess
 import sys
 import time
 
@@ -151,6 +153,96 @@ class Logger:
             self.fh.write(line + "\n"); self.fh.flush()
 
 
+class AgentLog:
+    """The reasoning trail the policy mandates — written by the RUNNER.
+
+    velo-impl.md requires `agent.log` in the worktree root with real timestamps,
+    a WHY line before each material change, a heartbeat, and an
+    AST-GREP-DECISION line for every structural edit. Its absence is declared a
+    brief violation and a STOP trigger.
+
+    No delegated dispatch has ever produced one. Checked 2026-09-20: the #1940
+    worktree has no agent.log at all, and the only file of that name on the
+    machine is in the main checkout, last written 2026-08-26 — its 13
+    AST-GREP-DECISION lines all came from native Claude agents. So the whole
+    section has been dead letter for every worker this tooling dispatches.
+
+    Asking the worker to self-report compliance is the wrong fix, and the
+    emptiness above is the evidence: a worker that skips ast-grep is exactly the
+    worker that will skip logging that it skipped. The runner already SEES every
+    tool call, so it writes the trail from ground truth instead. A worker cannot
+    forget to, and cannot overstate it.
+
+    Appended, never truncated: a resumed dispatch continues one history.
+    """
+
+    def __init__(self, cwd: str):
+        self.path = pathlib.Path(cwd) / "agent.log"
+        self.ast_grep_calls = 0
+        self.ast_grep_applied = 0
+        self.fh = None
+        try:
+            self.fh = open(self.path, "a", encoding="utf-8")
+        except OSError as exc:
+            # Surfaced, not swallowed. A missing trail is a policy violation and
+            # the operator needs to know the runner could not write it.
+            print(f"WARN: cannot open {self.path}: {exc}", file=sys.stderr)
+
+    def emit(self, msg: str) -> None:
+        if not self.fh:
+            return
+        self.fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.000Z {msg}\n")
+        self.fh.flush()
+
+    def tool(self, name: str, args_summary: str) -> None:
+        if name == "ast_grep":
+            self.ast_grep_calls += 1
+            # `apply=False` is a DRY RUN — it changes nothing. Recording it as
+            # "applied" would put a false compliance claim in the very file
+            # that exists to evidence compliance, and the policy's own recipe
+            # makes the dry run a distinct, required step.
+            result = "dry-run" if "apply=False" in args_summary else "applied"
+            if result == "applied":
+                self.ast_grep_applied += 1
+            self.emit(f"AST-GREP-DECISION | op=structural | pattern={args_summary} "
+                      f"| result={result}")
+        else:
+            self.emit(f"TOOL {name} | {args_summary}")
+
+    def why(self, text: str) -> None:
+        """The model's own reasoning for the step — the policy's WHY line."""
+        first = " ".join(text.strip().split())[:300]
+        if first:
+            self.emit(f"WHY: {first}")
+
+    def close(self, status: str, files_changed: int, read_only: bool = False) -> None:
+        # The check the policy describes but nothing has ever run. Computed from
+        # the tool log, so it needs nothing from the worker.
+        counts = (f"files_changed={files_changed} | ast_grep_calls={self.ast_grep_calls} "
+                  f"(applied={self.ast_grep_applied}, "
+                  f"dry_run={self.ast_grep_calls - self.ast_grep_applied})")
+
+        if files_changed >= 2 and self.ast_grep_calls == 0:
+            verdict = ("review — a change spanning 2+ files with no ast_grep is the "
+                       "trigger-list violation velo-impl.md §AST-grep defines")
+        elif (not read_only and files_changed == 0 and self.ast_grep_calls > 0
+              and self.ast_grep_applied == 0):
+            # Caught by this check's own first end-to-end run: the worker
+            # dry-ran ast_grep three times, never passed apply=True, changed
+            # nothing, and reported status=success. An earlier version scored
+            # that VERDICT=ok purely because ast_grep_calls > 0 — counting
+            # SEARCHES as evidence of WORK. Searching is not doing.
+            verdict = ("review — ast_grep ran but every call was a dry run and "
+                       "nothing changed on a write task; the search happened, the "
+                       "edit did not")
+        else:
+            verdict = "ok"
+
+        self.emit(f"STRUCTURAL-EDIT-CHECK | {counts} | VERDICT={verdict}")
+        self.emit(f"FINAL STATE — status={status} files_changed={files_changed}")
+        self.fh and self.fh.close()
+
+
 class BudgetExceeded(Exception):
     """Raised from the usage hook to stop a run that has spent its budget.
 
@@ -171,10 +263,13 @@ class Hooks(RunHooks):
     return value loses every token for exactly the runs that burned the most.
     """
 
-    def __init__(self, logger: Logger, label: str, max_budget_usd: float | None = None):
+    def __init__(self, logger: Logger, label: str, max_budget_usd: float | None = None,
+                 agent_log: "AgentLog | None" = None):
         self.log, self.label = logger, label
+        self.agent_log = agent_log
         self.max_budget_usd = max_budget_usd
         self.inp = self.out = self.cached = self.turns = 0
+        self.leaked = 0
         self.cost = 0.0
         # Accumulated here because `Runner.run` RAISES on max_turns and on a
         # model error, and the conversation goes with it — there is no result
@@ -208,8 +303,37 @@ class Hooks(RunHooks):
                 f"{getattr(c,'name','?')}({summarise_tool_input(getattr(c,'arguments',None))})"
                 for c in calls)
             self.log.emit(f"[{self.label}] tool start names={names} | {detail}")
+            if self.agent_log:
+                for c in calls:
+                    self.agent_log.tool(
+                        getattr(c, "name", "?"),
+                        summarise_tool_input(getattr(c, "arguments", None)))
         else:
             self.log.emit(f"[{self.label}] sdk assistant text_len=0")
+
+        # The model's own text is the WHY the policy asks for, captured where it
+        # is actually produced rather than requested of the worker afterwards.
+        if self.agent_log:
+            for blob in (getattr(o, "text", "") or "" for o in
+                         (getattr(response, "output", None) or [])):
+                self.agent_log.why(blob)
+
+        # Leaked tool calls — ported from the incumbent, which detected these and
+        # this runtime did not. The failure is SILENT: the model emits its NATIVE
+        # tool-call syntax as plain assistant TEXT, the SDK's parser does not
+        # recognise it, so the call never runs while the turn still reports
+        # success. The intended edit simply does not happen and the worker says
+        # it is done.
+        #
+        # Observed on DeepSeek (fullwidth-pipe DSML markers) when the task string
+        # carried nested quotes, and it is not model-specific — Qwen leaks
+        # <tool_call>, and <function_calls>/<invoke name= appear across providers.
+        for blob in (getattr(o, "text", "") or "" for o in
+                     (getattr(response, "output", None) or [])):
+            for kind in scan_for_leaked_tool_calls(blob):
+                self.leaked += 1
+                self.log.emit(f"[{self.label}] LEAKED TOOL CALL kind={kind} "
+                              f"turn={self.turns} — emitted as text, never executed")
 
         # LAST, deliberately. Raising before the usage and transcript are
         # recorded threw away the very turn salvage exists to preserve: the first
@@ -249,8 +373,40 @@ def task_is_read_only(task: str) -> bool:
 hooks_ref: dict = {"cost": 0.0}
 
 
-def tool_preamble(tools) -> str:
-    """Tell the SDK worker its registered tools do NOT replace the mandated ones.
+# Ported verbatim in intent from velo_worker_runner.py, which had this and the
+# openai-agents runtime did not — a capability lost in the #2088 switch and not
+# noticed until #2075, because the field was hardcoded to 0 and so always looked
+# clean.
+CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+LEAKED_TOOL_CALL_PATTERNS = (
+    ("DSML", re.compile(r"<[|｜]\s*DSML")),
+    ("tool_call", re.compile(r"</?tool_calls?>")),
+    ("function_calls", re.compile(r"</?function_calls>")),
+    ("invoke", re.compile(r"<invoke\s+name=")),
+)
+
+
+def scan_for_leaked_tool_calls(text: str) -> list:
+    """Names of leak shapes present in `text`, ignoring quoted syntax.
+
+    Two guards keep this from firing on a worker that legitimately QUOTES
+    tool-call syntax in its report — e.g. one writing up this very failure mode:
+
+      1. fenced and inline code spans are stripped first, since a report puts
+         the syntax in backticks while a real leak is bare;
+      2. each pattern requires the real structural delimiters, so prose that
+         merely says "DSML" or "invoke" does not match.
+    """
+    if not text:
+        return []
+    scannable = INLINE_CODE_RE.sub("", CODE_FENCE_RE.sub("", text))
+    return [name for name, pat in LEAKED_TOOL_CALL_PATTERNS if pat.search(scannable)]
+
+
+def tool_contract(tools) -> str:
+    """The registered-tool contract, emitted BEFORE the policy.
 
     Measured across the two dispatch paths, same policy, same repo (#2075):
 
@@ -259,23 +415,42 @@ def tool_preamble(tools) -> str:
         SDK     14 runs        0      2
 
     Codex reads velo-impl.md and runs `ast-grep` and `zg query`, because the
-    shell is its only interface. The SDK worker has seven registered tools that
-    LOOK like they cover the same ground — grep, glob_files, read_file,
-    edit_file — reaches for those, and never gets to the commands the policy
-    actually mandates. 361 of its edits went through edit_file/sed; ast-grep was
-    invoked zero times, in a policy that makes it MANDATORY for any rename,
-    signature or match change across two or more files, and a STOP trigger to
-    skip without logging AST-GREP-DECISION.
+    shell is its only interface. The SDK worker has registered tools that LOOK
+    like they cover the same ground — grep, glob_files, read_file, edit_file —
+    reaches for those, and never gets to the commands the policy mandates.
 
-    So the registered toolset is SUBSTITUTING for the mandated tooling rather
-    than complementing it, and the substitution is invisible: grep finds the
-    sites, edit_file changes them, the run looks clean, and the structural
-    guarantee ast-grep exists to provide was never obtained.
+    POSITION IS THE DEFECT, and it took two failed attempts to see it.
 
-    The first version of this preamble said "prefer your tools over bash". That
-    would have made it worse. The correction is the opposite: bash is the ONLY
-    route to the mandated tooling, and the convenience tools are not substitutes
-    for it.
+    Attempt 1 told the worker to prefer its tools over bash; wrong direction.
+    Attempt 2 (#2166) registered `ast_grep` as a real tool and appended this
+    text after the policy. A live deepseek dispatch on #1940 then ran 45 tool
+    calls, ALL bash, with ast_grep and zg_query at zero — and zero `ast-grep`
+    even THROUGH bash, so it was not tool-vs-shell preference at all. The
+    mandated tooling simply never entered the run.
+
+    The reason is measurable: velo-impl.md is ~45KB and teaches every mandated
+    tool as a SHELL COMMAND LINE (`zg query "..."`, `ast-grep run --pattern`).
+    Appended after it, this block was 3.27% of the system prompt, last. The
+    bulk of the prompt demonstrates bash; the correction was a footnote, and
+    the worker was consistent with the bulk.
+
+    Do NOT cite #2088's runtime benchmark as evidence for this shape. It
+    measured correctness, cost, wall clock and tool-call COUNT — never which
+    tools — and #2075 records that 0 of its 15 runs used zg at all, because no
+    index existed in those worktrees. An earlier version of this docstring
+    claimed it showed tool-first prompting working. It does not.
+
+    The evidence is a re-dispatch of #1940 on this prompt: at 14 turns, 20
+    read_file + 10 grep + 14 bash, where the same worker on the same class of
+    brief had run 45 bash and nothing else. bash stopped being the search-and-
+    read instrument from turn 2 on.
+
+    So this block leads, carries an explicit count, and translates the policy's
+    shell idioms to tool calls before the worker ever reads them.
+
+    KNOWN UNFIXED: zg_query stayed at zero through that run, on a task whose
+    first step was a call-chain trace — the exact question the index answers.
+    Position moved the worker off bash but not onto the semantic index.
 
     Built from `tools` so a read-only run is not told it can edit_file.
     """
@@ -300,20 +475,56 @@ def tool_preamble(tools) -> str:
     ]
     lines = [f"- {n}: {why}" for n, why in limits if n in have]
 
+    # The policy teaches each mandated tool as a shell command line. Those exact
+    # spellings are what the worker will meet below, so translate them here,
+    # before it reads them, rather than correcting the impression afterwards.
+    shell_to_tool = [
+        ("zg query \"...\"",              "zg_query"),
+        ("zg query --fts \"...\"",        "zg_query"),
+        ("ast-grep run --pattern '...'",  "ast_grep"),
+        ("grep -n / rg",                  "grep"),
+        ("cat / sed -n '1,80p'",          "read_file"),
+    ]
+    xlate = "\n".join(
+        f"    {sh:<32} -> {tool}" for sh, tool in shell_to_tool
+        if tool in have
+    )
+
     return (
-        "\n\n=== THE MANDATED TOOLS ARE REGISTERED — USE THEM ===\n"
-        "The policy above mandates `ast-grep` for structural changes and `zg query`\n"
-        "for discovery. Both are TOOLS here: ast_grep and zg_query. You do not need\n"
-        "bash for either.\n\n"
+        "=== YOUR TOOLS (read this before the policy) ===\n"
+        f"You have EXACTLY {len(lines)} tools:\n\n"
         + "\n".join(lines)
-        + "\n\nBefore any rename, signature change, match-arm change or trait change that\n"
-          "touches two or more files: use ast_grep, and log the AST-GREP-DECISION line\n"
-          "the policy requires. Reaching for grep plus a per-file edit instead is the specific\n"
-          "failure this section exists to prevent.\n\n"
+        + "\n\nStart with zg_query, in plain English, whenever you do not already know the\n"
+          "symbol name. It is a semantic index of this worktree and it is already built.\n\n"
+          "The policy below is written for a shell-only worker, so it spells every one of\n"
+          "these out as a COMMAND LINE. When you read those commands, they mean the tool:\n\n"
+        + xlate
+        + "\n\nRunning them through bash instead is not wrong, but it is slower and loses the\n"
+          "structured result — and in practice a worker that starts in bash stays in bash\n"
+          "and never reaches ast_grep at all. Prefer the tool every time.\n\n"
+          "MANDATORY: before any rename, signature change, match-arm change or trait change\n"
+          "that touches two or more files, use ast_grep and log the AST-GREP-DECISION line\n"
+          "the policy requires. grep plus a per-file edit is a brief violation, not a\n"
+          "shortcut — grep matches comments and partial identifiers; ast_grep matches syntax.\n\n"
           "IGNORE tool names in the repo CLAUDE.md and AGENTS.md. Those are written\n"
           "for a Claude Code session and name tools you do NOT have: LSP, Grep,\n"
           "Read, Edit. There is no LSP on this runtime. Their RULES still apply;\n"
           "only the tool names do not.\n"
+    )
+
+
+def tool_contract_reminder(tools) -> str:
+    """One-line recency anchor after the policy's 45KB of shell examples."""
+    have = {t if isinstance(t, str) else getattr(t, "name", getattr(t, "__name__", ""))
+            for t in tools}
+    mandated = [n for n in ("zg_query", "ast_grep") if n in have]
+    if not mandated:
+        return ""
+    return (
+        "\n=== REMINDER ===\n"
+        "The commands the policy just showed you are registered tools here: "
+        + ", ".join(mandated)
+        + ". Use them directly.\n"
     )
 
 
@@ -334,6 +545,10 @@ async def main() -> int:
     ap.add_argument("--base-url", default="https://openrouter.ai/api/v1")
     ap.add_argument("--skill", action="append", default=[],
                     help="Inline a skill definition ahead of the task (repeatable).")
+    ap.add_argument("--no-force-first-tool", action="store_true",
+                    help="Do not force the opening tool call to zg_query. For "
+                         "measuring what the prompt alone achieves, and as an "
+                         "escape hatch if a provider mishandles tool_choice.")
     a = ap.parse_args()
 
     log = Logger(a.log_file)
@@ -349,14 +564,19 @@ async def main() -> int:
     # registered tools, so a read-only run is not told it can edit_file.
     _tools = T.READ_ONLY_TOOLS if read_only else T.ALL_TOOLS
 
+    # Tool contract FIRST, policy second, one-line anchor last. Appending the
+    # contract after the policy put it at 3.27% of the prompt, behind 45KB that
+    # teaches every mandated tool as a bash command — and the #1940 dispatch ran
+    # 45/45 bash with zero ast_grep. Order is the fix, not wording (#2075).
     system = (
         f"You are a full autonomous Velostream implementation worker.\n\n"
         f"MODEL:\n{a.model}\n\nWORKTREE:\n{a.cwd}\n\n"
         "You operate only inside the assigned Velostream worktree.\n\n"
-        "The following Velostream implementation policy is authoritative and mandatory:\n\n"
+        + tool_contract(_tools)
+        + "\nThe following Velostream implementation policy is authoritative and mandatory:\n\n"
         f"================ VELO-IMPL POLICY ================\n{policy}\n"
         "================ END VELO-IMPL POLICY ============\n"
-        + tool_preamble(_tools)
+        + tool_contract_reminder(_tools)
     )
     budget = (
         f"\n\n=== TURN BUDGET ===\nYou have {a.max_turns} tool-use turns and the run is "
@@ -396,6 +616,35 @@ async def main() -> int:
 
     client.chat.completions.create = _with_cost
     tools = _tools
+    # Force the FIRST tool call to be zg_query, then hand choice back.
+    #
+    # A guarantee, NOT a rescue — the distinction matters, because an earlier
+    # version of this comment got it wrong.
+    #
+    # #2166 registered ast_grep and appended guidance to the prompt: 45/45
+    # bash. Moving the contract to the front fixed that — bash fell to 52/130
+    # and is now only git/cargo/find — but zg_query stayed at ZERO across all
+    # 49 turns of that run, whose own first step was a call-chain trace.
+    #
+    # That is NOT because instruction cannot move it. Measured on a clean
+    # worktree with the forcing OFF, the contract alone put zg_query first and
+    # answered a discovery question in 3 turns for $0.0025. The real pattern is
+    # narrower: a long task that opens with worktree orientation (git log, git
+    # status) proceeds file-by-file and never comes back to the index. That is
+    # the expensive case, and the one this pins.
+    #
+    # Worth forcing, because the one call is not marginal: run by hand against
+    # that same step-1 question, zg returned analyze_multi_statement at
+    # query_analyzer.rs:379-442 — the exact seam — plus the test file the
+    # worker did not open until turn 18, as hit #2 of 10.
+    #
+    # reset_tool_choice (SDK default, left on) flips tool_choice back to "auto"
+    # after the first call, so this constrains the opening move and nothing
+    # else. Omitted for read-only gates, whose task is already narrow, and
+    # skipped when zg_query is not registered.
+    force_first = "zg_query" if (not read_only and not a.no_force_first_tool
+                                 and "zg_query" in
+                                 {getattr(t, "name", "") for t in tools}) else None
     agent = Agent(
         name="velo-worker",
         instructions=system,
@@ -403,6 +652,7 @@ async def main() -> int:
         tools=tools,
         model_settings=ModelSettings(
             parallel_tool_calls=True,
+            **({"tool_choice": force_first} if force_first else {}),
             max_tokens=MAX_TOKENS_BY_MODEL.get(a.model, a.max_tokens),
             # provider.order and usage.include are OpenRouter fields. A plain
             # OpenAI-compatible server rejects unknown body keys, so sending them
@@ -416,11 +666,18 @@ async def main() -> int:
     if a.max_budget_usd is not None and a.max_budget_usd <= 0:
         print("ERROR: --max-budget-usd must be > 0", file=sys.stderr)
         return 1
-    hooks = Hooks(log, "prompt 1", max_budget_usd=a.max_budget_usd)
+    # Written into the WORKTREE, which is where velo-impl.md says it lives and
+    # where a human debugging the run will look for it.
+    agent_log = AgentLog(a.cwd)
+    agent_log.emit(f"RUN START model={a.model} cwd={a.cwd} "
+                   f"read_only={str(read_only).lower()} max_turns={a.max_turns}")
+    hooks = Hooks(log, "prompt 1", max_budget_usd=a.max_budget_usd,
+                  agent_log=agent_log)
     hooks_ref["obj"] = hooks
     log.emit("[prompt 1] sdk system event=init")
     log.emit(f"[prompt 1] start timeout_seconds={a.prompt_timeout:.0f} "
-             f"backend=openai-agents tools={len(tools)} read_only={str(read_only).lower()}")
+             f"backend=openai-agents tools={len(tools)} read_only={str(read_only).lower()} "
+             f"force_first_tool={force_first or 'none'}")
 
     t0 = time.time()
     status, text = "success", ""
@@ -487,6 +744,22 @@ async def main() -> int:
 
     if text:
         print(text.strip())
+    # files_changed comes from git, not from the worker's report — the whole
+    # point of writing this trail in the runner is that it needs nothing from
+    # the worker to be true.
+    try:
+        _diff = subprocess.run(["git", "-C", a.cwd, "diff", "--name-only", "HEAD"],
+                               capture_output=True, text=True, timeout=30)
+        _files = len([ln for ln in _diff.stdout.splitlines() if ln.strip()])
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Not swallowed: an unknown file count makes the structural check
+        # unresolvable, and saying so beats recording a confident 0.
+        agent_log.emit(f"STRUCTURAL-EDIT-CHECK | VERDICT=unknown — git diff failed: {exc}")
+        _files = -1
+    if _files >= 0:
+        agent_log.close(status, _files, read_only=read_only)
+    else:
+        agent_log.emit(f"FINAL STATE — status={status} files_changed=unknown")
     log.emit(f"[prompt 1] sdk result status={status} turns={hooks.turns} text_len={len(text)}")
     log.emit(f"[prompt 1] completed in_seconds={wall:.1f} status={status} final_result=true")
 
@@ -494,15 +767,14 @@ async def main() -> int:
     # are compared directly, and mixing conventions made a 229k-token run read as 7k.
     fresh = max(hooks.inp - hooks.cached, 0)
     log.emit(
-        # `unmeasured`, NOT 0. This runtime does not count leaked tool calls —
-        # a tool call emitted as plain text, which executes nothing while the run
-        # still reports success. It was a hardcoded 0, and three consumers read
-        # it as a measurement: velo-record parses it, ranks it above every other
-        # outcome ("the run may look clean"), and velo-status paints LEAKED red.
-        #
-        # A null is honest; a 0 is the SAFE value, so the absence of evidence was
-        # displayed as evidence of absence on every run since 2026-09-12.
-        f"TOTALS prompts=1 leaked_tool_calls=unmeasured "
+        # A real count now. This was a hardcoded 0 until #2075, then honestly
+        # `unmeasured` once it was clear nothing counted them — three consumers
+        # read the field as a measurement (velo-record parses it and ranks it
+        # above every other outcome; velo-status paints LEAKED red), so the
+        # absence of evidence was displayed as evidence of absence on every run
+        # from 2026-09-12. The detector the incumbent always had is now ported,
+        # so the field means what its name says.
+        f"TOTALS prompts=1 leaked_tool_calls={hooks.leaked} "
         f"input_tokens={fresh} output_tokens={hooks.out} cached_tokens={hooks.cached} "
         # A local endpoint bills nothing and reports no cost. Labelling a
         # $0.000000 local run "openrouter-billed" would put a fabricated zero

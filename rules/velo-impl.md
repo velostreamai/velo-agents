@@ -44,7 +44,7 @@ If any of these are missing, STOP and report — do not proceed on a velostream 
 
 - **`Edit`, not `Write`**, for any existing file. `Write` is allowed ONLY for new files. Overwriting an existing file with `Write` during a refactor is a STOP condition.
 - **`ast-grep`** for structural Rust refactors — mandatory trigger list and procedure in §AST-grep — mandatory below. The standing rule "use ast-grep for structural refactors" has been demoted to descriptive guidance; the trigger list is the enforceable rule.
-- **`LSP`** for read-only navigation (`findReferences`, `goToDefinition`, `hover`, `documentSymbol`, `workspaceSymbol`, `goToImplementation`, `incomingCalls`, `outgoingCalls`). Coordinates are 1-based line + character. **Do NOT** use `mcp__rust-analyzer__*` on type names (15K+ lines of noise) — per-method only, as a fallback when LSP wedges.
+- **`zg`** for read-only navigation and discovery — NOT a type server. There is no `LSP` tool on this runtime and `rust-analyzer` must not be started (operator directive 2026-09-17; see §Type-aware refactors for why). `zg_query` with a plain-English question when you do not yet know the symbol; exact-symbol search when you do.
 - **`cargo check --no-default-features`** for inner-loop type-check passes. **Nextest scope discipline — three shapes, pick the right one:**
   - Single test or single family: `cargo nextest run <name_or_-E_regex> --no-default-features`.
   - Multi-file sweep / regression check (project fast lane): `cargo nextest run --no-default-features --no-fail-fast --profile unit --lib --test mod`. The `unit` profile (`.config/nextest.toml`) excludes the `performance::` and `integration::` trees; with `--lib --test mod` that is the same set `run-commit.sh --fast` runs, and what CLAUDE.md's "inner edit loop" rule means by iteration scope.
@@ -55,7 +55,7 @@ If any of these are missing, STOP and report — do not proceed on a velostream 
   - **Never** `cargo nextest run --no-default-features` with no `--test` filter during iteration — that builds + links every `performance_*`, `integration_*`, and `comprehensive_*` test binary, which is 5–10 min of cold compile per run and validates nothing the unit suite doesn't already cover. The full-repo run belongs in `./run-commit.sh` at the push gate, not in the edit loop.
   
   **Do NOT** run `cargo clippy` in the inner edit loop — recompiles everything, blows up context. **Do NOT** run `./run-commit.sh --fast` during iteration — it is the final gate, not the iteration tool. Each `--fast` invocation is minutes of cold compile across the whole tree; using it as a probe is wasted wall-clock.
-- **No tool-existence probes.** Do NOT run `command -v X`, `which X`, `X --version || echo missing`, or similar compound-shell probes to check whether a tool is installed. The standard toolchain (`cargo`, `cargo nextest`, `git`, `ast-grep`, `samply`, `rustup`, `rust-analyzer`) is assumed present; if it isn't, the direct invocation will fail with a clear error in one round-trip. Probes add latency, often get garbled by permission gating, and have caused the agent to mistakenly fall back to inferior paths (e.g. `cargo test` when `cargo nextest` was available). Run the real command directly and read the error if it fails.
+- **No tool-existence probes.** Do NOT run `command -v X`, `which X`, `X --version || echo missing`, or similar compound-shell probes to check whether a tool is installed. The standard toolchain (`cargo`, `cargo nextest`, `git`, `ast-grep`, `zg`, `samply`, `rustup`) is assumed present; if it isn't, the direct invocation will fail with a clear error in one round-trip. Probes add latency, often get garbled by permission gating, and have caused the agent to mistakenly fall back to inferior paths (e.g. `cargo test` when `cargo nextest` was available). Run the real command directly and read the error if it fails.
 
 ## AST-grep — mandatory
 
@@ -117,46 +117,69 @@ So, explicitly: **`grep` + `edit_file` twice is the same brief violation as `Edi
 
 The trigger list is exhaustive; if an operation doesn't match it, `Edit` is fine.
 
-### Type-aware refactors — LSP-first, ast-grep-after
+### Type-aware refactors — zg-first, ast-grep-after
 
-> **FIRST: do you actually have an LSP tool?** This policy governs two kinds of
-> worker and only one of them does.
->
-> - **Native Claude Code agents** have the `LSP` tool. Follow this section as
->   written.
-> - **Delegated workers** (`worker:local` / `deepseek` / `glm` / `codex`) have
->   exactly `Read, Glob, Grep, Bash, Edit, Write`. There is no LSP tool — the
->   SDK ships a 43-line stub whose every call returns
->   `"LSP operation is not yet implemented"`. Skip to
->   **"Without LSP"** below. Do not attempt the steps here; they cannot be run,
->   and step 1 would have you STOP on every single task.
+**Your tools are whatever your runtime registers.** On the openai-agents
+runtime that is `zg_query, ast_grep, grep, glob_files, read_file, bash,
+edit_file, write_file` — so the `zg query` and `ast-grep` this document
+mandates are **tools you call directly**, not shell commands you type.
 
+**There is no type server, and you must not start one.** No `rust-analyzer`,
+no `LSP` tool. That is an operator directive (2026-09-17), and it is not a
+style preference: full-core indexing competes with the work being measured. On
+#2147 a worker's own warmup produced an anomalous test FAIL that took a round
+of investigation to clear as contention rather than a defect; on #2138 the
+same class of contention produced a false −39.5% benchmark result. Your
+discovery index is already built for your worktree before you start, so there
+is nothing to warm and nothing to wait on.
 
-**ast-grep is type-blind.** A pattern like `$X.record_count` matches every `.record_count` in the codebase regardless of `$X`'s type. Field names collide across structs — e.g. `record_count` exists as a field on `ProcessorContext`, `ProducerSpanContext`, `TumblingWindowStrategy::stats`, and others. Bulk-rewriting with the bare pattern WILL break unrelated structs.
+**Your first action should answer a question about the code**, not warm a
+service or survey the worktree. `zg_query` in plain English is the intended
+opener.
 
-**Pre-warm rust-analyzer at startup.** Indexing the velostream workspace takes 30s–2min on first run; doing it mid-task means LSP `findReferences` returns empty until indexing completes, silently degrading the agent to grep-based rewriting. Kick rust-analyzer in the background as the FIRST shell action on the worktree, then continue with brief-reading + field-map reading while it indexes:
+**ast-grep is type-blind and that has not changed.** A pattern like
+`$X.record_count` matches every `.record_count` regardless of `$X`'s type, and
+field names collide across structs — `record_count` exists on
+`ProcessorContext`, `ProducerSpanContext`, `TumblingWindowStrategy::stats` and
+others. Bulk-rewriting with the bare pattern WILL break unrelated structs. The
+steps below are how you get a type filter without a type server.
 
-```bash
-# Pre-warm rust-analyzer in background (kicked once, agent waits at first LSP call)
-rust-analyzer analysis-stats ~/RustroverProjects/<worktree> > /tmp/ra-warmup-<worktree>.log 2>&1 &
-RA_WARMUP_PID=$!
-# ... agent reads CLAUDE.md, brief, field map, etc. while indexing runs ...
-wait $RA_WARMUP_PID  # Block before the first LSP type-aware query
-```
+**The mechanic for any type-aware refactor** (renaming a field on one struct,
+migrating callers of one struct's method, splitting an impl):
 
-If `rust-analyzer` is not on `$PATH` or fails, fall back to `cargo check --no-default-features --manifest-path <worktree>/Cargo.toml` which builds the dep graph rust-analyzer needs. Either way, verify in step 1 below that LSP is responsive before any type-aware refactor.
+1. **`zg_query`** — ask semantically for the concept, then by exact symbol, to
+   enumerate candidate sites. The recurring defect on this repo is not a bad
+   edit, it is a **missed site**: three consecutive review rounds on #2146 each
+   fixed one cache-invalidation trigger and missed its sibling. Grep finds the
+   spelling you already thought of, which is the wrong instrument when the bug
+   is the site you did not think of. Put the list in your report.
+2. **Narrow by container type by READING the hits.** `zg` returns file:line
+   with the enclosing symbol, so the owning type is visible without a type
+   server. Discard same-name fields on other types here — this is the step that
+   replaces `findReferences`, and it is manual on purpose.
+3. **Where visibility makes it provable, say so.** A private field can only be
+   touched from its own module, so a search scoped to that file is exhaustive
+   *by Rust's visibility rules* — a stronger claim than any index's coverage.
+   Prefer that argument when it is available (#2147 used exactly this).
+4. **`ast_grep` restricted to the file set from steps 1-3** for the bulk
+   syntactic rewrite (e.g. `$X.foo` → `$X.foo()`). **That path restriction is
+   the type filter.** Dry-run first: a pattern matching 0 is wrong, and
+   applying it silently changes nothing.
+5. **`cargo check --no-default-features`** to verify. Same-name false hits show
+   up here as `no method named …` / `expected … found …` from the wrongly
+   rewritten struct.
+6. **Run the scope-relevant tests**: `cargo nextest run --no-default-features
+   --profile unit --test mod <feature>`. Keep `--profile unit` so a broad
+   filter cannot pull in `performance::`/`integration::` (#2103).
+7. **Migration order**: ALL field-access sites migrate BEFORE the legacy field
+   is renamed or removed. A final exact-symbol search on the legacy name
+   returning only the definition is the safe-to-remove signal.
 
-**The mechanic for any type-aware refactor** (renaming a field on one struct, migrating callers of one struct's method, splitting an impl) is **LSP-first, ast-grep-after**:
-
-1. **Verify rust-analyzer is indexing the worktree.** Run `LSP findReferences` on a known-used symbol in the migration target file. If it returns empty, rust-analyzer isn't indexed yet — wait on the pre-warm PID OR re-trigger. If still empty after a second attempt, STOP and report. Bulk migration without LSP type-awareness silently degrades to grep-based rewriting and will introduce same-name false hits.
-2. **LSP `findReferences`** on the field / method / type being migrated → enumerate typed call sites. This is type-aware: querying references on `ProcessorContext::record_count` returns only callers that hold `&ProcessorContext`, ignoring same-named fields on other structs.
-3. **Filter the result set by container type.** Only the references on the target type are in scope; same-name references on other types are ignored.
-4. **ast-grep within the filtered file set** for the bulk syntactic rewrite (e.g. `$X.foo` → `$X.foo()`). Restrict the `src/` argument to just the files LSP identified — that's the type-aware filter at the path level.
-5. **`cargo check --no-default-features`** to verify the rewrite. Any same-name false-hit damage shows up here as `no method named …` or `expected … found …` errors from the wrongly-rewritten struct.
-6. **Run scope-relevant test suite** (`cargo nextest run --no-default-features --profile unit --test mod <feature>`). The `<feature>` name filter bounds this, but keep `--profile unit` so a broad filter cannot pull in `performance::`/`integration::` (#2103).
-7. **Migration order**: ALL field-access sites must migrate to method syntax BEFORE the legacy field is renamed or removed. Use LSP `findReferences` on the legacy field name as the final-check: zero results = safe to remove.
-
-**Why this discipline matters at scale**: ADR-707 Phase 5a-followup migrates ~65 fields × N callers. A 7-site spike on `spike/707-accessor-dual-syntax` (2026-06-17) caught a `telemetry.rs:792` false positive (`ctx.record_count` where `ctx: ProducerSpanContext`, not `ProcessorContext`) using only `grep` — exactly the failure mode the LSP-first mechanic prevents.
+**Why this discipline matters at scale**: ADR-707 Phase 5a-followup migrates
+~65 fields × N callers. A 7-site spike on `spike/707-accessor-dual-syntax`
+(2026-06-17) caught a `telemetry.rs:792` false positive — `ctx.record_count`
+where `ctx: ProducerSpanContext`, not `ProcessorContext` — that a bare `grep`
+would have rewritten. Steps 2 and 3 exist to catch exactly that.
 
 ### Finding code you cannot yet name — `zg`
 
@@ -240,9 +263,9 @@ Hits carry `status: possibly_stale`, but that is one line among many and does no
 distinguish "slightly behind" from "another branch entirely". **Never use the
 index to verify your own edits** — it is a snapshot taken before you started.
 
-### Without LSP — what a delegated worker must do instead
+### Working without a type server
 
-You have `ast-grep` (via Bash — verified present) and `cargo check`. `ast-grep`
+You have `zg_query`, `ast_grep` and `cargo check`. `ast-grep`
 is **type-blind**: `$X.record_count` matches 79 sites across 14 files in this
 repo and cannot tell a `ProcessorContext` from a `ProducerSpanContext`. Nothing
 in your toolset can, *before* the edit.
@@ -312,8 +335,7 @@ Two cautions, both learned by getting them wrong:
 
 **Migration order**, adapted: all access sites must migrate before the legacy
 field is renamed or removed, and the final check is `cargo check` plus
-`ast-grep --pattern '$X.<legacy_name>'` returning zero — not LSP
-`findReferences`, which you cannot run.
+`ast_grep` on `$X.<legacy_name>` returning zero.
 
 ## Tool-use efficiency
 
@@ -369,7 +391,7 @@ A recurring failure across 4 consecutive ADR-707 phases (Phase 7d #803, 7f #806,
 2026-06-18T08:32:00Z PROD-WIRING-BEFORE | symbol=build_optimized_plan | sites=8 (coordinator.rs:1237,1483; dual_input_partition_receiver.rs:367; processors/{simple,common}.rs; engine.rs:105; internal.rs:894) | plan=collapse-into-strict (Option A) — bump signature to Result<_, SqlError>, propagate through 8 callers via `?`
 ```
 
-Run the grep that produced the call sites with `LSP findReferences` (preferred — type-aware) or `Bash(grep)` if LSP unavailable, capture in the log line.
+Run the search that produced the call sites with `zg_query` (preferred — returns the enclosing symbol) or `grep`, and capture it in the log line.
 
 **BEFORE PR open** — log the post-change state proving the contract:
 

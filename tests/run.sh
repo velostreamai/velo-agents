@@ -91,7 +91,9 @@ echo "── record writing ─────────────────�
 bash "$HERE/test_record.sh" || RC=1
 echo
 echo "── tool preamble ─────────────────────────────────────"
-"$PY" "$HERE/test_tool_preamble.py" || RC=1
+"$PY" "$HERE/test_tool_contract.py" || RC=1
+"$PY" "$HERE/test_leaked_tool_calls.py" || RC=1
+"$PY" "$HERE/test_agent_log.py" || RC=1
 python3 "$HERE/test_ast_grep_tool.py" || RC=1
 bash "$HERE/test_history_routing.sh" || RC=1
 

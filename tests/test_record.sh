@@ -208,11 +208,15 @@ else
 fi
 
 # 2. the leak counter was a hardcoded 0 — the SAFE value — on a runtime that
-#    never counts. Three consumers read it as measured.
-if grep -q 'leaked_tool_calls=unmeasured' "$RUN"; then
-  echo "  PASS  the runner reports unmeasured rather than a fabricated 0"
+#    never counted. Three consumers read it as measured. It then became an
+#    honest `unmeasured`, and now it is a REAL count: the incumbent's detector
+#    is ported (see test_leaked_tool_calls.py). What must never come back is a
+#    constant, in either spelling.
+if grep -q 'leaked_tool_calls={hooks.leaked}' "$RUN" \
+   && ! grep -qE 'leaked_tool_calls=(0|unmeasured) ' "$RUN"; then
+  echo "  PASS  the runner reports a measured leak count, not a constant"
 else
-  echo "  FAIL  leaked_tool_calls is still asserted as 0"; FAILURES=$((FAILURES+1))
+  echo "  FAIL  leaked_tool_calls is a constant again (0 or unmeasured)"; FAILURES=$((FAILURES+1))
 fi
 if grep -q 'None if g("VR_LEAKED") == "unmeasured"' "$REC"; then
   echo "  PASS  unmeasured is recorded as null, not 0"
