@@ -206,5 +206,57 @@ def zg_query(question: str) -> str:
     return _cap(out.strip(), "zg")
 
 
-ALL_TOOLS = [zg_query, grep, glob_files, read_file, bash, edit_file, write_file]
-READ_ONLY_TOOLS = [zg_query, grep, glob_files, read_file, bash]
+@function_tool
+def ast_grep(pattern: str, path: str = "src/", rewrite: str = "",
+             lang: str = "rust", apply: bool = False) -> str:
+    """STRUCTURAL search/replace over Rust syntax. REQUIRED by the policy for any
+    rename, signature change, match-arm change or trait change touching 2+ files.
+
+    `grep` matches text; this matches SYNTAX, so it cannot hit a comment, a
+    string, or a partial identifier, and it survives a signature split across
+    lines. Meta-variables: $X is one node, $$$ARGS a list.
+
+    Call it first WITHOUT rewrite to see the match count — a pattern matching 0
+    is wrong, and applying it would silently change nothing. Then pass rewrite,
+    and apply=True only once the dry run looks right.
+
+    Examples:
+      pattern='fn $NAME($$$ARGS) -> $RET'
+      pattern='$X.record_count', rewrite='$X.record_count()'
+    """
+    # Registered as a TOOL rather than left to bash (#2075). Measured across both
+    # dispatch paths on the same policy: codex ran ast-grep 894 times in 15 runs,
+    # the SDK worker 0 times in 14 — because every convenience action here had a
+    # first-class tool and the one the policy MANDATES did not. Asking the worker
+    # in prose to reach past its tools into bash is weaker than giving it the
+    # tool.
+    if not shutil.which("ast-grep"):
+        return ("Error: ast-grep is not on PATH. It is REQUIRED for structural "
+                "changes across 2+ files — do not substitute grep + edit_file, "
+                "which is a brief violation. Report this and STOP.")
+    cmd = ["ast-grep", "run", "--pattern", pattern, "--lang", lang]
+    if rewrite:
+        cmd.extend(["--rewrite", rewrite])
+        if apply:
+            cmd.append("-U")
+    cmd.append(path)
+    rc, out, err = _run(cmd)
+    # rc=1 is NO MATCHES, not failure — ast-grep follows grep's convention. An
+    # earlier version reported it as "ast-grep failed", so the zero-match
+    # guidance below never fired and the worker saw a broken tool instead of a
+    # wrong pattern. rc>=2 is a real error (bad --lang, unreadable path).
+    if rc >= 2 or (rc != 0 and err.strip()):
+        return f"ast-grep failed (rc={rc}): {err.strip() or out.strip()}"
+    if rc == 1 or not out.strip():
+        # A zero-match pattern is the single most common ast-grep mistake and is
+        # silent: with -U it rewrites nothing and reports success. Say so.
+        return ("0 matches — the PATTERN is wrong, not the codebase. Vary the "
+                "meta-variable count ($X vs $$$X) or the syntax anchor, and "
+                "re-run WITHOUT rewrite until the count is non-zero.")
+    if rewrite and not apply:
+        return _cap(out, "ast-grep dry run") + "\n\n(DRY RUN — pass apply=True to write)"
+    return _cap(out, "ast-grep")
+
+
+ALL_TOOLS = [zg_query, ast_grep, grep, glob_files, read_file, bash, edit_file, write_file]
+READ_ONLY_TOOLS = [zg_query, ast_grep, grep, glob_files, read_file, bash]

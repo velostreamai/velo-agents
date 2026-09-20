@@ -48,6 +48,8 @@ and the tests** — never from the worker's self-report.
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_status.sh                 velo-status worker naming
+    test_tool_preamble.py          the worker is told which tools it has (#2075)
+    test_ast_grep_tool.py          ast_grep is registered, and behaves (#2075)
     test_zg_hidden.sh              zg can see .agents/ — both routes, and the index
     test_history_routing.sh        the re-dispatch guard: tiers, failure modes, bad records
     test_worker_env.py             the worker can run the tools its policy names

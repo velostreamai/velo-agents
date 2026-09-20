@@ -249,6 +249,74 @@ def task_is_read_only(task: str) -> bool:
 hooks_ref: dict = {"cost": 0.0}
 
 
+def tool_preamble(tools) -> str:
+    """Tell the SDK worker its registered tools do NOT replace the mandated ones.
+
+    Measured across the two dispatch paths, same policy, same repo (#2075):
+
+                        ast-grep     zg
+        codex   15 runs      894    179
+        SDK     14 runs        0      2
+
+    Codex reads velo-impl.md and runs `ast-grep` and `zg query`, because the
+    shell is its only interface. The SDK worker has seven registered tools that
+    LOOK like they cover the same ground — grep, glob_files, read_file,
+    edit_file — reaches for those, and never gets to the commands the policy
+    actually mandates. 361 of its edits went through edit_file/sed; ast-grep was
+    invoked zero times, in a policy that makes it MANDATORY for any rename,
+    signature or match change across two or more files, and a STOP trigger to
+    skip without logging AST-GREP-DECISION.
+
+    So the registered toolset is SUBSTITUTING for the mandated tooling rather
+    than complementing it, and the substitution is invisible: grep finds the
+    sites, edit_file changes them, the run looks clean, and the structural
+    guarantee ast-grep exists to provide was never obtained.
+
+    The first version of this preamble said "prefer your tools over bash". That
+    would have made it worse. The correction is the opposite: bash is the ONLY
+    route to the mandated tooling, and the convenience tools are not substitutes
+    for it.
+
+    Built from `tools` so a read-only run is not told it can edit_file.
+    """
+    have = {t if isinstance(t, str) else getattr(t, "name", getattr(t, "__name__", ""))
+            for t in tools}
+
+    # Each line names the tool, then what it must NOT be used to avoid.
+    limits = [
+        ("ast_grep",   "REQUIRED for any rename, signature change, match-arm change or "
+                       "trait change touching 2+ files. Matches SYNTAX, so it cannot hit a "
+                       "comment or a partial identifier. Dry-run first: a pattern matching "
+                       "0 is wrong, and applying it silently changes nothing."),
+        ("grep",       "finding a literal string. It does NOT replace ast_grep for a "
+                       "structural search (a rename, a signature, a match arm, a trait impl)."),
+        ("glob_files", "finding files by name."),
+        ("read_file",  "reading a file or a range."),
+        ("edit_file",  "a targeted edit in ONE file. If the same change lands in two or "
+                       "more files, the policy REQUIRES ast-grep — using edit_file twice "
+                       "instead is a brief violation, not a shortcut."),
+        ("write_file", "creating a NEW file."),
+        ("zg_query",   "the same thing as `zg query` in bash; either is fine."),
+    ]
+    lines = [f"- {n}: {why}" for n, why in limits if n in have]
+
+    return (
+        "\n\n=== THE MANDATED TOOLS ARE REGISTERED — USE THEM ===\n"
+        "The policy above mandates `ast-grep` for structural changes and `zg query`\n"
+        "for discovery. Both are TOOLS here: ast_grep and zg_query. You do not need\n"
+        "bash for either.\n\n"
+        + "\n".join(lines)
+        + "\n\nBefore any rename, signature change, match-arm change or trait change that\n"
+          "touches two or more files: use ast_grep, and log the AST-GREP-DECISION line\n"
+          "the policy requires. Reaching for grep plus a per-file edit instead is the specific\n"
+          "failure this section exists to prevent.\n\n"
+          "IGNORE tool names in the repo CLAUDE.md and AGENTS.md. Those are written\n"
+          "for a Claude Code session and name tools you do NOT have: LSP, Grep,\n"
+          "Read, Edit. There is no LSP on this runtime. Their RULES still apply;\n"
+          "only the tool names do not.\n"
+    )
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -277,6 +345,10 @@ async def main() -> int:
     # declaration, and a gate that writes is a gate that has already gone wrong.
     read_only = task_is_read_only(task)
 
+    # Selected BEFORE the system prompt: the preamble is built from the actual
+    # registered tools, so a read-only run is not told it can edit_file.
+    _tools = T.READ_ONLY_TOOLS if read_only else T.ALL_TOOLS
+
     system = (
         f"You are a full autonomous Velostream implementation worker.\n\n"
         f"MODEL:\n{a.model}\n\nWORKTREE:\n{a.cwd}\n\n"
@@ -284,6 +356,7 @@ async def main() -> int:
         "The following Velostream implementation policy is authoritative and mandatory:\n\n"
         f"================ VELO-IMPL POLICY ================\n{policy}\n"
         "================ END VELO-IMPL POLICY ============\n"
+        + tool_preamble(_tools)
     )
     budget = (
         f"\n\n=== TURN BUDGET ===\nYou have {a.max_turns} tool-use turns and the run is "
@@ -322,7 +395,7 @@ async def main() -> int:
         return resp
 
     client.chat.completions.create = _with_cost
-    tools = T.READ_ONLY_TOOLS if read_only else T.ALL_TOOLS
+    tools = _tools
     agent = Agent(
         name="velo-worker",
         instructions=system,

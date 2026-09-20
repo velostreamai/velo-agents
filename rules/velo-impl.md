@@ -97,6 +97,17 @@ For every edit that matches a trigger above, append to `agent.log` BEFORE runnin
 
 One line per attempt. Three lines with `attempt-N-of-3-failed` followed by `stopped-after-3-failures` is the only legitimate path to using `Edit` for a trigger-list operation. Absence of any `AST-GREP-DECISION` line for a structural change found in your diff = brief violation = STOP and report.
 
+**If your runtime has a file-editing TOOL, it is not an exception to this.** Measured across both dispatch paths on this same policy:
+
+| | ast-grep | zg |
+|---|---|---|
+| codex, 15 runs | 894 | 179 |
+| openai-agents SDK, 14 runs | **0** | **2** |
+
+Codex follows this section because the shell is its only interface. The SDK worker has registered tools — `grep`, `read_file`, `edit_file` — that look like they cover the same ground, so it finds sites with `grep`, changes them one at a time with `edit_file`, and never reaches `ast-grep`. 361 of its edits went that way. The run looks clean; the structural guarantee was never obtained, and no `AST-GREP-DECISION` line is logged because from inside that path nothing felt like a trigger-list operation.
+
+So, explicitly: **`grep` + `edit_file` twice is the same brief violation as `Edit` twice.** The trigger list is about the CHANGE, not about which tool your runtime happens to expose. There is no `ast-grep` tool on any runtime — `bash` is the only route to it, and running it through `bash` is correct and expected, not a fallback.
+
 ### When `Edit` IS correct
 
 - Edits in a single file (no second site to keep in sync)
