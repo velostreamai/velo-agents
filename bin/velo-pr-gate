@@ -59,9 +59,14 @@
 #
 # --exec — let the reviewer RUN things
 #
-# `codex review` is sandboxed by default, and that is the right default: a
-# reviewer should not need to execute anything, and the sandbox is what stops a
-# review agent writing into a live PR worktree.
+# `codex review` is NOT sandboxed by default — this comment used to claim it
+# was, and that claim was false. Probed on the current CLI (#2171): a bare
+# `codex review -` ran `touch` inside the PR worktree and the file was created.
+#
+# So the restriction has to be asked for: `-c sandbox_mode=read-only`, which the
+# non---exec branch now passes explicitly. Until it did, --exec and non---exec
+# issued the same unrestricted command, and a reviewer could write into the
+# live worktree whose diff the merge decision was about.
 #
 # But it makes a review VACUOUS when the PR's subject IS runtime behaviour. On
 # #1963 (a benchmark whose assertions were the whole change) the reviewer could
@@ -595,7 +600,13 @@ EOF
   CODEX_LOG="$GATE_DIR/review.log"
   if command -v codex >/dev/null 2>&1; then
     if [[ $EXEC -eq 1 ]]; then
-      nohup sh -c "cd '$WTPATH' && codex review --dangerously-bypass-approvals-and-sandbox - < '$OUT'" > "$CODEX_LOG" 2>&1 &
+      # No flag: `codex review` is NOT sandboxed by default on the current CLI
+      # (probed — a bare `codex review -` ran `touch` in the worktree and the
+      # file appeared), so execution is already granted. The flag this used to
+      # pass moved to the top level and the subcommand now REJECTS it:
+      #   error: unexpected argument '--dangerously-bypass-approvals-and-sandbox'
+      # which killed the leg at launch every time (#2171).
+      nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
       CODEX_PID=$!
       GATE_DISPATCHED=1
       ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
@@ -604,10 +615,18 @@ EOF
       warn "The brief still says do-not-write, but nothing now enforces it."
       warn "Check \`git -C $WTPATH status\` when the review finishes."
     else
-      nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
+      # read-only is passed EXPLICITLY, because it is not the default.
+      #
+      # Without this, --exec and non---exec were the same command: both ran
+      # unrestricted, so the flag that exists to GRANT execution granted
+      # nothing, and the branch that exists to WITHHOLD it withheld nothing.
+      # A reviewer with write access to a live PR worktree can mutate the tree
+      # the merge decision is about — and this session lost a check-spec report
+      # to exactly that, a fix agent writing into the worktree concurrently.
+      nohup sh -c "cd '$WTPATH' && codex review -c sandbox_mode=read-only - < '$OUT'" > "$CODEX_LOG" 2>&1 &
       CODEX_PID=$!
       GATE_DISPATCHED=1
-      ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
+      ok "code-review -> codex (pid $CODEX_PID, sandbox_mode=read-only)  log: $CODEX_LOG"
       gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
     fi
     echo "     brief: $OUT   (diff range: $RANGE)"

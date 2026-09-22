@@ -37,6 +37,61 @@ if [[ "$FILE" == "-" ]]; then BODY=$(cat); else
 fi
 [[ -n "${BODY// }" ]] || die "report is empty — refusing to post a gate result with no content"
 
+# ---- is this a REPORT, or the brief it was supposed to overwrite? -----------
+#
+# Same defect as #2107's cost provenance, one tool along: that stamps
+# source="openrouter-billed" over a usd it never received; this stamps
+# `gate: <name> @ <sha>` over a report whose leg never ran.
+#
+# Hit for real on PR #2170 round 3. velo-pr-gate passed a flag the current codex
+# CLI rejects (#2171), so the review leg died at launch and its log held only
+# the unfilled brief template. Zero findings was read as a clean review, a
+# summary claiming "all five attacks were run" was written by hand, and this
+# script accepted it without objection. The PR then carried a
+# `gate: code-review @ a43c3aabe` stamp for a review that never happened.
+#
+# velo-pr-gate's own gate_health_check DID catch it and printed "a dispatched
+# gate died before doing any work" — but nothing downstream consults that
+# verdict, and a human relaying a report by hand bypasses it entirely. That
+# hand-relay is exactly the path that needs this check, not the one that should
+# skip it.
+#
+# These markers cannot appear in a real report: a reviewer that produced output
+# wrote OVER them.
+TEMPLATE_MARKERS=(
+  '<<< FILL THIS IN'
+  '<!-- velo-gate-brief'
+  '**Verdict:** approve | approve-with-findings | blocked'
+)
+for _m in "${TEMPLATE_MARKERS[@]}"; do
+  if grep -qF -- "$_m" <<<"$BODY"; then
+    die "refusing to post — this is the BRIEF TEMPLATE, not a report.
+
+  Found an unfilled template marker:
+    $_m
+
+  A reviewer that ran would have written over it. Its presence means the leg
+  died at launch (or was never dispatched) and the log still holds the brief.
+
+  This is what put a 'gate: code-review' stamp on PR #2170 for a review that
+  never ran. Check the leg's log before posting:
+    tail -40 <gate-dir>/review.log
+
+  If the leg really did die, re-dispatch it — do not hand-write a verdict for
+  it."
+  fi
+done
+
+# A CLI that refused to start leaves its usage text where the report should be.
+if grep -qE '^(error|Usage): ' <<<"$BODY"; then
+  die "refusing to post — the report contains a CLI usage/error line, so the
+  gate process failed to start rather than producing findings:
+
+$(grep -m3 -E '^(error|Usage): ' <<<"$BODY" | sed 's/^/    /')
+
+  Fix the launch, re-run the gate, then post its real output."
+fi
+
 HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null) \
   || die "PR #$PR not found"
 

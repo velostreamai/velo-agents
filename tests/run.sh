@@ -38,6 +38,7 @@ echo
 echo "── gate health (end-to-end) ───────────────────────────"
 bash "$HERE/test_gate_health.sh" || RC=1
 bash "$HERE/test_gate_post_sha.sh" || RC=1
+bash "$HERE/test_gate_template_guard.sh" || RC=1
 bash "$HERE/test_spec_review_worker.sh" || RC=1
 bash "$HERE/test_gate_routing.sh" || RC=1
 echo
