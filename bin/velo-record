@@ -192,7 +192,7 @@ VR_COMMITS="$COMMITS" VR_DIRTY="$DIRTY" VR_FILES="$FILES" VR_INS="$INS" VR_DELS=
 VR_PUSHED="$PUSHED" VR_OUTCOME="$OUTCOME" VR_LOG="$LOG" VR_SPECDIR="$ROOT/.agents/tasks" \
 VR_OUTFILE="$OUT" \
 python3 <<'PY'
-import json, os, pathlib, datetime
+import json, os, pathlib, datetime, sys
 
 g = os.environ.get
 def i(name, default=0):
@@ -256,6 +256,27 @@ def _cost_block():
     """
     source = g("VR_USAGE_SRC") or "unavailable"
     estimate = round(f("VR_COST"), 6)
+
+    # A priced source must be backed by a value that was actually REPORTED.
+    #
+    # #2107's second checkbox: "`openrouter-billed` with `usd: null` should be
+    # impossible to write, not merely unlikely". It was fixed only on the happy
+    # path. `COST=$(kv cost_usd "$TOTALS")` yields "" when the line carries no
+    # cost, and `f()` coerces "" to 0.0 — so a TOTALS line that claims
+    # openrouter-billed but reports no figure writes `usd: 0.0` under a billed
+    # label. That is the same lie as `usd: null` wearing one, in the shape that
+    # survives a null check: a run that cost money, recorded as free, and it
+    # averages into every cost-per-worker figure as a real zero.
+    #
+    # So the provenance is DERIVED from whether a number arrived, never copied
+    # from the claim.
+    raw_cost = (g("VR_COST") or "").strip()
+    cost_reported = raw_cost not in ("", "null", "none")
+    if not cost_reported and (source == "openrouter-billed" or source == "sdk"):
+        print(f"velo-record: {source} claimed with no cost_usd in TOTALS — "
+              f"recording source as '{source}-unreported' with usd null",
+              file=sys.stderr)
+        source = f"{source}-unreported"
     block = {
         "input_tokens": i("VR_IN"),
         "output_tokens": i("VR_OUT"),

@@ -90,6 +90,7 @@ bash "$HERE/test_oai_backend.sh" || RC=1
 echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
+bash "$HERE/test_billed_invariant.sh" || RC=1
 echo
 echo "── tool preamble ─────────────────────────────────────"
 "$PY" "$HERE/test_tool_contract.py" || RC=1

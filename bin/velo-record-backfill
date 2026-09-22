@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Repair rows that assert billed provenance over a cost they never carried (#2107).
+
+#2107 said "backfill #2091's row, or mark it source: unknown". Sweeping the
+class first found **18** such rows across 12 issues, not one — every dispatch
+between the openai-agents switch and the fix, because the recorder had no
+branch for `openrouter-billed` and wrote `usd: null` under a billed label.
+
+The cost is usually recoverable: the runner logged it correctly the whole time
+and only the recorder dropped it. #2091's own log still reads
+`cost_usd=0.060266`. So this prefers TRUE backfill from the log and falls back
+to relabelling only when the log is gone or never carried a figure.
+
+An edited audit row is marked, never silently rewritten: `cost.backfilled`
+records where the number came from and when. A record that quietly changes is
+the same defect class as the one being fixed.
+
+Usage:
+    velo-record-backfill [--apply]       # default is a dry run
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import shutil
+import sys
+import time
+
+RECORDS = pathlib.Path.home() / ".agents/state/records"
+TOTALS_COST = re.compile(r"\bcost_usd=([0-9.]+)")
+APPLY = "--apply" in sys.argv
+
+
+def cost_from_log(log_path: str | None) -> float | None:
+    """The gateway's own billed figure, from the run's log. None if unavailable."""
+    if not log_path:
+        return None
+    p = pathlib.Path(log_path)
+    if not p.exists():
+        return None
+    hit = None
+    try:
+        for line in p.read_text(errors="replace").splitlines():
+            if line.startswith("TOTALS ") or " TOTALS " in line:
+                m = TOTALS_COST.search(line)
+                if m:
+                    hit = float(m.group(1))
+    except OSError as exc:
+        print(f"  ! cannot read {p}: {exc}", file=sys.stderr)
+        return None
+    return hit
+
+
+def main() -> int:
+    if not RECORDS.is_dir():
+        print(f"no records directory at {RECORDS}", file=sys.stderr)
+        return 1
+
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    repaired = relabelled = 0
+    touched_files = []
+
+    for path in sorted(RECORDS.glob("*.result.jsonl")):
+        lines = path.read_text().splitlines()
+        out, changed = [], False
+
+        for line in lines:
+            if not line.strip():
+                out.append(line)
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                out.append(line)   # not ours to rewrite
+                continue
+
+            cost = row.get("cost") or {}
+            src, usd = cost.get("source"), cost.get("usd")
+            if not (isinstance(src, str) and src.endswith("billed") and usd is None):
+                out.append(line)
+                continue
+
+            real = cost_from_log((row.get("runner") or {}).get("log"))
+            if real is not None:
+                cost["usd"] = real
+                cost["backfilled"] = {"from": "runner log TOTALS cost_usd", "at": stamp}
+                repaired += 1
+                print(f"  {path.name} issue={row.get('issue')}: usd None -> {real}")
+            else:
+                # No figure was ever reported, so the billed claim cannot stand.
+                cost["source"] = f"{src}-unreported"
+                cost["backfilled"] = {"from": "no cost in log; provenance corrected",
+                                      "at": stamp}
+                relabelled += 1
+                print(f"  {path.name} issue={row.get('issue')}: "
+                      f"{src} -> {cost['source']} (usd stays null)")
+
+            row["cost"] = cost
+            out.append(json.dumps(row))
+            changed = True
+
+        if changed:
+            touched_files.append(path)
+            if APPLY:
+                # Timestamped, never a bare .bak — a backup you cannot date is a
+                # backup you cannot trust.
+                shutil.copy2(path, path.with_suffix(f".jsonl.bak-{stamp}"))
+                path.write_text("\n".join(out) + "\n")
+
+    verb = "repaired" if APPLY else "would repair"
+    print(f"\n{verb}: {repaired} backfilled from log, {relabelled} relabelled, "
+          f"across {len(touched_files)} file(s)")
+    if not APPLY:
+        print("dry run — re-run with --apply to write (backups are timestamped)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
