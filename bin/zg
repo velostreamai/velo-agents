@@ -78,6 +78,29 @@ zg_rewrite_args() {   # sets ARGS from "$@"
   ARGS=(query --rg --hidden ${1+"$@"})
 }
 
+# `--root <dir>` — which workspace to search, without a `cd`.
+#
+# zvec-grep resolves the workspace index from the CURRENT DIRECTORY and has no
+# root option. velo-impl.md forbids workers from `cd`-ing into their worktree (it
+# triggers a hook-trust prompt that stalls autonomous runs), so from a worker's
+# cwd — the main checkout — `zg query "..."` searched the MAIN checkout's index,
+# not the worktree being changed, and returned stale or wrong sites with no error.
+# A #2193 worker noticed and fell back to `--rg`, which is the blind search zg
+# exists to replace.
+#
+# POSITIONAL, like the `--rg` rewrite below: only `zg --root <dir> <command> …`,
+# i.e. the first two tokens. A `--root` anywhere else is left alone for zvec-grep
+# to reject, rather than guessed at. `ZG_ROOT` in the environment does the same.
+ROOT="${ZG_ROOT:-}"
+if [[ "${1:-}" == "--root" ]]; then
+  [[ -n "${2:-}" ]] || { echo "zg: --root needs a directory" >&2; exit 2; }
+  ROOT="$2"
+  shift 2
+fi
+if [[ -n "$ROOT" ]]; then
+  cd "$ROOT" 2>/dev/null || { echo "zg: --root '$ROOT' is not a directory" >&2; exit 2; }
+fi
+
 ARGS=()
 zg_rewrite_args "$@"
 
