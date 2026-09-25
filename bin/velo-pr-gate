@@ -292,9 +292,58 @@ dispatch_local() {  # $1 = skill, $2 = log suffix
 FTP_ISSUE=$(sed -nE 's|^[a-z]+/([0-9]+)-.*|\1|p' <<<"${WT:-}" | head -1)
 [[ -n "$FTP_ISSUE" ]] || FTP_ISSUE=$(gh pr view "$PR" --repo "$REPO" --json title \
     --jq '.title | capture("\\[#(?<n>[0-9]+)\\]") | .n' 2>/dev/null)
-# The spec is read from the PR's own worktree, not the canonical checkout: a PR
-# that ADDS or edits its spec must be gated against the version it ships.
+# The spec is read from the PR's own worktree FIRST, not the canonical checkout:
+# a PR that ADDS or edits its spec must be gated against the version it ships.
+#
+# But the worktree only contains TRACKED files, and in this project the spec
+# sidecars are deliberately untracked (`.git/info/exclude` — they are orchestrator
+# working state, not repo content). So the worktree path is absent for every
+# normal dispatch, and this whole fail_to_pass check silently no-op'd: no spec
+# file, no names, no verification, no message (#2180). A check that reports
+# nothing when it finds nothing is indistinguishable from one that passed.
+#
+# Fall back to the canonical checkout, and SAY which copy was used — the two can
+# disagree, and a gate that verified a different spec than the one under review
+# needs to be visible rather than inferred.
 FTP_SPEC="$WTPATH/.agents/tasks/${FTP_ISSUE}.json"
+FTP_SPEC_SRC="worktree"
+if [[ -n "$FTP_ISSUE" && ! -f "$FTP_SPEC" ]]; then
+  # #2191 part 5 AX7: --show-toplevel resolves to WHICHEVER worktree this
+  # script happens to run FROM, not the canonical checkout -- run from the
+  # PR's own worktree (sidecars untracked, so absent there by design), the
+  # "fallback" is the same missing path and the warning below wrongly
+  # implies both copies were checked; run from a DIFFERENT PR's worktree,
+  # it silently reads THAT worktree's sidecar and labels it
+  # "canonical-checkout". --git-common-dir always resolves to the shared
+  # .git directory of the canonical checkout regardless of which worktree
+  # invoked it (a linked worktree's .git is a file pointing back to it);
+  # its parent directory is the canonical checkout root. --path-format=absolute
+  # (git >=2.31) guarantees an absolute path so `dirname` doesn't need to
+  # special-case a relative result.
+  # #2191 part 6 BA9: guard the empty/failed case explicitly, BEFORE
+  # `dirname` ever sees it. `git rev-parse --git-common-dir` fails (git
+  # <2.31, no --path-format support, or run outside a repo entirely) with
+  # its stderr swallowed by `2>/dev/null`, so the command substitution
+  # yields an empty string — and `dirname ""` returns "." (POSIX
+  # behaviour), not an error. Without this guard the script would then
+  # read "./.agents/tasks/${FTP_ISSUE}.json" — the INVOKING SHELL's cwd,
+  # whatever that happens to be — and label it "canonical-checkout" if it
+  # happens to exist there, exactly the misattribution AX7 exists to
+  # remove. An empty/failed git-common-dir must fall straight through to
+  # the loud "NOT being verified" warning, never to a "." fallback.
+  FTP_GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [[ -n "$FTP_GIT_COMMON_DIR" ]]; then
+    FTP_SPEC_FALLBACK="$(dirname "$FTP_GIT_COMMON_DIR")/.agents/tasks/${FTP_ISSUE}.json"
+    if [[ -f "$FTP_SPEC_FALLBACK" ]]; then
+      FTP_SPEC="$FTP_SPEC_FALLBACK"
+      FTP_SPEC_SRC="canonical-checkout (untracked in the branch worktree)"
+    else
+      warn "no spec sidecar for #$FTP_ISSUE in either the PR worktree or the canonical checkout — fail_to_pass is NOT being verified for this gate"
+    fi
+  else
+    warn "could not resolve the canonical checkout (git rev-parse --git-common-dir failed or returned empty) — fail_to_pass is NOT being verified for this gate"
+  fi
+fi
 
 if [[ -n "$FTP_ISSUE" && -f "$FTP_SPEC" ]]; then
   FTP_NAMES=$(python3 -c "
@@ -347,7 +396,7 @@ print('\n'.join(str(t) for t in v))
       warn "this change and the spec needs different names."
     fi
 
-    ok "fail_to_pass: $(wc -l <<<"$FTP_NAMES" | tr -d ' ') name(s), all defined at PR head"
+    ok "fail_to_pass: $(wc -l <<<"$FTP_NAMES" | tr -d ' ') name(s), all defined at PR head [spec from $FTP_SPEC_SRC]"
   fi
 fi
 # <<< velo-fail-to-pass-merge

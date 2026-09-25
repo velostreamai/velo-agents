@@ -97,7 +97,7 @@ running_pid_for() {
   wt=$(ere_escape "$1")
   snap=$(ps -axww -o pid=,command= 2>/dev/null)
   printf '%s\n' "$snap" \
-    | grep -E "velo-(openrouter-agent-sdk|lmstudio-agent-sdk)\.py.*--cwd $wt( |$)|codex exec .*--cd $wt( |$)" \
+    | grep -E "velo-(openrouter-agent-sdk|lmstudio-agent-sdk|openai-agents-runner)\.py.*--cwd $wt( |$)|codex exec .*--cd $wt( |$)" \
     | grep -vE '^[[:space:]]*[0-9]+[[:space:]]+(bash -c|timeout )' \
     | awk '{print $1}' | head -1
 }
