@@ -12,6 +12,20 @@ import subprocess
 from typing import Any
 
 
+def local_conf(key: str) -> str:
+    """One plain value from velo-local.conf, the file that defines the local
+    model, endpoint and sampling for every script. The shell tools source it;
+    both Python runners read it through this one function. A missing or empty
+    entry raises: there is nothing to fall back to.
+    """
+    conf = pathlib.Path(__file__).with_name("velo-local.conf")
+    for line in conf.read_text().splitlines():
+        k, sep, value = line.strip().partition("=")
+        if sep and k == key and value.strip():
+            return value.split(" #", 1)[0].strip().strip('"')
+    raise RuntimeError(f"{conf} does not set {key}")
+
+
 def _git(root: str, *args: str) -> tuple[int, str]:
     r = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
     return r.returncode, (r.stdout or r.stderr).strip()

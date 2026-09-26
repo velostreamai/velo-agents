@@ -63,7 +63,7 @@ import velo_oai_tools as T  # noqa: E402
 from velo_skills import apply_skills  # noqa: E402
 # Salvage is SDK-agnostic — pure git plus a transcript dump — so both runtimes
 # share ONE implementation rather than each growing its own half-working copy.
-from velo_runner_lib import salvage_on_failure  # noqa: E402
+from velo_runner_lib import local_conf, salvage_on_failure  # noqa: E402
 
 set_tracing_disabled(True)
 
@@ -665,6 +665,12 @@ async def main() -> int:
         model_settings=ModelSettings(
             parallel_tool_calls=True,
             **({"tool_choice": force_first} if force_first else {}),
+            # Local sampling is SENT, never left to the server: LM Studio's
+            # per-model sampling config could not be shown to apply, and
+            # llama.cpp's own default is temp 0.8, not the model's 1.0.
+            **({} if is_gateway else {
+                "temperature": float(local_conf("VELO_LOCAL_TEMPERATURE")),
+                "top_p": float(local_conf("VELO_LOCAL_TOP_P"))}),
             max_tokens=MAX_TOKENS_BY_MODEL.get(a.model, a.max_tokens),
             # provider.order and usage.include are OpenRouter fields. A plain
             # OpenAI-compatible server rejects unknown body keys, so sending them
@@ -672,7 +678,9 @@ async def main() -> int:
             # parallel_tool_calls sent to Azure did exactly that).
             extra_body=({"provider": {"order": PROVIDER_ORDER.get(a.model, []),
                                       "allow_fallbacks": True},
-                         "usage": {"include": True}} if is_gateway else {})),
+                         "usage": {"include": True}} if is_gateway else
+                        {"top_k": int(local_conf("VELO_LOCAL_TOP_K")),
+                         "min_p": float(local_conf("VELO_LOCAL_MIN_P"))})),
     )
 
     if a.max_budget_usd is not None and a.max_budget_usd <= 0:

@@ -135,7 +135,7 @@ carrying.
 | need | for |
 |---|---|
 | `OPENROUTER_API_KEY` in the environment | DeepSeek and GLM workers |
-| `velo-llama-server install` (launchd) | the free local worker: llama-server serving the model named in `bin/velo-local.conf` at `VELO_LOCAL_BASE_URL`. Override per run with `VELO_LMSTUDIO_URL`. |
+| `velo-local-setup` (once per machine) | the free local worker: LM Studio, tuned, serving the model named in `bin/velo-local.conf` at `VELO_LOCAL_BASE_URL`. Idempotent. `velo-llama-server` is the faster no-UI alternative. Override per run with `VELO_LMSTUDIO_URL`. |
 | `gh`, authenticated | issue/PR validation |
 | `python3`, `jq`, `git`, `cargo`, `cargo-nextest`, `ast-grep` | dispatch + worker runtime |
 | **Node 22+** (optional) | the `zg` discovery index built per worktree at dispatch. Absent, dispatch warns and workers fall back to `rg` + `ast-grep`. `npm i -g @zvec/zvec-grep` makes it fast; without it the `zg` shim falls back to `npx` per call |

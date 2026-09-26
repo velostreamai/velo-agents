@@ -20,7 +20,7 @@ from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 # Runtime corrections to the SDK, applied before any tool can run (#2010).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from velo_zg_tool import ZgQueryTool
-from velo_runner_lib import salvage_on_failure  # noqa: E402
+from velo_runner_lib import local_conf, salvage_on_failure  # noqa: E402
 from velo_sdk_patches import (  # noqa: E402
     LEDGER,
     install_context_windows,
@@ -35,20 +35,6 @@ from velo_sdk_patches import (  # noqa: E402
 # label prefix, and whether a model can ever carry a real price. Every fix in
 # this file previously had to land twice, and the .bak graveyard in bin/ shows
 # how that drifts. One implementation, two profiles.
-def _local_conf(key: str) -> str:
-    """One plain value from velo-local.conf — the file that defines the local
-    model and its endpoint for every script. Shared with velo-dispatch,
-    velo-pr-gate and velo-status, which source it. A missing or empty entry
-    raises: there is nothing to fall back to.
-    """
-    conf = pathlib.Path(__file__).with_name("velo-local.conf")
-    for line in conf.read_text().splitlines():
-        k, sep, value = line.strip().partition("=")
-        if sep and k == key and value.strip():
-            return value.strip()
-    raise RuntimeError(f"{conf} does not set {key}")
-
-
 PROVIDERS: dict[str, dict[str, Any]] = {
     "openrouter": {
         "label": "velo-openrouter-agent",
@@ -66,8 +52,8 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     },
     "lmstudio": {
         "label": "velo-lmstudio-agent",
-        "default_model": os.environ.get("LM_STUDIO_MODEL") or _local_conf("VELO_LOCAL_MODEL_DEFAULT"),
-        "default_base_url": os.environ.get("LM_STUDIO_BASE_URL") or _local_conf("VELO_LOCAL_BASE_URL"),
+        "default_model": os.environ.get("LM_STUDIO_MODEL") or local_conf("VELO_LOCAL_MODEL_DEFAULT"),
+        "default_base_url": os.environ.get("LM_STUDIO_BASE_URL") or local_conf("VELO_LOCAL_BASE_URL"),
         "base_url_env": "LM_STUDIO_BASE_URL",
         "api_key_envs": ("LM_STUDIO_API_KEY", "CODEANY_API_KEY"),
         "api_key_fallback": "lm-studio",

@@ -18,8 +18,8 @@ The authoritative Velostream implementation policy is:
 ## Suitable for
 
 `qwen3.8-flash-next-ud` is **Qwen3.8-Flash-Next** (unsloth UD-Q3_K_XL GGUF,
-125B MoE, 6B active, thinking on), served by LM Studio's llama.cpp runtime
-(>= 2.46.0) at a 262144 context. It runs locally: **zero API cost**, ~33 tok/s,
+125B MoE, 6B active, thinking on), served by LM Studio (tuned by `velo-local-setup`) at a 262144 context. It runs
+locally: **zero API cost**, ~23 tok/s at a long context,
 but a two-bug triage took 140 min, so use it where latency does not matter.
 
 It replaced Qwen3-Coder-Next after the #2235 A/B: it was the only local model
@@ -78,11 +78,12 @@ Use:
 
 ## Endpoint
 
-`VELO_LOCAL_BASE_URL` in `~/.agents/bin/velo-local.conf` (currently
-`http://127.0.0.1:8091/v1`), served by `llama-server` directly — about 2.6x
-faster prefill and 2.8x faster decode than LM Studio's API on the same binary.
-Start it once with `velo-llama-server install` (a launchd agent);
-`velo-llama-server status` checks it.
+`VELO_LOCAL_BASE_URL` in `~/.agents/bin/velo-local.conf` — LM Studio at
+`http://127.0.0.1:1234/v1`, tuned. On a new machine run `velo-local-setup` once:
+it updates LM Studio's llama.cpp runtime, downloads the model into LM Studio's
+folder, writes the tuned load settings (without them LM Studio is 2.5x slower),
+loads the model and proves a tool call. Idempotent — re-run after LM Studio
+updates. `velo-llama-server` is the ~12% faster no-UI alternative; see the conf.
 
 ## Invocation — use `velo-dispatch`, do not hand-roll
 
@@ -145,7 +146,7 @@ Run detached via `nohup` so no tool timeout can reach it:
 nohup ~/.venvs/velo-openrouter-agent/bin/python \
   ~/.agents/bin/velo-lmstudio-agent-sdk.py \
   --model 'qwen3.8-flash-next-ud' \
-  --base-url http://127.0.0.1:8091/v1 \
+  --base-url http://127.0.0.1:1234/v1 \
   --policy ~/.agents/rules/velo-impl.md \
   --max-turns 120 \
   --prompt-timeout 14400 \

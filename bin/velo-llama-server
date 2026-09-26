@@ -1,14 +1,17 @@
 #!/bin/bash
-# velo-llama-server — serve the worker:local model with llama-server directly.
+# velo-llama-server — serve the worker:local model with llama-server.
 #
+#   velo-llama-server setup       one-shot, idempotent: brew llama.cpp + model + service
+#   velo-llama-server fetch       download any missing model shard (shared with velo-local-setup)
 #   velo-llama-server install     write + load the launchd agent (starts now, and at login)
-#   velo-llama-server uninstall   unload + remove the launchd agent
-#   velo-llama-server status      is it up, on which port, serving which model
+#   velo-llama-server uninstall   unload + remove the launchd agent (frees the model's memory)
+#   velo-llama-server status      is it up, which build, which model
 #   velo-llama-server run         run in the foreground (what launchd calls)
 #
-# Model, endpoint and flags come from velo-local.conf — the same file the
-# dispatcher reads — so the server and its clients cannot disagree about either.
-# Why not LM Studio's API: see the measurements in velo-local.conf.
+# Binary, model, endpoint and flags all come from velo-local.conf — the same file
+# the dispatcher reads — so the server and its clients cannot disagree.
+# Why llama-server and not LM Studio's API, and why Homebrew's build: see the
+# measurements in velo-local.conf.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
@@ -19,25 +22,18 @@ ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 LABEL=ai.velostream.velo-llama-server
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="${VELO_STATE:-$HOME/.agents/state}/llama-server.log"
-PORT="${VELO_LOCAL_BASE_URL##*:}"; PORT="${PORT%%/*}"
-HOST="${VELO_LOCAL_BASE_URL#*://}"; HOST="${HOST%%:*}"
+URL="$VELO_LLAMA_SERVER_URL"
+PORT="${URL##*:}"; PORT="${PORT%%/*}"
+HOST="${URL#*://}"; HOST="${HOST%%:*}"
+read -r -a SHARDS <<<"$VELO_LOCAL_GGUF_SHARDS"
+GGUF="$VELO_LOCAL_GGUF_DIR/${SHARDS[0]}"   # llama.cpp finds the other shards itself
 
-case "${1:-}" in
-  run)
-    [[ -x "$VELO_LLAMA_SERVER_DIR/llama-server" ]] || die "llama-server not found in $VELO_LLAMA_SERVER_DIR (update LM Studio's llama.cpp runtime, or fix velo-local.conf)"
-    [[ -f "$VELO_LOCAL_GGUF" ]] || die "model not found: $VELO_LOCAL_GGUF"
-    # Word-splitting VELO_LLAMA_ARGS is intended: it is a flag list.
-    # shellcheck disable=SC2086
-    DYLD_LIBRARY_PATH="$VELO_LLAMA_SERVER_DIR" exec "$VELO_LLAMA_SERVER_DIR/llama-server" \
-      -m "$VELO_LOCAL_GGUF" --alias "$VELO_LOCAL_MODEL_DEFAULT" --host "$HOST" --port "$PORT" \
-      $VELO_LLAMA_ARGS
-    ;;
-  install)
-    # The plist records THIS script's path. Installing from a worktree would
-    # point launchd at a checkout that gets removed.
-    [[ "$HERE" == "$HOME/.agents/bin" ]] || die "run install from ~/.agents/bin (after install.sh), not $HERE"
-    mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
-    cat > "$PLIST" <<EOF
+install_agent() {
+  # The plist records THIS script's path. Installing from a worktree would point
+  # launchd at a checkout that gets removed.
+  [[ "$HERE" == "$HOME/.agents/bin" ]] || die "run from ~/.agents/bin (after install.sh), not $HERE"
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+  cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -50,10 +46,57 @@ case "${1:-}" in
   <key>StandardErrorPath</key><string>$LOG</string>
 </dict></plist>
 EOF
-    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
-    launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed for $PLIST"
-    ok "launchd agent loaded: $LABEL  log: $LOG"
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed for $PLIST"
+  ok "launchd agent loaded: $LABEL  log: $LOG"
+}
+
+case "${1:-}" in
+  run)
+    [[ -x "$VELO_LLAMA_SERVER" ]] || die "llama-server not found at $VELO_LLAMA_SERVER — run: velo-llama-server setup"
+    [[ -f "$GGUF" ]] || die "model not found: $GGUF — run: velo-llama-server setup"
+    "$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version'
+    # Word-splitting VELO_LLAMA_ARGS is intended: it is a flag list.
+    # shellcheck disable=SC2086
+    exec "$VELO_LLAMA_SERVER" -m "$GGUF" --alias "$VELO_LOCAL_MODEL_DEFAULT" \
+      --host "$HOST" --port "$PORT" $VELO_LLAMA_ARGS
     ;;
+  setup)
+    # Every step checks before it acts, so re-running is safe and cheap.
+    if [[ -x "$VELO_LLAMA_SERVER" ]]; then
+      ok "llama.cpp present: $("$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version')"
+    else
+      command -v brew >/dev/null || die "Homebrew not found — install it from https://brew.sh first"
+      brew install llama.cpp || die "brew install llama.cpp failed"
+      [[ -x "$VELO_LLAMA_SERVER" ]] || die "installed, but not at $VELO_LLAMA_SERVER — fix velo-local.conf"
+      ok "llama.cpp installed"
+    fi
+    "$0" fetch || exit 1
+    install_agent
+    echo "  .. waiting for the model to load"
+    for _ in $(seq 1 100); do curl -sf "http://$HOST:$PORT/health" >/dev/null && break; sleep 3; done
+    "$0" status
+    ;;
+  fetch)
+    mkdir -p "$VELO_LOCAL_GGUF_DIR"
+    repo="${VELO_LOCAL_HF%%/*}/$(cut -d/ -f2 <<<"$VELO_LOCAL_HF")"
+    sub="$(cut -d/ -f3- <<<"$VELO_LOCAL_HF")"
+    for s in "${SHARDS[@]}"; do
+      dest="$VELO_LOCAL_GGUF_DIR/$s"
+      want=$(curl -fsSL "https://huggingface.co/api/models/$repo/tree/main/$sub" \
+        | python3 -c 'import json,sys; n=sys.argv[1]; print(next(f["size"] for f in json.load(sys.stdin) if f["path"].endswith("/"+n)))' "$s") \
+        || die "could not read the size of $s from huggingface.co/$repo"
+      have=$(stat -f %z "$dest" 2>/dev/null || echo 0)
+      if [[ "$have" == "$want" ]]; then ok "model shard present: $s"; continue; fi
+      echo "  .. downloading $s ($((want / 1000000000)) GB; resumes if interrupted)"
+      curl -fL --retry 10 --retry-delay 10 -C - -o "$dest" \
+        "https://huggingface.co/$repo/resolve/main/$sub/$s" || die "download failed: $s (re-run setup to resume)"
+      have=$(stat -f %z "$dest")
+      [[ "$have" == "$want" ]] || die "size mismatch for $s: $have != $want (re-run setup to resume)"
+      ok "model shard downloaded: $s"
+    done
+    ;;
+  install)   install_agent ;;
   uninstall)
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
     rm -f "$PLIST"
@@ -61,10 +104,11 @@ EOF
     ;;
   status)
     if curl -sf "http://$HOST:$PORT/health" >/dev/null; then
-      ok "up at $VELO_LOCAL_BASE_URL serving $(curl -s "$VELO_LOCAL_BASE_URL/models" | python3 -c 'import json,sys;print(",".join(m["id"] for m in json.load(sys.stdin)["data"]))')"
+      ok "up at $URL serving $(curl -s "$URL/models" | python3 -c 'import json,sys;print(",".join(m["id"] for m in json.load(sys.stdin)["data"]))')"
+      ok "binary: $VELO_LLAMA_SERVER ($("$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version'))"
     else
-      die "not responding at $VELO_LOCAL_BASE_URL — see $LOG"
+      die "not responding at $URL — see $LOG"
     fi
     ;;
-  *) die "usage: velo-llama-server install | uninstall | status | run" ;;
+  *) die "usage: velo-llama-server setup | fetch | install | uninstall | status | run" ;;
 esac

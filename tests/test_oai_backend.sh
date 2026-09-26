@@ -107,7 +107,11 @@ done
 echo
 echo "the local endpoint is handled without OpenRouter-only fields"
 has "gateway detected from the base url"      'is_gateway = "openrouter.ai" in' "$SRC"
-has "provider/usage body sent ONLY to the gateway" 'if is_gateway else {}' "$SRC"
+has "provider/usage body sent ONLY to the gateway" '"usage": \{"include": True\}\} if is_gateway else' "$SRC"
+# Local sampling is SENT per request: LM Studio's per-model sampling config could
+# not be shown to apply, and llama.cpp's own default is temp 0.8.
+has "local sampling is sent to a local endpoint" 'local_conf\("VELO_LOCAL_TEMPERATURE"\)' "$SRC"
+has "  and only to a local endpoint"            '\{\} if is_gateway else \{' "$SRC"
 has "a local endpoint does not require an OpenRouter key" 'LM_STUDIO_API_KEY' "$SRC"
 has "skills come from the shared module"      'from velo_skills import apply_skills' "$SRC"
 
@@ -118,7 +122,7 @@ echo "salvage — a dying run must not lose the work it did"
 # harness ASKING the model to checkpoint. Demonstrated on this runtime: a task
 # that finished but was never told to commit left 223 lines of completed work
 # untracked, one `worktree remove` from gone.
-has "salvage is wired, not reimplemented"     'from velo_runner_lib import salvage_on_failure' "$SRC"
+has "salvage is wired, not reimplemented"     'from velo_runner_lib import .*salvage_on_failure' "$SRC"
 has "it fires on any non-success exit"        'if status != "success"' "$SRC"
 has "read_only is passed through"             'read_only=read_only' "$SRC"
 has "a transcript is accumulated for it"      'self\.transcript' "$SRC"
