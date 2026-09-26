@@ -462,7 +462,7 @@ label must not imply a reviewer that never ran.
 
 | skill | model | cost | pick it for |
 |---|---|---|---|
-| `velo-local` | `qwen3-coder-next-mlx@6bit` (LM Studio) | **free** | default — scoped implementation, audits, anything latency-insensitive |
+| `velo-local` | `qwen3.8-flash-next-ud` (LM Studio, llama.cpp >= 2.46.0, 262K ctx) | **free** | triage, investigation, check-spec, second-opinion review; latency-insensitive only (#2235) |
 | `velo-deepseek` | `deepseek/deepseek-v4-flash-0731` | **very cheap** | fast scoped implementation against a pinned design |
 | `velo-glm` | `z-ai/glm-5.3-flash` | **pricier, good value** | multi-step reasoning, per-case classification judgement |
 | `worker:codex` | `codex exec` (CLI) | **most expensive** | architecture-weight work — anything where a WRONG answer costs more than the run |

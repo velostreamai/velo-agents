@@ -86,7 +86,9 @@ worker_from_cmd() {   # $1 = the process argv
   case "$1" in
     *deepseek/deepseek*)      echo "velo-deepseek" ;;
     *z-ai/glm*)               echo "velo-glm" ;;
-    *lmstudio-agent-sdk*|*qwen3-coder*) echo "velo-local" ;;
+    # The LM Studio endpoint IS the local route — a model-name arm broke
+    # the moment the model changed (a live Flash-Next run showed `running?`).
+    *lmstudio-agent-sdk*|*":1234/v1"*) echo "velo-local" ;;
     *"codex exec"*)           echo "velo-codex" ;;
     *)                        echo "running?" ;;
   esac

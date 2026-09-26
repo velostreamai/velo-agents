@@ -17,17 +17,24 @@ The authoritative Velostream implementation policy is:
 
 ## Suitable for
 
-`qwen3-coder-next-mlx@6bit` is **Qwen3-Coder-Next**, a purpose-built coding
-model, MLX 6-bit quantised. Treat it as a peer of `velo-deepseek` for
-implementation work, not as a read-only helper. It runs locally: **zero API
-cost**, but slower per turn than the hosted models, so prefer it when latency
-does not matter and volume does.
+`qwen3.8-flash-next-ud` is **Qwen3.8-Flash-Next** (unsloth UD-Q3_K_XL GGUF,
+125B MoE, 6B active, thinking on), served by LM Studio's llama.cpp runtime
+(>= 2.46.0) at a 262144 context. It runs locally: **zero API cost**, ~33 tok/s,
+but a two-bug triage took 140 min, so use it where latency does not matter.
+
+It replaced Qwen3-Coder-Next after the #2235 A/B: it was the only local model
+with correct verdicts, exact root-cause lines and probes that failed for the
+right reason. Qwen3-Coder-Next and Qwen3.8-27B (6/8-bit, thinking on or off)
+produced none. With thinking OFF the 27B never converged — never disable it.
 
 Good fits:
-- scoped implementation against a design you have already pinned — it has
-  matched a pinned design exactly and shipped a green 53-test change
+- bug triage and re-verification: root cause, blast radius, red probe tests
 - read-only investigation, code-path tracing, freshness checks
-- `/check-code` and `/check-spec` structured audits against a fixed checklist
+- `/check-spec` audits against a fixed checklist
+- the non-blocking `second-opinion` leg of `velo-pr-gate` (never the gate)
+
+Not yet: implementation with a deadline — `velo-deepseek` is the default for
+code changes. Never `/check-code` (see velo-pr-gate's routing table).
 - mechanical file moves with a byte-identical constraint
 - any bulk reading where per-turn latency is irrelevant and cost matters
 
@@ -67,7 +74,7 @@ A brief missing any of those has caused a real failed run.
 
 Use:
 
-     qwen3-coder-next-mlx@6bit
+     qwen3.8-flash-next-ud
 
 ## Endpoint
 
@@ -135,7 +142,7 @@ Run detached via `nohup` so no tool timeout can reach it:
 ```bash
 nohup ~/.venvs/velo-openrouter-agent/bin/python \
   ~/.agents/bin/velo-lmstudio-agent-sdk.py \
-  --model 'qwen3-coder-next-mlx@6bit' \
+  --model 'qwen3.8-flash-next-ud' \
   --base-url http://192.168.1.193:1234/v1 \
   --policy ~/.agents/rules/velo-impl.md \
   --max-turns 120 \
@@ -180,7 +187,7 @@ untrustworthy.
 
 | worker | model | cost | pick it for |
 |---|---|---|---|
-| `velo-local` | qwen3-coder-next-mlx@6bit (Qwen3-Coder-Next, LM Studio) | **free** — runs locally | scoped implementation + audit; slower per turn |
+| `velo-local` | qwen3.8-flash-next-ud (Qwen3.8-Flash-Next, LM Studio) | **free** — runs locally | triage, investigation, check-spec, second-opinion review; slow per task |
 | `velo-deepseek` | deepseek/deepseek-v4-flash-0731 | **very cheap** | fast, scoped implementation against a pinned design |
 | `velo-glm` | z-ai/glm-5.3-flash | **more expensive, good value** | longer-horizon agentic work, per-case classification judgement |
 

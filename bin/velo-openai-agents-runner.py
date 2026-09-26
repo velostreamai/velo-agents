@@ -102,6 +102,13 @@ MAX_TOKENS_BY_MODEL = {
 # Applies to any model not named above. Deliberately generous for the same reason.
 DEFAULT_MAX_TOKENS = 65536
 
+# Recovery for an empty final turn (no text, no tool call). See the retry loop
+# around Runner.run for the failure it answers.
+EMPTY_FINAL_RETRIES = 3
+EMPTY_FINAL_NUDGE = ("Continue from where you left off. Your last reply contained no "
+                     "text and no tool call. If there is more to do, emit the tool call "
+                     "you planned now. If the task is complete, give your final report.")
+
 PROVIDER_ORDER = {
     "deepseek/deepseek-v4-flash-0731": ["Relace", "Baidu", "OpenInference"],
     "z-ai/glm-5.3-flash": ["Z.AI", "DeepInfra", "Novita"],
@@ -366,8 +373,10 @@ class Hooks(RunHooks):
 
 
 def task_is_read_only(task: str) -> bool:
-    t = task.lower()
-    return "read-only" in t or "read only" in t
+    # Only the explicit declaration the review skills inline. A substring match on
+    # "read only" stripped write tools from implementation briefs that merely said
+    # "Read ONLY the issue body" (#2235).
+    return "=== THIS IS A READ-ONLY REVIEW TASK ===" in task
 
 
 hooks_ref: dict = {"cost": 0.0}
@@ -642,7 +651,10 @@ async def main() -> int:
     # after the first call, so this constrains the opening move and nothing
     # else. Omitted for read-only gates, whose task is already narrow, and
     # skipped when zg_query is not registered.
+    # A named-function tool_choice is an object; LM Studio accepts only the
+    # strings none/auto/required and 400s the whole run on turn 0.
     force_first = "zg_query" if (not read_only and not a.no_force_first_tool
+                                 and "openrouter.ai" in a.base_url
                                  and "zg_query" in
                                  {getattr(t, "name", "") for t in tools}) else None
     agent = Agent(
@@ -687,11 +699,39 @@ async def main() -> int:
         # error belongs back in the model's lap so it can recover.
         cfg = RunConfig(tool_not_found_behavior="return_error_to_model",
                         tool_execution=ToolExecutionConfig(max_function_tool_concurrency=6))
-        res = await asyncio.wait_for(
-            Runner.run(agent, task + budget, max_turns=a.max_turns,
-                       run_config=cfg, hooks=hooks),
-            timeout=a.prompt_timeout)
+        # An EMPTY final turn — no text and no tool call — is not a finish.
+        # openai-agents treats any reply without a tool call as the final
+        # output, so a reasoning model that ends its turn at the close of its
+        # thinking block (Qwen3.8 on #2235: 7,166 reasoning tokens ending
+        # "Let me trace through the git history…", content="", tool_calls=[])
+        # was recorded as status=success with nothing done. Mirror the
+        # incumbent's max_tokens recovery: hand the conversation back with a
+        # nudge, up to EMPTY_FINAL_RETRIES times, then fail loud.
+        async def _run_with_empty_final_retry():
+            inp = task + budget
+            for attempt in range(EMPTY_FINAL_RETRIES + 1):
+                remaining = a.max_turns - hooks.turns
+                if remaining <= 0:
+                    raise MaxTurnsExceeded("max turns exhausted during empty-final retries")
+                r = await Runner.run(agent, inp, max_turns=remaining,
+                                     run_config=cfg, hooks=hooks)
+                if str(r.final_output or "").strip():
+                    return r, ""
+                if attempt == EMPTY_FINAL_RETRIES:
+                    return r, "error_empty_final"
+                log.emit(f"[prompt 1] empty final turn (no text, no tool call) — "
+                         f"continuing, retry {attempt + 1}/{EMPTY_FINAL_RETRIES}")
+                inp = r.to_input_list() + [{"role": "user", "content": EMPTY_FINAL_NUDGE}]
+            raise AssertionError("unreachable")
+
+        res, empty_status = await asyncio.wait_for(_run_with_empty_final_retry(),
+                                                   timeout=a.prompt_timeout)
         text = str(res.final_output or "")
+        if empty_status:
+            status = empty_status
+            text = (f"The model ended {EMPTY_FINAL_RETRIES + 1} consecutive turns with no "
+                    f"text and no tool call; the run did not finish its task.")
+            log.emit(f"[prompt 1] ERROR {status}: {text}")
     except MaxTurnsExceeded:
         status = "error_max_turns"
     except BudgetExceeded as exc:

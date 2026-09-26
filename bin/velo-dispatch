@@ -16,7 +16,7 @@
 # caller never burns a worker run on an under-specified task.
 #
 # Worker selection comes from the issue's `worker:*` label:
-#   worker:local     -> qwen3-coder-next-mlx@6bit via LM Studio   (free)
+#   worker:local     -> $VELO_LOCAL_MODEL_DEFAULT (velo-local.conf) via LM Studio (free)
 #   worker:deepseek  -> deepseek/deepseek-v4-flash-0731           (very cheap)
 #   worker:glm       -> z-ai/glm-5.3-flash                        (pricier)
 
@@ -57,6 +57,10 @@ MAX_BUDGET_USD="${VELO_MAX_BUDGET_USD:-5.00}"
 DLOG=""
 _audit() { [[ -n "$DLOG" ]] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$DLOG"; return 0; }
 die()  { _audit "DIE  $1"; printf '\n\033[31mNOT READY:\033[0m %s\n\n' "$1" >&2; exit 1; }
+# The worker:local model is named in ONE file, shared with velo-pr-gate.
+# shellcheck source=velo-local.conf
+. "$(dirname "${BASH_SOURCE[0]}")/velo-local.conf" || die "velo-local.conf missing next to velo-dispatch"
+[[ -n "${VELO_LOCAL_MODEL_DEFAULT:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_MODEL_DEFAULT"
 warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
@@ -1461,7 +1465,9 @@ case "$NAME" in
     RECORD_MAX_TURNS=""
     ;;
   velo-local)
-    MODEL_ID='qwen3-coder-next-mlx@6bit'
+    # VELO_LOCAL_MODEL: A/B a different LM Studio model id on the same route (#2230).
+    MODEL_ID="${VELO_LOCAL_MODEL:-$VELO_LOCAL_MODEL_DEFAULT}"
+    [[ -n "${VELO_LOCAL_MODEL:-}" ]] && warn "local model override: $MODEL_ID"
     # Through the WRAPPER, like every other delegated route. This used to exec
     # velo-lmstudio-agent-sdk.py directly, so VELO_AGENT_BACKEND governed the
     # OpenRouter workers and silently did NOT govern this one. A switch that

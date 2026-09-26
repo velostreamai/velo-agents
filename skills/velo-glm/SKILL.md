@@ -210,7 +210,7 @@ validation before considering the issue complete.
 
 | worker | model | cost | pick it for |
 |---|---|---|---|
-| `velo-local` | qwen3-coder-next-mlx@6bit (Qwen3-Coder-Next, LM Studio) | **free** — runs locally | scoped implementation + audit; slower per turn |
+| `velo-local` | qwen3.8-flash-next-ud (Qwen3.8-Flash-Next, LM Studio) | **free** — runs locally | triage, investigation, check-spec, second-opinion review; slow per task |
 | `velo-deepseek` | deepseek/deepseek-v4-flash-0731 | **very cheap** | fast, scoped implementation against a pinned design |
 | `velo-glm` | z-ai/glm-5.3-flash | **more expensive, good value** | longer-horizon agentic work, per-case classification judgement |
 

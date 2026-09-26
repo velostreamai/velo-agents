@@ -42,6 +42,17 @@
 #                              is exactly what code-review disproved), so treat
 #                              a check-spec pass as "found nothing", never as
 #                              "nothing is there".
+#   second-opinion -> velo-local  the code-review brief, run a second time on the
+#                              free local model. NON-BLOCKING and never a gate:
+#                              its findings are leads for the orchestrator to
+#                              verify, and its silence proves nothing. Earned
+#                              by #2235, where Qwen3.8-Flash-Next found exact
+#                              root causes plus a 12-site blast radius. Named
+#                              so it does NOT end in "review" — the diff-range
+#                              lookup below treats any `*review @ sha` stamp as
+#                              a completed review, and a second-opinion stamp
+#                              must not move Codex's next range. Skip with
+#                              VELO_SECOND_OPINION=0.
 #
 # All three gates are dispatched by this script. `codex review` runs
 # non-interactively and takes its prompt on stdin.
@@ -133,6 +144,8 @@ if [[ "$SCOPE" == "--plan" ]]; then
   [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> opus:high via claude CLI (needs the brief's ATTACK section filled in)"
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
   [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
+  [[ $NEEDS_REVIEW -eq 1 && "${VELO_SECOND_OPINION:-1}" == "1" ]] && \
+    echo "  second-opinion -> velo-local, same brief, non-blocking"
   [[ $NEEDS_REVIEW -eq 1 && $EXEC -eq 1 ]] && echo "                 --exec: sandbox BYPASSED, reviewer can compile and run tests"
   exit 0
 fi
@@ -259,7 +272,11 @@ gate_health_check() {   # $1 = pid, $2 = log, $3 = gate name
 # Through the wrapper, so the local GATES move with the workers rather than
 # staying on a runtime nobody remembers is still in use.
 WRAPPER=/Users/neilavery/.agents/bin/velo-openrouter-agent
-LOCAL_MODEL=qwen3-coder-next-mlx@6bit
+# Same model as the worker:local route, from the one file that names it.
+# shellcheck source=velo-local.conf
+. "$(dirname "${BASH_SOURCE[0]}")/velo-local.conf" || die "velo-local.conf missing next to velo-pr-gate"
+[[ -n "${VELO_LOCAL_MODEL_DEFAULT:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_MODEL_DEFAULT"
+LOCAL_MODEL="${VELO_LOCAL_MODEL:-$VELO_LOCAL_MODEL_DEFAULT}"
 LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://127.0.0.1:1234/v1}"
 POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 
@@ -700,6 +717,21 @@ EOF
     gate_health_check "$CODE_PID" "$CODE_LOG" "check-code"
   fi
 
+  # Second opinion: the SAME brief on the free local model. Deliberately outside
+  # the gate accounting — it never sets GATE_DISPATCHED or GATE_FAILED, so it can
+  # neither satisfy #2005's "something is running" check nor block on dying. It
+  # is extra evidence, not a gate. Read-only by construction: the marker line
+  # makes the runner register READ_ONLY_TOOLS only.
+  if [[ "${VELO_SECOND_OPINION:-1}" == "1" ]]; then
+    SECOND_LOG="$GATE_DIR/second-opinion.log"
+    nohup "$WRAPPER" --model "$LOCAL_MODEL" --base-url "$LMSTUDIO_URL" \
+        --policy "$POLICY" --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
+        --task "$(printf '%s\n\n' '=== THIS IS A READ-ONLY REVIEW TASK ==='; cat "$OUT")" \
+        > "$SECOND_LOG" 2>&1 &
+    ok "second-opinion -> velo-local (pid $!, non-blocking)  log: $SECOND_LOG"
+    echo "     Leads to verify, not a verdict. Its silence proves nothing."
+  fi
+
   echo
   echo "  Then relay every report and record the verdict:"
   # Print the sha the gates ACTUALLY ran against (#2110).
@@ -721,6 +753,9 @@ EOF
   [[ $NEEDS_CODE  -eq 1 ]] && echo "    velo-gate-post $PR check-code  <report>$GPS"
   [[ $NEEDS_SPEC  -eq 1 ]] && echo "    velo-gate-post $PR check-spec  <report>$GPS"
   echo "    velo-gate-post $PR code-review <report>$GPS"
+  # Never post it under a *review name: that stamp would move Codex's next range.
+  [[ "${VELO_SECOND_OPINION:-1}" == "1" ]] && \
+    echo "    velo-gate-post $PR second-opinion <report>$GPS   (optional, non-blocking)"
   echo "    velo-gate $PR --pass | --block"
 fi
 

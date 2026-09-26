@@ -88,7 +88,10 @@ fi
 cmd_worker() { worker_from_cmd "$1"; }
 check "live glm names velo-glm"        "$(cmd_worker '--model z-ai/glm-5.3-flash')"          "velo-glm"
 check "live codex names velo-codex"    "$(cmd_worker 'codex exec --cd /x')"                  "velo-codex"
-check "live local names velo-local"    "$(cmd_worker '--model qwen3-coder-next-mlx@6bit')"   "velo-local"
+check "live local names velo-local"    "$(cmd_worker '--model qwen3.8-flash-next-ud --base-url http://192.168.1.193:1234/v1')" "velo-local"
+# The route is the LM Studio endpoint, not a model name: any local model matches.
+check "a re-pinned local model still names velo-local" \
+  "$(cmd_worker '--model some-future-model --base-url http://127.0.0.1:1234/v1')" "velo-local"
 check "live deepseek names velo-deepseek" "$(cmd_worker '--model deepseek/deepseek-v4-flash-0731')" "velo-deepseek"
 # Any deepseek model maps to the one unversioned route — a re-pin must not need
 # a velo-status edit.
