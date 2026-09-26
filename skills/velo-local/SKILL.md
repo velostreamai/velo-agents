@@ -78,9 +78,11 @@ Use:
 
 ## Endpoint
 
-Use:
-
-    http://192.168.1.193:1234/v1
+`VELO_LOCAL_BASE_URL` in `~/.agents/bin/velo-local.conf` (currently
+`http://127.0.0.1:8091/v1`), served by `llama-server` directly — about 2.6x
+faster prefill and 2.8x faster decode than LM Studio's API on the same binary.
+Start it once with `velo-llama-server install` (a launchd agent);
+`velo-llama-server status` checks it.
 
 ## Invocation — use `velo-dispatch`, do not hand-roll
 
@@ -143,7 +145,7 @@ Run detached via `nohup` so no tool timeout can reach it:
 nohup ~/.venvs/velo-openrouter-agent/bin/python \
   ~/.agents/bin/velo-lmstudio-agent-sdk.py \
   --model 'qwen3.8-flash-next-ud' \
-  --base-url http://192.168.1.193:1234/v1 \
+  --base-url http://127.0.0.1:8091/v1 \
   --policy ~/.agents/rules/velo-impl.md \
   --max-turns 120 \
   --prompt-timeout 14400 \

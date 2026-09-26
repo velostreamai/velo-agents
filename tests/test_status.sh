@@ -86,9 +86,14 @@ else
   FAILURES=$((FAILURES+1)); exit 1
 fi
 cmd_worker() { worker_from_cmd "$1"; }
+# The function reads the local endpoint velo-status sources from velo-local.conf.
+# shellcheck source=/dev/null
+. "$BIN/velo-local.conf"
+check "an empty local endpoint does not claim every run" \
+  "$(VELO_LOCAL_BASE_URL='' worker_from_cmd 'codex exec --cd /x')" "velo-codex"
 check "live glm names velo-glm"        "$(cmd_worker '--model z-ai/glm-5.3-flash')"          "velo-glm"
 check "live codex names velo-codex"    "$(cmd_worker 'codex exec --cd /x')"                  "velo-codex"
-check "live local names velo-local"    "$(cmd_worker '--model qwen3.8-flash-next-ud --base-url http://192.168.1.193:1234/v1')" "velo-local"
+check "live local names velo-local"    "$(cmd_worker '--model qwen3.8-flash-next-ud --base-url http://127.0.0.1:8091/v1')" "velo-local"
 # The route is the LM Studio endpoint, not a model name: any local model matches.
 check "a re-pinned local model still names velo-local" \
   "$(cmd_worker '--model some-future-model --base-url http://127.0.0.1:1234/v1')" "velo-local"

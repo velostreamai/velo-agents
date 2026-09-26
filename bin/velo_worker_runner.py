@@ -35,18 +35,18 @@ from velo_sdk_patches import (  # noqa: E402
 # label prefix, and whether a model can ever carry a real price. Every fix in
 # this file previously had to land twice, and the .bak graveyard in bin/ shows
 # how that drifts. One implementation, two profiles.
-def _local_model_default() -> str:
-    """The worker:local model, from velo-local.conf — the one file that names it.
-
-    Shared with velo-dispatch and velo-pr-gate, which source the same file. A
-    missing or empty entry raises: there is no model to fall back to.
+def _local_conf(key: str) -> str:
+    """One plain value from velo-local.conf — the file that defines the local
+    model and its endpoint for every script. Shared with velo-dispatch,
+    velo-pr-gate and velo-status, which source it. A missing or empty entry
+    raises: there is nothing to fall back to.
     """
     conf = pathlib.Path(__file__).with_name("velo-local.conf")
     for line in conf.read_text().splitlines():
-        key, sep, value = line.strip().partition("=")
-        if sep and key == "VELO_LOCAL_MODEL_DEFAULT" and value.strip():
+        k, sep, value = line.strip().partition("=")
+        if sep and k == key and value.strip():
             return value.strip()
-    raise RuntimeError(f"{conf} does not set VELO_LOCAL_MODEL_DEFAULT")
+    raise RuntimeError(f"{conf} does not set {key}")
 
 
 PROVIDERS: dict[str, dict[str, Any]] = {
@@ -66,8 +66,8 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     },
     "lmstudio": {
         "label": "velo-lmstudio-agent",
-        "default_model": os.environ.get("LM_STUDIO_MODEL") or _local_model_default(),
-        "default_base_url": os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
+        "default_model": os.environ.get("LM_STUDIO_MODEL") or _local_conf("VELO_LOCAL_MODEL_DEFAULT"),
+        "default_base_url": os.environ.get("LM_STUDIO_BASE_URL") or _local_conf("VELO_LOCAL_BASE_URL"),
         "base_url_env": "LM_STUDIO_BASE_URL",
         "api_key_envs": ("LM_STUDIO_API_KEY", "CODEANY_API_KEY"),
         "api_key_fallback": "lm-studio",

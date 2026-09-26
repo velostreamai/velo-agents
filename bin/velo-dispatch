@@ -30,7 +30,6 @@ VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 POLICY="$HOME/.agents/rules/velo-impl.md"
 ASSIGNEE="bluemonk3y"
 MIN_DISK_GB=40
-LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://192.168.1.193:1234/v1}"
 MAX_TURNS=250
 PROMPT_TIMEOUT=14400
 # A spend ceiling for every dispatch. MAX_TURNS and PROMPT_TIMEOUT bound the run
@@ -61,6 +60,8 @@ die()  { _audit "DIE  $1"; printf '\n\033[31mNOT READY:\033[0m %s\n\n' "$1" >&2;
 # shellcheck source=velo-local.conf
 . "$(dirname "${BASH_SOURCE[0]}")/velo-local.conf" || die "velo-local.conf missing next to velo-dispatch"
 [[ -n "${VELO_LOCAL_MODEL_DEFAULT:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_MODEL_DEFAULT"
+[[ -n "${VELO_LOCAL_BASE_URL:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_BASE_URL"
+LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-$VELO_LOCAL_BASE_URL}"
 warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 

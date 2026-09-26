@@ -277,7 +277,7 @@ WRAPPER=/Users/neilavery/.agents/bin/velo-openrouter-agent
 . "$(dirname "${BASH_SOURCE[0]}")/velo-local.conf" || die "velo-local.conf missing next to velo-pr-gate"
 [[ -n "${VELO_LOCAL_MODEL_DEFAULT:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_MODEL_DEFAULT"
 LOCAL_MODEL="${VELO_LOCAL_MODEL:-$VELO_LOCAL_MODEL_DEFAULT}"
-LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-http://127.0.0.1:1234/v1}"
+LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-$VELO_LOCAL_BASE_URL}"
 POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 
 dispatch_local() {  # $1 = skill, $2 = log suffix

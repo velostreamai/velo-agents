@@ -24,6 +24,9 @@ LIB="$(dirname "${BASH_SOURCE[0]}")/velo-worktree-lib.sh"
 [[ -f "$LIB" ]] || LIB="$ROOT/.agents/bin/velo-worktree-lib.sh"
 # shellcheck source=/dev/null
 source "$LIB"
+# The local route is recognised by its endpoint, which velo-local.conf defines.
+# shellcheck source=velo-local.conf
+source "$(dirname "$LIB")/velo-local.conf" || { echo "velo-local.conf missing next to $LIB" >&2; exit 1; }
 
 VERBOSE=0; ONLY=""
 for a in "$@"; do
@@ -83,6 +86,12 @@ worker_from_cmd() {   # $1 = the process argv
   # One arm per ROUTE, not per model: routes are unversioned and the model is
   # pinned in velo-dispatch. A per-model arm would need editing on every re-pin,
   # and the model a run used is already recorded per row in result.jsonl.
+  # The local endpoint is tested OUTSIDE the case: an unset or empty value would
+  # make the pattern `*""*`, which matches every argv and would name a codex run
+  # velo-local. Guarded here rather than trusted to the caller's environment.
+  if [[ -n "${VELO_LOCAL_BASE_URL:-}" && "$1" == *"$VELO_LOCAL_BASE_URL"* ]]; then
+    echo "velo-local"; return
+  fi
   case "$1" in
     *deepseek/deepseek*)      echo "velo-deepseek" ;;
     *z-ai/glm*)               echo "velo-glm" ;;
