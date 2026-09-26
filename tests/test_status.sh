@@ -90,7 +90,7 @@ cmd_worker() { worker_from_cmd "$1"; }
 # shellcheck source=/dev/null
 . "$BIN/velo-local.conf"
 check "an empty local endpoint does not claim every run" \
-  "$(VELO_LOCAL_BASE_URL='' worker_from_cmd 'codex exec --cd /x')" "velo-codex"
+  "$(VELO_LMSTUDIO_BASE_URL='' VELO_LLAMA_SERVER_URL='' worker_from_cmd 'codex exec --cd /x')" "velo-codex"
 check "live glm names velo-glm"        "$(cmd_worker '--model z-ai/glm-5.3-flash')"          "velo-glm"
 check "live codex names velo-codex"    "$(cmd_worker 'codex exec --cd /x')"                  "velo-codex"
 check "live local names velo-local"    "$(cmd_worker '--model qwen3.8-flash-next-ud --base-url http://127.0.0.1:8091/v1')" "velo-local"

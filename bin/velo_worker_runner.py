@@ -20,7 +20,7 @@ from open_agent_sdk.types import SDKMessageType, SDKResultStatus
 # Runtime corrections to the SDK, applied before any tool can run (#2010).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from velo_zg_tool import ZgQueryTool
-from velo_runner_lib import local_conf, salvage_on_failure  # noqa: E402
+from velo_runner_lib import local_base_url, local_conf, salvage_on_failure  # noqa: E402
 from velo_sdk_patches import (  # noqa: E402
     LEDGER,
     install_context_windows,
@@ -53,7 +53,7 @@ PROVIDERS: dict[str, dict[str, Any]] = {
     "lmstudio": {
         "label": "velo-lmstudio-agent",
         "default_model": os.environ.get("LM_STUDIO_MODEL") or local_conf("VELO_LOCAL_MODEL_DEFAULT"),
-        "default_base_url": os.environ.get("LM_STUDIO_BASE_URL") or local_conf("VELO_LOCAL_BASE_URL"),
+        "default_base_url": os.environ.get("LM_STUDIO_BASE_URL") or local_base_url(),
         "base_url_env": "LM_STUDIO_BASE_URL",
         "api_key_envs": ("LM_STUDIO_API_KEY", "CODEANY_API_KEY"),
         "api_key_fallback": "lm-studio",

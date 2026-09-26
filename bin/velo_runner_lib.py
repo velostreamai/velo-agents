@@ -26,6 +26,18 @@ def local_conf(key: str) -> str:
     raise RuntimeError(f"{conf} does not set {key}")
 
 
+def local_base_url() -> str:
+    """The endpoint worker:local uses right now. Resolved by SOURCING
+    velo-local.conf — the backend choice is shell logic there, and re-deriving it
+    here would be a second definition to drift."""
+    conf = pathlib.Path(__file__).with_name("velo-local.conf")
+    out = subprocess.run(["bash", "-c", f'. "{conf}" && printf %s "${{VELO_LOCAL_BASE_URL:-}}"'],
+                         capture_output=True, text=True, timeout=10)
+    if out.returncode != 0 or not out.stdout:
+        raise RuntimeError(f"{conf} did not resolve VELO_LOCAL_BASE_URL: {out.stderr.strip()}")
+    return out.stdout
+
+
 def _git(root: str, *args: str) -> tuple[int, str]:
     r = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
     return r.returncode, (r.stdout or r.stderr).strip()

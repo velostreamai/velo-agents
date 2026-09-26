@@ -56,6 +56,20 @@ case "${1:-}" in
     [[ -x "$VELO_LLAMA_SERVER" ]] || die "llama-server not found at $VELO_LLAMA_SERVER — run: velo-llama-server setup"
     [[ -f "$GGUF" ]] || die "model not found: $GGUF — run: velo-llama-server setup"
     "$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version'
+    # One copy of the model in memory. At login LM Studio may reload its last
+    # models (it remembers this one); two 84 GB copies do not fit, and a failed
+    # allocation here would make launchd retry every 30 s forever. So if LM
+    # Studio's server is up AND has the model loaded, unload it there first.
+    # Only called when the server already answers: `lms` can start LM Studio's
+    # background service itself, and this must never launch LM Studio.
+    if curl -sf -m 3 "$VELO_LMSTUDIO_BASE_URL/models" >/dev/null 2>&1 && [[ -x "$VELO_LMS" ]] \
+       && "$VELO_LMS" ps --json 2>/dev/null | python3 -c "
+import json, sys
+sys.exit(0 if any(m.get('identifier') == '$VELO_LOCAL_MODEL_DEFAULT' for m in json.load(sys.stdin)) else 1)"; then
+      "$VELO_LMS" unload "$VELO_LOCAL_MODEL_DEFAULT" >/dev/null 2>&1 \
+        && echo "velo-llama-server: unloaded $VELO_LOCAL_MODEL_DEFAULT from LM Studio (one copy in memory)" \
+        || echo "velo-llama-server: WARNING could not unload $VELO_LOCAL_MODEL_DEFAULT from LM Studio" >&2
+    fi
     # Word-splitting VELO_LLAMA_ARGS is intended: it is a flag list.
     # shellcheck disable=SC2086
     exec "$VELO_LLAMA_SERVER" -m "$GGUF" --alias "$VELO_LOCAL_MODEL_DEFAULT" \

@@ -277,6 +277,7 @@ WRAPPER=/Users/neilavery/.agents/bin/velo-openrouter-agent
 . "$(dirname "${BASH_SOURCE[0]}")/velo-local.conf" || die "velo-local.conf missing next to velo-pr-gate"
 [[ -n "${VELO_LOCAL_MODEL_DEFAULT:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_MODEL_DEFAULT"
 LOCAL_MODEL="${VELO_LOCAL_MODEL:-$VELO_LOCAL_MODEL_DEFAULT}"
+[[ -n "${VELO_LOCAL_BASE_URL:-}" ]] || die "velo-local.conf resolved no endpoint (backend '${VELO_LOCAL_BACKEND:-}') — run: velo-local use lmstudio|llama"
 LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-$VELO_LOCAL_BASE_URL}"
 POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 

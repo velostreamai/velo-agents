@@ -92,7 +92,7 @@ worker_from_cmd() {   # $1 = the process argv
   # Both local servers are the local route: the default (LM Studio) and the
   # llama-server alternative. Either may be the one a run was dispatched to.
   local u
-  for u in "${VELO_LOCAL_BASE_URL:-}" "${VELO_LLAMA_SERVER_URL:-}"; do
+  for u in "${VELO_LMSTUDIO_BASE_URL:-}" "${VELO_LLAMA_SERVER_URL:-}"; do
     if [[ -n "$u" && "$1" == *"$u"* ]]; then echo "velo-local"; return; fi
   done
   case "$1" in
