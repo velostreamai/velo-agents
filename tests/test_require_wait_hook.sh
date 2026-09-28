@@ -64,6 +64,37 @@ check "background true but --wait missing entirely -> DENY" \
 check "both present, --wait not the last token -> ALLOW" \
   "velo-pr-gate 2999 scope.md --wait --exec" true 0
 
+# ---- command-POSITION matching (#2285): a MENTION of a gated tool name
+# must never be mistaken for an invocation of it, and every real
+# command-position shape must still be caught. ----
+check "argument to ls is not command position -> ALLOW" \
+  "ls ~/.agents/bin/velo-dispatch" false 0
+check "argument to grep is not command position -> ALLOW" \
+  "grep x .agents/bin/velo-pr-gate" false 0
+check "arguments to diff are not command position -> ALLOW" \
+  "diff a/velo-merge b/velo-merge" false 0
+check "mention inside a quoted string argument -> ALLOW" \
+  'gh pr comment --body "please rerun velo-merge after ci"' false 0
+HEREDOC_MENTION_CMD=$'cat >> notes.md <<\x27EOF\x27\nthis mentions velo-dispatch in body text\nEOF'
+check "mention inside a heredoc body -> ALLOW" \
+  "$HEREDOC_MENTION_CMD" false 0
+
+check "direct invocation, start of string -> DENY" \
+  "velo-dispatch 1 b" false 2
+check "path-prefixed invocation, start of string -> DENY" \
+  "~/.agents/bin/velo-pr-gate 2 s" false 2
+check "chained with && -> DENY" \
+  "cd x && velo-merge 3" false 2
+check "env assignment prefix -> DENY" \
+  "FOO=1 velo-dispatch 1 b" false 2
+check "bash runner prefix -> DENY" \
+  "bash ~/.agents/bin/velo-merge 3" false 2
+check "inside a subshell -> DENY" \
+  "(velo-pr-gate 2 s)" false 2
+TWOLINE_CMD=$'true\nvelo-dispatch 1 b'
+check "invocation on a second physical line -> DENY" \
+  "$TWOLINE_CMD" false 2
+
 # A malformed payload (no tool_input at all) must degrade to allow, not crash
 # the hook and block every unrelated Bash call in the session.
 out=$(echo '{}' | "$HOOK" 2>&1); rc=$?
