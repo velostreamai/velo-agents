@@ -15,6 +15,7 @@
 
 set -uo pipefail
 REPO="velostreamai/velostream"
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
@@ -96,6 +97,20 @@ HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev
   || die "PR #$PR not found"
 
 if [[ -z "$SHA" ]]; then
+  # velo-pr-gate (#2285 Round 2) records the sha it actually dispatched
+  # against at LAUNCH time, before any finding could have been fixed and
+  # committed — a stronger source than the mtime heuristic below, which can
+  # only ever compare timestamps, never identity. Prefer it whenever it
+  # exists; the heuristic remains for reports with no gate directory at all
+  # (older gates, or a report relayed from somewhere velo-pr-gate never ran).
+  GATED_SHA_FILE="$VELO_STATE/gate/$PR/gated.sha"
+  if [[ -f "$GATED_SHA_FILE" ]]; then
+    SHA=$(tr -d '[:space:]' < "$GATED_SHA_FILE")
+    [[ -n "$SHA" ]] && ok "using recorded gate sha from $GATED_SHA_FILE: ${SHA:0:9} (not the live head)"
+  fi
+fi
+
+if [[ -z "$SHA" ]]; then
   # Defaulting to HEAD is right only if the gate ran against HEAD. When the
   # report predates the current head — the usual case after fixing findings and
   # committing before posting — this default silently stamps coverage the gate
@@ -139,8 +154,41 @@ else
   FULL="$HDR"$'\n\n'"$BODY"
 fi
 
+# ---- post-once guard: (pr, gate-name, sha) ----------------------------------
+#
+# This is the ONE place that actually calls `gh pr comment` for a gate result,
+# with two callers that can legitimately race: a human relaying a --wait
+# report by hand, and velo-orchestrd's own step_gates on its next tick.
+# step_gates' own check ("does a header like this already exist in the PR's
+# comments") reads the PR, THEN posts — a window a concurrent caller can land
+# in. Putting the lock and the done-marker in the function that performs the
+# side effect covers every caller by construction, rather than asking each one
+# to remember to guard itself (#2285 Round 2, Integration after PR1).
+POST_DIR="$VELO_STATE/gate/$PR"
+mkdir -p "$POST_DIR"
+POST_KEY="$NAME-${SHA:0:9}"
+POST_DONE="$POST_DIR/.posted-$POST_KEY"
+POST_LOCK="$POST_DIR/.posting-$POST_KEY.lock"
+if [[ -f "$POST_DONE" ]]; then
+  ok "'$NAME' @ ${SHA:0:9} already posted ($(cat "$POST_DONE" 2>/dev/null)) — skipping (idempotent)"
+  exit 0
+fi
+if ! mkdir "$POST_LOCK" 2>/dev/null; then
+  # Someone else is posting this EXACT (pr, name, sha) right now. The common
+  # case is seconds from writing a done-marker, not a stuck process — poll
+  # briefly rather than racing a second `gh pr comment`.
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -f "$POST_DONE" ]] && { ok "'$NAME' @ ${SHA:0:9} was posted concurrently — skipping"; exit 0; }
+    sleep 1
+  done
+  die "another velo-gate-post for '$NAME' @ ${SHA:0:9} on #$PR has held $POST_LOCK for 10s with no done-marker.
+  Check for a stuck process, then: rm -rf $POST_LOCK"
+fi
+trap 'rm -rf "$POST_LOCK"' EXIT
+
 URL=$(gh pr comment "$PR" --repo "$REPO" --body "$FULL" 2>&1 | tail -1) \
   || die "could not post to #$PR: $URL"
+printf 'pid %s at %s\n' "$$" "$(date -u +%FT%TZ)" > "$POST_DONE"
 
 ok "posted '$NAME' to #$PR @ ${SHA:0:9}"
 echo "   $URL"

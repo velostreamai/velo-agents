@@ -28,6 +28,7 @@
 
 set -uo pipefail
 REPO="velostreamai/velostream"
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die()  { printf '\n\033[31mREFUSING TO MERGE:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
@@ -124,6 +125,21 @@ CODE=$(( $(grep -c '^src/' <<<"$FILES" || true) \
         + $(grep -cE '^\.agents/(bin|rules|skills|tasks)/' <<<"$FILES" || true) \
         + $(grep -cE '^\.agents/(install|update)\.sh$' <<<"$FILES" || true) ))
 
+# Mirrors velo-orch-lib.sh's is_agents_only (as of #2285 Round 2) rather than
+# sourcing it: that file is daemon-support tooling built for velo-orchestrd,
+# and having this production entry point depend on it would run the coupling
+# backwards. `.agents/`-only diffs still count as CODE above (gating still
+# applies — code-review, and check-code if src/ is ALSO touched, which by
+# definition it is not here), and STILL need `gate:passed`; the ONLY thing
+# this changes is that ci.yml's own `paths-ignore` means CI never runs a lane
+# for them AT ALL, so the "no CI checks" case below must warn, not die, for
+# this one file-shape — otherwise an .agents/-only PR could never be merged
+# through this tool no matter how thoroughly it was gated by hand.
+AGENTS_ONLY=0
+if [[ -n "${FILES//[[:space:]]/}" ]] && ! grep -qvE '^\.agents/' <<<"$FILES"; then
+  AGENTS_ONLY=1
+fi
+
 echo "── #$PR $TITLE"
 echo "   head $SHORT   mergeable=$MERGEABLE"
 
@@ -139,8 +155,15 @@ case "$CI" in
     # permanently unmergeable through this tool, which just pushes people to
     # merge by hand and skip every other check as well.
     #
-    # Code changes still die: there, "no CI" means something is wrong.
-    if [[ "$CODE" -eq 0 ]]; then
+    # An .agents/-only PR is the SAME shape for the SAME reason (paths-ignore
+    # covers it too) but is NOT "no code" — it still needs gate:passed, per
+    # the CODE sum above. Only the CI expectation is waived here.
+    #
+    # Any OTHER code change still dies: there, "no CI" means something is
+    # wrong (the build lane itself failed to trigger or report).
+    if [[ "$AGENTS_ONLY" -eq 1 ]]; then
+      warn "no CI checks — expected for an .agents/-only PR (ci.yml paths-ignore skips non-Rust paths). Gate reports are what verified this, not CI — the gate check below still applies."
+    elif [[ "$CODE" -eq 0 ]]; then
       warn "no CI checks — expected for a docs/tooling-only PR (ci.yml paths-ignore). Nothing automated has verified this; the PR body must say what did."
     else
       die "no CI checks reported against $SHORT — nothing has verified this build."
@@ -285,5 +308,36 @@ fi
 [[ $FORCE -eq 1 ]] && printf '\033[33mwarn:\033[0m --force: overriding the checks above\n' >&2
 
 echo
+
+# ---- merge-once guard: (pr, head-sha) ---------------------------------------
+#
+# This is the ONE place that calls `gh pr merge`, with two callers that can
+# now legitimately overlap: a session's own --wait loop (re-running this
+# whole script every 60s) and velo-orchestrd's step_merge on its own tick
+# schedule. Both can pass every check above for the SAME head within the same
+# poll window. The guard belongs here, where the side effect happens, not
+# duplicated in each caller (#2285 Round 2, Integration after PR1) — same
+# reasoning as velo-gate-post's post-once guard, one door down.
+MERGE_DIR="$VELO_STATE/gate/$PR"
+mkdir -p "$MERGE_DIR"
+MERGE_DONE="$MERGE_DIR/.merged-$SHORT"
+MERGE_LOCK="$MERGE_DIR/.merging-$SHORT.lock"
+if [[ -f "$MERGE_DONE" ]]; then
+  ok "already merged @ $SHORT ($(cat "$MERGE_DONE" 2>/dev/null)) — skipping (idempotent)"
+  exit 0
+fi
+if ! mkdir "$MERGE_LOCK" 2>/dev/null; then
+  # The common case is seconds from a done-marker, not a stuck process — poll
+  # briefly rather than racing a second `gh pr merge` against the same head.
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -f "$MERGE_DONE" ]] && { ok "merged concurrently @ $SHORT — skipping"; exit 0; }
+    sleep 1
+  done
+  die "another velo-merge for #$PR @ $SHORT has held $MERGE_LOCK for 10s with no done-marker.
+  Check for a stuck process, then: rm -rf $MERGE_LOCK"
+fi
+trap 'rm -rf "$MERGE_LOCK"' EXIT
+
 gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
-  && ok "merged #$PR" || die "gh pr merge failed"
+  && { printf 'pid %s at %s\n' "$$" "$(date -u +%FT%TZ)" > "$MERGE_DONE"; ok "merged #$PR"; } \
+  || die "gh pr merge failed"

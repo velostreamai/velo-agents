@@ -9,19 +9,61 @@
 # Wakes when: a gate reviewer process exits, a dispatched worker exits, or a
 # watched PR's CI checks all finish. Prints what changed.
 #
-# usage: velo-watch [--pr N]... [--interval SECS] [--max SECS]
+# --attention switches to a DIFFERENT wait condition: block until
+# ~/.agents/state/orch/attention.jsonl (velo-orchestrd, #2285 PR2) has an
+# event nobody has acked yet, then exit. This is what closes the loop the
+# daemon opened: the daemon can detect and escalate on its own schedule with
+# nobody watching, but something still has to wake a human/session up when it
+# does — same "its EXIT is the notification" contract as the default mode,
+# a different signal.
+#
+# usage: velo-watch [--pr N]... [--interval SECS] [--max SECS] [--attention]
 set -u
 interval=60
 max=21600
 prs=()
+attention_mode=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) prs+=("$2"); shift 2 ;;
     --interval) interval="$2"; shift 2 ;;
     --max) max="$2"; shift 2 ;;
+    --attention) attention_mode=1; shift ;;
     *) echo "velo-watch: unknown arg $1" >&2; exit 2 ;;
   esac
 done
+
+if [ "$attention_mode" -eq 1 ]; then
+  HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  # shellcheck source=./velo-orch-lib.sh
+  . "$HERE/velo-orch-lib.sh"
+  echo "velo-watch --attention: armed $(date -u +%FT%TZ), polling every ${interval}s"
+  unhandled=$(attention_unhandled)
+  if [ -n "$unhandled" ]; then
+    echo "velo-watch: UNACKED event(s) already waiting $(date -u +%FT%TZ)"
+    printf '%s\n' "$unhandled" | while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      echo "  $(jq -r '"\(.kind) pr=\(.pr) issue=\(.issue): \(.evidence)"' <<<"$line" 2>/dev/null)"
+    done
+    exit 0
+  fi
+  start=$(date +%s)
+  while :; do
+    sleep "$interval"
+    unhandled=$(attention_unhandled)
+    if [ -n "$unhandled" ]; then
+      echo "velo-watch: UNACKED event(s) $(date -u +%FT%TZ)"
+      printf '%s\n' "$unhandled" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        echo "  $(jq -r '"\(.kind) pr=\(.pr) issue=\(.issue): \(.evidence)"' <<<"$line" 2>/dev/null)"
+      done
+      exit 0
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$max" ]; then
+      echo "velo-watch --attention: TIMEOUT after ${max}s, no unacked events — check for a wedge"; exit 1
+    fi
+  done
+fi
 
 gates() {
   ps -eo pid=,command= | grep -E "(codex review|claude -p).*state/gate/[0-9]+/" | grep -v grep \

@@ -1,0 +1,518 @@
+#!/bin/bash
+# velo-orchestrd — the always-on, LLM-free orchestration checker (#2285 PR2).
+#
+#   velo-orchestrd [tick]      run one idempotent tick (default action)
+#   velo-orchestrd install     install the launchd agent (runs every 300s)
+#   velo-orchestrd uninstall   remove the launchd agent
+#   velo-orchestrd status      launchd status + tail of the daemon log
+#
+# Why this exists: `velo-dispatch`, `velo-pr-gate` and `velo-merge` all start
+# detached work and return immediately, and nothing woke the orchestrating
+# session when that work finished (#2285) — six gates and two workers once sat
+# unprocessed for ~8 hours overnight. The fix is not "remember to poll"; it is
+# a mechanical checker that needs no model and runs on its own schedule.
+#
+# Every tick is idempotent: posting and merging are guarded, doubly — a cheap
+# pre-check in step_gates/step_merge below, and the authoritative (pr,
+# gate-name-or-head, sha) lock + done-marker INSIDE velo-gate-post and
+# velo-merge themselves (#2285 Round 2), so a session's own --wait loop and
+# this daemon's tick can never post or merge the same fact twice even when
+# they race. Escalation ids are deduped by content so the same fact is never
+# raised twice either. See .agents/README.md "velo-orchestrd" for the full
+# design.
+#
+# This PR's "Integration after PR1" list — velo-watch --attention, the
+# SessionStart listing, velo-pr-gate recording the gated sha at launch, the
+# shared post/merge-once guard, and the .agents-only merge exception in
+# velo-merge itself — is now done (#2285 Round 2). The one thing this daemon
+# still deliberately does NOT do is auto-merge an .agents/-only PR itself
+# (see step_merge below) — velo-merge can now merge one when a human or a
+# --wait loop calls it directly, but this daemon escalates instead, by
+# policy: tooling changes that alter how every future gate/merge/dispatch
+# behaves get a human's final click, on purpose, even once CI-not-required is
+# handled at the tool level.
+#
+# Bash 3.2 only (macOS system /bin/bash). No associative arrays, no `${x,,}`.
+
+set -uo pipefail
+REPO="velostreamai/velostream"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=./velo-orch-lib.sh
+source "$HERE/velo-orch-lib.sh"
+# shellcheck source=./velo-worktree-lib.sh
+source "$HERE/velo-worktree-lib.sh"
+
+VELO_GATE="${VELO_GATE_BIN:-$HERE/velo-gate}"
+VELO_GATE_POST="${VELO_GATE_POST_BIN:-$HERE/velo-gate-post}"
+VELO_MERGE="${VELO_MERGE_BIN:-$HERE/velo-merge}"
+VELO_DISPATCH="${VELO_DISPATCH_BIN:-$HERE/velo-dispatch}"
+
+WIP_CAP="${VELO_ORCH_WIP_CAP:-4}"
+MIN_DISK_GB="${VELO_ORCH_MIN_DISK_GB:-25}"
+# Two configurable numbers, per the #2285 review's "define wedge in numbers":
+# how long agent.log may sit still (WEDGE_MINUTES) before it counts at all,
+# and a grace period (WEDGE_GRACE_MINUTES) a freshly-dispatched worktree gets
+# before it is even eligible — a brand-new worker's agent.log is legitimately
+# quiet during index build / first-turn setup, and without a grace period
+# that reads as wedged. WEDGE_MINUTES must also stay long enough that a local
+# worker's own slow prefill (measured ~85s per 43K tokens, several per run)
+# does not trip it — 30m default clears that with a wide margin.
+WEDGE_MINUTES="${VELO_ORCH_WEDGE_MINUTES:-30}"
+WEDGE_GRACE_MINUTES="${VELO_ORCH_WEDGE_GRACE_MINUTES:-10}"
+WORKTREE_GLOB="${VELO_ORCH_WORKTREE_GLOB:-$HOME/RustroverProjects/velostream-*}"
+LOG_FILE="${VELO_ORCH_LOG:-$ORCH_DIR/orchestrd.log}"
+LOG_MAX_BYTES="${VELO_ORCH_LOG_MAX_BYTES:-5242880}"
+
+PLIST_LABEL="ai.velostream.orchestrd"
+PLIST_SRC="$(cd "$HERE/.." && pwd)/launchd/$PLIST_LABEL.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+
+log()  { mkdir -p "$ORCH_DIR"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$LOG_FILE"; }
+
+rotate_log_if_needed() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local sz
+  sz=$(stat -f %z "$LOG_FILE" 2>/dev/null || stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  [[ "$sz" -gt "$LOG_MAX_BYTES" ]] || return 0
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+}
+
+# ---- kill switch, auth, global lock ------------------------------------------
+
+is_paused() { [[ -f "$PAUSE_FILE" ]]; }
+
+check_gh_auth() {
+  local out
+  if out=$(gh auth status 2>&1); then
+    return 0
+  fi
+  # Deduped per-day: a broken token stays broken for hours, and re-raising the
+  # same fact every 5 minutes is exactly the noise #2285's own id-dedup rule
+  # exists to prevent.
+  local day; day=$(date -u +%Y-%m-%d)
+  if attention_append "gh-auth:orch:$day" "gh-auth" "" "" "$day" \
+       "gh auth status failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; then
+    log "ESCALATE gh-auth: $(printf '%s' "$out" | head -1)"
+  fi
+  return 1
+}
+
+LOCK_OWNED=0
+acquire_lock() {
+  mkdir -p "$ORCH_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local holder; holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+    if [[ -n "$holder" ]] && orch_pid_alive "$holder"; then
+      return 1
+    fi
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  fi
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  LOCK_OWNED=1
+  return 0
+}
+
+release_lock() {
+  [[ "$LOCK_OWNED" -eq 1 ]] || return 0
+  local holder; holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+  [[ "$holder" == "$$" ]] && rm -rf "$LOCK_DIR"
+}
+
+# ---- detect: finished workers -------------------------------------------------
+#
+# "Finished" means a NEW line landed in ~/.agents/state/records/<issue>.result.jsonl
+# — append-only, one row per worker exit (crash, timeout or clean). Offsets are
+# tracked per issue so a tick never re-reads the whole history, and the escalation
+# id includes the row's own `dispatched_at`, which is unique per run.
+
+step_workers() {
+  [[ -d "$RECORDS_DIR" ]] || return 0
+  mkdir -p "$OFFSETS_DIR"
+  local f issue count offset_file prev_count
+  for f in "$RECORDS_DIR"/*.result.jsonl; do
+    [[ -f "$f" ]] || continue
+    issue=$(basename "$f" .result.jsonl)
+    [[ "$issue" =~ ^[0-9]+$ ]] || continue
+    count=$(grep -c . "$f" 2>/dev/null || echo 0)
+    offset_file="$OFFSETS_DIR/$issue.count"
+    prev_count=0
+    [[ -f "$offset_file" ]] && prev_count=$(cat "$offset_file" 2>/dev/null || echo 0)
+    [[ "$prev_count" =~ ^[0-9]+$ ]] || prev_count=0
+    if [[ "$count" -gt "$prev_count" ]]; then
+      local line n=0 dispatched_at outcome worker
+      while IFS= read -r line; do
+        n=$((n + 1))
+        [[ "$n" -le "$prev_count" ]] && continue
+        [[ -n "$line" ]] || continue
+        dispatched_at=$(jq -r '.dispatched_at // ""' <<<"$line" 2>/dev/null)
+        outcome=$(jq -r '.outcome // "unknown"' <<<"$line" 2>/dev/null)
+        worker=$(jq -r '.worker // "unknown"' <<<"$line" 2>/dev/null)
+        [[ -n "$dispatched_at" ]] || dispatched_at="line-$n"
+        if attention_append "worker-finished:$issue:$dispatched_at" "worker-finished" "" "$issue" "$dispatched_at" \
+             "#$issue worker=$worker outcome=$outcome — verify from git before any PR, never from the worker's own report."; then
+          log "ESCALATE worker-finished #$issue outcome=$outcome"
+        fi
+      done < "$f"
+    fi
+    printf '%s\n' "$count" > "$offset_file"
+  done
+}
+
+# ---- detect + post: gates -----------------------------------------------------
+#
+# "Finished" means the reviewer's pid (persisted by velo-pr-gate's
+# gate_track_pid to "<log>.pid" right after launch) has exited. A gate whose
+# pid file does not exist is NOT assumed finished — it predates the
+# pid-persistence, or was dispatched by something else — so it is left alone
+# rather than guessed at from the log's mtime.
+#
+# Posting always uses the sha recorded in "$GATE_DIR/gated.sha" — written by
+# velo-pr-gate at LAUNCH, before any gate is dispatched (#2285 Round 2). Its
+# absence is still read defensively: escalate rather than ever posting
+# against the CURRENT head, which could stamp coverage the gate never had —
+# it happens for gates dispatched before that write existed, or run some
+# other way entirely.
+#
+# The actual `gh pr comment` call, and the (pr, gate-name, sha) post-once
+# guard against a session's own --wait racing this same tick, both live
+# INSIDE velo-gate-post now (#2285 Round 2) — this loop's own
+# "does a header already exist" check below is a cheap pre-filter that saves
+# calling velo-gate-post at all in the common case, not the enforcement.
+
+step_gates() {
+  local prs pr
+  prs=$(gh pr list --repo "$REPO" --label gate:running --state open --json number 2>/dev/null | jq -r '.[].number')
+  [[ -n "$prs" ]] || return 0
+  for pr in $prs; do
+    local meta head comments needed
+    meta=$(gh pr view "$pr" --repo "$REPO" --json headRefOid,comments 2>/dev/null) || continue
+    head=$(jq -r '.headRefOid' <<<"$meta")
+    comments=$(jq -r '[.comments[].body] | join("\n---\n")' <<<"$meta")
+    needed=$(gate_needed_names "$pr" "$VELO_GATE")
+    [[ -n "$needed" ]] || continue
+
+    local all_approve=1 any_blocked=0 name
+    for name in $needed; do
+      local log_base gate_dir log_file pid_file
+      log_base=$(gate_log_for_name "$name") || { all_approve=0; continue; }
+      gate_dir="$GATE_ROOT/$pr"
+      log_file="$gate_dir/$log_base"
+      pid_file="$log_file.pid"
+      [[ -f "$log_file" ]] || { all_approve=0; continue; }
+
+      if [[ -f "$pid_file" ]]; then
+        local pid; pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && orch_pid_alive "$pid"; then
+          all_approve=0
+          continue   # still running
+        fi
+      else
+        all_approve=0
+        continue   # cannot tell "finished" from "still running" without the pid
+      fi
+
+      local sha_file gated_sha
+      sha_file="$gate_dir/gated.sha"
+      if [[ ! -f "$sha_file" ]]; then
+        if attention_append "gate-nosha:$pr:$head" "gate-nosha" "$pr" "" "$head" \
+             "gate '$name' finished for #$pr but $sha_file does not exist — cannot post without risking a claim of coverage the gate never had. Post by hand: velo-gate-post $pr $name $log_file --sha <the sha this gate ran against>"; then
+          log "ESCALATE gate-nosha #$pr $name"
+        fi
+        all_approve=0
+        continue
+      fi
+      gated_sha=$(tr -d '[:space:]' < "$sha_file")
+      [[ -n "$gated_sha" ]] || { all_approve=0; continue; }
+
+      local header; header="gate: $name @ ${gated_sha:0:9}"
+      if ! grep -qiF "$header" <<<"$comments"; then
+        local post_out post_rc
+        post_out=$("$VELO_GATE_POST" "$pr" "$name" "$log_file" --sha "$gated_sha" 2>&1); post_rc=$?
+        if [[ $post_rc -ne 0 ]]; then
+          if attention_append "gate-post-failed:$pr:$gated_sha:$name" "gate-post-failed" "$pr" "" "$gated_sha" \
+               "velo-gate-post refused '$name' for #$pr @ ${gated_sha:0:9}: $(printf '%s' "$post_out" | tr '\n' ' ' | cut -c1-300)"; then
+            log "ESCALATE gate-post-failed #$pr $name"
+          fi
+          all_approve=0
+          continue
+        fi
+        comments="$comments"$'\n'"$header"   # so a later gate in this same loop sees it too
+        log "POST #$pr $name @ ${gated_sha:0:9}"
+      fi
+
+      local verdict; verdict=$(verdict_of "$(cat "$log_file")")
+      case "$verdict" in
+        approve) : ;;
+        approve-with-findings)
+          all_approve=0
+          if attention_append "gate-findings:$pr:$gated_sha:$name" "gate-findings" "$pr" "" "$gated_sha" \
+               "'$name' returned approve-with-findings for #$pr @ ${gated_sha:0:9} — fix hot-path/wrong-data findings, waive the rest to the nits issue, then re-gate."; then
+            log "ESCALATE gate-findings #$pr $name"
+          fi
+          ;;
+        blocked)
+          all_approve=0; any_blocked=1
+          if attention_append "gate-blocked:$pr:$gated_sha:$name" "gate-blocked" "$pr" "" "$gated_sha" \
+               "'$name' returned blocked for #$pr @ ${gated_sha:0:9} — a fix brief is needed."; then
+            log "ESCALATE gate-blocked #$pr $name"
+          fi
+          ;;
+        *)
+          all_approve=0
+          if attention_append "gate-malformed:$pr:$gated_sha:$name" "gate-malformed" "$pr" "" "$gated_sha" \
+               "'$name' for #$pr @ ${gated_sha:0:9} has no recognisable **Verdict:** line — read $log_file by hand."; then
+            log "ESCALATE gate-malformed #$pr $name"
+          fi
+          ;;
+      esac
+    done
+
+    if [[ "$any_blocked" -eq 1 ]]; then
+      "$VELO_GATE" "$pr" --block >/dev/null 2>&1
+      log "gate:blocked #$pr"
+    elif [[ "$all_approve" -eq 1 ]]; then
+      "$VELO_GATE" "$pr" --pass >/dev/null 2>&1
+      log "gate:passed #$pr"
+    fi
+  done
+}
+
+# ---- merge ---------------------------------------------------------------------
+#
+# Never merges a PR whose diff is entirely under .agents/. velo-merge itself
+# now accepts one of these without CI (#2285 Round 2 — this repo's CI skips
+# non-Rust paths, so no lane ever runs for them, and velo-merge's own
+# AGENTS_ONLY check tells "no CI ran" apart from "something is wrong" for
+# exactly this shape). This daemon deliberately does NOT use that: tooling
+# changes govern how every future gate/merge/dispatch behaves, so this one
+# file-shape always gets a human's final click regardless of what the tool
+# itself now allows. Escalate, never call velo-merge for these at all.
+
+step_merge() {
+  local prs pr
+  prs=$(gh pr list --repo "$REPO" --label gate:passed --state open --json number 2>/dev/null | jq -r '.[].number')
+  [[ -n "$prs" ]] || return 0
+  for pr in $prs; do
+    local meta files head
+    meta=$(gh pr view "$pr" --repo "$REPO" --json files,headRefOid 2>/dev/null) || continue
+    files=$(jq -r '[.files[].path] | join("\n")' <<<"$meta")
+    head=$(jq -r '.headRefOid' <<<"$meta")
+
+    if is_agents_only "$files"; then
+      if attention_append "agents-only-merge:$pr:$head" "agents-only-merge" "$pr" "" "$head" \
+           "#$pr touches only .agents/ paths — auto-merge is refused (CI does not run on tooling-only diffs). Merge by hand once verified."; then
+        log "ESCALATE agents-only-merge #$pr"
+      fi
+      continue
+    fi
+
+    local out rc
+    out=$("$VELO_MERGE" "$pr" 2>&1); rc=$?
+    if [[ $rc -eq 0 ]]; then
+      log "MERGED #$pr"
+    elif grep -q 'CI FAILING' <<<"$out"; then
+      if attention_append "ci-failed:$pr:$head" "ci-failed" "$pr" "" "$head" \
+           "CI is failing on #$pr @ ${head:0:9}: $(grep 'CI FAILING' <<<"$out" | head -1 | cut -c1-300)"; then
+        log "ESCALATE ci-failed #$pr"
+      fi
+    else
+      # Routine and self-healing: stale gate, pending CI, merge conflicts.
+      # None of these need a human paged at 3am — they clear on their own
+      # (re-gate, wait, rebase) and the next tick tries again.
+      log "merge refused #$pr (routine): $(printf '%s' "$out" | tail -1 | cut -c1-200)"
+    fi
+  done
+}
+
+# ---- dispatch --------------------------------------------------------------------
+#
+# Consumes ONE entry from the front of $QUEUE_FILE per tick (FIFO), popping it
+# unconditionally so a malformed or now-mismatched entry cannot wedge every
+# later one behind it. The two things pinned at queue time — the worker label
+# and the brief's sha256 — are re-checked against live state before dispatch.
+
+list_active_worktrees() {   # -> one worktree path per line with a live worker pid
+  local d pid
+  for d in $WORKTREE_GLOB; do
+    [[ -d "$d" ]] || continue
+    pid=$(orch_running_pid_for "$d")
+    [[ -n "$pid" ]] && printf '%s\n' "$d"
+  done
+}
+
+wip_count() { list_active_worktrees | grep -c . ; }
+
+free_disk_gb() { df -g "$HOME" 2>/dev/null | awk 'NR==2{print $4}'; }
+
+queue_pop_head() {
+  local rest; rest=$(tail -n +2 "$QUEUE_FILE" 2>/dev/null)
+  if [[ -n "$rest" ]]; then printf '%s\n' "$rest" > "$QUEUE_FILE"; else : > "$QUEUE_FILE"; fi
+}
+
+step_dispatch() {
+  [[ -s "$QUEUE_FILE" ]] || return 0
+
+  local wip; wip=$(wip_count)
+  if [[ "$wip" -ge "$WIP_CAP" ]]; then
+    log "dispatch: WIP cap reached ($wip/$WIP_CAP) — nothing dispatched"
+    return 0
+  fi
+
+  local disk; disk=$(free_disk_gb)
+  if [[ -z "$disk" || "$disk" -lt "$MIN_DISK_GB" ]]; then
+    local day; day=$(date -u +%Y-%m-%d)
+    if attention_append "low-disk:orch:$day" "low-disk" "" "" "$day" \
+         "only ${disk:-?}GB free (< ${MIN_DISK_GB}GB) — dispatch paused until this clears."; then
+      log "ESCALATE low-disk ${disk:-?}GB"
+    fi
+    return 0
+  fi
+
+  local line; line=$(head -1 "$QUEUE_FILE")
+  queue_pop_head
+  [[ -n "$line" ]] || return 0
+
+  local issue brief worker brief_sha256
+  issue=$(jq -r '.issue // ""' <<<"$line" 2>/dev/null)
+  brief=$(jq -r '.brief // ""' <<<"$line" 2>/dev/null)
+  worker=$(jq -r '.worker // ""' <<<"$line" 2>/dev/null)
+  brief_sha256=$(jq -r '.brief_sha256 // ""' <<<"$line" 2>/dev/null)
+
+  if [[ -z "$issue" || -z "$brief" || ! -f "$brief" ]]; then
+    log "dispatch: malformed/unreadable queue head, dropped: $(printf '%s' "$line" | cut -c1-200)"
+    return 0
+  fi
+
+  local cur_labels cur_worker cur_sha256
+  cur_labels=$(gh issue view "$issue" --repo "$REPO" --json labels --jq '[.labels[].name]|join(",")' 2>/dev/null)
+  cur_worker=$(tr ',' '\n' <<<"$cur_labels" | grep '^worker:' | head -1)
+  cur_worker="${cur_worker#worker:}"
+  cur_sha256=$(shasum -a 256 "$brief" 2>/dev/null | awk '{print $1}')
+
+  if [[ "$cur_worker" != "$worker" || "$cur_sha256" != "$brief_sha256" ]]; then
+    if attention_append "dispatch-mismatch:$issue:$brief_sha256" "dispatch-mismatch" "" "$issue" "$brief_sha256" \
+         "queue pinned worker=$worker sha256=${brief_sha256:0:12} but the issue now has worker:${cur_worker:-<none>} and the brief now hashes to ${cur_sha256:0:12} — dropped, re-queue after resolving."; then
+      log "ESCALATE dispatch-mismatch #$issue"
+    fi
+    return 0
+  fi
+
+  log "dispatch: #$issue -> worker:$worker (wip $wip/$WIP_CAP)"
+  "$VELO_DISPATCH" "$issue" "$brief" >> "$LOG_FILE" 2>&1
+}
+
+# ---- wedge + STOP detection -------------------------------------------------------
+
+step_wedge_and_stop() {
+  local d issue
+  for d in $WORKTREE_GLOB; do
+    [[ -d "$d" ]] || continue
+    issue="${d##*-}"
+    [[ "$issue" =~ ^[0-9]+$ ]] || issue="$(basename "$d")"
+
+    if wt_stop_fired "$d"; then
+      local stamp; stamp=$(wt_agentlog_last "$d")
+      if attention_append "stop:$issue:$stamp" "stop" "" "$issue" "$stamp" \
+           "agent.log in $d recorded a STOP-trigger activation."; then
+        log "ESCALATE stop #$issue"
+      fi
+      continue   # a STOPped worker is not also a wedge
+    fi
+
+    local pid; pid=$(orch_running_pid_for "$d")
+    [[ -n "$pid" ]] || continue
+    local age; age=$(wt_agentlog_age_min "$d")
+    [[ -n "$age" ]] || continue
+    [[ "$age" -ge "$WEDGE_GRACE_MINUTES" ]] || continue
+    [[ "$age" -ge "$WEDGE_MINUTES" ]] || continue
+    local bucket=$(( age / WEDGE_MINUTES ))
+    if attention_append "wedge:$issue:$bucket" "wedge" "" "$issue" "$bucket" \
+         "agent.log in $d has not grown for ${age}m (pid $pid still alive; threshold ${WEDGE_MINUTES}m, grace ${WEDGE_GRACE_MINUTES}m)."; then
+      log "ESCALATE wedge #$issue age=${age}m"
+    fi
+  done
+}
+
+# ---- launchd install / uninstall / status ----------------------------------------
+
+usage() {
+  cat <<'EOF'
+velo-orchestrd — the always-on, LLM-free orchestration checker (#2285 PR2).
+
+  velo-orchestrd [tick]      run one idempotent tick (default)
+  velo-orchestrd install     install the launchd agent (runs every 300s)
+  velo-orchestrd uninstall   remove the launchd agent
+  velo-orchestrd status      launchd status + tail of the daemon log
+
+Kill switch: touch ~/.agents/state/orch/paused to stop every future tick;
+remove it to resume. Unhandled events: velo-attention list / ack.
+EOF
+}
+
+cmd_install() {
+  mkdir -p "$(dirname "$PLIST_DST")" "$ORCH_DIR"
+  [[ -f "$PLIST_SRC" ]] || { echo "ERROR: no plist source at $PLIST_SRC" >&2; return 1; }
+  sed "s#__BIN__#$HOME/.agents/bin#g; s#__HOME_DIR__#$HOME#g; s#__LOG__#$ORCH_DIR/orchestrd.log#g; s#__ERRLOG__#$ORCH_DIR/orchestrd.err.log#g" \
+    "$PLIST_SRC" > "$PLIST_DST"
+  launchctl bootout "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" \
+    && launchctl enable "gui/$(id -u)/$PLIST_LABEL" \
+    && echo "installed: $PLIST_DST (every 300s, logs to $ORCH_DIR/orchestrd.log)"
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1
+  rm -f "$PLIST_DST"
+  echo "uninstalled: $PLIST_DST"
+}
+
+cmd_status() {
+  launchctl print "gui/$(id -u)/$PLIST_LABEL" 2>&1 | head -20
+  echo
+  echo "-- last 10 lines of $LOG_FILE --"
+  tail -10 "$LOG_FILE" 2>/dev/null || echo "(no log yet)"
+}
+
+cmd_tick() {
+  if is_paused; then
+    log "PAUSED ($PAUSE_FILE exists) — skipping tick"
+    echo "paused — $PAUSE_FILE exists"
+    return 0
+  fi
+  check_gh_auth || { echo "gh auth failed — escalated, skipping tick"; return 1; }
+
+  if ! acquire_lock; then
+    log "lock held by another tick — skipping"
+    echo "another tick is already running — skipping"
+    return 0
+  fi
+  trap release_lock EXIT
+
+  rotate_log_if_needed
+  log "TICK start"
+  step_workers
+  step_gates
+  step_merge
+  step_dispatch
+  step_wedge_and_stop
+  log "TICK end"
+  echo "tick complete"
+}
+
+main() {
+  local cmd="${1:-tick}"
+  case "$cmd" in
+    tick) cmd_tick ;;
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    status) cmd_status ;;
+    -h|--help) usage ;;
+    *) usage >&2; return 1 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

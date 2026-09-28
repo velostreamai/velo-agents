@@ -216,6 +216,24 @@ trap 'rm -rf "$GATE_LOCK"' EXIT
 # One directory per PR, so pruning is a directory walk with no glob to get
 # wrong — and no symlink between here and the files.
 find "$VELO_STATE/gate" -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+
+# >>> velo-gated-sha (extracted verbatim by tests/test_pr_gate_launch.sh)
+# Recorded at LAUNCH, before any gate is dispatched — not derived later from
+# whatever HEAD happens to be at POSTING time, which is the exact defect that
+# stamped PR #2141's review two commits stale and collapsed #2123's next range
+# to empty. velo-gate-post and velo-orchestrd (#2285 PR2) both read this file
+# rather than the PR's live head; its absence means escalate, never "assume
+# current head" (#2285 Round 2, Integration after PR1).
+#
+# Computed here — before the NEEDS_SPEC/NEEDS_REVIEW dispatches below, not
+# inside the NEEDS_REVIEW block the way it used to live — so a check-spec-only
+# run (NEEDS_REVIEW=0) still gets a gated.sha, and the printed
+# `velo-gate-post ... --sha` hint further down is never empty for that shape.
+HEAD=$(git -C "$WTPATH" rev-parse --short HEAD 2>/dev/null)
+[[ -n "$HEAD" ]] || die "could not resolve HEAD in $WTPATH"
+printf '%s\n' "$HEAD" > "$GATE_DIR/gated.sha"
+# <<< velo-gated-sha
+
 # Set AFTER the dispatches are known to be alive (#2005) — see the end of the
 # script. Marking a PR gate:running for a gate that died on quota is how a PR
 # ends up with three gate comments and zero independent scrutiny.
@@ -311,7 +329,21 @@ POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 # re-derived from `ps` afterwards, which would still have to work out which
 # `codex`/`claude`/velo-local process belongs to THIS PR — exactly the
 # disambiguation the per-PR GATE_DIR already exists to avoid.
+#
+# gate_track_pid is the ONE place both records are written: the in-process
+# GATE_PIDS array --wait uses to `wait` on its own children below, and the
+# persisted "<log>.pid" file a SEPARATE process (velo-orchestrd, #2285 PR2)
+# reads across ticks to tell a reviewer has exited without having been the
+# one that forked it. Four call sites used to each own this bookkeeping
+# independently (#2285 Round 2) — one function is what stops the two records
+# drifting apart at a site that forgets one half.
+# >>> velo-gate-track-pid (extracted verbatim by tests/test_pr_gate_launch.sh)
 GATE_PIDS=()
+gate_track_pid() {  # $1 = pid, $2 = log path (pid persisted to $2.pid)
+  GATE_PIDS+=("$1")
+  printf '%s\n' "$1" > "$2.pid"
+}
+# <<< velo-gate-track-pid
 
 dispatch_local() {  # $1 = skill, $2 = log suffix
   local skill="$1" log="$GATE_DIR/$2.log"
@@ -322,6 +354,7 @@ dispatch_local() {  # $1 = skill, $2 = log suffix
   # Global, not local: the caller needs this pid for GATE_PIDS, and `local`
   # would die with the function's return.
   LAST_DISPATCH_PID=$!
+  gate_track_pid "$LAST_DISPATCH_PID" "$log"
   ok "$skill -> velo-local (pid $LAST_DISPATCH_PID)  log: $log"
 }
 
@@ -458,7 +491,6 @@ fi
 # routing table in this file's header for the measurement that moved it.
 if [[ $NEEDS_SPEC -eq 1 ]]; then
   dispatch_local check-spec spec
-  GATE_PIDS+=("$LAST_DISPATCH_PID")
 fi
 
 if [[ $NEEDS_REVIEW -eq 1 ]]; then
@@ -467,7 +499,6 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # Hand-writing the whole brief each time is what produced a review that came
   # back as a task handle, and another that wrote into a live PR worktree.
   BASE=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null)
-  HEAD=$(git -C "$WTPATH" rev-parse --short HEAD 2>/dev/null)
   # Match ANY review gate, not just 'codex-review'. The old pattern was literal,
   # so a review recorded under any other name — including a declared substitute
   # when Codex was unavailable — left GSHA empty and the range silently widened
@@ -693,8 +724,8 @@ EOF
     # report and let a human run it.
     nohup sh -c "cd '$WTPATH' && claude -p --model opus --effort high --permission-mode dontAsk --disallowed-tools 'Edit Write NotebookEdit' < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
     CODE_PID=$!
+    gate_track_pid "$CODE_PID" "$CODE_LOG"
     GATE_DISPATCHED=1
-    GATE_PIDS+=("$CODE_PID")
     ok "check-code -> opus:high (pid $CODE_PID)  log: $CODE_LOG"
     [[ $EXEC -eq 1 ]] && warn "--exec does not apply to check-code: it stays read-only by construction."
   elif [[ $NEEDS_CODE -eq 1 ]]; then
@@ -714,8 +745,8 @@ EOF
       # which killed the leg at launch every time (#2171).
       nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
       CODEX_PID=$!
+      gate_track_pid "$CODEX_PID" "$CODEX_LOG"
       GATE_DISPATCHED=1
-      GATE_PIDS+=("$CODEX_PID")
       ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
       gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
       warn "--exec: sandbox BYPASSED — the reviewer can compile, run tests, AND write."
@@ -732,8 +763,8 @@ EOF
       # to exactly that, a fix agent writing into the worktree concurrently.
       nohup sh -c "cd '$WTPATH' && codex review -c sandbox_mode=read-only - < '$OUT'" > "$CODEX_LOG" 2>&1 &
       CODEX_PID=$!
+      gate_track_pid "$CODEX_PID" "$CODEX_LOG"
       GATE_DISPATCHED=1
-      GATE_PIDS+=("$CODEX_PID")
       ok "code-review -> codex (pid $CODEX_PID, sandbox_mode=read-only)  log: $CODEX_LOG"
       gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
     fi
@@ -771,7 +802,7 @@ EOF
         --task "$(printf '%s\n\n' '=== THIS IS A READ-ONLY REVIEW TASK ==='; cat "$OUT")" \
         > "$SECOND_LOG" 2>&1 &
     SECOND_PID=$!
-    GATE_PIDS+=("$SECOND_PID")
+    gate_track_pid "$SECOND_PID" "$SECOND_LOG"
     ok "second-opinion -> velo-local (pid $SECOND_PID, non-blocking)  log: $SECOND_LOG"
     echo "     Leads to verify, not a verdict. Its silence proves nothing."
   fi

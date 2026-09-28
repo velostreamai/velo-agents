@@ -26,6 +26,9 @@ and the tests** — never from the worker's self-report.
     velo-merge                     merge only if gated against the CURRENT head
     velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
     velo-spec-review               attest a spec was read; --check has Codex REVIEW it
+    velo-orchestrd                 always-on LLM-free checker (#2285 PR2): detect/post/merge/dispatch/escalate
+    velo-attention                 list/ack unhandled events from velo-orchestrd
+    velo-orch-lib.sh               helpers shared by velo-orchestrd + velo-attention
     velo-worktree-lib.sh           worktree derivations shared by velo-status + velo-record
     zg                             discovery-search shim — the `zg` the policy tells workers to run
     velo_worker_runner.py          the one worker runner, two provider profiles
@@ -53,6 +56,10 @@ and the tests** — never from the worker's self-report.
     test_zg_hidden.sh              zg can see .agents/ — both routes, and the index
     test_history_routing.sh        the re-dispatch guard: tiers, failure modes, bad records
     test_worker_env.py             the worker can run the tools its policy names
+    test_orchestrd.sh              velo-orchestrd: detect, post, merge, dispatch, escalate, idempotency
+    test_attention.sh              velo-attention: list/ack, dedup, acked ids stay acked
+  launchd/
+    ai.velostream.orchestrd.plist  source template for the velo-orchestrd launchd agent
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
     velo-brief-spec.md             what a task brief MUST contain, and why
@@ -85,6 +92,15 @@ Runtime state lives **outside the repo**, under `$VELO_STATE` (default
   spec/<issue>/
     review-<UTC>.log       one `--check` round's report
     rounds.jsonl           the round ledger: verdict, spec hash, findings
+  records/<issue>.result.jsonl   every dispatch's OUTCOME row (velo-orchestrd watches this)
+  orch/
+    attention.jsonl        one line per event needing a human — see "velo-orchestrd" below
+    acked-ids              ids a human has already handled (velo-attention ack)
+    queue.jsonl            pending dispatches: {issue, brief, worker, brief_sha256}
+    offsets/<issue>.count  how far velo-orchestrd has read each records/*.result.jsonl
+    paused                 touch this to stop every future tick; rm to resume
+    .lock/                 one tick at a time (mkdir lock, pid inside)
+    orchestrd.log          the daemon's own reasoning trail, rotated at 5MB
 ```
 
 This was `/tmp` until four separate defects traced to it: a fixture race
@@ -1005,6 +1021,154 @@ somereviewer | velo-gate-post 1902 check-code -  # or from stdin
 It refuses an empty report, enforces a lowercase-kebab gate name, defaults the
 SHA to the PR's current head, and warns (rather than back-dating) when you
 record against an older one.
+
+---
+
+## `velo-orchestrd` — the always-on checker
+
+`velo-dispatch`, `velo-pr-gate` and `velo-merge` all start detached work and
+return immediately, and nothing used to wake the orchestrating session when
+that work finished — six gates and two workers once sat unprocessed overnight
+for ~8 hours (#2285). `velo-orchestrd` is the fix: a macOS `launchd` agent that
+runs every 300s, needs no model, and does five mechanical things per tick —
+**detect, post, merge, dispatch, escalate**. It never asks a question a script
+cannot answer; anything that needs judgement goes to `attention.jsonl` instead.
+
+```bash
+velo-orchestrd tick         # run one idempotent tick by hand (also the default)
+velo-orchestrd install      # render + load ~/Library/LaunchAgents/ai.velostream.orchestrd.plist
+velo-orchestrd uninstall    # bootout + remove the plist
+velo-orchestrd status       # launchctl status + tail of orchestrd.log
+```
+
+**Kill switch.** `touch ~/.agents/state/orch/paused` stops every future tick
+cold, before it does anything else — including the `gh auth status` check.
+`rm` it to resume. The daemon merges PRs unattended, so there must be a
+one-command way to stop it.
+
+**Every tick, in order:**
+
+1. **Paused?** — exit immediately if `orch/paused` exists.
+2. **`gh auth status`** — escalate (kind `gh-auth`, deduped per day) and exit
+   if it fails, rather than silently doing nothing every 5 minutes forever.
+3. **Global lock** — `orch/.lock` (mkdir, pid inside, dead-holder reclaimed).
+   One tick at a time; a second one skips rather than interleaving.
+4. **Detect finished workers** — a NEW line in
+   `~/.agents/state/records/<issue>.result.jsonl` (offset-tracked per issue)
+   escalates `worker-finished`. Verify from git before any PR — never from
+   the worker's own report.
+5. **Detect + post finished gates** — a gate counts as finished when the
+   reviewer's pid (persisted to `<log>.pid` by `velo-pr-gate`'s
+   `gate_track_pid` — the single write-site it shares with PR1's in-process
+   `GATE_PIDS`, so the two records can never drift apart at a launch site
+   that forgets one half) has exited. Posting always uses the sha recorded in
+   `gate/<pr>/gated.sha`, written by `velo-pr-gate` **at launch, before any
+   gate is dispatched** — its absence still escalates (`gate-nosha`) rather
+   than risk stamping coverage the gate never had, but that is now the
+   exceptional case (a gate dispatched before this file existed, or run some
+   other way), not the normal one. Before posting it checks the PR's own
+   comments for that exact `gate: <name> @ <sha>` header — a session's own
+   fast path may have posted it first — and the actual `gh pr comment` call
+   plus the authoritative `(pr, gate-name, sha)` lock + done-marker live
+   INSIDE `velo-gate-post` itself, so a session relaying a `--wait` report by
+   hand and this tick can never both post the same fact even if they race
+   past this cheap pre-check at the same moment.
+   - every needed gate **approve** → `velo-gate <pr> --pass`
+   - any gate **blocked** → `velo-gate <pr> --block` + escalate `gate-blocked`
+   - any gate **approve-with-findings** → escalate `gate-findings`, label untouched
+   - a missing or unrecognised `**Verdict:**` line → escalate `gate-malformed`,
+     label untouched. Real local-model output has drifted to `request-changes`
+     and to `blocked.` (with a trailing period) — the parser is strict, not
+     the report format.
+6. **Merge** — for every `gate:passed` PR: refuse (and escalate
+   `agents-only-merge`) if every changed file is under `.agents/` — by
+   POLICY, not because the tool can't: `velo-merge` itself now accepts an
+   `.agents/`-only PR with no CI (ci.yml's `paths-ignore` skips non-Rust
+   paths entirely, which is not "something is wrong" for this one
+   file-shape), but tooling changes govern how every future gate/merge/
+   dispatch behaves, so this daemon always defers that one file-shape to a
+   human's final click regardless of what the tool now allows. For every
+   other PR, run the real `velo-merge <pr>`; a stale-gate or CI-pending
+   refusal is routine and self-healing (no escalation, next tick retries); a
+   genuine CI failure escalates `ci-failed`. The actual `gh pr merge` call and
+   its own `(pr, head-sha)` lock + done-marker live INSIDE `velo-merge`
+   itself, so a session's own `--wait` loop and this daemon's tick can never
+   both merge the same head.
+7. **Dispatch** — pop one entry from `orch/queue.jsonl`
+   (`{issue, brief, worker, brief_sha256}`, FIFO, popped unconditionally so a
+   bad entry cannot wedge everything behind it) when fewer than
+   `VELO_ORCH_WIP_CAP` (default 4) workers are live and at least
+   `VELO_ORCH_MIN_DISK_GB` (default 25) is free. The pinned worker label and
+   brief sha256 are **re-checked against live state** before dispatch — a
+   mismatch drops the entry and escalates `dispatch-mismatch` rather than
+   retrying a decision that is now wrong on every future tick.
+8. **Wedge / STOP** — for every live worktree (`VELO_ORCH_WORKTREE_GLOB`,
+   default `~/RustroverProjects/velostream-*`) whose worker pid is still
+   alive: a STOP-trigger line in `agent.log` escalates `stop`; no `agent.log`
+   growth for `VELO_ORCH_WEDGE_MINUTES` (default 30) — after a
+   `VELO_ORCH_WEDGE_GRACE_MINUTES` (default 10) grace period so a
+   freshly-dispatched worker's quiet index-build isn't mistaken for a wedge —
+   escalates `wedge`.
+
+**`attention.jsonl`** (`~/.agents/state/orch/attention.jsonl`) is one JSON
+line per event: `{id, kind, pr, issue, sha, evidence, ts}`. The `id` — built
+as `<kind>:<pr-or-issue>:<sha>` — is the only dedup key: appending the same id
+twice is a no-op, so a fact that hasn't changed is never re-escalated, and a
+new commit / new outcome naturally produces a new id.
+
+```bash
+velo-attention list          # every UNACKED event, oldest first
+velo-attention ack <id>      # mark one handled
+velo-attention ack --all     # mark every currently-unhandled event handled
+velo-watch --attention       # BLOCK until one exists, then exit — run this
+                              # in the background instead of polling `list`
+```
+
+There is no "unack" — the acked-ids file is a durable ledger of what a human
+has already seen, not a queue a background process can silently drain.
+
+### Integration after PR1 — done (#2285 Round 2)
+
+This PR (`tooling/orchestrd`) started against `tooling/wait-and-enforce` (PR1)
+still in flight, and deliberately did not touch `velo-dispatch`, `velo-merge`,
+`velo-watch` or its hooks in its first round. PR1 has since merged
+(`3436e0367`); all four deferred edits landed in the same PR, on top of a
+rebase that resolved the resulting conflict in `velo-pr-gate` by keeping BOTH
+PR1's in-process `GATE_PIDS` (what `--wait` itself waits on — a real `wait
+<pid>` needs a direct child of the SAME shell) and this PR's persisted
+`<log>.pid` (what a SEPARATE process, this daemon, reads across ticks),
+unified behind one `gate_track_pid` call per launch site:
+
+- **`velo-watch --attention`** — shipped. Blocks until `attention.jsonl` has
+  an event nobody has acked, then exits; sources `velo-orch-lib.sh` so
+  "unhandled" means the same thing here, in `velo-attention`, and in the
+  daemon.
+- **The `SessionStart` hook** (`session-start-inflight.sh`) — shipped. Lists
+  unhandled attention events alongside in-flight gates/workers/PRs, and
+  recommends `velo-watch --attention` specifically (in addition to the plain
+  `velo-watch`) whenever one exists.
+- **`velo-pr-gate` recording the gated sha at launch** — shipped. Computed
+  once, before ANY gate is dispatched (moved out of the `code-review`-only
+  block it used to live in, so a check-spec-only run gets one too) and
+  written to `gate/<pr>/gated.sha`. `velo-gate-post` now prefers this file
+  over the PR's live head whenever `--sha` is omitted, not just this daemon.
+- **The shared post/merge-once guard** — shipped, but not where the original
+  plan put it. Rather than threading a lock through every `--wait` caller
+  AND this daemon separately, the `(pr, gate-name, sha)` lock + done-marker
+  for posting lives INSIDE `velo-gate-post`, and the `(pr, head-sha)` lock +
+  done-marker for merging lives INSIDE `velo-merge` — the one place each
+  side effect (`gh pr comment`, `gh pr merge`) actually happens. Every caller
+  — a human relaying a `--wait` report by hand, a `--wait` loop re-polling,
+  or this daemon's own tick — is covered by construction, with nothing left
+  for a caller to remember.
+- **The `.agents`-only merge exception** — shipped in `velo-merge` itself (a
+  `.agents/`-only PR with no CI now merges with a warn, not a die — gating
+  still applies, only the CI expectation is waived, since ci.yml's
+  `paths-ignore` means no lane ever runs for this shape at all). This
+  daemon deliberately does NOT use that new capability — `step_merge` still
+  refuses and escalates (`agents-only-merge`) for these, by policy: tooling
+  changes govern every future gate/merge/dispatch, so they always get a
+  human's final click here, regardless of what the tool itself now allows.
 
 ---
 

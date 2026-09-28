@@ -75,6 +75,38 @@ if command -v gh >/dev/null 2>&1; then
   fi
 fi
 
+# ---- unhandled orchestrator attention events (velo-orchestrd, #2285 PR2) ---
+# The daemon can detect and escalate a fact on its own schedule with nobody
+# watching — that is its whole job. But if the PREVIOUS session's own --wait
+# call died with the session (the exact gap this hook exists to close, one
+# layer up), the escalation just sits in attention.jsonl until something
+# asks. Ask here, sourcing the same library the daemon and velo-attention use
+# so "unhandled" means the same thing in all three places. Resolved relative
+# to THIS script's own directory, not an installed copy: hooks run from
+# $CLAUDE_PROJECT_DIR/.agents/hooks/ per .claude/settings.json, and are never
+# copied into ~/.agents by install.sh, so the sibling bin/ next to the
+# checked-out hook is the only copy guaranteed to exist here.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORCH_LIB="$HOOK_DIR/../bin/velo-orch-lib.sh"
+ATTENTION_LINES=""
+if [[ -f "$ORCH_LIB" ]]; then
+  # shellcheck source=../bin/velo-orch-lib.sh
+  . "$ORCH_LIB"
+  ATTENTION_RAW=$(attention_unhandled 2>/dev/null || true)
+  if [[ -n "$ATTENTION_RAW" ]]; then
+    ATTENTION_LINES=$(printf '%s\n' "$ATTENTION_RAW" | while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      jq -r '"  " + .kind + " pr=" + (.pr|tostring) + " issue=" + (.issue|tostring) + ": " + .evidence' <<<"$line" 2>/dev/null
+    done)
+  fi
+fi
+NEED_ATTENTION_WATCH=0
+if [[ -n "$ATTENTION_LINES" ]]; then
+  FOUND=1
+  NEED_ATTENTION_WATCH=1
+  SECTIONS+=$'unhandled orchestrator attention event(s) (velo-attention list for the full record):\n'"$ATTENTION_LINES"$'\n\n'
+fi
+
 [[ "$FOUND" -eq 0 ]] && exit 0
 
 # Dedupe PR_NUMS (a PR can show up in both scans above).
@@ -93,6 +125,19 @@ with it, but the detached work above did not stop. Re-arm the watch now so
 this session is woken when it finishes, rather than finding out hours late:
 
   ~/.agents/bin/velo-watch$WATCH_ARGS
+$( [[ "$NEED_ATTENTION_WATCH" -eq 1 ]] && cat <<'ATTN'
+
+There is also at least one unhandled attention event above. That watch exits
+on a gate/worker/CI change; this one exits the moment ANY attention event (or
+a new one) is still unacked, which is the more direct signal for what is
+listed above:
+
+  ~/.agents/bin/velo-watch --attention
+
+velo-attention ack <id> once you have handled one, or velo-attention ack
+--all once you have handled everything currently listed.
+ATTN
+)
 
 Run it via run_in_background: true, exactly like any other detached-work
 watch — its EXIT is the notification.

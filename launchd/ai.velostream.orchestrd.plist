@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ai.velostream.orchestrd.plist — versioned SOURCE for the velo-orchestrd
+  launchd agent (#2285 PR2).
+
+  This file is a TEMPLATE: `velo-orchestrd install` renders it to
+  ~/Library/LaunchAgents/ai.velostream.orchestrd.plist, substituting:
+    __BIN__     ->  $HOME/.agents/bin      (PATH must include this — it does
+                                             not inherit the login shell's PATH)
+    __LOG__     ->  $HOME/.agents/state/orch/orchestrd.log
+    __ERRLOG__  ->  $HOME/.agents/state/orch/orchestrd.err.log
+
+  Do not edit ~/Library/LaunchAgents/ai.velostream.orchestrd.plist by hand —
+  re-run `velo-orchestrd install`, which re-renders it from this file.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.velostream.orchestrd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__/velo-orchestrd</string>
+    <string>tick</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__BIN__:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME_DIR__</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__ERRLOG__</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

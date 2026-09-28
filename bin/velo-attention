@@ -1,0 +1,79 @@
+#!/bin/bash
+# velo-attention — the session's view of ~/.agents/state/orch/attention.jsonl.
+#
+#   velo-attention list             unhandled (unacked) events, oldest first
+#   velo-attention ack <id>         mark one event handled
+#   velo-attention ack --all        mark every currently-unhandled event handled
+#
+# "Unhandled" is defined once, in velo-orch-lib.sh, and read by both this
+# command and (in a follow-up PR, per #2285's "Integration after PR1") the
+# SessionStart hook — so a human acking an event here is exactly what makes it
+# stop showing up there. There is deliberately no "unack": the acked-ids file
+# is an append-only ledger of what a human has already seen, not a queue.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./velo-orch-lib.sh
+source "$HERE/velo-orch-lib.sh"
+
+die() { printf '\nERROR: %s\n\n' "$1" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+velo-attention — read and acknowledge ~/.agents/state/orch/attention.jsonl
+
+  velo-attention list          unhandled events, oldest first, one per line
+  velo-attention ack <id>      mark one event handled
+  velo-attention ack --all     mark every currently-unhandled event handled
+EOF
+}
+
+cmd_list() {
+  local rows n
+  rows=$(attention_unhandled)
+  if [[ -z "$rows" ]]; then
+    echo "no unhandled attention events"
+    return 0
+  fi
+  n=$(printf '%s\n' "$rows" | grep -c .)
+  echo "$n unhandled attention event(s):"
+  echo
+  printf '%s\n' "$rows" | while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    jq -r '"  [\(.kind)] \(.id)\n    pr=\(.pr) issue=\(.issue) sha=\(.sha) ts=\(.ts)\n    \(.evidence)\n"' <<<"$row"
+  done
+}
+
+cmd_ack() {
+  local arg="${1:-}"
+  [[ -n "$arg" ]] || die "usage: velo-attention ack <id>|--all"
+  if [[ "$arg" == "--all" ]]; then
+    local rows n=0
+    rows=$(attention_unhandled)
+    [[ -n "$rows" ]] || { echo "nothing to ack"; return 0; }
+    printf '%s\n' "$rows" | while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      local id; id=$(jq -r '.id' <<<"$row")
+      attention_ack "$id"
+      n=$((n + 1))
+      echo "  acked $id"
+    done
+    return 0
+  fi
+  attention_ack "$arg"
+  echo "acked $arg"
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    list) cmd_list ;;
+    ack) shift; cmd_ack "${1:-}" ;;
+    -h|--help|"") usage ;;
+    *) usage >&2; return 1 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

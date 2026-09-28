@@ -40,6 +40,7 @@ bash "$HERE/test_gate_health.sh" || RC=1
 bash "$HERE/test_second_opinion.sh" || RC=1
 bash "$HERE/test_local_backend.sh" || RC=1
 bash "$HERE/test_gate_post_sha.sh" || RC=1
+bash "$HERE/test_gate_post_once.sh" || RC=1
 bash "$HERE/test_gate_template_guard.sh" || RC=1
 bash "$HERE/test_spec_review_worker.sh" || RC=1
 bash "$HERE/test_gate_routing.sh" || RC=1
@@ -51,6 +52,7 @@ echo "── --wait / detached-work enforcement ──────────�
 bash "$HERE/test_require_wait_hook.sh" || RC=1
 bash "$HERE/test_dispatch_wait.sh" || RC=1
 bash "$HERE/test_pr_gate_wait.sh" || RC=1
+bash "$HERE/test_pr_gate_launch.sh" || RC=1
 echo
 echo "── brief fields ───────────────────────────────────────"
 bash "$HERE/test_brief_fields.sh" || RC=1
@@ -85,6 +87,7 @@ echo "── zg discovery tool ────────────────�
 echo
 echo "── merge gate staleness ───────────────────────────────"
 bash "$HERE/test_merge_gates.sh" || RC=1
+bash "$HERE/test_merge_once.sh" || RC=1
 echo
 echo "── routing: label vs spec ─────────────────────────────"
 bash "$HERE/test_routing.sh" || RC=1
@@ -98,6 +101,12 @@ echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
 bash "$HERE/test_billed_invariant.sh" || RC=1
+echo
+echo "── orchestrator daemon (#2285 PR2 + Round 2 integration) ─"
+bash "$HERE/test_orchestrd.sh" || RC=1
+bash "$HERE/test_attention.sh" || RC=1
+bash "$HERE/test_watch_attention.sh" || RC=1
+bash "$HERE/test_session_start_attention.sh" || RC=1
 echo
 echo "── tool preamble ─────────────────────────────────────"
 "$PY" "$HERE/test_tool_contract.py" || RC=1
