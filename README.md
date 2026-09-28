@@ -689,6 +689,12 @@ A worker's own report is not evidence. A worker that commits looks "unchanged"
 to its runner, and one that emits a tool call as plain text reports success
 having executed nothing (`velo-status` flags that as `LEAKED`).
 
+Always invoke `velo-dispatch` with `--wait`, via a Bash tool call with
+`run_in_background: true`, instead of manually polling as above — a
+PreToolUse hook (`.agents/hooks/require-wait.sh`) enforces this and denies
+the call otherwise, because a detached run that finishes with nobody
+watching is exactly how a completed dispatch went unnoticed for 8 hours.
+
 ### 6. Read what the run actually cost — `<issue>.result.jsonl`
 
 Every dispatch appends one record when its worker exits, written by `velo-record`
@@ -965,6 +971,10 @@ yourself is NOT gating it — that is how an ungated PR gets described as ready.
 for the commit it ran against; a PR was once green against a commit that had
 already been replaced. `velo-merge` compares that SHA to `headRefOid` and
 refuses on mismatch.
+
+Always invoke `velo-pr-gate` with `--wait`, via a Bash tool call with
+`run_in_background: true` — the same PreToolUse hook enforces this and denies
+the call otherwise, so a finished review can no longer go unnoticed.
 
 **One label, several gates.** `gate:passed` is a single label, but a `src/` PR
 runs up to three gates. `velo-merge` therefore cross-checks the gates

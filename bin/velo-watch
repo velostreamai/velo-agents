@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# velo-watch — block until detached velo work changes state, then exit.
+#
+# Gate reviewers (velo-pr-gate) and dispatched workers (velo-dispatch) run
+# detached, so the orchestrating session is never notified when they finish.
+# Run this as a background command: its EXIT is the notification. Re-arm it
+# after handling each wake-up.
+#
+# Wakes when: a gate reviewer process exits, a dispatched worker exits, or a
+# watched PR's CI checks all finish. Prints what changed.
+#
+# usage: velo-watch [--pr N]... [--interval SECS] [--max SECS]
+set -u
+interval=60
+max=21600
+prs=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pr) prs+=("$2"); shift 2 ;;
+    --interval) interval="$2"; shift 2 ;;
+    --max) max="$2"; shift 2 ;;
+    *) echo "velo-watch: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+
+gates() {
+  ps -eo pid=,command= | grep -E "(codex review|claude -p).*state/gate/[0-9]+/" | grep -v grep \
+    | sed -E 's#^ *([0-9]+) .*state/gate/([0-9]+)/([a-z-]+)[.-].*#\2:\3#' | sort -u
+}
+# A worker's exit is recorded by its supervisor as a new line in
+# ~/.agents/state/records/<issue>.result.jsonl — that is the authoritative
+# signal (process command lines do not reliably carry the worktree path).
+workers() {
+  for f in "$HOME"/.agents/state/records/*.result.jsonl; do
+    [ -f "$f" ] && echo "$(basename "$f" .result.jsonl):$(wc -l < "$f" | tr -d ' ')"
+  done | sort
+}
+running_workers() {
+  ps -eo command= | grep -E "velo-openai-agents-runner|velo_worker_runner|velo-openrouter-agent|velo-local-agent|velo-vercel-runner" \
+    | grep -v grep | wc -l | tr -d ' '
+}
+ci_pending() {
+  for p in "${prs[@]+"${prs[@]}"}"; do
+    if gh pr checks "$p" --repo velostreamai/velostream 2>/dev/null | grep -qE "\bpending\b"; then
+      echo "$p"
+    fi
+  done
+}
+
+g0=$(gates); w0=$(workers); c0=$(ci_pending)
+echo "velo-watch: armed $(date -u +%FT%TZ)"
+echo "  gates:   $(echo $g0)"
+echo "  workers running: $(running_workers)"
+echo "  ci-pending: $(echo $c0)"
+if [ -z "$g0$c0" ] && [ "$(running_workers)" = 0 ]; then
+  echo "velo-watch: nothing running to watch"; exit 0
+fi
+
+start=$(date +%s)
+while :; do
+  sleep "$interval"
+  g1=$(gates); w1=$(workers); c1=$(ci_pending)
+  gdone=$(comm -23 <(echo "$g0") <(echo "$g1") | grep -v '^$')
+  wdone=$(comm -13 <(echo "$w0") <(echo "$w1") | grep -v '^$' | cut -d: -f1)
+  cdone=$(comm -23 <(echo "$c0" | sort) <(echo "$c1" | sort) | grep -v '^$')
+  if [ -n "$gdone$wdone$cdone" ]; then
+    echo "velo-watch: CHANGED $(date -u +%FT%TZ)"
+    [ -n "$gdone" ] && echo "  gate finished:   $(echo $gdone)"
+    [ -n "$wdone" ] && echo "  worker finished: $(echo $wdone)"
+    [ -n "$cdone" ] && echo "  CI finished:     $(echo $cdone)"
+    echo "  still running: gates=[$(echo $g1)] workers=$(running_workers) ci=[$(echo $c1)]"
+    exit 0
+  fi
+  if [ $(( $(date +%s) - start )) -ge "$max" ]; then
+    echo "velo-watch: TIMEOUT after ${max}s, nothing changed — check for a wedge"; exit 1
+  fi
+done

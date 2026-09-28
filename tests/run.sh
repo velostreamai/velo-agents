@@ -47,6 +47,11 @@ echo
 echo "── dispatch preflight (end-to-end) ────────────────────"
 bash "$HERE/test_dispatch_preflight.sh" || RC=1
 echo
+echo "── --wait / detached-work enforcement ──────────────────"
+bash "$HERE/test_require_wait_hook.sh" || RC=1
+bash "$HERE/test_dispatch_wait.sh" || RC=1
+bash "$HERE/test_pr_gate_wait.sh" || RC=1
+echo
 echo "── brief fields ───────────────────────────────────────"
 bash "$HERE/test_brief_fields.sh" || RC=1
 echo

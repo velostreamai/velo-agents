@@ -2,6 +2,12 @@
 # velo-pr-gate — run every gate a PR needs, each on the right model.
 #
 #   velo-pr-gate <pr> <scope-file>     dispatch the local gates, print the rest
+#   velo-pr-gate <pr> <scope-file> --wait   dispatch, then BLOCK until every
+#                                       reviewer process it launched has
+#                                       exited, printing each report's verdict
+#                                       and HIGH/MEDIUM lines. Exits 0. Without
+#                                       --wait this returns the moment the
+#                                       gates are launched, exactly as before.
 #   velo-pr-gate <pr> --plan           show what would run, dispatch nothing
 #
 # Why this exists: `velo-gate --plan` says WHICH gates a PR needs, but nothing
@@ -116,14 +122,15 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
-PR="${1:-}"; SCOPE=""; EXEC=0
+PR="${1:-}"; SCOPE=""; EXEC=0; WAIT=0
 for a in "${@:2}"; do
   case "$a" in
     --exec) EXEC=1 ;;
+    --wait) WAIT=1 ;;
     *)      [[ -z "$SCOPE" ]] && SCOPE="$a" ;;
   esac
 done
-[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] | <pr> --plan"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] | <pr> --plan"
 
 PLAN=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null) || die "PR #$PR not found"
 echo "$PLAN"
@@ -269,6 +276,24 @@ gate_health_check() {   # $1 = pid, $2 = log, $3 = gate name
   return 1
 }
 
+# `codex review -` writes its own transcript into review.log, and the actual
+# report is the LAST message in it — everything from the line that is exactly
+# "codex" to EOF (confirmed against real logs: `## Codex review — PR N @ sha`
+# always immediately follows the final bare "codex" line). Earlier occurrences
+# of that same literal line are turn markers from the transcript, not the
+# report, so taking the FIRST one would return an intermediate turn instead of
+# the final verdict on any multi-turn review.
+gate_final_codex_message() {  # $1 = review.log path
+  awk '
+    $0 == "codex" { start = NR + 1 }
+    { line[NR] = $0 }
+    END {
+      if (start == 0) { for (i = 1; i <= NR; i++) print line[i]; exit }
+      for (i = start; i <= NR; i++) print line[i]
+    }
+  ' "$1" 2>/dev/null
+}
+
 # Through the wrapper, so the local GATES move with the workers rather than
 # staying on a runtime nobody remembers is still in use.
 WRAPPER=/Users/neilavery/.agents/bin/velo-openrouter-agent
@@ -281,13 +306,23 @@ LOCAL_MODEL="${VELO_LOCAL_MODEL:-$VELO_LOCAL_MODEL_DEFAULT}"
 LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-$VELO_LOCAL_BASE_URL}"
 POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 
+# Every pid this script launches, in launch order — --wait blocks on all of
+# them (see the end of the script). Tracked as they are launched rather than
+# re-derived from `ps` afterwards, which would still have to work out which
+# `codex`/`claude`/velo-local process belongs to THIS PR — exactly the
+# disambiguation the per-PR GATE_DIR already exists to avoid.
+GATE_PIDS=()
+
 dispatch_local() {  # $1 = skill, $2 = log suffix
   local skill="$1" log="$GATE_DIR/$2.log"
   nohup "$WRAPPER" --model "$LOCAL_MODEL" --base-url "$LMSTUDIO_URL" \
       --policy "$POLICY" --skill "$skill" \
       --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
       --task "$(cat "$SCOPE")" > "$log" 2>&1 &
-  ok "$skill -> velo-local (pid $!)  log: $log"
+  # Global, not local: the caller needs this pid for GATE_PIDS, and `local`
+  # would die with the function's return.
+  LAST_DISPATCH_PID=$!
+  ok "$skill -> velo-local (pid $LAST_DISPATCH_PID)  log: $log"
 }
 
 # >>> velo-fail-to-pass-merge (extracted verbatim by tests/test_fail_to_pass.sh)
@@ -421,7 +456,10 @@ fi
 
 # check-code is dispatched to Codex alongside code-review below — see the
 # routing table in this file's header for the measurement that moved it.
-[[ $NEEDS_SPEC -eq 1 ]] && dispatch_local check-spec spec
+if [[ $NEEDS_SPEC -eq 1 ]]; then
+  dispatch_local check-spec spec
+  GATE_PIDS+=("$LAST_DISPATCH_PID")
+fi
 
 if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # Generate the review brief. Everything that is invariant is written HERE, so
@@ -656,6 +694,7 @@ EOF
     nohup sh -c "cd '$WTPATH' && claude -p --model opus --effort high --permission-mode dontAsk --disallowed-tools 'Edit Write NotebookEdit' < '$CODE_BRIEF'" > "$CODE_LOG" 2>&1 &
     CODE_PID=$!
     GATE_DISPATCHED=1
+    GATE_PIDS+=("$CODE_PID")
     ok "check-code -> opus:high (pid $CODE_PID)  log: $CODE_LOG"
     [[ $EXEC -eq 1 ]] && warn "--exec does not apply to check-code: it stays read-only by construction."
   elif [[ $NEEDS_CODE -eq 1 ]]; then
@@ -676,6 +715,7 @@ EOF
       nohup sh -c "cd '$WTPATH' && codex review - < '$OUT'" > "$CODEX_LOG" 2>&1 &
       CODEX_PID=$!
       GATE_DISPATCHED=1
+      GATE_PIDS+=("$CODEX_PID")
       ok "code-review -> codex (pid $CODEX_PID)  log: $CODEX_LOG"
       gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
       warn "--exec: sandbox BYPASSED — the reviewer can compile, run tests, AND write."
@@ -693,6 +733,7 @@ EOF
       nohup sh -c "cd '$WTPATH' && codex review -c sandbox_mode=read-only - < '$OUT'" > "$CODEX_LOG" 2>&1 &
       CODEX_PID=$!
       GATE_DISPATCHED=1
+      GATE_PIDS+=("$CODEX_PID")
       ok "code-review -> codex (pid $CODEX_PID, sandbox_mode=read-only)  log: $CODEX_LOG"
       gate_health_check "$CODEX_PID" "$CODEX_LOG" "code-review"
     fi
@@ -729,7 +770,9 @@ EOF
         --policy "$POLICY" --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
         --task "$(printf '%s\n\n' '=== THIS IS A READ-ONLY REVIEW TASK ==='; cat "$OUT")" \
         > "$SECOND_LOG" 2>&1 &
-    ok "second-opinion -> velo-local (pid $!, non-blocking)  log: $SECOND_LOG"
+    SECOND_PID=$!
+    GATE_PIDS+=("$SECOND_PID")
+    ok "second-opinion -> velo-local (pid $SECOND_PID, non-blocking)  log: $SECOND_LOG"
     echo "     Leads to verify, not a verdict. Its silence proves nothing."
   fi
 
@@ -780,3 +823,41 @@ if [[ "${GATE_RUNNING_PENDING:-0}" -eq 1 ]]; then
   fi
   ~/.agents/bin/velo-gate "$PR" --running >/dev/null 2>&1 && ok "gate:running"
 fi
+
+# >>> velo-pr-gate-wait (extracted verbatim by tests/test_pr_gate_wait.sh)
+# ---- --wait: block until every launched reviewer has exited ----------------
+#
+# `wait <pid>` on a pid started with `nohup ... &` earlier IN THIS SAME SHELL
+# is a direct wait on a real child process — no polling needed here the way
+# velo-dispatch's --wait has to poll a file, because these processes ARE this
+# script's children, not a detached supervisor's.
+if [[ $WAIT -eq 1 ]]; then
+  if [[ ${#GATE_PIDS[@]} -eq 0 ]]; then
+    warn "--wait: nothing was dispatched for #$PR — nothing to wait for."
+  else
+    echo
+    echo "── --wait: blocking on ${#GATE_PIDS[@]} gate process(es): ${GATE_PIDS[*]} ──"
+    for gp in "${GATE_PIDS[@]}"; do
+      wait "$gp" 2>/dev/null
+    done
+    echo "── all gate processes for #$PR have exited ─────────────────────────"
+
+    if [[ -f "${CODE_LOG:-}" ]]; then
+      echo
+      echo "── check-code report ($CODE_LOG) ──"
+      grep -E 'Verdict|HIGH|MEDIUM' "$CODE_LOG" | sed 's/^/    /'
+    fi
+    if [[ -f "${CODEX_LOG:-}" ]]; then
+      echo
+      echo "── code-review (codex) final message ($CODEX_LOG) ──"
+      gate_final_codex_message "$CODEX_LOG" | grep -E 'Verdict|HIGH|MEDIUM' | sed 's/^/    /'
+    fi
+  fi
+  # Explicit, not incidental: under `set -o pipefail` the last pipeline above
+  # is a `grep` that exits 1 when a clean report has no HIGH/MEDIUM line, and
+  # that would otherwise become THIS SCRIPT's exit code. --wait's contract is
+  # unconditional exit 0 — reporting is what it does, not a verdict — so state
+  # it rather than let a lucky grep match decide it.
+  exit 0
+fi
+# <<< velo-pr-gate-wait

@@ -4,7 +4,15 @@
 #
 # Usage:
 #   velo-dispatch <issue> <brief-file> [--branch <name>] [--dry-run] [--force]
-#                                      [--resume]
+#                                      [--resume] [--wait]
+#
+# --wait blocks until the detached supervisor records the worker's exit (a new
+# line in ~/.agents/state/records/<issue>.result.jsonl), then prints the
+# outcome, the branch's commits, and the worker's agent.log STOP/MUTATION-PROOF
+# lines. Exits 0 when the worker landed, non-zero when it failed or stopped.
+# Without --wait the launch returns immediately, exactly as before: a detached
+# run that finishes with nobody watching is how gates and workers went
+# unnoticed for 8 hours.
 #
 # --resume continues an EXISTING worktree instead of cutting a fresh one: the
 # tree, the branch and the commits on it are left exactly as they are and a new
@@ -66,13 +74,17 @@ warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
 ISSUE="${1:-}"; BRIEF="${2:-}"; shift 2 2>/dev/null || true
-BRANCH=""; DRY=0; FORCE=0; RESUME=0; SAME_TIER_REASON=""
+BRANCH=""; DRY=0; FORCE=0; RESUME=0; WAIT=0; SAME_TIER_REASON=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --force) FORCE=1; shift ;;
     --resume) RESUME=1; shift ;;
+    # Block until the detached supervisor records the worker's exit, instead of
+    # returning the moment it is launched. See the wait loop right after the
+    # nohup dispatch below for why a result.jsonl line count is the signal used.
+    --wait) WAIT=1; shift ;;
     # Deliberately takes a REASON rather than being a bare flag (#2120). A bare
     # --same-tier would be typed reflexively the second time anyone hit the
     # guard; having to state why this attempt differs from the one that failed
@@ -84,7 +96,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force] [--resume] [--same-tier <reason>]"
+[[ -n "$ISSUE" && -n "$BRIEF" ]] || die "usage: velo-dispatch <issue> <brief-file> [--branch N] [--dry-run] [--force] [--resume] [--wait] [--same-tier <reason>]"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "issue must be a number, got '$ISSUE'"
 
 # Open the audit log now: the issue number is validated, so the path is safe to
@@ -1535,6 +1547,14 @@ esac
 #
 # velo-record is observational and always exits 0; it can never fail a run that
 # has already finished. The `|| true` is belt and braces on that promise.
+#
+# --wait's baseline: the line count BEFORE the launch below, taken here rather
+# than after `&` returns, so a worker that finishes in the same second the
+# nohup is issued cannot be missed by a watcher that only starts counting once
+# the launch line has already returned control.
+WAIT_RECORD_FILE="${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl"
+WAIT_BASELINE_LINES=0
+[[ -f "$WAIT_RECORD_FILE" ]] && WAIT_BASELINE_LINES=$(wc -l < "$WAIT_RECORD_FILE" | tr -d ' ')
 nohup bash -c '
   LOGF="$1"; RI="$2"; RWT="$3"; RNAME="$4"; RMODEL="$5"
   RBRIEF="$6"; RSTART="$7"; RMT="$8"; RBASE="$9"
@@ -1564,3 +1584,47 @@ echo
 echo "  Detached. The supervisor records the outcome when the worker exits,"
 echo "  including on crash or timeout. Still verify from git and the tests,"
 echo "  never from the worker's self-report."
+
+# ---- --wait: block until the supervisor appends the exit record ------------
+#
+# The authoritative signal is a NEW line in result.jsonl, not the supervisor
+# pid dying — the supervisor outlives the worker just long enough to run
+# velo-record, and polling the pid instead would wake one velo-record write
+# too early, before the outcome exists to read.
+# >>> velo-dispatch-wait (extracted verbatim by tests/test_dispatch_wait.sh)
+if [[ $WAIT -eq 1 ]]; then
+  echo
+  echo "── --wait: blocking until #$ISSUE's exit is recorded ──────────────"
+  WAIT_INTERVAL="${VELO_WAIT_INTERVAL:-30}"
+  while :; do
+    CUR_LINES=0
+    [[ -f "$WAIT_RECORD_FILE" ]] && CUR_LINES=$(wc -l < "$WAIT_RECORD_FILE" | tr -d ' ')
+    [[ "$CUR_LINES" -gt "$WAIT_BASELINE_LINES" ]] && break
+    sleep "$WAIT_INTERVAL"
+  done
+  RESULT_LINE=$(tail -n "+$((WAIT_BASELINE_LINES + 1))" "$WAIT_RECORD_FILE" | head -1)
+  OUTCOME=$(python3 -c 'import json,sys
+print(json.loads(sys.argv[1]).get("outcome","unknown"))' "$RESULT_LINE" 2>/dev/null)
+  [[ -n "$OUTCOME" ]] || OUTCOME="unknown"
+
+  echo
+  echo "── #$ISSUE exited — outcome: $OUTCOME ──────────────────────────────"
+  echo "$RESULT_LINE"
+  echo
+  echo "  git -C $WT log --oneline origin/master..HEAD"
+  git -C "$WT" log --oneline origin/master..HEAD 2>&1 | sed 's/^/    /'
+  echo
+  if [[ -f "$WT/agent.log" ]]; then
+    echo "  $WT/agent.log — STOP/REAL/MUTATION-PROOF lines:"
+    grep -E 'STOP|REAL|MUTATION-PROOF' "$WT/agent.log" | sed 's/^/    /'
+  else
+    warn "no agent.log at $WT/agent.log — the worker never wrote the mandated reasoning trail"
+  fi
+  echo
+
+  case "$OUTCOME" in
+    landed) ok "landed"; exit 0 ;;
+    *) warn "outcome is '$OUTCOME', not landed"; exit 1 ;;
+  esac
+fi
+# <<< velo-dispatch-wait

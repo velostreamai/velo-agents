@@ -1,7 +1,16 @@
 #!/bin/bash
 # velo-merge — merge a PR only if it has been gated against its CURRENT head.
 #
-#   velo-merge <pr> [--force]
+#   velo-merge <pr> [--force] [--wait]
+#
+# --wait polls every 60s, re-running the exact single-shot check below each
+# time, until it either merges (conditions hold) or hits a DEFINITIVE failure
+# that waiting cannot fix: CI failed, gate:blocked, or the head moved past the
+# gated sha (STALE GATE) — plus a real merge conflict, and a PR that is
+# CLOSED/MERGED/not found, on the same footing. Everything else (CI pending,
+# gate still running, a missing gate-post comment someone might still add) is
+# treated as "not yet" and retried, bounded by a 6h timeout. Without --wait
+# this runs once, exactly as before.
 #
 # This is the enforcement point. Everything else records state; this refuses to
 # act on bad state. Three things must hold:
@@ -23,9 +32,60 @@ die()  { printf '\n\033[31mREFUSING TO MERGE:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
-PR="${1:-}"; FORCE=0
-[[ "${2:-}" == "--force" ]] && FORCE=1
-[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-merge <pr> [--force]"
+PR="${1:-}"; FORCE=0; WAIT=0
+# Unrecognized 2nd+ args are silently ignored, matching the single check this
+# replaces ([[ "${2:-}" == "--force" ]]) — no new refusal for existing callers.
+for a in "${@:2}"; do
+  case "$a" in
+    --force) FORCE=1 ;;
+    --wait)  WAIT=1 ;;
+  esac
+done
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-merge <pr> [--force] [--wait]"
+
+# >>> velo-merge-wait (extracted verbatim by tests/test_merge_wait.sh)
+# ---- --wait: poll until the SAME checks below hold or definitively fail -----
+#
+# Every check past this point is a die() in the single-shot path below, so its
+# state space is read back OUT OF that die()'s own message text rather than
+# re-implemented: this re-invokes the UNMODIFIED script for every poll, so the
+# check body can never drift from the single-shot behaviour it is polling, and
+# a caller who never passes --wait sees byte-identical behaviour to before.
+if [[ $WAIT -eq 1 ]]; then
+  SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  WAIT_INTERVAL="${VELO_MERGE_WAIT_INTERVAL:-60}"
+  WAIT_MAX="${VELO_MERGE_WAIT_MAX:-21600}"   # 6h — same default velo-watch uses
+  WSTART=$(date +%s)
+  ATTEMPT=0
+  while :; do
+    ATTEMPT=$((ATTEMPT + 1))
+    if [[ $FORCE -eq 1 ]]; then
+      WOUT=$(bash "$SELF" "$PR" --force 2>&1)
+    else
+      WOUT=$(bash "$SELF" "$PR" 2>&1)
+    fi
+    WRC=$?
+    echo "$WOUT"
+    [[ $WRC -eq 0 ]] && exit 0
+
+    # DEFINITIVE — waiting cannot make these true. The three the brief names
+    # (CI failed, gate:blocked, head moved past the gated sha) plus a real
+    # merge conflict and a PR that is closed/merged/nonexistent, on the same
+    # footing: none of these resolve by the clock ticking.
+    if grep -qE 'CI FAILING against|gate:blocked|STALE GATE|mergeable=CONFLICTING| is CLOSED| is MERGED|PR #[0-9]+ not found' <<<"$WOUT"; then
+      echo
+      warn "--wait: definitive failure on attempt $ATTEMPT — not retrying. See above."
+      exit 1
+    fi
+    if [[ $(( $(date +%s) - WSTART )) -ge "$WAIT_MAX" ]]; then
+      echo
+      warn "--wait: TIMEOUT after ${WAIT_MAX}s ($ATTEMPT attempts) — still not mergeable. Check for a wedge."
+      exit 1
+    fi
+    sleep "$WAIT_INTERVAL"
+  done
+fi
+# <<< velo-merge-wait
 
 M=$(gh pr view "$PR" --repo "$REPO" \
      --json headRefOid,labels,files,state,title,mergeable,statusCheckRollup 2>/dev/null) \
