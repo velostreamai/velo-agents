@@ -1,8 +1,8 @@
 #!/bin/bash
 # velo-llama-server — serve the worker:local model with llama-server.
 #
-#   velo-llama-server setup       one-shot, idempotent: brew llama.cpp + model + service
-#   velo-llama-server fetch       download any missing model shard (shared with velo-local-setup)
+#   velo-llama-server setup       one-shot, idempotent: pinned llama.cpp build + model + service
+#   velo-llama-server fetch       download any missing model shard or MTP head (shared with velo-local-setup)
 #   velo-llama-server install     write + load the launchd agent (starts now, and at login)
 #   velo-llama-server uninstall   unload + remove the launchd agent (frees the model's memory)
 #   velo-llama-server status      is it up, which build, which model
@@ -10,8 +10,8 @@
 #
 # Binary, model, endpoint and flags all come from velo-local.conf — the same file
 # the dispatcher reads — so the server and its clients cannot disagree.
-# Why llama-server and not LM Studio's API, and why Homebrew's build: see the
-# measurements in velo-local.conf.
+# Why llama-server and not LM Studio's API, and why unsloth's fork rather than
+# Homebrew's build (MTP): see the measurements in velo-local.conf.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
@@ -27,6 +27,25 @@ PORT="${URL##*:}"; PORT="${PORT%%/*}"
 HOST="${URL#*://}"; HOST="${HOST%%:*}"
 read -r -a SHARDS <<<"$VELO_LOCAL_GGUF_SHARDS"
 GGUF="$VELO_LOCAL_GGUF_DIR/${SHARDS[0]}"   # llama.cpp finds the other shards itself
+MTP="$VELO_LOCAL_GGUF_DIR/$VELO_LOCAL_MTP"
+
+# One file from the model's Hugging Face repo: size-checked, resumable, idempotent.
+hf_fetch() {  # <subdir in repo> <file name>
+  local repo sub want have dest
+  repo="${VELO_LOCAL_HF%%/*}/$(cut -d/ -f2 <<<"$VELO_LOCAL_HF")"
+  sub="$1"; dest="$VELO_LOCAL_GGUF_DIR/$2"
+  want=$(curl -fsSL "https://huggingface.co/api/models/$repo/tree/main/$sub" \
+    | python3 -c 'import json,sys; n=sys.argv[1]; print(next(f["size"] for f in json.load(sys.stdin) if f["path"].endswith("/"+n)))' "$2") \
+    || die "could not read the size of $2 from huggingface.co/$repo"
+  have=$(stat -f %z "$dest" 2>/dev/null || echo 0)
+  if [[ "$have" == "$want" ]]; then ok "present: $2"; return 0; fi
+  echo "  .. downloading $2 ($((want / 1000000000)) GB; resumes if interrupted)"
+  curl -fL --retry 10 --retry-delay 10 -C - -o "$dest" \
+    "https://huggingface.co/$repo/resolve/main/$sub/$2" || die "download failed: $2 (re-run setup to resume)"
+  have=$(stat -f %z "$dest")
+  [[ "$have" == "$want" ]] || die "size mismatch for $2: $have != $want (re-run setup to resume)"
+  ok "downloaded: $2"
+}
 
 install_agent() {
   # The plist records THIS script's path. Installing from a worktree would point
@@ -55,6 +74,10 @@ case "${1:-}" in
   run)
     [[ -x "$VELO_LLAMA_SERVER" ]] || die "llama-server not found at $VELO_LLAMA_SERVER — run: velo-llama-server setup"
     [[ -f "$GGUF" ]] || die "model not found: $GGUF — run: velo-llama-server setup"
+    [[ -f "$MTP" ]] || die "MTP head not found: $MTP — run: velo-llama-server fetch"
+    # llama.cpp's own env vars, because the message has spaces (see velo-local.conf).
+    export LLAMA_ARG_THINK_BUDGET="$VELO_LLAMA_THINK_BUDGET"
+    export LLAMA_ARG_THINK_BUDGET_MESSAGE="$VELO_LLAMA_THINK_BUDGET_MESSAGE"
     "$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version'
     # One copy of the model in memory. At login LM Studio may reload its last
     # models (it remembers this one); two 84 GB copies do not fit, and a failed
@@ -80,10 +103,16 @@ sys.exit(0 if any(m.get('identifier') == '$VELO_LOCAL_MODEL_DEFAULT' for m in js
     if [[ -x "$VELO_LLAMA_SERVER" ]]; then
       ok "llama.cpp present: $("$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version')"
     else
-      command -v brew >/dev/null || die "Homebrew not found — install it from https://brew.sh first"
-      brew install llama.cpp || die "brew install llama.cpp failed"
-      [[ -x "$VELO_LLAMA_SERVER" ]] || die "installed, but not at $VELO_LLAMA_SERVER — fix velo-local.conf"
-      ok "llama.cpp installed"
+      [[ "$(uname -sm)" == "Darwin arm64" ]] || die "the pinned build is macOS arm64 only; set VELO_LLAMA_SERVER in velo-local.conf"
+      tarball="llama-$VELO_LLAMA_FORK_TAG-bin-macos-arm64.tar.gz"
+      mkdir -p "$VELO_LLAMA_FORK_DIR"
+      echo "  .. downloading llama.cpp $VELO_LLAMA_FORK_TAG (unslothai/llama.cpp)"
+      curl -fL --retry 5 -o "$VELO_LLAMA_FORK_DIR/$tarball" \
+        "https://github.com/unslothai/llama.cpp/releases/download/$VELO_LLAMA_FORK_TAG/$tarball" \
+        || die "download failed: $tarball"
+      tar xzf "$VELO_LLAMA_FORK_DIR/$tarball" -C "$VELO_LLAMA_FORK_DIR" || die "could not unpack $tarball"
+      [[ -x "$VELO_LLAMA_SERVER" ]] || die "unpacked, but no llama-server at $VELO_LLAMA_SERVER — fix velo-local.conf"
+      ok "llama.cpp installed: $("$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version')"
     fi
     "$0" fetch || exit 1
     install_agent
@@ -93,22 +122,8 @@ sys.exit(0 if any(m.get('identifier') == '$VELO_LOCAL_MODEL_DEFAULT' for m in js
     ;;
   fetch)
     mkdir -p "$VELO_LOCAL_GGUF_DIR"
-    repo="${VELO_LOCAL_HF%%/*}/$(cut -d/ -f2 <<<"$VELO_LOCAL_HF")"
-    sub="$(cut -d/ -f3- <<<"$VELO_LOCAL_HF")"
-    for s in "${SHARDS[@]}"; do
-      dest="$VELO_LOCAL_GGUF_DIR/$s"
-      want=$(curl -fsSL "https://huggingface.co/api/models/$repo/tree/main/$sub" \
-        | python3 -c 'import json,sys; n=sys.argv[1]; print(next(f["size"] for f in json.load(sys.stdin) if f["path"].endswith("/"+n)))' "$s") \
-        || die "could not read the size of $s from huggingface.co/$repo"
-      have=$(stat -f %z "$dest" 2>/dev/null || echo 0)
-      if [[ "$have" == "$want" ]]; then ok "model shard present: $s"; continue; fi
-      echo "  .. downloading $s ($((want / 1000000000)) GB; resumes if interrupted)"
-      curl -fL --retry 10 --retry-delay 10 -C - -o "$dest" \
-        "https://huggingface.co/$repo/resolve/main/$sub/$s" || die "download failed: $s (re-run setup to resume)"
-      have=$(stat -f %z "$dest")
-      [[ "$have" == "$want" ]] || die "size mismatch for $s: $have != $want (re-run setup to resume)"
-      ok "model shard downloaded: $s"
-    done
+    for sh in "${SHARDS[@]}"; do hf_fetch "$(cut -d/ -f3- <<<"$VELO_LOCAL_HF")" "$sh"; done
+    hf_fetch "$VELO_LOCAL_MTP_HF_DIR" "$VELO_LOCAL_MTP"
     ;;
   install)   install_agent ;;
   uninstall)

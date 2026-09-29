@@ -39,6 +39,7 @@ echo "── gate health (end-to-end) ──────────────
 bash "$HERE/test_gate_health.sh" || RC=1
 bash "$HERE/test_second_opinion.sh" || RC=1
 bash "$HERE/test_local_backend.sh" || RC=1
+bash "$HERE/test_llama_server_run.sh" || RC=1
 bash "$HERE/test_gate_post_sha.sh" || RC=1
 bash "$HERE/test_gate_post_once.sh" || RC=1
 bash "$HERE/test_gate_template_guard.sh" || RC=1
