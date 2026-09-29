@@ -12,7 +12,22 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH="$(cd "$HERE/.." && pwd)/bin/velo-dispatch"
 FAILED=0
-TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
+TMPD=$(mktemp -d)
+# Every background wait loop this test starts. `kill $PID` alone stops only the
+# ( ... ) & wrapper, orphaning the `bash -c` loop inside it, which then polls a
+# records file in a deleted temp dir forever: 13 of them, up to 36 h old and
+# ~20% CPU each, had piled up from past runs of this suite.
+BG_PIDS=()
+stop_bg() {  # <wrapper pid>: stop the loop inside it, then the wrapper
+  pkill -P "$1" 2>/dev/null
+  kill "$1" 2>/dev/null
+}
+cleanup() {
+  local p
+  for p in "${BG_PIDS[@]:-}"; do [[ -n "$p" ]] && stop_bg "$p"; done
+  rm -rf "$TMPD"
+}
+trap cleanup EXIT
 
 BLOCK=$(sed -n '/^# >>> velo-dispatch-wait/,/^# <<< velo-dispatch-wait/p' "$DISPATCH")
 if [[ -z "$BLOCK" ]]; then
@@ -53,7 +68,7 @@ run_wait_block_bg() {  # $1 = baseline line count, $2 = output file
       set -uo pipefail
       ok()   { echo \"OK: \$1\"; }
       warn() { echo \"WARN: \$1\"; }
-      ISSUE=9999 WT='$WT' WAIT=1 WAIT_RECORD_FILE='$RECORD_FILE' WAIT_BASELINE_LINES='$baseline' VELO_WAIT_INTERVAL=0
+      ISSUE=9999 WT='$WT' WAIT=1 WAIT_RECORD_FILE='$RECORD_FILE' WAIT_BASELINE_LINES='$baseline' VELO_WAIT_INTERVAL=0.05
       $BLOCK
     "
     echo $? > "$outfile.rc"
@@ -64,7 +79,7 @@ run_wait_block_bg() {  # $1 = baseline line count, $2 = output file
 # ---- it does NOT return before a new line exists ---------------------------
 : > "$RECORD_FILE"   # baseline: file exists, 0 lines
 OUT1="$TMPD/out1.txt"
-PID=$(run_wait_block_bg 0 "$OUT1")
+PID=$(run_wait_block_bg 0 "$OUT1"); BG_PIDS+=("$PID")
 sleep 0.3
 if kill -0 "$PID" 2>/dev/null; then
   echo "  ok   still blocked with no new record line after 0.3s"
@@ -79,7 +94,7 @@ WAITED=0
 while kill -0 "$PID" 2>/dev/null && [[ $WAITED -lt 50 ]]; do sleep 0.1; WAITED=$((WAITED+1)); done
 if kill -0 "$PID" 2>/dev/null; then
   echo "  FAIL did not return within 5s of a new record line landing"
-  kill "$PID" 2>/dev/null
+  stop_bg "$PID"
   FAILED=1
 else
   RC=$(cat "$OUT1.rc" 2>/dev/null || echo "?")
@@ -97,12 +112,12 @@ fi
 # ---- a non-landed outcome exits non-zero -----------------------------------
 : > "$RECORD_FILE"
 OUT2="$TMPD/out2.txt"
-PID2=$(run_wait_block_bg 0 "$OUT2")
+PID2=$(run_wait_block_bg 0 "$OUT2"); BG_PIDS+=("$PID2")
 printf '{"issue":9999,"outcome":"stopped","branch":"fix/9999-auto"}\n' >> "$RECORD_FILE"
 WAITED=0
 while kill -0 "$PID2" 2>/dev/null && [[ $WAITED -lt 50 ]]; do sleep 0.1; WAITED=$((WAITED+1)); done
 if kill -0 "$PID2" 2>/dev/null; then
-  echo "  FAIL did not return within 5s for outcome=stopped"; kill "$PID2" 2>/dev/null; FAILED=1
+  echo "  FAIL did not return within 5s for outcome=stopped"; stop_bg "$PID2"; FAILED=1
 else
   RC2=$(cat "$OUT2.rc" 2>/dev/null || echo "?")
   if [[ "$RC2" != "0" ]]; then echo "  ok   returned non-zero exit ($RC2) for outcome=stopped"
@@ -112,17 +127,27 @@ fi
 # ---- the baseline is respected: pre-existing lines don't count as "new" ----
 printf '{"issue":9999,"outcome":"landed"}\n{"issue":9999,"outcome":"landed"}\n' > "$RECORD_FILE"
 OUT3="$TMPD/out3.txt"
-PID3=$(run_wait_block_bg 2 "$OUT3")   # baseline=2: both existing lines are "old"
+PID3=$(run_wait_block_bg 2 "$OUT3"); BG_PIDS+=("$PID3")   # baseline=2: both existing lines are "old"
 sleep 0.3
 if kill -0 "$PID3" 2>/dev/null; then
   echo "  ok   2 pre-existing lines with baseline=2 do not satisfy the wait"
-  kill "$PID3" 2>/dev/null
+  stop_bg "$PID3"
 else
   echo "  FAIL returned immediately on PRE-EXISTING lines — baseline is not being respected,"
   echo "        which means a worker that already finished before --wait started would be"
   echo "        misread as the CURRENT dispatch's result"
   FAILED=1
 fi
+
+# ---- nothing it started outlives it ----------------------------------------
+# Checked here, before the EXIT trap's own cleanup, so a leak is a FAIL and not
+# something the trap quietly tidies up.
+sleep 0.2
+# -ww: the loop's command line is long and ps truncates it otherwise. Matched on
+# comm == bash, not `grep -v grep`: the extracted block itself contains "grep".
+LEFT=$(ps -ww -ax -o comm=,command= | awk -v pat="WAIT_RECORD_FILE='$RECORD_FILE'" '$1 == "bash" && index($0, pat) { n++ } END { print n + 0 }')
+if [[ "$LEFT" -eq 0 ]]; then echo "  ok   no wait loop outlives its test case"
+else echo "  FAIL $LEFT wait loop(s) still running after their case was stopped"; FAILED=1; fi
 
 echo
 [[ $FAILED -eq 0 ]] && echo "all velo-dispatch --wait checks passed" || echo "FAILURES"
