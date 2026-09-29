@@ -123,6 +123,18 @@ NO_PROGRESS_NUDGE = ("Continue: execute the next step of your task now, with a t
                      "has changed since this run started, so the task is not done. If you are "
                      "genuinely blocked, reply with a line starting 'STOP:' and the reason.")
 
+# Old tool outputs are replaced with a stub once the outputs in context grow past
+# COMPACT_HIGH_CHARS, oldest first, down to COMPACT_LOW_CHARS; the latest
+# COMPACT_KEEP_RECENT are never touched. The stubbing is STICKY and STEPPED, not
+# a sliding window: a prefix that changed every turn would miss llama-server's
+# prompt cache and re-read the whole context every turn, which costs more than it
+# saves. Once stubbed, an output stays stubbed, so the prefix is stable until the
+# next step. Sizes are characters (~3.5 per token): 90K is ~26K tokens of tool
+# output on top of the ~15K-token brief and policy.
+COMPACT_HIGH_CHARS = 90_000
+COMPACT_LOW_CHARS = 50_000
+COMPACT_KEEP_RECENT = 6
+
 PROVIDER_ORDER = {
     "deepseek/deepseek-v4-flash-0731": ["Relace", "Baidu", "OpenInference"],
     "z-ai/glm-5.3-flash": ["Z.AI", "DeepInfra", "Novita"],
@@ -412,6 +424,44 @@ def ended_without_progress(read_only: bool, text: str,
     if re.search(r"^\s*\**STOP\b", text, re.MULTILINE):
         return False
     return before == after
+
+
+def _output_len(item) -> int:
+    out = item.get("output")
+    return len(out) if isinstance(out, str) else len(json.dumps(out, default=str))
+
+
+def compact_tool_outputs(items: list, elided: set, high: int = COMPACT_HIGH_CHARS,
+                         low: int = COMPACT_LOW_CHARS,
+                         keep_recent: int = COMPACT_KEEP_RECENT) -> tuple[list, int]:
+    """Stub old tool outputs so context stays small; returns (items, newly stubbed).
+
+    `elided` is the run's sticky set of stubbed call_ids and is updated in place.
+    Items are never mutated — the SDK keeps the originals — so the same stubs are
+    re-applied from `elided` on every call and the prefix does not change.
+    """
+    outputs = [i for i, it in enumerate(items)
+               if isinstance(it, dict) and it.get("type") == "function_call_output"]
+    live = [i for i in outputs if items[i].get("call_id") not in elided]
+    size = sum(_output_len(items[i]) for i in live)
+    newly = 0
+    if size > high:
+        for i in live[:max(0, len(live) - keep_recent)]:
+            if size <= low:
+                break
+            size -= _output_len(items[i])
+            elided.add(items[i].get("call_id"))
+            newly += 1
+    if not elided:
+        return items, 0
+    out = []
+    for it in items:
+        if (isinstance(it, dict) and it.get("type") == "function_call_output"
+                and it.get("call_id") in elided):
+            it = {**it, "output": f"[output elided to save context ({_output_len(it)} "
+                                  f"characters). Re-run the tool if you need it again.]"}
+        out.append(it)
+    return out, newly
 
 
 def task_is_read_only(task: str) -> bool:
@@ -747,8 +797,19 @@ async def main() -> int:
         # tool_not_found_behavior: a model that improvises a tool name kills the
         # whole run under the default 'raise_error'. For an unattended worker the
         # error belongs back in the model's lap so it can recover.
+        elided: set = set()
+
+        def _compact(data):
+            items, newly = compact_tool_outputs(list(data.model_data.input), elided)
+            if newly:
+                log.emit(f"[prompt 1] context compaction: elided {newly} old tool "
+                         f"output(s), {len(elided)} total")
+            data.model_data.input = items
+            return data.model_data
+
         cfg = RunConfig(tool_not_found_behavior="return_error_to_model",
-                        tool_execution=ToolExecutionConfig(max_function_tool_concurrency=6))
+                        tool_execution=ToolExecutionConfig(max_function_tool_concurrency=6),
+                        call_model_input_filter=_compact)
         # An EMPTY final turn — no text and no tool call — is not a finish.
         # openai-agents treats any reply without a tool call as the final
         # output, so a reasoning model that ends its turn at the close of its

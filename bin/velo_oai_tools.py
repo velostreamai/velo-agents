@@ -28,7 +28,11 @@ import subprocess
 
 from agents import function_tool
 
-MAX_RESULT_CHARS = 20_000
+# Every result stays in the conversation for the rest of the run, and decode
+# speed falls with context: on #2291 a local run grew to 120K tokens and decoded
+# at 15-17 tok/s against ~30 at 15K. 8K characters (~2.3K tokens) keeps one call
+# from costing a whole turn's worth of context; the note tells the model to narrow.
+MAX_RESULT_CHARS = 8_000
 DEFAULT_BASH_TIMEOUT_S = 2_400
 
 _CWD = pathlib.Path(".")
@@ -46,7 +50,8 @@ def _cap(text: str, what: str) -> str:
     dropped = len(text) - MAX_RESULT_CHARS
     return (
         text[:MAX_RESULT_CHARS]
-        + f"\n\n... [{what} truncated: {dropped} of {len(text)} characters not shown]"
+        + f"\n\n... [{what} truncated: {dropped} of {len(text)} characters not shown."
+        + " Narrow the command (a line range, a tighter pattern, | head) to see the rest.]"
     )
 
 

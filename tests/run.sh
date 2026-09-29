@@ -98,6 +98,10 @@ echo
 echo "── openai-agents backend ──────────────────────────────"
 bash "$HERE/test_oai_backend.sh" || RC=1
 python3 "$HERE/test_no_progress_nudge.py" || RC=1
+# The SDK-wiring half needs the openai-agents venv; with plain python3 it skips.
+OAI_PY="${VELO_OAI_PY:-$HOME/.venvs/velo-openai-agents/bin/python}"
+[[ -x "$OAI_PY" ]] || OAI_PY=python3
+"$OAI_PY" "$HERE/test_context_compaction.py" || RC=1
 echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1
