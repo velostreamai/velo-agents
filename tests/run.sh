@@ -97,6 +97,7 @@ bash "$HERE/test_policy_single_source.sh" || RC=1
 echo
 echo "── openai-agents backend ──────────────────────────────"
 bash "$HERE/test_oai_backend.sh" || RC=1
+python3 "$HERE/test_no_progress_nudge.py" || RC=1
 echo
 echo "── record writing ─────────────────────────────────────"
 bash "$HERE/test_record.sh" || RC=1

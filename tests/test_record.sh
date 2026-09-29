@@ -77,10 +77,11 @@ mkdir -p "$TMP/root/.agents/tasks"
 printf 'READ-ONLY review. Do not modify any file.\n' > "$TMP/ro-brief.md"
 printf 'Implement the thing.\n' > "$TMP/impl-brief.md"
 
-run_record() {  # <issue> <worktree> <log> <brief> <rc>
+run_record() {  # <issue> <worktree> <log> <brief> <rc> [start-head]
   VELO_RECORD_ROOT="$TMP/root" "$BIN/velo-record" "$1" --worktree "$2" \
     --worker w --model m --log "$3" --brief "$4" \
-    --started 2020-01-01T00:00:00Z --rc "$5" --max-turns 10 >/dev/null 2>&1
+    --started 2020-01-01T00:00:00Z --rc "$5" --max-turns 10 \
+    ${6:+--start-head "$6"} >/dev/null 2>&1
   outcome_of "$TMP/root/records/$1.result.jsonl"
 }
 
@@ -96,6 +97,23 @@ check "non-zero rc -> failed"                     "$(run_record 5 "$TMP/clean" "
 # codex writes no TOTALS, so read_only can only come from the brief. Without the
 # fallback every codex review — the gate velo-pr-gate routes to — scored failed.
 check "codex (no TOTALS) + read-only brief"       "$(run_record 6 "$TMP/empty" "$TMP/no-totals.log" "$TMP/ro-brief.md" 0)"   "reported"
+
+echo "resumed branch: score the run's own commits (#2291)"
+# A resume starts on a branch that already carries earlier runs' commits. Counting
+# from origin/master scored two velo-local runs that committed nothing as landed.
+make_repo "$TMP/resumed" 3
+RESUME_HEAD=$(git -C "$TMP/resumed" rev-parse HEAD)
+check "resume + no new commits -> abandoned" \
+      "$(run_record 20 "$TMP/resumed" "$TMP/impl.log" "$TMP/impl-brief.md" 0 "$RESUME_HEAD")" "abandoned"
+check "read-only resume on a committed branch -> reported" \
+      "$(run_record 21 "$TMP/resumed" "$TMP/ro.log" "$TMP/ro-brief.md" 0 "$RESUME_HEAD")" "reported"
+echo more >> "$TMP/resumed/f"; git -C "$TMP/resumed" commit -qam "run commit"
+check "resume + one new commit -> landed" \
+      "$(run_record 22 "$TMP/resumed" "$TMP/impl.log" "$TMP/impl-brief.md" 0 "$RESUME_HEAD")" "landed"
+check "run_commits counts only this run" \
+      "$(python3 -c "import json,sys;w=json.loads(open(sys.argv[1]).read().strip().split(chr(10))[-1])['work'];print(w['run_commits'],w['commits'])" "$TMP/root/records/22.result.jsonl")" "1 4"
+check "unresolvable start head -> branch count, not a guess of 0" \
+      "$(run_record 23 "$TMP/resumed" "$TMP/impl.log" "$TMP/impl-brief.md" 0 deadbeefdeadbeef)" "landed"
 
 echo "push state (#2012 R1)"
 # `git log origin/<b>..HEAD` on a branch with NO remote errors to empty, so

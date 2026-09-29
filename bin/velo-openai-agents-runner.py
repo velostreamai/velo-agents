@@ -109,6 +109,20 @@ EMPTY_FINAL_NUDGE = ("Continue from where you left off. Your last reply containe
                      "text and no tool call. If there is more to do, emit the tool call "
                      "you planned now. If the task is complete, give your final report.")
 
+# Recovery for a written final reply that did NOTHING. openai-agents takes any
+# reply without a tool call as the final output, so a worker that answers in
+# prose mid-task ends the run. On #2291 two velo-local runs of a 7-step apply
+# plan ended that way (17 and 23 turns, zero edits) right after the thinking
+# budget fired, and were recorded as successes. Only an implementation run whose
+# worktree is byte-for-byte unchanged since it started is nudged: a run that
+# edited or committed anything, a read-only run, and a declared STOP are all
+# legitimate finishes and are accepted as-is.
+NO_PROGRESS_RETRIES = 3
+NO_PROGRESS_NUDGE = ("Continue: execute the next step of your task now, with a tool call. "
+                     "You ended your turn with a written reply, but nothing in the worktree "
+                     "has changed since this run started, so the task is not done. If you are "
+                     "genuinely blocked, reply with a line starting 'STOP:' and the reason.")
+
 PROVIDER_ORDER = {
     "deepseek/deepseek-v4-flash-0731": ["Relace", "Baidu", "OpenInference"],
     "z-ai/glm-5.3-flash": ["Z.AI", "DeepInfra", "Novita"],
@@ -370,6 +384,34 @@ class Hooks(RunHooks):
         bad = body.startswith(("Error", "Search failed")) or "failed (exit" in body[:60]
         self.log.emit(f"[{self.label}] tool completed name={getattr(tool,'name','unknown')} "
                       f"outcome={'error' if bad else 'ok'} result_len={len(body)}")
+
+
+def worktree_state(cwd: str) -> str | None:
+    """HEAD plus the full uncommitted diff and untracked list, as one string.
+
+    Compared before and after a run to decide whether it changed anything. The
+    diff text, not `git status`, because a tree that was already dirty at start
+    shows the same status line however much more the worker edits a file.
+    None when git cannot answer — the caller then does not guess "no progress".
+    """
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                              text=True, check=True, timeout=60).stdout
+    try:
+        return "\0".join((git("rev-parse", "HEAD"), git("diff", "HEAD", "--binary"),
+                          git("ls-files", "--others", "--exclude-standard")))
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def ended_without_progress(read_only: bool, text: str,
+                           before: str | None, after: str | None) -> bool:
+    """A written final reply from an implementation run that changed nothing."""
+    if read_only or before is None or after is None:
+        return False
+    if re.search(r"^\s*\**STOP\b", text, re.MULTILINE):
+        return False
+    return before == after
 
 
 def task_is_read_only(task: str) -> bool:
@@ -715,22 +757,34 @@ async def main() -> int:
         # was recorded as status=success with nothing done. Mirror the
         # incumbent's max_tokens recovery: hand the conversation back with a
         # nudge, up to EMPTY_FINAL_RETRIES times, then fail loud.
+        start_state = worktree_state(a.cwd)
+
         async def _run_with_empty_final_retry():
             inp = task + budget
-            for attempt in range(EMPTY_FINAL_RETRIES + 1):
+            empty = stalled = 0
+            while True:
                 remaining = a.max_turns - hooks.turns
                 if remaining <= 0:
-                    raise MaxTurnsExceeded("max turns exhausted during empty-final retries")
+                    raise MaxTurnsExceeded("max turns exhausted during final-turn retries")
                 r = await Runner.run(agent, inp, max_turns=remaining,
                                      run_config=cfg, hooks=hooks)
-                if str(r.final_output or "").strip():
+                final = str(r.final_output or "").strip()
+                if not final:
+                    if empty == EMPTY_FINAL_RETRIES:
+                        return r, "error_empty_final"
+                    empty += 1
+                    log.emit(f"[prompt 1] empty final turn (no text, no tool call) — "
+                             f"continuing, retry {empty}/{EMPTY_FINAL_RETRIES}")
+                    nudge = EMPTY_FINAL_NUDGE
+                elif (stalled < NO_PROGRESS_RETRIES and ended_without_progress(
+                        read_only, final, start_state, worktree_state(a.cwd))):
+                    stalled += 1
+                    log.emit(f"[prompt 1] final reply with no worktree change — "
+                             f"continuing, retry {stalled}/{NO_PROGRESS_RETRIES}")
+                    nudge = NO_PROGRESS_NUDGE
+                else:
                     return r, ""
-                if attempt == EMPTY_FINAL_RETRIES:
-                    return r, "error_empty_final"
-                log.emit(f"[prompt 1] empty final turn (no text, no tool call) — "
-                         f"continuing, retry {attempt + 1}/{EMPTY_FINAL_RETRIES}")
-                inp = r.to_input_list() + [{"role": "user", "content": EMPTY_FINAL_NUDGE}]
-            raise AssertionError("unreachable")
+                inp = r.to_input_list() + [{"role": "user", "content": nudge}]
 
         res, empty_status = await asyncio.wait_for(_run_with_empty_final_retry(),
                                                    timeout=a.prompt_timeout)

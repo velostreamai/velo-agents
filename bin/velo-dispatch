@@ -1555,19 +1555,23 @@ esac
 WAIT_RECORD_FILE="${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl"
 WAIT_BASELINE_LINES=0
 [[ -f "$WAIT_RECORD_FILE" ]] && WAIT_BASELINE_LINES=$(wc -l < "$WAIT_RECORD_FILE" | tr -d ' ')
+# The worktree's HEAD at launch, so velo-record scores the commits THIS run made.
+# A resumed branch already carries earlier runs' commits; counting from
+# origin/master scored a run that committed nothing as `landed` (#2291).
+START_HEAD=$(git -C "$WT" rev-parse HEAD) || die "cannot resolve HEAD in $WT"
 nohup bash -c '
   LOGF="$1"; RI="$2"; RWT="$3"; RNAME="$4"; RMODEL="$5"
   RBRIEF="$6"; RSTART="$7"; RMT="$8"; RBASE="$9"
   # $10 would parse as $1 followed by a literal 0, silently passing the log path
   # as the index state, so take it after a shift instead of using ${10}.
-  shift 9; RIDX="$1"; shift 1
+  shift 9; RIDX="$1"; RSHEAD="$2"; shift 2
   "$@" > "$LOGF" 2>&1
   rc=$?
   "$HOME/.agents/bin/velo-record" "$RI" --index "$RIDX" --worktree "$RWT" --worker "$RNAME" \
     --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
-    --rc "$rc" --max-turns "$RMT" --base "$RBASE" >> "$LOGF" 2>&1 || true
+    --rc "$rc" --max-turns "$RMT" --base "$RBASE" --start-head "$RSHEAD" >> "$LOGF" 2>&1 || true
 ' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
-  "${INDEX_STATE:-unknown}" "${CMD[@]}" > /dev/null 2>&1 &
+  "${INDEX_STATE:-unknown}" "$START_HEAD" "${CMD[@]}" > /dev/null 2>&1 &
 PID=$!
 
 echo

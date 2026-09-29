@@ -3,7 +3,7 @@
 #
 # Usage (called by velo-dispatch on worker exit; also runnable by hand):
 #   velo-record <issue> --worktree P --worker W --model M --brief F --log L \
-#               --started <iso> --rc <n> --max-turns <n> [--base <sha>]
+#               --started <iso> --rc <n> --max-turns <n> [--base <sha>] [--start-head <sha>]
 #
 # Why this exists (issue #1992): every gate in this directory validates what
 # happens BEFORE a worker runs. Nothing recorded what happened after, so the
@@ -37,7 +37,7 @@ LIB="$(dirname "${BASH_SOURCE[0]}")/velo-worktree-lib.sh"
 source "$LIB"
 
 ISSUE="${1:-}"; shift || true
-WORKTREE=""; WORKER=""; MODEL=""; BRIEF=""; LOG=""; STARTED=""; RC=0; MAXTURNS=""; BASE=""
+WORKTREE=""; WORKER=""; MODEL=""; BRIEF=""; LOG=""; STARTED=""; RC=0; MAXTURNS=""; BASE=""; START_HEAD=""
 # Whether the discovery index existed for this run: built|refused|failed|skipped.
 # Recorded because the ONLY evidence of it was a warn line in a terminal, and the
 # index turned out never to have been built at all — a dead feature that a single
@@ -54,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --rc)        RC="$2";       shift 2 ;;
     --max-turns) MAXTURNS="$2"; shift 2 ;;
     --base)      BASE="$2";     shift 2 ;;
+    --start-head) START_HEAD="$2"; shift 2 ;;
     --index)     INDEX="$2"; export INDEX; shift 2 ;;
     *) shift ;;
   esac
@@ -101,6 +102,19 @@ read -r FILES INS DELS <<<"$(wt_diffstat "$WORKTREE")"
 PUSHED=false
 [[ "$COMMITS" != "0" && "$UNPUSHED" == "0" ]] && PUSHED=true
 
+# Commits THIS run made. `commits` counts the whole branch ahead of origin/master,
+# so a resumed run that adds nothing inherits every earlier run's commits and was
+# scored `landed` — on #2291 two velo-local runs on e307daf56 were recorded as
+# landed with zero new commits. velo-dispatch passes the worktree's HEAD at launch;
+# without it (a hand run) the branch count is the only measure there is.
+RUN_COMMITS="$COMMITS"
+if [[ -n "$START_HEAD" ]]; then
+  if ! RUN_COMMITS=$(git -C "$WORKTREE" rev-list --count "$START_HEAD..HEAD" 2>/dev/null); then
+    echo "velo-record: WARNING start head $START_HEAD not resolvable in $WORKTREE — outcome uses the branch commit count" >&2
+    RUN_COMMITS="$COMMITS"; START_HEAD=""
+  fi
+fi
+
 # ---- comparability keys -----------------------------------------------------
 # Two rows only compare workers if the brief and spec they ran against match.
 # Without these, a table of per-worker averages measures the ISSUES, not the
@@ -146,13 +160,13 @@ elif [[ "$RC" != "0" ]]; then             OUTCOME="failed"
 # is the "worker ignored its instructions" case a record exists to surface, so
 # it gets its own value rather than hiding under the same label as a clean
 # review — `outcome` is the field any routing table will aggregate on.
-elif [[ "$READ_ONLY" == "true" && "$COMMITS" != "0" ]]; then
+elif [[ "$READ_ONLY" == "true" && "$RUN_COMMITS" != "0" ]]; then
                                           OUTCOME="read-only-violation"
 # A read-only task producing no commits is the CORRECT outcome, not an
 # abandonment — writing nothing is what a review gate is supposed to do. Without
 # this branch every review in the history reads as a failed run.
 elif [[ "$READ_ONLY" == "true" ]]; then   OUTCOME="reported"
-elif [[ "$COMMITS" == "0" ]]; then        OUTCOME="abandoned"
+elif [[ "$RUN_COMMITS" == "0" ]]; then    OUTCOME="abandoned"
 else                                      OUTCOME="landed"
 fi
 
@@ -188,7 +202,7 @@ VR_WORKER="$WORKER" VR_MODEL="$MODEL" VR_BRIEF_SHA="$BRIEF_SHA" VR_BASE="$BASE" 
 VR_BRANCH="$BRANCH" VR_TURNS="$TURNS" VR_MAXTURNS="$MAXTURNS" VR_STATUS="$STATUS" \
 VR_LEAKED="${LEAKED:-unmeasured}" VR_TIMEDOUT="$TIMEDOUT" VR_RC="$RC" \
 VR_IN="$IN_TOK" VR_OUT="$OUT_TOK" VR_CACHED="$CACHED_TOK" VR_COST="$COST" VR_USAGE_SRC="$USAGE_SRC" \
-VR_COMMITS="$COMMITS" VR_DIRTY="$DIRTY" VR_FILES="$FILES" VR_INS="$INS" VR_DELS="$DELS" \
+VR_COMMITS="$COMMITS" VR_RUN_COMMITS="$RUN_COMMITS" VR_START_HEAD="$START_HEAD" VR_DIRTY="$DIRTY" VR_FILES="$FILES" VR_INS="$INS" VR_DELS="$DELS" \
 VR_PUSHED="$PUSHED" VR_OUTCOME="$OUTCOME" VR_LOG="$LOG" VR_SPECDIR="$ROOT/.agents/tasks" \
 VR_OUTFILE="$OUT" \
 python3 <<'PY'
@@ -342,6 +356,9 @@ record = {
     "cost": _cost_block(),
     "work": {
         "commits": i("VR_COMMITS"),
+        # Commits made by THIS run (start_head..HEAD); `commits` is the branch total.
+        "run_commits": i("VR_RUN_COMMITS"),
+        "start_head": s("VR_START_HEAD"),
         "dirty": i("VR_DIRTY"),
         "files_changed": i("VR_FILES"),
         "insertions": i("VR_INS"),
@@ -371,7 +388,7 @@ _c = record["cost"]
 _shown = f"${_c['usd']}" if _c["usd"] is not None else "no-price"
 _wall = f"{record['wall_clock_s']}s" if record["wall_clock_s"] is not None else "?"
 print(f"velo-record: {out}  outcome={record['outcome']} "
-      f"wall={_wall} commits={record['work']['commits']} "
+      f"wall={_wall} commits={record['work']['run_commits']}/{record['work']['commits']} (run/branch) "
       f"tokens={_c['input_tokens']}in/{_c['output_tokens']}out "
       f"cost={_shown} ({_c['source']})")
 PY
