@@ -49,6 +49,14 @@ echo
 echo "── dispatch preflight (end-to-end) ────────────────────"
 bash "$HERE/test_dispatch_preflight.sh" || RC=1
 echo
+echo "── check-code skill inlining (#2301) ──────────────────"
+bash "$HERE/test_check_code_skill.sh" || RC=1
+echo
+echo "── skill inlining (#2301) ─────────────────────────────"
+# velo_skills has no SDK dependency, so plain python3 runs it — same interpreter
+# install.sh copies it to, which is the one whose behaviour matters here.
+python3 "$HERE/test_skill_inlining.py" || RC=1
+echo
 echo "── --wait / detached-work enforcement ──────────────────"
 bash "$HERE/test_require_wait_hook.sh" || RC=1
 bash "$HERE/test_dispatch_wait.sh" || RC=1

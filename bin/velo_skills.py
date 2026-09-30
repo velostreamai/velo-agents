@@ -57,11 +57,34 @@ that.
 def resolve_skill(name: str) -> tuple[str, str]:
     """Return (path, body) for a skill, or fail loudly.
 
+    Accepts EITHER a skill name (`check-code`, searched under SKILL_SEARCH) or a
+    direct path to a skill file (`$HOME/.claude/commands/check-code.md`).
+
+    The path form exists for #2301. velo-dispatch inlines /check-code into every
+    SDK worker run, and the name form is the wrong instrument there for two
+    reasons:
+
+      * SKILL_SEARCH is ordered, so the name `check-code` resolves to
+        ~/.agents/skills/check-code/SKILL.md whenever that exists and silently
+        NOT to the ~/.claude/commands/check-code.md the gate names. A dispatch
+        that says "inline this file" must inline THAT file.
+      * A name is also the review-gate idiom (velo-pr-gate passes skill NAMES to
+        dispatch a reviewer). Keeping the two forms distinguishable is what lets
+        apply_skills decide the read-only declaration by form — see below.
+
+    A path is a .md file, and the commands-style ones carry no YAML frontmatter,
+    unlike SKILL.md. _FRONTMATTER_RE is anchored with \\A and needs the closing
+    `---`, so stripping is a no-op on frontmatter-less input — the body is the
+    file, stripped. Nothing here requires frontmatter; verified by
+    tests/test_skill_inlining.py rather than assumed.
+
     Failing loudly matters: a silently-missing skill produces a review that
     looks like it ran a gate and did not.
     """
+    if looks_like_path(name):
+        return _read_skill_file(pathlib.Path(name).expanduser(), name)
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
-        fail(f"invalid skill name '{name}' (expected lowercase-kebab)")
+        fail(f"invalid skill name '{name}' (expected lowercase-kebab, or a path to a .md file)")
     home = str(pathlib.Path.home())
     tried = []
     for tpl in SKILL_SEARCH:
@@ -74,6 +97,26 @@ def resolve_skill(name: str) -> tuple[str, str]:
             return str(p), body
     fail("skill '" + name + "' not found. Tried:\n  " + "\n  ".join(tried))
     raise AssertionError("unreachable")
+
+
+def looks_like_path(value: str) -> bool:
+    """True when `value` names a file rather than a skill to search for.
+
+    `/` is unambiguous — a kebab name never contains one. The `.md` suffix covers
+    a path given relative or bare (`check-code.md`), which the name regex would
+    otherwise reject with a message about lowercase-kebab names.
+    """
+    return "/" in value or value.endswith(".md")
+
+
+def _read_skill_file(p: pathlib.Path, label: str) -> tuple[str, str]:
+    if not p.is_file():
+        fail(f"skill '{label}' is not a file: {p}")
+    body = _FRONTMATTER_RE.sub("", p.read_text(errors="replace")).strip()
+    if not body:
+        fail(f"skill '{label}' resolved to an empty file: {p}")
+    return str(p), body
+
 
 
 READ_ONLY_DECLARATION = """=== THIS IS A READ-ONLY REVIEW TASK ===
@@ -105,13 +148,43 @@ def apply_skills(task: str, names: list[str]) -> str:
     blocks = []
     for name in names:
         path, body = resolve_skill(name)
-        print(f"  skill: /{name} <- {path} ({len(body)} chars)", file=sys.stderr)
-        blocks.append(
-            f"=== SKILL: /{name} ===\n"
-            f"You do NOT have a Skill tool. The full definition of /{name} is\n"
-            f"inlined below; follow it as written for the scope given after it.\n\n"
-            f"{body}\n"
-            f"=== END SKILL: /{name} ===\n"
+        # Two ways to ask for a skill, and they mean different jobs.
+        #
+        #   BY NAME   — the review-gate idiom. velo-pr-gate passes `check-code`
+        #               to dispatch a REVIEWER, whose whole job is that skill.
+        #   BY PATH   — #2301. velo-dispatch inlines the /check-code gate into a
+        #               WORKER that is already implementing something.
+        #
+        # The distinction is load-bearing, not cosmetic. Both runners choose the
+        # tool set from task_is_read_only(), which keys off exactly the
+        # declaration below, so handing a WORKER the review framing would strip
+        # its write tools mid-implementation.
+        as_path = looks_like_path(name)
+        # Keep the slash-label readable: `/x/check-code.md` is the file, but the
+        # command it defines is `/check-code`.
+        label = pathlib.PurePath(name).stem if as_path else name
+        print(f"  skill: /{label} <- {path} ({len(body)} chars)", file=sys.stderr)
+        framing = (
+            "Your TASK is the SCOPE at the end of this prompt. This skill is a\n"
+            f"gate to run over your OWN diff before you push — it is not a\n"
+            "redefinition of the task and not a request to stop implementing\n"
+            "and review instead. Finish the task, run /"
+            f"{label} on what you changed, then report.\n"
+            if as_path
+            else "You do NOT have a Skill tool. The full definition of /"
+            f"{label} is\ninlined below; follow it as written for the scope given after it.\n"
         )
-    prefix = READ_ONLY_DECLARATION if any(n in REVIEW_SKILLS for n in names) else ""
+        blocks.append(
+            f"=== SKILL: /{label} ===\n"
+            f"{framing}"
+            f"\n{body}\n"
+            f"=== END SKILL: /{label} ===\n"
+        )
+    # A review skill asked for BY NAME is the gate; asked for by PATH it is a
+    # pre-push step inside an implementation run, which must keep its write
+    # tools. A bare kebab name can never contain "/", so the two sets are
+    # disjoint by construction — the second half is here to say so, not to filter.
+    review = any(n in REVIEW_SKILLS and not looks_like_path(n) for n in names)
+    prefix = READ_ONLY_DECLARATION if review else ""
     return prefix + "\n".join(blocks) + "\n\n=== SCOPE ===\n" + task
+

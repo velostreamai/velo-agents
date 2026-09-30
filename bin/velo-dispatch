@@ -36,6 +36,22 @@ WORKTREE_BASE="$HOME/RustroverProjects"
 # See velo-pr-gate's header: worker logs live under ~/.agents/state, not /tmp.
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 POLICY="$HOME/.agents/rules/velo-impl.md"
+# The /check-code skill, inlined into every SDK-runner worker run (#2301).
+#
+# The policy's Pre-push HARD GATE item 2 requires `/check-code` before any push,
+# but `/check-code` is a Claude Code slash command and the SDK runners have no
+# Skill tool — so #2291's worker honestly reported "skill unavailable on this
+# runtime" and the gate was unsatisfiable by construction. The runners already
+# take `--skill <file>` and inline it ahead of the task via velo_skills
+# (velo-openrouter-agent forwards "$@"); dispatch was the only missing link.
+#
+# Named once HERE rather than three times in the case below, per this script's
+# own convention for POLICY and VELO_LOCAL_MODEL_DEFAULT: a path written per
+# route is a path that drifts per route.
+#
+# Overridable for tests; the preflight below (section 5b) dies when the resolved
+# path is missing, so an override can never silently disable the inline.
+CHECK_CODE_SKILL="${VELO_CHECK_CODE_SKILL:-$HOME/.claude/commands/check-code.md}"
 ASSIGNEE="bluemonk3y"
 MIN_DISK_GB=40
 MAX_TURNS=250
@@ -998,6 +1014,35 @@ AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
   Free space (rm -rf <merged-worktree>/target) then retry."
 ok "disk: ${AVAIL}GB free"
 
+# ---- 5b. the /check-code skill the SDK routes inline (#2301) ----------------
+# >>> velo-check-code-skill (extracted verbatim by tests/test_check_code_skill.sh)
+# The policy's Pre-push HARD GATE item 2 tells every worker to run /check-code
+# before pushing, and the SDK routes now satisfy it by inlining the skill into
+# the worker's task. That only holds if the file is there at dispatch time.
+#
+# Checked HERE, before the worktree is cut and the issue is assigned, for the
+# same reason the runner venv is checked in velo-openrouter-agent rather than
+# trusted: a failure the operator can act on beats a traceback from deep inside
+# a worker that has already burned its budget. The three SDK arms below all
+# pass "$CHECK_CODE_SKILL" — the SAME variable this checks — so no route can
+# carry a path this gate did not validate, and none can drop the flag.
+#
+# codex is deliberately not covered: it takes no --skill flag at all, and the
+# brief says to leave codex routing untouched.
+if [[ "$NAME" == "velo-codex" ]]; then
+  ok "check-code skill: not applicable to the codex route (no --skill flag)"
+else
+  [[ -f "$CHECK_CODE_SKILL" ]] || die "the /check-code skill is missing: $CHECK_CODE_SKILL
+  Every SDK worker route (local, deepseek, glm) inlines it via --skill, and the
+  policy's pre-push gate requires it. Install it or point VELO_CHECK_CODE_SKILL
+  at the file. Refusing to dispatch WITHOUT it is deliberate — a worker that
+  silently skips the gate reports a green run that never ran the gate."
+  [[ -s "$CHECK_CODE_SKILL" ]] || die "the /check-code skill is EMPTY: $CHECK_CODE_SKILL
+  Inlining an empty skill satisfies the flag and not the gate. Fill the file in."
+  ok "check-code skill: $CHECK_CODE_SKILL"
+fi
+# <<< velo-check-code-skill
+
 # ---- 6. worktree ------------------------------------------------------------
 [[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
 WT="$WORKTREE_BASE/velostream-$ISSUE"
@@ -1490,7 +1535,7 @@ case "$NAME" in
           --model "$MODEL_ID" --base-url "$LMSTUDIO_URL"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"
-          --cwd "$WT" --task "$TASK" )
+          --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
     ;;
   velo-deepseek)
     # Pinned at V4.1-Flash. The route is unversioned and the model is pinned
@@ -1514,14 +1559,14 @@ case "$NAME" in
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"
-          --cwd "$WT" --task "$TASK" )
+          --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
     ;;
   velo-glm)
     MODEL_ID='z-ai/glm-5.3-flash'
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"
-          --cwd "$WT" --task "$TASK" )
+          --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
     ;;
   *)
     # A NAME with no arm produced NO CMD and fell straight through, because this
