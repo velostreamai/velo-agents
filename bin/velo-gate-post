@@ -146,10 +146,42 @@ else
 fi
 
 HDR="gate: $NAME @ ${SHA:0:9}"
+
+# ---- a declared reviewer substitution ----------------------------------------
+#
+# velo-pr-gate records WHO ran check-code in gate/<pr>/check-code.by. When that is
+# `sonnet`, the comment posted here must say so: the label alone (`gate:passed`)
+# would otherwise imply the routed opus --effort high reviewer, which is the
+# silent-substitution failure the README names. It is applied HERE, at the one
+# place a gate result is posted, rather than asked of each caller — a note the
+# caller has to remember to write is the note that was written by hand on every
+# round before this existed.
+#
+# A body that already opens a line with its own "Reviewer substitution" (the
+# hand-written form) is left alone, so it is never declared twice. Anchored to a
+# line start on purpose: a finding that merely MENTIONS the words must not
+# suppress the declaration.
+SUBST_NOTE=""
+if [[ "$NAME" == "check-code" ]]; then
+  CC_BY=""
+  [[ -f "$VELO_STATE/gate/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/gate/$PR/check-code.by")
+  if [[ "$CC_BY" == "sonnet" ]] && ! grep -qiE '^[[:space:]>*_-]*reviewer substitution' <<<"$BODY"; then
+    SUBST_NOTE="Reviewer substitution (declared): check-code was NOT run by its routed reviewer (opus --effort high — that leg has never produced a report; it times out). It was run by a read-only Sonnet agent launched by the orchestrator from the prompt velo-pr-gate wrote. Read this result as a Sonnet-grade check-code."
+  fi
+fi
+
 # Do not double-stamp a report that already carries the header.
 if grep -qiE "^gate: *$NAME *@" <<<"$BODY"; then
   FULL="$BODY"
   ok "report already carries its gate header"
+  if [[ -n "$SUBST_NOTE" ]]; then
+    # Keep the header first; the note goes straight under it.
+    FULL=$(SUBST_NOTE="$SUBST_NOTE" awk -v n="$NAME" '
+      { print }
+      !done && tolower($0) ~ ("^gate: *" n " *@") { print ""; print ENVIRON["SUBST_NOTE"]; done = 1 }' <<<"$BODY")
+  fi
+elif [[ -n "$SUBST_NOTE" ]]; then
+  FULL="$HDR"$'\n\n'"$SUBST_NOTE"$'\n\n'"$BODY"
 else
   FULL="$HDR"$'\n\n'"$BODY"
 fi
@@ -191,6 +223,7 @@ URL=$(gh pr comment "$PR" --repo "$REPO" --body "$FULL" 2>&1 | tail -1) \
 printf 'pid %s at %s\n' "$$" "$(date -u +%FT%TZ)" > "$POST_DONE"
 
 ok "posted '$NAME' to #$PR @ ${SHA:0:9}"
+[[ -n "$SUBST_NOTE" ]] && ok "the comment declares the reviewer substitution: check-code was run by a Sonnet agent, not opus:high"
 echo "   $URL"
 echo
 echo "   Next: record the VERDICT — a comment says a gate RAN, the label says what it FOUND:"

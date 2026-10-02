@@ -1,0 +1,196 @@
+#!/bin/bash
+# velo-gate-finish — post a round's gate reports, then record its verdict.
+#
+#   velo-gate-finish <pr> <sha> --pass|--block <check-code-report> <code-review-report>
+#   velo-gate-finish <pr> <sha> --pass|--block [--check-code <file>] [--code-review <file>]
+#
+# What the orchestrator ran by hand once the reviewers had reported:
+#
+#   velo-gate-post <pr> check-code  post-cc-<pr>.md --sha <sha>
+#   velo-gate-post <pr> code-review post-cr-<pr>.md --sha <sha>
+#   velo-gate <pr> --pass|--block
+#
+# <sha> is the commit the gates RAN against (velo-gate-run prints it): every report
+# is stamped with it, never with whatever the PR's head is by now. The positional
+# form is check-code first, code-review second. The named form lets a PR that needs
+# only one of them (a tooling-only PR has no check-code) finish with just that one;
+# it is also how any report is given when the other is not.
+#
+# Idempotent. A report whose `gate: <name> @ <sha>` header is already on the PR is
+# not posted again, so the whole command can be re-run after any failure and
+# continues from where it stopped.
+#
+# Fail fast, and never label a verdict whose reports did not land: the first post
+# that fails stops the run BEFORE `velo-gate --pass|--block`, and a post the poster
+# calls OK is confirmed on the PR itself first. A gate:passed label with a missing
+# report is how a finding never reached the PR.
+#
+# Retries: a transient gh failure ("PR #N not found", a post that timed out, a label
+# that would not set) is retried up to 3 times, 5s apart (VELO_GATE_RETRY_DELAY).
+# A post that failed on the wire may still have landed, so after a transient post
+# failure the PR is checked for the header before the post is tried again; without
+# that, a lost response becomes a duplicate comment. Deterministic failures — the
+# template guard, an empty report, a head that moved so `--pass` is refused — fail
+# on the first attempt: they would only fail again.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE_POST="${VELO_GATE_POST_BIN:-$HERE/velo-gate-post}"
+GATE="${VELO_GATE_BIN:-$HERE/velo-gate}"
+REPO="velostreamai/velostream"
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
+RETRY_DELAY="${VELO_GATE_RETRY_DELAY:-5}"
+MAX_RETRIES=3
+
+die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+
+USAGE="usage: velo-gate-finish <pr> <sha> --pass|--block <check-code-report> <code-review-report>
+       velo-gate-finish <pr> <sha> --pass|--block [--check-code <file>] [--code-review <file>]"
+
+VERDICT=""; CC=""; CR=""; POS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pass|--block)
+      [[ -z "$VERDICT" ]] || die "give exactly one of --pass / --block
+$USAGE"
+      VERDICT="$1"; shift ;;
+    --check-code)
+      [[ $# -ge 2 ]] || die "--check-code needs a report file
+$USAGE"
+      CC="$2"; shift 2 ;;
+    --code-review)
+      [[ $# -ge 2 ]] || die "--code-review needs a report file
+$USAGE"
+      CR="$2"; shift 2 ;;
+    -*) die "unknown flag: $1
+$USAGE" ;;
+    *)  POS+=("$1"); shift ;;
+  esac
+done
+
+[[ -n "$VERDICT" ]] || die "give --pass or --block
+$USAGE"
+case ${#POS[@]} in
+  2) ;;
+  4) [[ -z "$CC" && -z "$CR" ]] || die "give the reports positionally OR with --check-code / --code-review, not both
+$USAGE"
+     CC="${POS[2]}"; CR="${POS[3]}" ;;
+  *) die "expected <pr> <sha> and then either both reports or --check-code / --code-review
+$USAGE" ;;
+esac
+PR="${POS[0]}"; SHA="${POS[1]}"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "the PR must be a number, got '$PR'
+$USAGE"
+[[ "$SHA" =~ ^[0-9a-f]{7,40}$ ]] || die "the sha must be 7-40 hex characters, got '$SHA' — it is the commit the gates ran against
+$USAGE"
+[[ -n "$CC" || -n "$CR" ]] || die "no report to post: give --check-code and/or --code-review (or both positionally)
+$USAGE"
+
+# Everything is checked before anything is posted: a half-finished round caused by a
+# typo in the second filename is exactly what this refuses to produce.
+for f in "$CC" "$CR"; do
+  [[ -z "$f" ]] && continue
+  [[ -f "$f" ]] || die "report file not found: $f"
+  [[ -s "$f" ]] || die "report file is empty: $f"
+done
+
+GATE_DIR="$VELO_STATE/gate/$PR"
+mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
+
+# ---- what counts as transient ------------------------------------------------------
+#
+# `PR #N not found` is how both velo-gate-post and velo-gate report gh failing to
+# answer; `could not set gate:...` is velo-gate's label edit failing; a post that
+# `could not post` is transient only when gh's own last line reads like the wire
+# (a 422 or a 401 is not going to improve).
+is_transient() {   # <output file>
+  grep -qiE "PR #$PR not found|could not set gate:|could not post to #$PR:.*(timeout|timed out|deadline exceeded|error connecting|connection|dial tcp|no such host|temporary failure|HTTP 5[0-9][0-9]|EOF|reset by peer|TLS)" "$1"
+}
+
+# Is `gate: <name> @ <sha>` already a comment on the PR? The PR is the source of
+# truth for "posted", so this holds across a lost post response, a deleted state
+# directory and a second invocation alike. Spacing is as tolerant as velo-gate's own
+# capture of the header, so what counts as a gate comment here is what counts there.
+header_on_pr() {   # <name>
+  local comments
+  comments=$(gh pr view "$PR" --repo "$REPO" --json comments --jq '[.comments[].body] | join("\n---\n")' 2>/dev/null) || return 1
+  grep -qiE "gate: *$1 *@ *${SHA:0:9}" <<<"$comments"
+}
+
+# After velo-gate-post says OK, the PR must say so too. The poster exits 0 without
+# posting when its own done-marker exists (for a comment someone has since deleted)
+# or another process holds the lock, and a verdict label over a report that is not
+# there is the failure this command exists to prevent. GitHub is given the retries a
+# slow read-after-write needs before this concludes the comment is missing.
+confirm_on_pr() {   # <name>
+  local i=0
+  while :; do
+    header_on_pr "$1" && return 0
+    [[ $i -ge $MAX_RETRIES ]] && return 1
+    i=$((i + 1))
+    sleep "$RETRY_DELAY"
+  done
+}
+
+post_gate() {   # <name> <report file>
+  local name="$1" file="$2" attempt=0 rc url out
+  out="$GATE_DIR/gate-finish.$name.out"   # a separate statement: `local` expands every word before it assigns any
+  if header_on_pr "$name"; then
+    ok "$name @ ${SHA:0:9} is already on #$PR — not posted again (what that comment holds is not compared with $file)"
+    return 0
+  fi
+  while :; do
+    attempt=$((attempt + 1))
+    "$GATE_POST" "$PR" "$name" "$file" --sha "$SHA" > "$out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      if ! confirm_on_pr "$name"; then
+        cat "$out" >&2
+        die "velo-gate-post reported success for $name, but 'gate: $name @ ${SHA:0:9}' is not on #$PR. No verdict was recorded.
+  A stale done-marker is the usual cause (the comment was deleted): remove $GATE_DIR/.posted-$name-${SHA:0:9} and re-run."
+      fi
+      url=$(grep -m1 -oE 'https?://[^ ]+' "$out" || true)
+      ok "posted $name @ ${SHA:0:9}${url:+  $url}"
+      return 0
+    fi
+    if [[ $attempt -le $MAX_RETRIES ]] && is_transient "$out"; then
+      # The response may have been lost after the comment landed.
+      if header_on_pr "$name"; then
+        ok "$name @ ${SHA:0:9} landed despite the reported failure — not posted again"
+        return 0
+      fi
+      warn "$name: transient failure (attempt $attempt of $((MAX_RETRIES + 1))), retrying in ${RETRY_DELAY}s: $(tail -1 "$out" | cut -c1-160)"
+      sleep "$RETRY_DELAY"
+      continue
+    fi
+    cat "$out" >&2
+    die "velo-gate-post failed for $name (exit $rc, $attempt attempt(s)). No verdict was recorded; re-run this command once it is fixed — reports already on the PR are skipped."
+  done
+}
+
+record_verdict() {
+  local out="$GATE_DIR/gate-finish.verdict.out" attempt=0 rc
+  while :; do
+    attempt=$((attempt + 1))
+    "$GATE" "$PR" "$VERDICT" > "$out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      tail -1 "$out"
+      return 0
+    fi
+    if [[ $attempt -le $MAX_RETRIES ]] && is_transient "$out"; then
+      warn "velo-gate $VERDICT: transient failure (attempt $attempt of $((MAX_RETRIES + 1))), retrying in ${RETRY_DELAY}s: $(tail -1 "$out" | cut -c1-160)"
+      sleep "$RETRY_DELAY"
+      continue
+    fi
+    cat "$out" >&2
+    die "velo-gate $VERDICT failed for #$PR (exit $rc, $attempt attempt(s)). The reports above are posted; the label was NOT set."
+  done
+}
+
+# check-code first, as the hand-run sequence had it.
+[[ -n "$CC" ]] && post_gate check-code "$CC"
+[[ -n "$CR" ]] && post_gate code-review "$CR"
+record_verdict

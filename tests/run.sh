@@ -45,6 +45,10 @@ bash "$HERE/test_gate_post_once.sh" || RC=1
 bash "$HERE/test_gate_template_guard.sh" || RC=1
 bash "$HERE/test_spec_review_worker.sh" || RC=1
 bash "$HERE/test_gate_routing.sh" || RC=1
+bash "$HERE/test_gate_check_code_mode.sh" || RC=1
+bash "$HERE/test_gate_substitution.sh" || RC=1
+bash "$HERE/test_gate_run.sh" || RC=1
+bash "$HERE/test_gate_finish.sh" || RC=1
 echo
 echo "── dispatch preflight (end-to-end) ────────────────────"
 bash "$HERE/test_dispatch_preflight.sh" || RC=1

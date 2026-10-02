@@ -1,0 +1,380 @@
+#!/bin/bash
+# velo-gate-run — run one PR gate round end to end and leave Codex's verdict on disk.
+#
+#   velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]
+#
+# The hand-run sequence, as one command:
+#
+#   1. velo-pr-gate <pr> --plan                    which gates this PR needs, and how each is routed
+#   2. velo-pr-gate <pr> <scope> --brief-only      generate the review brief; dispatches NOTHING
+#   3. fill the brief's ## ATTACK from the scope file's own ## ATTACK section
+#   4. velo-pr-gate <pr> <scope> --exec --wait     launch the gates, block until they exit
+#   5. wait for the Codex pid, then write Codex's final message to
+#      $VELO_STATE/gate/<pr>/codex-verdict.md      (default ~/.agents/state)
+#
+# Run it with `run_in_background: true`: it blocks for the whole review, which is
+# minutes. The inner `velo-pr-gate ... --wait` is what the require-wait hook
+# insists on for a launch; this wrapper is the thing that must not hold a session.
+# `--wait` also waits for the non-blocking second opinion — set
+# VELO_SECOND_OPINION=0 to skip it, as with velo-pr-gate itself.
+#
+# THE SCOPE FILE MUST CARRY A `## ATTACK` SECTION. Its body (up to the next heading
+# of the same or a shallower depth; fenced code is skipped over) becomes the
+# brief's ATTACK section, which is the one part of a review brief that cannot be
+# templated: a generic checklist produces a generic review. A scope with no ATTACK
+# heading, or an empty one, is refused before anything is touched — velo-pr-gate
+# would refuse the stub anyway, later and more obscurely.
+#
+# Why the prime is `--brief-only` rather than the old `<pr> <scope> --plan`: that
+# spelling only dodged the require-wait hook. The script treats it as a plain run,
+# so it launched check-spec before reaching the unfilled-ATTACK refusal, and the
+# real run then launched it again over the same log.
+#
+# check-code: with the default route (sonnet) velo-pr-gate launches nothing for it;
+# it writes check-code-agent-prompt.md and prints ONE line saying to launch a
+# read-only Sonnet agent. That line appears in this command's output as soon as the
+# gates are dispatched — read the background output, do not wait for the end.
+#
+# Retries: a transient gh failure inside velo-pr-gate ("PR #N not found", "could
+# not read head/base branch for #N") is retried up to 3 times, 5s apart
+# (VELO_GATE_RETRY_DELAY). Anything else — a refusal, a missing worktree, a held
+# gate lock — fails on the first attempt: retrying those would only repeat them.
+#
+# Exit 0: the round ran and the verdict file is written (or nothing needed
+# gating). Non-zero: it did not, and the output says why.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PR_GATE="${VELO_PR_GATE_BIN:-$HERE/velo-pr-gate}"
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
+RETRY_DELAY="${VELO_GATE_RETRY_DELAY:-5}"
+POLL="${VELO_GATE_POLL:-5}"
+MAX_RETRIES=3
+
+die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+
+usage() {
+  die "usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]
+  The scope file must carry a '## ATTACK' section: its body becomes the review
+  brief's ATTACK. Launch with run_in_background: true — it blocks for the review."
+}
+
+PR="${1:-}"; SCOPE="${2:-}"
+[[ "$PR" =~ ^[0-9]+$ ]] || usage
+[[ -n "$SCOPE" ]] || usage
+shift 2
+PASS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check-code-by)
+      [[ $# -ge 2 ]] || die "--check-code-by needs a value: sonnet | opus"
+      PASS+=(--check-code-by "$2"); shift 2 ;;
+    --check-code-by=*)
+      PASS+=("$1"); shift ;;
+    *) die "unknown argument: $1
+  usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]" ;;
+  esac
+done
+# velo-pr-gate validates the route too, but a bad one should fail before the first
+# step, not after the plan has been read.
+if [[ ${#PASS[@]} -gt 0 ]]; then
+  BY="${PASS[${#PASS[@]}-1]#--check-code-by=}"
+  case "$BY" in
+    sonnet|opus) ;;
+    *) die "check-code route must be 'sonnet' or 'opus', got '$BY'" ;;
+  esac
+fi
+
+[[ -f "$SCOPE" ]] || die "scope file not found: $SCOPE"
+[[ -x "$PR_GATE" ]] || die "velo-pr-gate not found or not executable: $PR_GATE"
+
+# ---- the ATTACK section, from the scope file -----------------------------------
+#
+# Exit 3: no `## ATTACK` heading. Exit 4: the heading is there but the body is
+# empty. A heading inside a fenced block is not a heading, and a `#` line inside a
+# fence does not end the section.
+extract_attack() {   # <scope-file> -> stdout: the section body
+  python3 - "$1" <<'PY'
+import re, sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    lines = f.read().replace("\r\n", "\n").split("\n")
+
+fence = None      # the fence marker that opened the current fenced block
+depth = None      # heading depth of the ATTACK heading, once found
+body = []
+for line in lines:
+    m = re.match(r"^[ \t]*(`{3,}|~{3,})", line)
+    if m:
+        if fence is None:
+            fence = m.group(1)[0]
+        elif m.group(1)[0] == fence:
+            fence = None
+        if depth is not None:
+            body.append(line)
+        continue
+    if fence is None:
+        h = re.match(r"^(#{1,6})[ \t]+(.*)$", line)
+        if h:
+            if depth is None:
+                if re.match(r"ATTACK\b", h.group(2)):
+                    depth = len(h.group(1))
+                continue
+            if len(h.group(1)) <= depth:
+                break
+    if depth is not None:
+        body.append(line)
+
+if depth is None:
+    sys.exit(3)
+text = "\n".join(body).strip("\n")
+if not text.strip():
+    sys.exit(4)
+sys.stdout.write(text + "\n")
+PY
+}
+
+ATTACK_BODY=$(extract_attack "$SCOPE")
+case $? in
+  0) ;;
+  3) die "the scope file has no '## ATTACK' section: $SCOPE
+  Add one. Its body becomes the review brief's ATTACK — the specific things worth
+  this reviewer's effort: the shapes that would actually break this change, and
+  every claim the author made that rests on reasoning rather than evidence." ;;
+  4) die "the scope file's '## ATTACK' section is EMPTY: $SCOPE
+  An empty ATTACK is the stub the gate exists to refuse. Say what to attack." ;;
+  *) die "could not read the ATTACK section of $SCOPE (is python3 on PATH?)" ;;
+esac
+
+# ---- one gate per PR at a time --------------------------------------------------
+#
+# velo-pr-gate takes this lock itself and refuses a second gate on the same PR. The
+# check is repeated here, BEFORE this wrapper moves anything aside, because moving
+# a running gate's logs out from under it is worse than a refusal.
+GATE_DIR="$VELO_STATE/gate/$PR"
+LOCK="$GATE_DIR/.lock"
+if [[ -d "$LOCK" ]]; then
+  HOLDER=$(cat "$LOCK/pid" 2>/dev/null || true)
+  if [[ -n "$HOLDER" ]] && kill -0 "$HOLDER" 2>/dev/null; then
+    die "a gate is already running for #$PR (pid $HOLDER).
+  Wait for it, or read its output:  tail -f $GATE_DIR/review.log"
+  fi
+fi
+mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
+
+# ---- running velo-pr-gate, retrying only what is transient ----------------------
+#
+# A transient failure is gh failing inside velo-pr-gate. It surfaces as one of
+# these dies, and every one of them is worth another go; the others ("no local
+# worktree", "a gate is already running", the empty-range stop, an unfilled
+# ATTACK) describe local state that a retry cannot change.
+is_transient() {   # <output file>
+  grep -qE "PR #$PR not found|could not read (head|base) branch for #$PR" "$1"
+}
+
+STEP_RC=0
+run_gate_step() {   # <label> <velo-pr-gate args after the pr number...>
+  local label="$1"; shift
+  local out="$GATE_DIR/gate-run.$label.out" attempt=0 rc
+  while :; do
+    attempt=$((attempt + 1))
+    "$PR_GATE" "$PR" "$@" 2>&1 | tee "$out"
+    rc=${PIPESTATUS[0]}
+    [[ $rc -eq 0 ]] && return 0
+    if [[ $attempt -le $MAX_RETRIES ]] && is_transient "$out"; then
+      warn "$label: transient gh failure (attempt $attempt of $((MAX_RETRIES + 1))), retrying in ${RETRY_DELAY}s"
+      sleep "$RETRY_DELAY"
+      continue
+    fi
+    if is_transient "$out"; then
+      warn "$label: still failing after $attempt attempts — giving up"
+    fi
+    STEP_RC=$rc
+    return "$rc"
+  done
+}
+
+has_text() {   # <file> <fixed string>
+  grep -qF -- "$2" "$1"
+}
+
+# ---- 1. the plan ----------------------------------------------------------------
+echo "── 1/5 plan ──"
+run_gate_step plan --plan ${PASS[@]+"${PASS[@]}"} || die "velo-pr-gate --plan failed (exit $STEP_RC)"
+PLAN_FILE="$GATE_DIR/gate-run.plan.out"
+# The title line (`#<pr>  <title>`) is not a gate; see velo-pr-gate.
+PLAN_GATES=$(grep -v '^#' "$PLAN_FILE")
+if grep -q 'none —' <<<"$PLAN_GATES"; then
+  ok "no gates required — nothing to run"
+  exit 0
+fi
+NEEDS_REVIEW=0
+grep -q 'code-review' <<<"$PLAN_GATES" && NEEDS_REVIEW=1
+
+# ---- 2 + 3. the brief, and its ATTACK section ----------------------------------
+BRIEF="$GATE_DIR/review-brief.md"
+if [[ $NEEDS_REVIEW -eq 1 ]]; then
+  echo
+  echo "── 2/5 brief ──"
+  run_gate_step brief "$SCOPE" --brief-only ${PASS[@]+"${PASS[@]}"} \
+    || die "velo-pr-gate --brief-only failed (exit $STEP_RC)"
+  if has_text "$GATE_DIR/gate-run.brief.out" "is EMPTY"; then
+    ok "the diff range is empty — nothing has landed since the last review, so there is nothing to gate."
+    echo "     NO verdict was produced. Push the next commit, then re-run."
+    exit 0
+  fi
+  [[ -f "$BRIEF" ]] || die "velo-pr-gate generated no review brief at $BRIEF — see its output above."
+
+  echo
+  echo "── 3/5 ATTACK ──"
+  if has_text "$BRIEF" "<<< FILL THIS IN"; then
+    printf '%s\n' "$ATTACK_BODY" > "$GATE_DIR/attack-body.md" || die "could not write $GATE_DIR/attack-body.md"
+    python3 - "$BRIEF" "$GATE_DIR/attack-body.md" <<'PY'
+import re, sys
+
+brief_path, body_path = sys.argv[1], sys.argv[2]
+with open(brief_path, encoding="utf-8") as f:
+    brief = f.read()
+with open(body_path, encoding="utf-8") as f:
+    body = f.read().strip("\n") + "\n"
+
+# The brief's OWN section is the LAST `## ATTACK`: the scope text embedded above it
+# may carry an ATTACK heading of its own.
+idx = brief.rfind("\n## ATTACK\n")
+if idx < 0:
+    sys.exit(3)
+head, tail = brief[:idx], brief[idx:]
+# A function, not a template string: the body is literal text, and a replacement
+# string would interpret any backslash in it.
+tail, n = re.subn(r"(<<< [^\n]*>>>\n?)+", lambda m: body, tail, count=1)
+if n != 1:
+    sys.exit(4)
+with open(brief_path, "w", encoding="utf-8") as f:
+    f.write(head + tail)
+PY
+    case $? in
+      0) ;;
+      3) die "the generated brief has no '## ATTACK' heading: $BRIEF — velo-pr-gate's brief template changed shape." ;;
+      4) die "the generated brief's ATTACK placeholder was not found: $BRIEF — velo-pr-gate's brief template changed shape." ;;
+      *) die "could not fill the brief's ATTACK section (python3 failed)" ;;
+    esac
+    # Verify the postcondition rather than trust the rewrite.
+    if has_text "$BRIEF" "<<< FILL THIS IN"; then
+      die "the brief still has an unfilled ATTACK placeholder after the fill: $BRIEF"
+    fi
+    ok "ATTACK filled from $SCOPE ($(printf '%s\n' "$ATTACK_BODY" | wc -l | tr -d ' ') lines)"
+  else
+    ok "the brief is already filled and matches this scope and range — kept as is"
+  fi
+fi
+
+# ---- 4. run the gates ------------------------------------------------------------
+#
+# Whatever an earlier round left for Codex is moved aside first. velo-pr-gate
+# overwrites the log on a successful dispatch, but a run that dispatches nothing
+# (codex missing, an empty range) leaves the old one in place — and an old log with
+# a dead pid reads, to everything downstream, as a finished review of THIS run.
+for f in review.log codex-verdict.md; do
+  [[ -e "$GATE_DIR/$f" ]] && mv -f "$GATE_DIR/$f" "$GATE_DIR/$f.prev"
+done
+rm -f "$GATE_DIR/review.log.pid"
+
+echo
+echo "── 4/5 gates ──"
+run_gate_step run "$SCOPE" --exec --wait ${PASS[@]+"${PASS[@]}"} \
+  || die "velo-pr-gate failed (exit $STEP_RC) — see its output above. No verdict was extracted."
+if [[ $NEEDS_REVIEW -eq 1 ]] && has_text "$GATE_DIR/gate-run.run.out" "is EMPTY"; then
+  ok "the diff range is empty — nothing has landed since the last review, so there is nothing to gate."
+  echo "     NO verdict was produced. Push the next commit, then re-run."
+  exit 0
+fi
+
+# ---- 5. Codex's verdict ----------------------------------------------------------
+GATED_SHA=$(tr -d '[:space:]' < "$GATE_DIR/gated.sha" 2>/dev/null || true)
+CODE_PROMPT="$GATE_DIR/check-code-agent-prompt.md"
+VERDICT="$GATE_DIR/codex-verdict.md"
+
+next_steps() {
+  local have_cc=0 have_cr=0 finish
+  echo
+  echo "Next:"
+  if [[ -f "$CODE_PROMPT" ]]; then
+    have_cc=1
+    echo "  check-code  launch the read-only Sonnet agent on $CODE_PROMPT (if you have not) and save its report as post-cc-$PR.md"
+  elif [[ -f "$GATE_DIR/code.log" ]]; then
+    have_cc=1
+    echo "  check-code  the opus leg's report is $GATE_DIR/code.log — curate it as post-cc-$PR.md"
+  fi
+  if [[ -f "$VERDICT" ]]; then
+    have_cr=1
+    echo "  code-review read $VERDICT, curate it as post-cr-$PR.md"
+  fi
+  # The finish command names the reports THIS plan has — both positionally, one by
+  # flag. A line that names a report the plan never produces is a command that dies.
+  finish="velo-gate-finish $PR ${GATED_SHA:-<sha>} --pass|--block"
+  if [[ $have_cc -eq 1 && $have_cr -eq 1 ]]; then
+    echo "  then        $finish post-cc-$PR.md post-cr-$PR.md"
+  elif [[ $have_cc -eq 1 ]]; then
+    echo "  then        $finish --check-code post-cc-$PR.md"
+  elif [[ $have_cr -eq 1 ]]; then
+    echo "  then        $finish --code-review post-cr-$PR.md"
+  else
+    echo "  then        no check-code or code-review report to post for this plan, so nothing for velo-gate-finish — record the verdict with: velo-gate $PR --pass|--block"
+  fi
+}
+
+if [[ $NEEDS_REVIEW -eq 0 ]]; then
+  ok "no code-review gate in this plan — there is no Codex verdict to extract"
+  next_steps
+  exit 0
+fi
+
+echo
+echo "── 5/5 Codex verdict ──"
+PIDF="$GATE_DIR/review.log.pid"
+[[ -f "$PIDF" ]] || die "velo-pr-gate dispatched no Codex review for #$PR (no $PIDF).
+  Its output above says why — codex missing from PATH, or the diff range empty.
+  No verdict was written: $VERDICT does not exist."
+CODEX_PID=$(tr -d '[:space:]' < "$PIDF")
+[[ "$CODEX_PID" =~ ^[0-9]+$ ]] || die "$PIDF does not hold a pid: '$CODEX_PID'"
+
+# `--wait` has normally waited already. Waiting on the pid again costs nothing when
+# it is gone, and it is what stops this reading a log that is still being written.
+if kill -0 "$CODEX_PID" 2>/dev/null; then
+  echo "waiting for the Codex review (pid $CODEX_PID) ..."
+  while kill -0 "$CODEX_PID" 2>/dev/null; do
+    sleep "$POLL"
+  done
+fi
+
+LOG="$GATE_DIR/review.log"
+[[ -s "$LOG" ]] || die "the Codex log is missing or empty: $LOG"
+
+# The report is the LAST message in `codex review`'s transcript: everything after
+# the final line that is exactly "codex". Earlier occurrences are turn markers, so
+# the first one would return an intermediate turn on any multi-turn review.
+# Same rule as gate_final_codex_message in velo-pr-gate.
+LAST_MARKER=$(grep -n '^codex$' "$LOG" | tail -1 | cut -d: -f1)
+if [[ -n "$LAST_MARKER" ]]; then
+  tail -n +"$((LAST_MARKER + 1))" "$LOG" > "$VERDICT" || die "could not write $VERDICT"
+else
+  warn "no 'codex' marker line in $LOG — writing its whole content. That is the raw transcript"
+  warn "(brief and all), not a final message: the review probably did not finish."
+  cp "$LOG" "$VERDICT" || die "could not write $VERDICT"
+fi
+if [[ ! -s "$VERDICT" ]]; then
+  rm -f "$VERDICT"
+  die "Codex's final message is EMPTY — the review ended right after its last 'codex' marker.
+  Re-run the gate; there is nothing to post."
+fi
+
+ok "Codex verdict -> $VERDICT ($(wc -l < "$VERDICT" | tr -d ' ') lines)"
+VERDICT_LINE=$(grep -m1 -E '^\*\*Verdict:\*\*' "$VERDICT" || true)
+if [[ -z "$VERDICT_LINE" ]] || grep -qF 'approve | approve-with-findings | blocked' <<<"$VERDICT_LINE"; then
+  warn "no filled **Verdict:** line in Codex's final message — it did not finish a report. Read $VERDICT before posting anything."
+else
+  echo "     $VERDICT_LINE"
+fi
+next_steps

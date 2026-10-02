@@ -6,6 +6,52 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — velo-gate-finish: the reports posted at the gated sha, then the verdict
+
+`velo-gate-finish <pr> <sha> --pass|--block <check-code-report> <code-review-report>`
+replaces `velo-gate-post` twice and `velo-gate --pass|--block` by hand. It stamps
+every report with the sha the gates ran against, is idempotent (a header already on
+the PR is not posted again), retries a transient gh failure up to 3 times, and sets
+no label until every report is confirmed on the PR. **Prevents:** a `gate:passed`
+label over a report that never landed (the poster exits 0 without posting when its
+own done-marker survives a deleted comment); a report stamped with a head the
+review never saw; a lost post response retried into a duplicate comment; a
+`PR #N not found` network blip read as a refusal. `velo-gate-run` now prints the
+finish line that matches the plan's legs, rather than naming a check-code report an
+`.agents/`-only PR never produces.
+
+### Added — velo-gate-run, and velo-pr-gate --brief-only: one gate round in one command
+
+Plan, brief, the brief's `## ATTACK` filled from the scope file's own, `--exec
+--wait`, then Codex's final message — the text after the LAST line that is exactly
+`codex` — written to `gate/<pr>/codex-verdict.md`; transient `PR #N not found` is
+retried 3 times, a scope with no `## ATTACK` is refused before anything moves.
+`--brief-only` writes the brief and dispatches nothing. **Prevents:** a brief
+dispatched unfilled; a verdict cut at the FIRST `codex` marker (an intermediate
+turn); last round's `review.log` read as this round's; and the old prime
+(`<pr> <scope> --plan`), which dodged the require-wait hook by launching check-spec
+before the unfilled-ATTACK refusal and then launched it again over the same log.
+Two defects in `velo-pr-gate` the wrapper exposed are fixed with it: the plan's
+title line was read as a gate (a PR titled "check-code and code-review" was planned
+as needing both), and an unreadable base branch produced an EMPTY diff range — a
+vacuous `approve` — instead of a retryable failure.
+
+### Changed — check-code defaults to a read-only Sonnet agent, and the substitution is declared
+
+`velo-pr-gate` no longer launches the `check-code` leg: it writes
+`gate/<pr>/check-code-agent-prompt.md` (instructions, worktree, range, scope,
+ATTACK, read-only, a 40-tool-call cap, one output shape) and prints one line telling
+the orchestrator to launch a Sonnet agent on it. `--check-code-by opus` /
+`VELO_CHECK_CODE=opus` keeps the dispatched `claude -p --model opus --effort high`
+leg. The route is recorded in `gate/<pr>/check-code.by`; `velo-gate-post` prepends a
+reviewer-substitution note to the comment and `velo-gate` repeats it on the label,
+and `--plan` states the route it will take. **Prevents:** a gate that "ran" without
+ever producing a report (the opus leg has never returned one — it times out), and a
+`gate:passed` label implying an opus:high review that did not happen. Every run
+clears the previous run's prompt and route marker, and the Sonnet route also clears
+`code.log` and its pid, so `velo-orchestrd` cannot stamp a stale opus report with
+the new run's sha.
+
 ### Fixed — install.sh --check reported permanent drift (#2091)
 
 `install.sh` copied `bin/__pycache__/*.pyc` into the live tree and then compared

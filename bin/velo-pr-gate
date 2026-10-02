@@ -9,6 +9,15 @@
 #                                       --wait this returns the moment the
 #                                       gates are launched, exactly as before.
 #   velo-pr-gate <pr> --plan           show what would run, dispatch nothing
+#   velo-pr-gate <pr> <scope-file> --check-code-by sonnet|opus
+#                                      choose check-code's route (default sonnet;
+#                                      env VELO_CHECK_CODE; the flag wins)
+#   velo-pr-gate <pr> <scope-file> --brief-only
+#                                      generate (or reuse) the review brief and
+#                                      STOP: nothing is dispatched and an unfilled
+#                                      ## ATTACK is not refused. velo-gate-run
+#                                      primes with this, fills ATTACK, then runs
+#                                      the gate for real.
 #
 # Why this exists: `velo-gate --plan` says WHICH gates a PR needs, but nothing
 # said which MODEL runs each. Left to judgement, the routing drifted — reviews
@@ -21,7 +30,22 @@
 #   code-review  -> Codex      adversarial; found a real defect in EVERY round it
 #                              ran, including against designs the orchestrator had
 #                              pinned and code the orchestrator wrote
-#   check-code   -> opus:high  src/ correctness needs a reviewer that finds
+#   check-code   -> sonnet     DEFAULT (--check-code-by sonnet | VELO_CHECK_CODE=sonnet).
+#                              Prepared by this script, LAUNCHED by the orchestrator.
+#                              The opus leg below has never produced a report — it
+#                              times out — so every round ended in a hand-written
+#                              substitution. The script instead writes the exact
+#                              prompt for a read-only Sonnet agent to
+#                              $VELO_STATE/gate/<pr>/check-code-agent-prompt.md and
+#                              prints one line telling the orchestrator to launch it,
+#                              concurrently with Codex. The route is recorded in
+#                              gate/<pr>/check-code.by: velo-gate-post declares the
+#                              substitution in the posted comment, and velo-gate
+#                              --pass / --show repeat it. Nothing is skipped — the
+#                              same brief is reviewed, by a different reviewer.
+#   check-code   -> opus:high  OPT-IN (--check-code-by opus | VELO_CHECK_CODE=opus):
+#                              the original dispatched leg. src/ correctness needs a
+#                              reviewer that finds
 #                              things, and EFFORT is the knob that buys it —
 #                              coverage, edge cases and hot-path cost are what
 #                              this pass reasons about. `--effort` exists on the
@@ -60,8 +84,9 @@
 #                              must not move Codex's next range. Skip with
 #                              VELO_SECOND_OPINION=0.
 #
-# All three gates are dispatched by this script. `codex review` runs
-# non-interactively and takes its prompt on stdin.
+# Every gate is dispatched by this script except check-code's default route,
+# which is prepared here and launched by the orchestrator (see above).
+# `codex review` runs non-interactively and takes its prompt on stdin.
 #
 # This header used to say "Codex cannot be launched from a shell — it is an
 # Agent call". That was wrong, and it cost real money: every review on #1929,
@@ -122,33 +147,61 @@ die()  { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
-PR="${1:-}"; SCOPE=""; EXEC=0; WAIT=0
-for a in "${@:2}"; do
+PR="${1:-}"; SCOPE=""; EXEC=0; WAIT=0; BRIEF_ONLY=0
+# check-code's route. The flag wins over the environment, the environment over the
+# default. sonnet: this script writes the prompt and the orchestrator launches a
+# read-only Sonnet agent. opus: the original dispatched `claude` leg.
+CHECK_CODE_BY="${VELO_CHECK_CODE:-sonnet}"
+ARGS=("${@:2}")
+i=0
+while [[ $i -lt ${#ARGS[@]} ]]; do
+  a="${ARGS[$i]}"
   case "$a" in
     --exec) EXEC=1 ;;
     --wait) WAIT=1 ;;
+    --brief-only) BRIEF_ONLY=1 ;;
+    --check-code-by)
+      i=$((i + 1))
+      [[ $i -lt ${#ARGS[@]} ]] || die "--check-code-by needs a value: sonnet | opus"
+      CHECK_CODE_BY="${ARGS[$i]}" ;;
+    --check-code-by=*) CHECK_CODE_BY="${a#--check-code-by=}" ;;
     *)      [[ -z "$SCOPE" ]] && SCOPE="$a" ;;
   esac
+  i=$((i + 1))
 done
-[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] | <pr> --plan"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] [--brief-only] [--check-code-by sonnet|opus] | <pr> --plan"
+case "$CHECK_CODE_BY" in
+  sonnet|opus) ;;
+  *) die "check-code route must be 'sonnet' or 'opus', got '$CHECK_CODE_BY' (--check-code-by / VELO_CHECK_CODE)" ;;
+esac
 
 PLAN=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null) || die "PR #$PR not found"
 echo "$PLAN"
 echo
 
 NEEDS_REVIEW=0; NEEDS_CODE=0; NEEDS_SPEC=0
-grep -q 'code-review' <<<"$PLAN" && NEEDS_REVIEW=1
-grep -q 'check-code'  <<<"$PLAN" && NEEDS_CODE=1
-grep -q 'check-spec'  <<<"$PLAN" && NEEDS_SPEC=1
+# The gates are read from the plan's own lines, never from its title line.
+# `velo-gate --plan` opens with `#<pr>  <title>`, and matching the whole plan made
+# a PR TITLED "... check-code ..." need a check-code gate nothing had planned: a
+# stray Sonnet prompt or opus leg for a PR whose plan said it needed neither.
+# velo-merge and velo-orch-lib anchor on the bullet for the same reason.
+PLAN_GATES=$(grep -v '^#' <<<"$PLAN")
+grep -q 'code-review' <<<"$PLAN_GATES" && NEEDS_REVIEW=1
+grep -q 'check-code'  <<<"$PLAN_GATES" && NEEDS_CODE=1
+grep -q 'check-spec'  <<<"$PLAN_GATES" && NEEDS_SPEC=1
 
-if grep -q 'none —' <<<"$PLAN"; then
+if grep -q 'none —' <<<"$PLAN_GATES"; then
   ok "no gates required — docs/tooling only"
   exit 0
 fi
 
 if [[ "$SCOPE" == "--plan" ]]; then
   echo "would dispatch:"
-  [[ $NEEDS_CODE   -eq 1 ]] && echo "  check-code   -> opus:high via claude CLI (needs the brief's ATTACK section filled in)"
+  if [[ $NEEDS_CODE -eq 1 && "$CHECK_CODE_BY" == "sonnet" ]]; then
+    echo "  check-code   -> sonnet: NOT dispatched — writes check-code-agent-prompt.md for a read-only Sonnet agent YOU launch (needs the brief's ATTACK section filled in; --check-code-by opus restores the claude CLI leg)"
+  elif [[ $NEEDS_CODE -eq 1 ]]; then
+    echo "  check-code   -> opus:high via claude CLI (needs the brief's ATTACK section filled in)"
+  fi
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
   [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
   [[ $NEEDS_REVIEW -eq 1 && "${VELO_SECOND_OPINION:-1}" == "1" ]] && \
@@ -233,6 +286,17 @@ HEAD=$(git -C "$WTPATH" rev-parse --short HEAD 2>/dev/null)
 [[ -n "$HEAD" ]] || die "could not resolve HEAD in $WTPATH"
 printf '%s\n' "$HEAD" > "$GATE_DIR/gated.sha"
 # <<< velo-gated-sha
+
+# check-code's per-run artefacts, cleared on EVERY run so nothing written by an
+# earlier run can describe this one. check-code.by is how velo-gate-post knows to
+# declare a reviewer substitution on the posted comment; a stale `sonnet` would
+# put that declaration on an opus report, and a stale prompt would be launched
+# against a brief it was not written for. Both are written again below, only by
+# the route that produces them. Outside the velo-gated-sha block on purpose: that
+# block is extracted and run on its own by tests/test_pr_gate_launch.sh.
+CODE_BY_FILE="$GATE_DIR/check-code.by"
+CODE_AGENT_PROMPT="$GATE_DIR/check-code-agent-prompt.md"
+rm -f "$CODE_BY_FILE" "$CODE_AGENT_PROMPT"
 
 # Set AFTER the dispatches are known to be alive (#2005) — see the end of the
 # script. Marking a PR gate:running for a gate that died on quota is how a PR
@@ -356,6 +420,82 @@ dispatch_local() {  # $1 = skill, $2 = log suffix
   LAST_DISPATCH_PID=$!
   gate_track_pid "$LAST_DISPATCH_PID" "$log"
   ok "$skill -> velo-local (pid $LAST_DISPATCH_PID)  log: $log"
+}
+
+# The check-code gate's instructions: ONE definition, read by both routes. The
+# opus route feeds them (plus the brief) to `claude -p`; the sonnet route embeds
+# them in the prompt it writes for the orchestrator's agent.
+check_code_instructions() {
+  echo "You are running the CHECK-CODE gate, not the code review."
+  echo
+  echo "Scope: coverage, error handling, edge cases, duplication, hot-path"
+  echo "efficiency, complexity. Report what the DIFF does wrong on those"
+  echo "dimensions. Do not re-derive the design — a separate code-review"
+  echo "gate covers adversarial correctness against the author's claims."
+  echo
+  echo "State every finding as: file:line, what breaks, and the input or"
+  echo "state that makes it break. If you cannot name the failing case, say"
+  echo "the finding is reasoning-only and mark it as such."
+  echo
+  echo "Do NOT write to the worktree. Read-only."
+  echo
+}
+
+write_code_brief() {   # -> $CODE_BRIEF: the opus leg's stdin
+  { check_code_instructions; cat "$OUT"; } > "$CODE_BRIEF"
+}
+
+# The sonnet route's deliverable: the exact prompt for a read-only Sonnet agent.
+#
+# Built from the review brief, minus its Codex-only framing. The brief's
+# preamble may carry the --exec note ("you SHOULD run tests"), which is wrong
+# for a read-only agent with a tool cap, and its OUTPUT template is Codex's — an
+# agent that echoes `**Verdict:** approve | approve-with-findings | blocked`
+# back would be refused by velo-gate-post's template guard. So the body is cut
+# from the WORKTREE line to the OUTPUT line, and this prompt supplies its own
+# limits and its own output shape. The verdict values are described in words
+# for the same reason: the literal alternation is the template marker.
+write_check_code_agent_prompt() {   # -> $CODE_AGENT_PROMPT
+  local body
+  body=$(awk '/^WORKTREE: /{p=1} index($0, "OUTPUT — plain text") == 1{p=0} p' "$OUT")
+  [[ -n "$body" ]] || body=$(cat "$OUT")
+  {
+    echo "You are the CHECK-CODE gate reviewer for PR #$PR at $HEAD, run as a READ-ONLY Sonnet agent."
+    echo
+    echo "HARD LIMITS — part of the gate, not suggestions"
+    echo "- READ-ONLY. Do not create, edit, move or delete any file, and run nothing that"
+    echo "  changes the worktree or git state (no checkout, reset, stash, commit, apply)."
+    echo "  Use Read, Grep and Glob, and Bash only for git diff / log / show, rg, ast-grep, cat."
+    echo "- TOOL CAP: at most 40 tool calls in total. Read the diff first, then only the"
+    echo "  files and call sites it touches. At call 35 stop investigating and write the"
+    echo "  report; list anything you did not reach as UNVERIFIED."
+    echo "- Do not build or run tests. A claim that needs a run is reasoning-only: say so."
+    echo "- Do not post anywhere (no gh, no network). Your final message IS the report."
+    echo
+    check_code_instructions
+    printf '%s\n\n' "$body"
+    echo "OUTPUT — your final message, plain text, exactly this shape and nothing else:"
+    echo
+    echo "## check-code — PR $PR @ $HEAD"
+    echo "**Verdict:** <verdict>"
+    echo
+    echo "### Findings"
+    echo "SEVERITY file:line — what breaks, and the input or state that makes it break."
+    echo "Say whether it is REPRODUCED or reasoning-only. No findings: write \"none\"."
+    echo
+    echo "### Refutation attempts that FAILED"
+    echo
+    echo "### UNVERIFIED"
+    echo
+    echo "<verdict> is ONE word: approve (nothing needs changing), approve-with-findings"
+    echo "(LOW findings, or MEDIUM that produces no wrong or lost data), or blocked (any"
+    echo "HIGH, or any finding that produces wrong data, loses data or fails a deploy)."
+    echo "Write the single word; do not copy this sentence into the report."
+    echo "SEVERITY: HIGH = wrong or lost data, crash, failed deploy. MEDIUM = missing"
+    echo "coverage of changed behaviour, hot-path cost, an error swallowed. LOW = naming,"
+    echo "comments, style."
+    echo "Do not write a reviewer-substitution note: the posting tool declares it."
+  } > "$CODE_AGENT_PROMPT"
 }
 
 # >>> velo-fail-to-pass-merge (extracted verbatim by tests/test_fail_to_pass.sh)
@@ -487,9 +627,14 @@ print('\n'.join(str(t) for t in v))
 fi
 # <<< velo-fail-to-pass-merge
 
-# check-code is dispatched to Codex alongside code-review below — see the
-# routing table in this file's header for the measurement that moved it.
-if [[ $NEEDS_SPEC -eq 1 ]]; then
+# check-code is routed alongside code-review below (a read-only Sonnet agent the
+# orchestrator launches by default, the opus leg on request) — see the routing
+# table in this file's header for the measurement behind each route.
+# --brief-only dispatches NOTHING. Priming the brief with a plain run launched
+# check-spec here, ahead of the ATTACK refusal below, and the real run then
+# launched it a second time over the same spec.log while the first was still
+# writing it.
+if [[ $BRIEF_ONLY -eq 0 && $NEEDS_SPEC -eq 1 ]]; then
   dispatch_local check-spec spec
 fi
 
@@ -499,6 +644,11 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # Hand-writing the whole brief each time is what produced a review that came
   # back as a task handle, and another that wrote into a live PR worktree.
   BASE=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null)
+  # A failed lookup used to leave BASE empty, so RANGE became `origin/...HEAD`, the
+  # diff below came back empty and the run ended `exit 0` with a plausible "nothing
+  # has landed since the last review". Die instead, with the same retryable shape as
+  # the head-branch lookup above.
+  [[ -n "$BASE" ]] || die "could not read base branch for #$PR"
   # Match ANY review gate, not just 'codex-review'. The old pattern was literal,
   # so a review recorded under any other name — including a declared substitute
   # when Codex was unavailable — left GSHA empty and the range silently widened
@@ -652,6 +802,10 @@ real findings beats a long one with eight speculative ones.
 EOF
   fi
   echo
+  if [[ $BRIEF_ONLY -eq 1 ]]; then
+    ok "--brief-only: brief ready at $OUT (diff range: $RANGE) — nothing dispatched"
+    exit 0
+  fi
   # Dispatch the review to the Codex CLI, like any other gate.
   #
   # This used to print the brief and stop, on the belief that Codex "cannot be
@@ -678,23 +832,25 @@ EOF
   # on its own.
   CODE_LOG="$GATE_DIR/code.log"
   CODE_BRIEF="$GATE_DIR/code-brief.md"
-  if [[ $NEEDS_CODE -eq 1 ]] && command -v claude >/dev/null 2>&1; then
-    {
-      echo "You are running the CHECK-CODE gate, not the code review."
-      echo
-      echo "Scope: coverage, error handling, edge cases, duplication, hot-path"
-      echo "efficiency, complexity. Report what the DIFF does wrong on those"
-      echo "dimensions. Do not re-derive the design — a separate code-review"
-      echo "gate covers adversarial correctness against the author's claims."
-      echo
-      echo "State every finding as: file:line, what breaks, and the input or"
-      echo "state that makes it break. If you cannot name the failing case, say"
-      echo "the finding is reasoning-only and mark it as such."
-      echo
-      echo "Do NOT write to the worktree. Read-only."
-      echo
-      cat "$OUT"
-    } > "$CODE_BRIEF"
+  if [[ $NEEDS_CODE -eq 1 && "$CHECK_CODE_BY" == "sonnet" ]]; then
+    # The default route: nothing is launched here. The opus leg below has never
+    # produced a report (it times out), so what the orchestrator actually did on
+    # every round was run a read-only Sonnet agent by hand and write the
+    # substitution note by hand. This makes that the route: the prompt is
+    # generated, the route is recorded, and the note is applied by velo-gate-post.
+    #
+    # A code.log left by an earlier opus run is removed, with its pid file.
+    # velo-orchestrd treats "log present + pid dead" as a FINISHED gate and posts
+    # it under THIS run's gated.sha — a stale report stamped with a commit it
+    # never saw, which is the exact defect `gate: <name> @ <sha>` exists to stop.
+    rm -f "$CODE_LOG" "$CODE_LOG.pid"
+    write_code_brief
+    write_check_code_agent_prompt || die "could not write $CODE_AGENT_PROMPT"
+    printf '%s\n' sonnet > "$CODE_BY_FILE" || die "could not record the check-code route in $CODE_BY_FILE"
+    printf '\033[33m  >>\033[0m check-code (sonnet): LAUNCH a read-only Sonnet agent now (Agent tool, model sonnet, tool cap 40) with the prompt in %s — then post its report: velo-gate-post %s check-code <report> --sha %s\n' \
+      "$CODE_AGENT_PROMPT" "$PR" "$HEAD"
+  elif [[ $NEEDS_CODE -eq 1 ]] && command -v claude >/dev/null 2>&1; then
+    write_code_brief
     # check-code goes to opus at HIGH effort, via the `claude` CLI.
     #
     # The routing had drifted three ways at once: CLAUDE.md said `check-code ->
@@ -834,6 +990,14 @@ EOF
   echo "    velo-gate $PR --pass | --block"
 fi
 
+# --brief-only with no code-review planned: there is no brief to prepare, and the
+# check-spec dispatch above was skipped, so nothing was started either. Stop here
+# rather than fall into the gate:running bookkeeping below, which would report a
+# gate that was never launched as "NOTHING was dispatched".
+if [[ $BRIEF_ONLY -eq 1 ]]; then
+  ok "--brief-only: no code-review gate planned for #$PR — no brief to prepare, nothing dispatched"
+  exit 0
+fi
 
 # ---- #2005: only claim the gate is running if something actually is ---------
 if [[ "${GATE_RUNNING_PENDING:-0}" -eq 1 ]]; then

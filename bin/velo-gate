@@ -15,6 +15,7 @@
 
 set -uo pipefail
 REPO="velostreamai/velostream"
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die()  { printf '\n\033[31m%s\033[0m %s\n\n' "ERROR:" "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
@@ -32,6 +33,16 @@ TITLE=$(jq -r .title <<<"$META")
 LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$META")
 CUR=$(tr ',' '\n' <<<"$LABELS" | grep '^gate:' | head -1)
 [[ -n "$CUR" ]] || CUR="gate:none"
+
+# Who ran check-code for this PR's current gate run: velo-pr-gate records the
+# route in gate/<pr>/check-code.by. A substituted reviewer must never be silent,
+# so every mode that reports gate state repeats it — otherwise the label reads as
+# an opus:high result that never happened. velo-gate-post puts the same
+# declaration on the posted comment.
+CC_BY=""
+[[ -f "$VELO_STATE/gate/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/gate/$PR/check-code.by")
+SUBST=""
+[[ "$CC_BY" == "sonnet" ]] && SUBST=" [check-code: SUBSTITUTED reviewer, a read-only Sonnet agent and not opus:high; declared in the gate comment]"
 
 # --- which gates does this PR need? ------------------------------------------
 FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$META")
@@ -121,12 +132,13 @@ case "$MODE" in
       [[ "$l" == "$NEW" ]] || gh pr edit "$PR" --repo "$REPO" --remove-label "$l" >/dev/null 2>&1
     done
     gh pr edit "$PR" --repo "$REPO" --add-label "$NEW" >/dev/null 2>&1 \
-      && ok "#$PR -> $NEW (head $SHORT)" || die "could not set $NEW"
+      && ok "#$PR -> $NEW (head $SHORT)$SUBST" || die "could not set $NEW"
     ;;
   --show)
     echo "#$PR  $TITLE"
     echo "  head       : $SHORT"
     echo "  gate label : $CUR"
+    [[ -n "$SUBST" ]] && echo "  check-code : run by a SUBSTITUTED reviewer (read-only Sonnet agent, not opus:high) — declared in the gate comment"
     if [[ -n "$GSHA" ]]; then
       if [[ "$HEAD" == "$GSHA"* ]]; then
         if [[ "$CUR" == "gate:passed" ]]; then
