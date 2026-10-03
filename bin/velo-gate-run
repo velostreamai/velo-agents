@@ -1,7 +1,7 @@
 #!/bin/bash
 # velo-gate-run — run one PR gate round end to end and leave Codex's verdict on disk.
 #
-#   velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]
+#   velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|glm]
 #
 # The hand-run sequence, as one command:
 #
@@ -15,8 +15,13 @@
 # Run it with `run_in_background: true`: it blocks for the whole review, which is
 # minutes. The inner `velo-pr-gate ... --wait` is what the require-wait hook
 # insists on for a launch; this wrapper is the thing that must not hold a session.
-# `--wait` also waits for the non-blocking second opinion — set
-# VELO_SECOND_OPINION=0 to skip it, as with velo-pr-gate itself.
+# `--wait` does NOT wait for the non-blocking second opinion (#2350): it left the
+# gate lock held until the local model finished, and stalled three gates. Once
+# Codex's verdict is out, this wrapper gives it VELO_SECOND_OPINION_GRACE seconds
+# (default 120) to finish, then kills it — the pid in second-opinion.log.pid. Any
+# exit kills it, as does starting the next round. Its own runner timeout
+# (VELO_SECOND_OPINION_TIMEOUT, default 3600s) bounds it when nothing else does.
+# VELO_SECOND_OPINION=0 skips it, as with velo-pr-gate itself.
 #
 # THE SCOPE FILE MUST CARRY A `## ATTACK` SECTION. Its body (up to the next heading
 # of the same or a shallower depth; fenced code is skipped over) becomes the
@@ -29,6 +34,10 @@
 # spelling only dodged the require-wait hook. The script treats it as a plain run,
 # so it launched check-spec before reaching the unfilled-ATTACK refusal, and the
 # real run then launched it again over the same log.
+#
+# check-code --check-code-by deepseek|glm runs the same prompt on that OpenRouter
+# model, dispatched by velo-pr-gate; its report is ADVISORY (the posted comment and
+# velo-gate say so) — Codex's code-review stays the gating leg.
 #
 # check-code: with the default route (sonnet) velo-pr-gate launches nothing for it;
 # it writes check-code-agent-prompt.md and prints ONE line saying to launch a
@@ -56,7 +65,7 @@ ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
 usage() {
-  die "usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]
+  die "usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|glm]
   The scope file must carry a '## ATTACK' section: its body becomes the review
   brief's ATTACK. Launch with run_in_background: true — it blocks for the review."
 }
@@ -69,12 +78,12 @@ PASS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check-code-by)
-      [[ $# -ge 2 ]] || die "--check-code-by needs a value: sonnet | opus"
+      [[ $# -ge 2 ]] || die "--check-code-by needs a value: sonnet | opus | deepseek | glm"
       PASS+=(--check-code-by "$2"); shift 2 ;;
     --check-code-by=*)
       PASS+=("$1"); shift ;;
     *) die "unknown argument: $1
-  usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]" ;;
+  usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|glm]" ;;
   esac
 done
 # velo-pr-gate validates the route too, but a bad one should fail before the first
@@ -82,8 +91,8 @@ done
 if [[ ${#PASS[@]} -gt 0 ]]; then
   BY="${PASS[${#PASS[@]}-1]#--check-code-by=}"
   case "$BY" in
-    sonnet|opus) ;;
-    *) die "check-code route must be 'sonnet' or 'opus', got '$BY'" ;;
+    sonnet|opus|deepseek|glm) ;;
+    *) die "check-code route must be 'sonnet', 'opus', 'deepseek' or 'glm', got '$BY'" ;;
   esac
 fi
 
@@ -163,6 +172,50 @@ if [[ -d "$LOCK" ]]; then
   fi
 fi
 mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
+
+# ---- the second opinion is reaped, never waited for (#2350) ---------------------
+#
+# velo-pr-gate launches it detached and records its pid in second-opinion.log.pid.
+# Left alone it ran for hours after the gate had its verdict, holding the local
+# model; while --wait still waited on it, it held the gate lock too, and the next
+# round died on "a gate is already running" (#2341, #2333 twice).
+#
+# The pid is checked against what it should be running before anything is killed:
+# a pid file can outlive its process, and the pid be reused by something else.
+SECOND_GRACE="${VELO_SECOND_OPINION_GRACE:-120}"
+reap_second_opinion() {   # <grace-seconds>: let it finish within that, then kill it
+  local pidf="$GATE_DIR/second-opinion.log.pid" pid cmd waited=0 i
+  [[ -f "$pidf" ]] || return 0
+  pid=$(tr -d '[:space:]' < "$pidf")
+  [[ "$pid" =~ ^[0-9]+$ ]] || { warn "$pidf does not hold a pid: '$pid' — nothing reaped"; return 0; }
+  kill -0 "$pid" 2>/dev/null || return 0
+  cmd=$(ps -ww -o command= -p "$pid" 2>/dev/null || true)
+  case "$cmd" in
+    *velo-openai-agents-runner*|*velo-openrouter-agent*) ;;
+    *) warn "pid $pid from $pidf is not a second-opinion runner ('${cmd:0:80}') — left alone"; return 0 ;;
+  esac
+  if [[ $1 -gt 0 ]]; then
+    echo "second opinion (pid $pid) still running — giving it up to ${1}s to finish"
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt $1 ]]; do
+      sleep "$POLL"; waited=$((waited + POLL))
+    done
+  fi
+  kill -0 "$pid" 2>/dev/null || { ok "second opinion finished on its own"; return 0; }
+  # Its children first: the runner's tool subprocesses would otherwise outlive it.
+  pkill -TERM -P "$pid" 2>/dev/null
+  kill -TERM "$pid" 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    pkill -KILL -P "$pid" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+  fi
+  printf '\n[velo-gate-run] second opinion KILLED at %s: the gate round was over (grace %ss). Its report above is incomplete.\n' \
+    "$(date -u +%FT%TZ)" "$1" >> "$GATE_DIR/second-opinion.log"
+  warn "second opinion (pid $pid) killed — it had not finished; its partial log is $GATE_DIR/second-opinion.log"
+}
 
 # ---- running velo-pr-gate, retrying only what is transient ----------------------
 #
@@ -281,6 +334,12 @@ for f in review.log codex-verdict.md; do
 done
 rm -f "$GATE_DIR/review.log.pid"
 
+# A previous round's second opinion is reviewing a brief this round replaces, and
+# velo-pr-gate is about to truncate the log it writes to.
+reap_second_opinion 0
+# From here on, however this exits, the second opinion does not outlive it.
+trap 'reap_second_opinion 0' EXIT
+
 echo
 echo "── 4/5 gates ──"
 run_gate_step run "$SCOPE" --exec --wait ${PASS[@]+"${PASS[@]}"} \
@@ -305,7 +364,14 @@ next_steps() {
     echo "  check-code  launch the read-only Sonnet agent on $CODE_PROMPT (if you have not) and save its report as post-cc-$PR.md"
   elif [[ -f "$GATE_DIR/code.log" ]]; then
     have_cc=1
-    echo "  check-code  the opus leg's report is $GATE_DIR/code.log — curate it as post-cc-$PR.md"
+    local by
+    by=$(tr -d '[:space:]' < "$GATE_DIR/check-code.by" 2>/dev/null || true)
+    case "$by" in
+      deepseek|glm)
+        echo "  check-code  the $by leg's report (ADVISORY — not a gating verdict) is the tail of $GATE_DIR/code.log — curate it as post-cc-$PR.md" ;;
+      *)
+        echo "  check-code  the opus leg's report is $GATE_DIR/code.log — curate it as post-cc-$PR.md" ;;
+    esac
   fi
   if [[ -f "$VERDICT" ]]; then
     have_cr=1
@@ -377,4 +443,6 @@ if [[ -z "$VERDICT_LINE" ]] || grep -qF 'approve | approve-with-findings | block
 else
   echo "     $VERDICT_LINE"
 fi
+# Codex is done, so the round is: the second opinion gets a bounded grace, no more.
+reap_second_opinion "$SECOND_GRACE"
 next_steps

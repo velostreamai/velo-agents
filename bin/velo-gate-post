@@ -165,8 +165,16 @@ SUBST_NOTE=""
 if [[ "$NAME" == "check-code" ]]; then
   CC_BY=""
   [[ -f "$VELO_STATE/gate/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/gate/$PR/check-code.by")
-  if [[ "$CC_BY" == "sonnet" ]] && ! grep -qiE '^[[:space:]>*_-]*reviewer substitution' <<<"$BODY"; then
-    SUBST_NOTE="Reviewer substitution (declared): check-code was NOT run by its routed reviewer (opus --effort high — that leg has never produced a report; it times out). It was run by a read-only Sonnet agent launched by the orchestrator from the prompt velo-pr-gate wrote. Read this result as a Sonnet-grade check-code."
+  if ! grep -qiE '^[[:space:]>*_-]*reviewer substitution' <<<"$BODY"; then
+    case "$CC_BY" in
+      sonnet)
+        SUBST_NOTE="Reviewer substitution (declared): check-code was NOT run by its routed reviewer (opus --effort high — that leg has never produced a report; it times out). It was run by a read-only Sonnet agent launched by the orchestrator from the prompt velo-pr-gate wrote. Read this result as a Sonnet-grade check-code." ;;
+      deepseek|glm)
+        # The OpenRouter routes (#2350) have not earned a gating verdict: the
+        # report is posted, and declared ADVISORY so it never reads as a Claude
+        # review.
+        SUBST_NOTE="Reviewer substitution (declared): ADVISORY check-code. It was run by $CC_BY on OpenRouter (velo-pr-gate --check-code-by $CC_BY), not by a Claude reviewer. Codex's code-review is the gating leg; read this report as leads, not as a gating verdict." ;;
+    esac
   fi
 fi
 

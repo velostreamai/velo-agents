@@ -90,7 +90,15 @@ cat > "$TMPD/bin/codex" <<EOF
 cat >/dev/null
 exec -a $MARKER sleep 400
 EOF
-chmod +x "$TMPD/bin/gh" "$TMPD/nocodex/gh" "$TMPD/home/.agents/bin/velo-gate" "$TMPD/bin/claude" "$TMPD/bin/codex"
+# The OpenRouter runner velo-pr-gate launches for --check-code-by deepseek|glm
+# (it resolves it under $HOME, which run_gate points here). Records its argv.
+cat > "$TMPD/home/.agents/bin/velo-openrouter-agent" <<EOF
+#!/bin/bash
+printf '%s\n' "\$@" > "$TMPD/oragent.args"
+exec -a $MARKER sleep 400
+EOF
+chmod +x "$TMPD/bin/gh" "$TMPD/nocodex/gh" "$TMPD/home/.agents/bin/velo-gate" "$TMPD/bin/claude" "$TMPD/bin/codex" \
+  "$TMPD/home/.agents/bin/velo-openrouter-agent"
 
 # velo-gate --plan is what tells velo-pr-gate which gates to run; it only greps it.
 plan_with_code()    { printf '#1 t\n  gates needed:\n    - code-review  (independent reviewer)\n    - check-code   (src/ touched: 1 files)\n' > "$TMPD/plan.txt"; }
@@ -142,7 +150,7 @@ SC_FAILS=""
 sc_check() {   # <name> <exit status of the check>
   [[ "$2" -eq 0 ]] || SC_FAILS="$SC_FAILS $1"
 }
-has() { grep -qF -- "$2" "$1"; }   # <file> <fixed string>
+has() { grep -qF -- "$2" "$1" 2>/dev/null; }   # <file> <fixed string>
 
 # ── scenario: the default route prepares a prompt and launches nothing ───────
 sc_default_sonnet() {
@@ -232,6 +240,32 @@ sc_refused_run_writes_nothing() {
   [[ ! -e "$GATE_DIR/check-code.by" ]];              sc_check no-stale-route-after-a-refusal $?
 }
 
+# ── scenario: --check-code-by deepseek|glm runs the prompt on OpenRouter (#2350) ──
+# The route is dispatched by velo-pr-gate itself, read-only, with the sonnet
+# route's prompt and output shape, and recorded so it is declared ADVISORY.
+# Runs on FAST_PATH (no codex), so the leg under test is the only dispatch.
+sc_openrouter_route() {   # <route> <model id>
+  SC_FAILS=""
+  local by="$1" model="$2" A="$TMPD/oragent.args"
+  plan_with_code; prime_and_fill; rm -f "$TMPD/claude.called" "$A"
+  printf 'old prompt\n' > "$GATE_DIR/check-code-agent-prompt.md"
+  run_gate "$FAST_PATH" --check-code-by "$by"
+  [[ -s "$A" ]];                                         sc_check runner-launched $?
+  [[ "$(cat "$GATE_DIR/check-code.by" 2>/dev/null)" == "$by" ]]; sc_check route-recorded $?
+  [[ "$(grep -A1 -x -- '--model' "$A" 2>/dev/null | tail -1)" == "$model" ]]; sc_check pinned-model $?
+  ! grep -qx -- '--base-url' "$A" 2>/dev/null;           sc_check openrouter-not-local $?
+  has "$A" "=== THIS IS A READ-ONLY REVIEW TASK ===";    sc_check read-only-marker $?
+  has "$A" "You are running the CHECK-CODE gate, not the code review."; sc_check shared-instructions $?
+  has "$A" "ATTACK-PROBE-TEXT";                          sc_check carries-the-filled-attack $?
+  has "$A" '**Verdict:** <verdict>';                     sc_check same-output-shape $?
+  has "$A" "READ-ONLY $by ($model) agent";               sc_check names-the-reviewer $?
+  [[ -f "$GATE_DIR/code.log" && -f "$GATE_DIR/code.log.pid" ]]; sc_check code-log-and-pid $?
+  [[ ! -e "$GATE_DIR/check-code-agent-prompt.md" ]];     sc_check no-sonnet-prompt $?
+  [[ ! -f "$TMPD/claude.called" ]];                      sc_check claude-not-launched $?
+  has "$TMPD/out.txt" "check-code -> $by ($model, ADVISORY)"; sc_check says-advisory $?
+  [[ -f "$TMPD/running.flag" ]];                         sc_check gate-running-set $?
+}
+
 echo "check-code route (end to end, real velo-pr-gate)"
 
 # ── 1. the default is sonnet ─────────────────────────────────────────────────
@@ -253,6 +287,25 @@ sc_no_check_code_needed
 sc_refused_run_writes_nothing
 [[ -z "$SC_FAILS" ]] && ok "the refused (unfilled ATTACK) run clears stale artefacts and writes none" \
                      || fail "refused run left check-code state behind:$SC_FAILS"
+
+# ── 1b. the OpenRouter routes (each costs the 10s liveness window) ──────────
+sc_openrouter_route deepseek deepseek/deepseek-v4.1-flash
+[[ -z "$SC_FAILS" ]] && ok "--check-code-by deepseek: read-only OpenRouter leg, pinned model, same prompt, route recorded" \
+                     || fail "deepseek route:$SC_FAILS"
+sc_openrouter_route glm z-ai/glm-5.3-flash
+[[ -z "$SC_FAILS" ]] && ok "--check-code-by glm: read-only OpenRouter leg, pinned model, same prompt, route recorded" \
+                     || fail "glm route:$SC_FAILS"
+# The pins must be velo-dispatch's: a report from a model the worker records do
+# not describe is a reviewer nobody has measured.
+for r in deepseek glm; do
+  want=$(awk -v arm="  velo-$r)" '$0 == arm {f=1} f && /MODEL_ID=/ {gsub(/.*MODEL_ID=.|.$/, ""); print; exit}' "$BIN/velo-dispatch")
+  got=$(awk -v arm="  $r)" 'index($0, arm) == 1 && /CODE_MODEL_ID=/ {gsub(/.*CODE_MODEL_ID=.|. ;;$/, ""); print; exit}' "$GATE")
+  if [[ -n "$want" && "$want" == "$got" ]]; then
+    ok "$r: velo-pr-gate pins the same model as velo-dispatch ($want)"
+  else
+    fail "$r: velo-pr-gate pins '$got', velo-dispatch '$want'"
+  fi
+done
 
 # ── 2. a healthy default run: codex dispatched, claude not, gate:running set ──
 # This is the one that proves the whole point: no opus leg, and still a gate that
@@ -352,7 +405,7 @@ fi
 # ── 6. a bad route is refused before anything happens ────────────────────────
 rm -rf "$GATE_DIR"
 run_gate "$FAST_PATH" --check-code-by haiku
-if [[ $RC -ne 0 ]] && grep -q "must be 'sonnet' or 'opus', got 'haiku'" "$TMPD/out.txt"; then
+if [[ $RC -ne 0 ]] && grep -q "must be 'sonnet', 'opus', 'deepseek' or 'glm', got 'haiku'" "$TMPD/out.txt"; then
   ok "an unknown route is refused and the allowed values are named"
 else
   fail "unknown route accepted or unexplained (rc=$RC): $(tail -2 "$TMPD/out.txt")"
@@ -419,11 +472,20 @@ prove "the flag is parsed" sc_flag_beats_env \
 prove "route recorded in check-code.by" sc_default_sonnet \
   "printf '%s\\n' sonnet > \"\$CODE_BY_FILE\"" 'true'
 prove "stale opus report removal" sc_stale_removed \
-  'rm -f "$CODE_LOG" "$CODE_LOG.pid"' ': mutated out'
+  'rm -f "$CODE_LOG" "$CODE_LOG.pid"
+    write_code_brief' ': mutated out
+    write_code_brief'
 prove "per-run reset of route and prompt" sc_no_check_code_needed \
   'rm -f "$CODE_BY_FILE" "$CODE_AGENT_PROMPT"' ': mutated out'
 prove "Codex framing stripped from the prompt" sc_prompt_content \
   'index($0, "OUTPUT — plain text") == 1{p=0}' '0{p=0}'
+sc_deepseek() { sc_openrouter_route deepseek deepseek/deepseek-v4.1-flash; }
+prove "OpenRouter route recorded in check-code.by" sc_deepseek \
+  "printf '%s\\n' \"\$CHECK_CODE_BY\" > \"\$CODE_BY_FILE\"" 'true'
+prove "OpenRouter route dispatched" sc_deepseek \
+  'elif [[ $NEEDS_CODE -eq 1 && -n "$CODE_MODEL_ID" ]]; then' 'elif false; then'
+prove "OpenRouter route is read-only" sc_deepseek \
+  "--task \"\$(printf '%s\\n\\n' '=== THIS IS A READ-ONLY REVIEW TASK ==='; cat \"\$CODE_BRIEF\")\"" '--task "$(cat "$CODE_BRIEF")"'
 
 echo
 [[ $FAILED -eq 0 ]] && echo "all check-code route checks passed" || echo "FAILURES"

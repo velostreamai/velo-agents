@@ -9,9 +9,10 @@
 #                                       --wait this returns the moment the
 #                                       gates are launched, exactly as before.
 #   velo-pr-gate <pr> --plan           show what would run, dispatch nothing
-#   velo-pr-gate <pr> <scope-file> --check-code-by sonnet|opus
+#   velo-pr-gate <pr> <scope-file> --check-code-by sonnet|opus|deepseek|glm
 #                                      choose check-code's route (default sonnet;
-#                                      env VELO_CHECK_CODE; the flag wins)
+#                                      env VELO_CHECK_CODE; the flag wins).
+#                                      deepseek|glm are ADVISORY (see below)
 #   velo-pr-gate <pr> <scope-file> --brief-only
 #                                      generate (or reuse) the review brief and
 #                                      STOP: nothing is dispatched and an unfilled
@@ -64,6 +65,16 @@
 #                              "do not write" is a guarantee rather than a
 #                              request. velo-glm committed on 2 of its 3
 #                              read-only dispatches (#1987, #1994).
+#   check-code   -> deepseek|glm  OPT-IN, ADVISORY (--check-code-by deepseek|glm):
+#                              the cheap route. The sonnet leg costs ~90-115k
+#                              Claude tokens a PR; this runs the SAME prompt on an
+#                              OpenRouter model through velo-openrouter-agent, read-
+#                              only (the runner's READ-ONLY marker registers read
+#                              tools only), report in code.log. It has not earned a
+#                              gating verdict, so it is recorded as ADVISORY in
+#                              check-code.by: velo-gate-post says so on the posted
+#                              comment and velo-gate repeats it. Codex's
+#                              code-review remains the gating leg.
 #   check-spec   -> velo-local free; bar-by-bar verification against EXPLICIT
 #                              criteria, plus deletion-greps — both mechanical.
 #                              Its judgement calls are still unreliable (it also
@@ -162,17 +173,25 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
     --brief-only) BRIEF_ONLY=1 ;;
     --check-code-by)
       i=$((i + 1))
-      [[ $i -lt ${#ARGS[@]} ]] || die "--check-code-by needs a value: sonnet | opus"
+      [[ $i -lt ${#ARGS[@]} ]] || die "--check-code-by needs a value: sonnet | opus | deepseek | glm"
       CHECK_CODE_BY="${ARGS[$i]}" ;;
     --check-code-by=*) CHECK_CODE_BY="${a#--check-code-by=}" ;;
     *)      [[ -z "$SCOPE" ]] && SCOPE="$a" ;;
   esac
   i=$((i + 1))
 done
-[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] [--brief-only] [--check-code-by sonnet|opus] | <pr> --plan"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] [--brief-only] [--check-code-by sonnet|opus|deepseek|glm] | <pr> --plan"
 case "$CHECK_CODE_BY" in
-  sonnet|opus) ;;
-  *) die "check-code route must be 'sonnet' or 'opus', got '$CHECK_CODE_BY' (--check-code-by / VELO_CHECK_CODE)" ;;
+  sonnet|opus|deepseek|glm) ;;
+  *) die "check-code route must be 'sonnet', 'opus', 'deepseek' or 'glm', got '$CHECK_CODE_BY' (--check-code-by / VELO_CHECK_CODE)" ;;
+esac
+# The OpenRouter routes' models: the SAME pins as velo-dispatch's velo-deepseek /
+# velo-glm arms (tests/test_gate_check_code_openrouter.sh fails if they drift), so
+# a check-code report is from the model the worker records already describe.
+case "$CHECK_CODE_BY" in
+  deepseek) CODE_MODEL_ID='deepseek/deepseek-v4.1-flash' ;;
+  glm)      CODE_MODEL_ID='z-ai/glm-5.3-flash' ;;
+  *)        CODE_MODEL_ID='' ;;
 esac
 
 PLAN=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null) || die "PR #$PR not found"
@@ -199,8 +218,10 @@ if [[ "$SCOPE" == "--plan" ]]; then
   echo "would dispatch:"
   if [[ $NEEDS_CODE -eq 1 && "$CHECK_CODE_BY" == "sonnet" ]]; then
     echo "  check-code   -> sonnet: NOT dispatched — writes check-code-agent-prompt.md for a read-only Sonnet agent YOU launch (needs the brief's ATTACK section filled in; --check-code-by opus restores the claude CLI leg)"
-  elif [[ $NEEDS_CODE -eq 1 ]]; then
+  elif [[ $NEEDS_CODE -eq 1 && "$CHECK_CODE_BY" == "opus" ]]; then
     echo "  check-code   -> opus:high via claude CLI (needs the brief's ATTACK section filled in)"
+  elif [[ $NEEDS_CODE -eq 1 ]]; then
+    echo "  check-code   -> $CHECK_CODE_BY via OpenRouter, ADVISORY — Codex's code-review is the gating leg (needs the brief's ATTACK section filled in)"
   fi
   [[ $NEEDS_SPEC   -eq 1 ]] && echo "  check-spec   -> velo-local"
   [[ $NEEDS_REVIEW -eq 1 ]] && echo "  code-review  -> codex review (needs the brief's ATTACK section filled in)"
@@ -378,7 +399,7 @@ gate_final_codex_message() {  # $1 = review.log path
 
 # Through the wrapper, so the local GATES move with the workers rather than
 # staying on a runtime nobody remembers is still in use.
-WRAPPER=/Users/neilavery/.agents/bin/velo-openrouter-agent
+WRAPPER="$HOME/.agents/bin/velo-openrouter-agent"
 # Same model as the worker:local route, from the one file that names it.
 # shellcheck source=velo-local.conf
 . "$(dirname "${BASH_SOURCE[0]}")/velo-local.conf" || die "velo-local.conf missing next to velo-pr-gate"
@@ -405,6 +426,14 @@ POLICY=/Users/neilavery/.agents/rules/velo-impl.md
 GATE_PIDS=()
 gate_track_pid() {  # $1 = pid, $2 = log path (pid persisted to $2.pid)
   GATE_PIDS+=("$1")
+  printf '%s\n' "$1" > "$2.pid"
+}
+# A process that is NOT a gate: its pid is persisted, so velo-gate-run can reap
+# it, but it is kept OUT of GATE_PIDS, so --wait never blocks on it. The second
+# opinion used to be tracked like a gate; --wait then held this script — and the
+# gate lock with it — until the local model finished, and three gates stalled on
+# "a gate is already running" (#2350).
+gate_track_detached() {  # $1 = pid, $2 = log path (pid persisted to $2.pid)
   printf '%s\n' "$1" > "$2.pid"
 }
 # <<< velo-gate-track-pid
@@ -455,12 +484,12 @@ write_code_brief() {   # -> $CODE_BRIEF: the opus leg's stdin
 # from the WORKTREE line to the OUTPUT line, and this prompt supplies its own
 # limits and its own output shape. The verdict values are described in words
 # for the same reason: the literal alternation is the template marker.
-write_check_code_agent_prompt() {   # -> $CODE_AGENT_PROMPT
-  local body
+write_check_code_agent_prompt() {   # [out-file] [reviewer] -> $1 (default $CODE_AGENT_PROMPT)
+  local out="${1:-$CODE_AGENT_PROMPT}" reviewer="${2:-Sonnet agent}" body
   body=$(awk '/^WORKTREE: /{p=1} index($0, "OUTPUT — plain text") == 1{p=0} p' "$OUT")
   [[ -n "$body" ]] || body=$(cat "$OUT")
   {
-    echo "You are the CHECK-CODE gate reviewer for PR #$PR at $HEAD, run as a READ-ONLY Sonnet agent."
+    echo "You are the CHECK-CODE gate reviewer for PR #$PR at $HEAD, run as a READ-ONLY $reviewer."
     echo
     echo "HARD LIMITS — part of the gate, not suggestions"
     echo "- READ-ONLY. Do not create, edit, move or delete any file, and run nothing that"
@@ -495,7 +524,7 @@ write_check_code_agent_prompt() {   # -> $CODE_AGENT_PROMPT
     echo "coverage of changed behaviour, hot-path cost, an error swallowed. LOW = naming,"
     echo "comments, style."
     echo "Do not write a reviewer-substitution note: the posting tool declares it."
-  } > "$CODE_AGENT_PROMPT"
+  } > "$out"
 }
 
 # >>> velo-fail-to-pass-merge (extracted verbatim by tests/test_fail_to_pass.sh)
@@ -849,6 +878,29 @@ EOF
     printf '%s\n' sonnet > "$CODE_BY_FILE" || die "could not record the check-code route in $CODE_BY_FILE"
     printf '\033[33m  >>\033[0m check-code (sonnet): LAUNCH a read-only Sonnet agent now (Agent tool, model sonnet, tool cap 40) with the prompt in %s — then post its report: velo-gate-post %s check-code <report> --sha %s\n' \
       "$CODE_AGENT_PROMPT" "$PR" "$HEAD"
+  elif [[ $NEEDS_CODE -eq 1 && -n "$CODE_MODEL_ID" ]]; then
+    # The cheap route (#2350): the sonnet route's prompt — its limits and its
+    # output shape, so the report posts the same way — run on an OpenRouter model
+    # by the same runner the workers use. The READ-ONLY marker line makes the
+    # runner register read tools only. The prompt goes to code-brief.md, NOT to
+    # check-code-agent-prompt.md: that file's existence is what tells
+    # velo-gate-run to have the orchestrator launch a Sonnet agent.
+    #
+    # Recorded as ADVISORY: check-code.by names the model, and velo-gate-post /
+    # velo-gate declare it. Codex's code-review stays the gating leg.
+    rm -f "$CODE_LOG" "$CODE_LOG.pid"
+    write_check_code_agent_prompt "$CODE_BRIEF" "$CHECK_CODE_BY ($CODE_MODEL_ID) agent" \
+      || die "could not write $CODE_BRIEF"
+    printf '%s\n' "$CHECK_CODE_BY" > "$CODE_BY_FILE" || die "could not record the check-code route in $CODE_BY_FILE"
+    nohup "$WRAPPER" --model "$CODE_MODEL_ID" \
+        --policy "$POLICY" --max-turns 60 --prompt-timeout "${VELO_CHECK_CODE_TIMEOUT:-3600}" \
+        --max-budget-usd "${VELO_CHECK_CODE_BUDGET_USD:-1}" --cwd "$WTPATH" \
+        --task "$(printf '%s\n\n' '=== THIS IS A READ-ONLY REVIEW TASK ==='; cat "$CODE_BRIEF")" \
+        > "$CODE_LOG" 2>&1 &
+    CODE_PID=$!
+    gate_track_pid "$CODE_PID" "$CODE_LOG"
+    GATE_DISPATCHED=1
+    ok "check-code -> $CHECK_CODE_BY ($CODE_MODEL_ID, ADVISORY) (pid $CODE_PID)  log: $CODE_LOG"
   elif [[ $NEEDS_CODE -eq 1 ]] && command -v claude >/dev/null 2>&1; then
     write_code_brief
     # check-code goes to opus at HIGH effort, via the `claude` CLI.
@@ -954,12 +1006,12 @@ EOF
   if [[ "${VELO_SECOND_OPINION:-1}" == "1" ]]; then
     SECOND_LOG="$GATE_DIR/second-opinion.log"
     nohup "$WRAPPER" --model "$LOCAL_MODEL" --base-url "$LMSTUDIO_URL" \
-        --policy "$POLICY" --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
+        --policy "$POLICY" --max-turns 200 --prompt-timeout "${VELO_SECOND_OPINION_TIMEOUT:-3600}" --cwd "$WTPATH" \
         --task "$(printf '%s\n\n' '=== THIS IS A READ-ONLY REVIEW TASK ==='; cat "$OUT")" \
         > "$SECOND_LOG" 2>&1 &
     SECOND_PID=$!
-    gate_track_pid "$SECOND_PID" "$SECOND_LOG"
-    ok "second-opinion -> velo-local (pid $SECOND_PID, non-blocking)  log: $SECOND_LOG"
+    gate_track_detached "$SECOND_PID" "$SECOND_LOG"
+    ok "second-opinion -> velo-local (pid $SECOND_PID, non-blocking; --wait does not wait for it)  log: $SECOND_LOG"
     echo "     Leads to verify, not a verdict. Its silence proves nothing."
   fi
 

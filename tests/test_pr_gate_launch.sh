@@ -168,6 +168,56 @@ else
   echo "  FAIL gated.sha block is not before the first dispatch: sha=$SHA_LINE dispatch=$DISPATCH_LINE"; FAILED=1
 fi
 
+# ---- the second opinion is detached: --wait does not wait for it (#2350) ----
+# Tracked like a gate, it held velo-pr-gate's --wait — and the gate lock — until
+# the local model finished, and the next round died on "a gate is already
+# running". Runs the REAL launch block and the REAL --wait block in one process,
+# with a stub runner that outlives the wait by several seconds.
+SO_BLOCK=$(awk '/^  if \[\[ "\$\{VELO_SECOND_OPINION:-1\}" == "1" \]\]; then$/ {p=1} p {print} p && /^  fi$/ {exit}' "$PRGATE")
+WAIT_BLOCK=$(sed -n '/^# >>> velo-pr-gate-wait/,/^# <<< velo-pr-gate-wait/p' "$PRGATE")
+FN_BLOCK=$(sed -n '/^gate_final_codex_message/,/^}/p' "$PRGATE")
+[[ -n "$SO_BLOCK" && -n "$WAIT_BLOCK" ]] || { echo "  FAIL could not extract the second-opinion launch or the --wait block"; exit 1; }
+cat > "$TMPD/fake-runner" <<'EOF'
+#!/bin/bash
+sleep 8
+EOF
+chmod +x "$TMPD/fake-runner"
+so_wait_secs() {   # <launch block> -> seconds --wait took; leaves the pid in $TMPD/so/second-opinion.log.pid
+  rm -rf "$TMPD/so"; mkdir -p "$TMPD/so"; printf 'brief\n' > "$TMPD/so/brief.md"
+  local t0=$SECONDS
+  bash -c "
+    set -uo pipefail
+    ok() { :; }; warn() { :; }
+    GATE_DIR='$TMPD/so'; WRAPPER='$TMPD/fake-runner'; LOCAL_MODEL=m; LMSTUDIO_URL=u
+    POLICY=p; WTPATH='$TMPD'; OUT='$TMPD/so/brief.md'; WAIT=1; PR=1; CODE_LOG=''; CODEX_LOG=''
+    $TRACK_BLOCK
+    $FN_BLOCK
+    $1
+    $WAIT_BLOCK
+  " > "$TMPD/so/out.txt" 2>&1
+  echo $((SECONDS - t0))
+}
+T_REAL=$(so_wait_secs "$SO_BLOCK")
+SO_PID=$(cat "$TMPD/so/second-opinion.log.pid" 2>/dev/null)
+if [[ "$T_REAL" -lt 5 ]] && [[ -n "$SO_PID" ]] && kill -0 "$SO_PID" 2>/dev/null; then
+  echo "  ok   --wait returned in ${T_REAL}s with the second opinion still running (pid $SO_PID, persisted for velo-gate-run to reap)"
+else
+  echo "  FAIL --wait took ${T_REAL}s / second opinion pid '$SO_PID' not running: $(tail -3 "$TMPD/so/out.txt")"; FAILED=1
+fi
+[[ -n "$SO_PID" ]] && kill "$SO_PID" 2>/dev/null
+# MUTATION-PROOF: tracked as a gate again, --wait blocks for the runner's 8s.
+MUT_SO=${SO_BLOCK/gate_track_detached/gate_track_pid}
+if [[ "$MUT_SO" == "$SO_BLOCK" ]]; then
+  echo "  FAIL MUTATION-PROOF: the second-opinion launch does not call gate_track_detached"; FAILED=1
+else
+  T_MUT=$(so_wait_secs "$MUT_SO")
+  if [[ "$T_MUT" -ge 7 ]]; then
+    echo "  ok   MUTATION-PROOF red: tracked with gate_track_pid, --wait blocked ${T_MUT}s on the second opinion"
+  else
+    echo "  FAIL MUTATION-PROOF stayed green: --wait took only ${T_MUT}s with the second opinion in GATE_PIDS"; FAILED=1
+  fi
+fi
+
 echo
 [[ $FAILED -eq 0 ]] && echo "all velo-pr-gate launch-bookkeeping checks passed" || echo "FAILURES"
 exit $FAILED

@@ -6,6 +6,22 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — check-code on OpenRouter (advisory); the second opinion is reaped, not waited for (#2350)
+
+`velo-pr-gate` / `velo-gate-run --check-code-by deepseek|glm` runs the check-code
+prompt on the model `velo-dispatch` pins for that worker, read-only, and records
+the route so the posted comment and `velo-gate` declare the report **advisory** —
+Codex's code-review stays the gating leg. **Prevents:** spending ~90–115k Claude
+tokens on every check-code when a cheap advisory pass would do, without letting an
+unproven reviewer pass for a gating one.
+
+The second opinion is no longer in `--wait`'s set: `velo-gate-run` gives it a grace
+(`VELO_SECOND_OPINION_GRACE`, default 120s) once Codex is done, then kills it and its
+children; any exit, or the next round starting, kills it too; its runner timeout
+drops from 4h to 1h. **Prevents:** a finished gate held open — lock and all — by
+a local model that had hours left to run, which failed the next round with "a gate
+is already running" three times (#2341, #2333 twice).
+
 ### Added — velo-gate-finish: the reports posted at the gated sha, then the verdict
 
 `velo-gate-finish <pr> <sha> --pass|--block <check-code-report> <code-review-report>`

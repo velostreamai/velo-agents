@@ -954,15 +954,15 @@ velo-merge    1902                  # refuses unless gate:passed AND gate sha ==
 | gate | model | why this one |
 |---|---|---|
 | `code-review` | **Codex** | found a real defect in every round it ran, including against designs already pinned and code the orchestrator wrote |
-| `check-code` | **read-only Sonnet agent** (default) · opus at `--effort high` (`--check-code-by opus`) | the opus leg has never produced a report — it times out; a bounded Sonnet agent does, at a fraction of the cost |
+| `check-code` | **read-only Sonnet agent** (default) · opus at `--effort high` (`--check-code-by opus`) · DeepSeek / GLM on OpenRouter, **advisory** (`--check-code-by deepseek\|glm`) | the opus leg has never produced a report — it times out; a bounded Sonnet agent does, at a fraction of the cost; the OpenRouter route costs no Claude tokens but has not earned a gating verdict |
 | `check-spec` | velo-local | free; fine at bar-by-bar verification |
 
 Choosing the model per PR by judgement is how the routing drifted: a review once
 went to velo-local and came back `MERGE-READY` while missing a HIGH and asserting
 a fact that was demonstrably false. The routing is now in the script.
 
-**The `check-code` route** is chosen by `--check-code-by sonnet|opus` or
-`VELO_CHECK_CODE=sonnet|opus` (the flag wins; the default is `sonnet`):
+**The `check-code` route** is chosen by `--check-code-by sonnet|opus|deepseek|glm`
+or `VELO_CHECK_CODE=…` (the flag wins; the default is `sonnet`):
 
 - `sonnet` — the script launches **nothing** for this gate. It writes
   `~/.agents/state/gate/<pr>/check-code-agent-prompt.md` (the check-code
@@ -976,6 +976,14 @@ a fact that was demonstrably false. The routing is now in the script.
   never implies an opus:high result that did not happen.
 - `opus` — the original dispatched leg (`claude -p --model opus --effort high`,
   read-only by construction, health-checked), no substitution declared.
+- `deepseek` | `glm` — the sonnet route's prompt, run by `velo-openrouter-agent`
+  on the model `velo-dispatch` pins for that worker (a test fails if the two
+  drift), read-only via the runner's READ-ONLY marker, report in `code.log`
+  (`VELO_CHECK_CODE_TIMEOUT`, default 3600s; `VELO_CHECK_CODE_BUDGET_USD`,
+  default 1). It saves the ~90–115k Claude tokens a Sonnet check-code costs, but
+  it is **advisory**: `check-code.by` records the model, `velo-gate-post` declares
+  the report advisory on the comment and `velo-gate` repeats it. Codex's
+  code-review stays the gating leg.
 
 The Codex leg is the same on both routes, and `--plan` states which route it will
 take. Every run clears the previous run's prompt and route marker first, and the
@@ -1063,7 +1071,7 @@ record against an older one.
 ### `velo-gate-run` — one gate round in one command
 
 ```bash
-velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus]     # launch with run_in_background: true
+velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|glm]     # launch with run_in_background: true
 ```
 
 It replaces the hand-run sequence, each step of which went wrong in some round:
@@ -1079,12 +1087,20 @@ It replaces the hand-run sequence, each step of which went wrong in some round:
    skipped. **A scope with no `## ATTACK`, or an empty one, is refused before
    anything is touched.** A brief that is already filled for this scope and range is kept.
 4. `velo-pr-gate <pr> <scope> --exec --wait`, so the require-wait hook is satisfied
-   and every launched reviewer has exited when it returns. `--wait` includes the
-   non-blocking second opinion; `VELO_SECOND_OPINION=0` skips it.
+   and every launched reviewer has exited when it returns. `--wait` does **not**
+   wait for the non-blocking second opinion: it used to, which held the gate lock
+   until the local model finished and stalled the next round on "a gate is already
+   running". Its pid is in `second-opinion.log.pid`; `VELO_SECOND_OPINION=0` skips it.
 5. Waits for the Codex pid, then writes Codex's final message — the text after the
    **last** line that is exactly `codex` in `review.log` (the whole log, with a
    warning, if there is none) — to `gate/<pr>/codex-verdict.md`. An empty final
-   message is refused, not written.
+   message is refused, not written. Then the second opinion gets
+   `VELO_SECOND_OPINION_GRACE` seconds (default 120) to finish, and is killed —
+   children too — if it has not; its log says it was cut short. Any exit of the
+   wrapper kills it, as does the start of the next round (it would otherwise keep
+   writing into the log that round truncates). A pid file naming anything other
+   than an agent runner kills nothing. `VELO_SECOND_OPINION_TIMEOUT` (default
+   3600s) is the runner's own bound when nothing else ends it.
 
 It ends by printing the `velo-gate-finish` line for this plan. The wrapper holds a
 session for the length of a review, so launch it with `run_in_background: true`; with

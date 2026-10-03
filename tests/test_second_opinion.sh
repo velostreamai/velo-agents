@@ -26,7 +26,8 @@ check "operators are told to post it as second-opinion" "$POSTED" "second-opinio
 check "the posted name does not match the range regex"  "$(matches "gate: ${POSTED:-x} @ abc1234")" "0"
 
 # Read-only by construction: the dispatch must carry the runner's marker line.
+# (check-code's OpenRouter route carries it too, over its own brief.)
 check "the dispatch carries the read-only marker" \
-  "$(grep -c "=== THIS IS A READ-ONLY REVIEW TASK ===" "$GATE")" "1"
+  "$(grep -c "=== THIS IS A READ-ONLY REVIEW TASK ===.*cat \"\$OUT\"" "$GATE")" "1"
 
 exit $FAIL

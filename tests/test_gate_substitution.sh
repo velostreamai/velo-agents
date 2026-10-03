@@ -165,6 +165,21 @@ sc_post_under_existing_header() {
   has "$STUB_POSTED" '**Verdict:** approve';                      sc_check body-kept $?
 }
 
+# The OpenRouter routes (#2350): posted, and declared ADVISORY — never a gating verdict.
+sc_post_advisory() {
+  SC_FAILS=""
+  local by
+  for by in deepseek glm; do
+    post_report check-code "$by" "$REPORT"
+    [[ $RC -eq 0 ]];                                                sc_check "$by-posts" $?
+    [[ "$(nth "$STUB_POSTED" 1)" == "gate: check-code @ $SHORT" ]]; sc_check "$by-header-first" $?
+    [[ "$(nth "$STUB_POSTED" 3)" == "Reviewer substitution (declared): ADVISORY check-code."* ]]; sc_check "$by-advisory-under-header" $?
+    has "$STUB_POSTED" "run by $by on OpenRouter";                  sc_check "$by-names-the-model" $?
+    has "$STUB_POSTED" "Codex's code-review is the gating leg";     sc_check "$by-names-the-gating-leg" $?
+    has "$STUB_POSTED" "F1: a finding";                             sc_check "$by-body-kept" $?
+  done
+}
+
 # ── velo-gate ─────────────────────────────────────────────────────────────────
 gate_run() {   # <mode> <by: sonnet|opus|none>  -> $OUT $RC
   local mode="$1" by="$2"
@@ -191,6 +206,21 @@ sc_gate_declares() {
   has "$STUB_EDITS" "--add-label gate:blocked"; sc_check block-still-sets-the-label $?
   gate_run --show sonnet
   has "$TMPD/gate.out" "check-code : run by a SUBSTITUTED reviewer"; sc_check show-declares $?
+}
+
+sc_gate_advisory() {
+  SC_FAILS=""
+  local by m
+  for by in deepseek glm; do
+    for m in --pass --block --running; do
+      gate_run "$m" "$by"
+      [[ $RC -eq 0 ]]; sc_check "$by$m-succeeds" $?
+      tail -1 "$TMPD/gate.out" | grep -qF "check-code: ADVISORY, run by $by"; sc_check "$by$m-advisory-on-last-line" $?
+    done
+    gate_run --show "$by"
+    has "$TMPD/gate.out" "check-code : ADVISORY — run by $by"; sc_check "$by-show-declares" $?
+    ! has "$TMPD/gate.out" "SUBSTITUTED reviewer (read-only Sonnet"; sc_check "$by-show-not-the-sonnet-line" $?
+  done
 }
 
 sc_gate_silent_when_not_sonnet() {
@@ -226,12 +256,18 @@ sc_post_mention_does_not_suppress
 sc_post_under_existing_header
 [[ -z "$SC_FAILS" ]] && ok "a report with its own gate header keeps it first, with the note directly under" \
                      || fail "the declaration displaced or doubled the gate header:$SC_FAILS"
+sc_post_advisory
+[[ -z "$SC_FAILS" ]] && ok "deepseek/glm marker: the report is declared ADVISORY, Codex named as the gating leg" \
+                     || fail "an OpenRouter check-code is posted without its advisory declaration:$SC_FAILS"
 
 echo
 echo "velo-gate"
 sc_gate_declares
 [[ -z "$SC_FAILS" ]] && ok "--pass/--block/--running/--show state the substitution (and still set the label)" \
                      || fail "the label records a gate result without declaring the substitution:$SC_FAILS"
+sc_gate_advisory
+[[ -z "$SC_FAILS" ]] && ok "deepseek/glm marker: --pass/--block/--running/--show state the check-code is ADVISORY" \
+                     || fail "velo-gate records an OpenRouter check-code without declaring it advisory:$SC_FAILS"
 sc_gate_silent_when_not_sonnet
 [[ -z "$SC_FAILS" ]] && ok "no marker or an opus marker: velo-gate output is unchanged" \
                      || fail "velo-gate declares a substitution that did not happen:$SC_FAILS"
@@ -268,9 +304,11 @@ prove() {   # <label> <post|gate> <scenario fn> <anchor> <replacement>
 echo
 echo "mutation proofs"
 prove "post: marker read" post sc_post_declares \
-  '[[ "$CC_BY" == "sonnet" ]] && ! grep' '[[ "$CC_BY" == "never" ]] && ! grep'
+  '      sonnet)
+        SUBST_NOTE=' '      never)
+        SUBST_NOTE='
 prove "post: not doubled" post sc_post_not_doubled \
-  ']] && ! grep -qiE '"'"'^[[:space:]>*_-]*reviewer substitution'"'"' <<<"$BODY"; then' ']]; then'
+  'if ! grep -qiE '"'"'^[[:space:]>*_-]*reviewer substitution'"'"' <<<"$BODY"; then' 'if true; then'
 prove "post: check-code only" post sc_post_check_code_only \
   'if [[ "$NAME" == "check-code" ]]; then' 'if true; then'
 prove "post: anchored to a line start" post sc_post_mention_does_not_suppress \
@@ -278,11 +316,21 @@ prove "post: anchored to a line start" post sc_post_mention_does_not_suppress \
 prove "post: note goes under an existing header" post sc_post_under_existing_header \
   '{ print ""; print ENVIRON["SUBST_NOTE"]; done = 1 }' '{ done = 1 }'
 prove "gate: marker read" gate sc_gate_declares \
-  '[[ "$CC_BY" == "sonnet" ]] && SUBST=' '[[ "$CC_BY" == "never" ]] && SUBST='
+  '  sonnet)
+    SUBST=' '  never)
+    SUBST='
 prove "gate: label line" gate sc_gate_declares \
   'ok "#$PR -> $NEW (head $SHORT)$SUBST"' 'ok "#$PR -> $NEW (head $SHORT)"'
 prove "gate: --show line" gate sc_gate_declares \
-  '[[ -n "$SUBST" ]] && echo "  check-code :' '[[ -n "$SUBST" ]] && : "  check-code :'
+  '[[ -n "$SUBST_SHOW" ]] && echo "  check-code :' '[[ -n "$SUBST_SHOW" ]] && : "  check-code :'
+prove "post: advisory routes declared" post sc_post_advisory \
+  '      deepseek|glm)
+        #' '      never)
+        #'
+prove "gate: advisory routes declared" gate sc_gate_advisory \
+  '  deepseek|glm)
+    # #2350' '  never)
+    # #2350'
 
 echo
 [[ $FAILED -eq 0 ]] && echo "all substitution checks passed" || echo "FAILURES"

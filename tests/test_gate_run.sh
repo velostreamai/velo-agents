@@ -38,7 +38,7 @@ unset VELO_CHECK_CODE
 GATE_DIR="$VELO_STATE/gate/$TPR"
 STUB_DIR="$TMPD/stub"; export STUB_DIR
 STUB="$TMPD/stub-bin/velo-pr-gate"
-cleanup() { rm -rf "$TMPD"; }
+cleanup() { pkill -f "$TMPD/" 2>/dev/null; rm -rf "$TMPD"; }
 trap cleanup EXIT
 
 SC_FAILS=""
@@ -123,7 +123,19 @@ BRIEF
       exit 1
     fi
     printf '%s\n' abc1234 > "$GD/gated.sha"
+    # What a previous round's second opinion looked like at THIS moment (#2350).
+    if [[ -f "$STUB_DIR/old.pid" ]]; then
+      kill -0 "$(cat "$STUB_DIR/old.pid")" 2>/dev/null && echo alive > "$STUB_DIR/old.state" || echo dead > "$STUB_DIR/old.state"
+    fi
+    # The detached second opinion: a fake runner that sleeps <second.secs>.
+    if [[ -f "$STUB_DIR/second.secs" ]]; then
+      nohup "$(dirname "$0")/velo-openrouter-agent" "$(cat "$STUB_DIR/second.secs")" > "$GD/second-opinion.log" 2>&1 &
+      printf '%s\n' "$!" > "$GD/second-opinion.log.pid"
+    fi
     [[ -f "$STUB_DIR/sonnet" ]] && printf 'prompt\n' > "$GD/check-code-agent-prompt.md"
+    if [[ -f "$STUB_DIR/deepseek" ]]; then
+      printf 'report\n' > "$GD/code.log"; printf 'deepseek\n' > "$GD/check-code.by"
+    fi
     case "$(cat "$STUB_DIR/codex.mode" 2>/dev/null || echo finished)" in
       none) ;;
       finished)
@@ -145,6 +157,17 @@ BRIEF
 esac
 STUBEOF
 chmod +x "$STUB"
+# The fake second-opinion runner: named like the real wrapper (the reaper checks
+# the command line before killing), with a child of its own like the runner's
+# tool subprocesses.
+cat > "$TMPD/stub-bin/velo-openrouter-agent" <<'EOF'
+#!/bin/bash
+sleep "${1:-600}" &
+echo "$!" > "$STUB_DIR/second.child"
+wait
+echo "second opinion report"
+EOF
+chmod +x "$TMPD/stub-bin/velo-openrouter-agent"
 
 SCOPE="$TMPD/scope.md"
 EXPECTED_ATTACK="$TMPD/expected-attack.md"
@@ -272,7 +295,7 @@ sc_usage() {
   run_wrapper "$TPR" "$SCOPE" --bogus
   [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "unknown argument: --bogus"; sc_check unknown-flag $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by haiku
-  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "must be 'sonnet' or 'opus', got 'haiku'"; sc_check bad-route $?
+  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "must be 'sonnet', 'opus', 'deepseek' or 'glm', got 'haiku'"; sc_check bad-route $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by=haiku
   [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "got 'haiku'"; sc_check bad-route-equals-form $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by
@@ -716,6 +739,18 @@ sc_empty_range() {
   [[ ! -e "$GATE_DIR/codex-verdict.md" ]];         sc_check no-verdict-file $?
 }
 
+sc_advisory_hint() {
+  SC_FAILS=""
+  reset
+  : > "$STUB_DIR/deepseek"
+  run_wrapper "$TPR" "$SCOPE" --check-code-by deepseek
+  [[ $RC -eq 0 ]];                                 sc_check deepseek-route-accepted $?
+  has "$TMPD/wrapper.out" "the deepseek leg's report (ADVISORY — not a gating verdict) is the tail of $GATE_DIR/code.log"; sc_check says-advisory $?
+  ! has "$TMPD/wrapper.out" "the opus leg's report"; sc_check not-called-opus $?
+  run_wrapper "$TPR" "$SCOPE" --check-code-by glm
+  [[ $RC -eq 0 ]];                                 sc_check glm-route-accepted $?
+}
+
 sc_check_code_hint() {
   SC_FAILS=""
   reset
@@ -756,6 +791,72 @@ sc_finish_line() {
   has "$TMPD/wrapper.out" "velo-gate $TPR --pass|--block"; sc_check neither-points-at-velo-gate $?
 }
 
+# ── the second opinion is reaped, never left holding the gate (#2350) ─────────
+alive() { kill -0 "$1" 2>/dev/null; }
+second_pid() { cat "$GATE_DIR/second-opinion.log.pid" 2>/dev/null; }
+
+sc_reap_after_codex() {
+  SC_FAILS=""
+  reset
+  echo 600 > "$STUB_DIR/second.secs"
+  VELO_SECOND_OPINION_GRACE=1 run_wrapper "$TPR" "$SCOPE"
+  local p c
+  p=$(second_pid); c=$(cat "$STUB_DIR/second.child" 2>/dev/null)
+  [[ $RC -eq 0 ]];                                   sc_check exits-0 $?
+  [[ -s "$GATE_DIR/codex-verdict.md" ]];             sc_check verdict-still-written $?
+  [[ -n "$p" ]] && ! alive "$p";                     sc_check runner-killed $?
+  [[ -n "$c" ]] && ! alive "$c";                     sc_check its-child-killed $?
+  has "$GATE_DIR/second-opinion.log" "second opinion KILLED"; sc_check log-says-incomplete $?
+  has "$TMPD/wrapper.out" "second opinion (pid $p) killed"; sc_check says-so $?
+}
+
+sc_reap_grace() {
+  SC_FAILS=""
+  reset
+  echo 2 > "$STUB_DIR/second.secs"
+  VELO_SECOND_OPINION_GRACE=20 run_wrapper "$TPR" "$SCOPE"
+  [[ $RC -eq 0 ]];                                   sc_check exits-0 $?
+  has "$TMPD/wrapper.out" "second opinion finished on its own"; sc_check finished-within-grace $?
+  ! has "$GATE_DIR/second-opinion.log" "KILLED";     sc_check not-killed $?
+  has "$GATE_DIR/second-opinion.log" "second opinion report"; sc_check its-report-is-complete $?
+}
+
+sc_reap_on_failure() {
+  SC_FAILS=""
+  reset
+  echo 600 > "$STUB_DIR/second.secs"
+  echo none > "$STUB_DIR/codex.mode"
+  VELO_SECOND_OPINION_GRACE=60 run_wrapper "$TPR" "$SCOPE"
+  local p; p=$(second_pid)
+  [[ $RC -ne 0 ]];                                   sc_check the-round-failed $?
+  [[ -n "$p" ]] && ! alive "$p";                     sc_check killed-on-the-way-out $?
+}
+
+sc_reap_previous_round() {
+  SC_FAILS=""
+  reset
+  mkdir -p "$GATE_DIR"
+  nohup "$TMPD/stub-bin/velo-openrouter-agent" 600 > "$GATE_DIR/second-opinion.log" 2>&1 &
+  local old=$!
+  printf '%s\n' "$old" > "$GATE_DIR/second-opinion.log.pid"; printf '%s\n' "$old" > "$STUB_DIR/old.pid"
+  run_wrapper "$TPR" "$SCOPE"
+  [[ "$(cat "$STUB_DIR/old.state" 2>/dev/null)" == "dead" ]]; sc_check dead-before-the-gates-run $?
+  kill "$old" 2>/dev/null; return 0
+}
+
+sc_reap_not_a_runner() {
+  SC_FAILS=""
+  reset
+  mkdir -p "$GATE_DIR"
+  sleep 600 &
+  local other=$!
+  printf '%s\n' "$other" > "$GATE_DIR/second-opinion.log.pid"
+  run_wrapper "$TPR" "$SCOPE"
+  alive "$other";                                    sc_check unrelated-process-left-alone $?
+  has "$TMPD/wrapper.out" "is not a second-opinion runner"; sc_check says-why $?
+  kill "$other" 2>/dev/null; wait "$other" 2>/dev/null; return 0
+}
+
 run_scenarios() {   # "<function>::<what it pins>" ...
   local entry fn what
   for entry in "$@"; do
@@ -791,7 +892,13 @@ run_scenarios \
   "sc_spec_only::a spec-only plan runs the gates with no brief and no verdict" \
   "sc_empty_range::an empty diff range ends the round without a verdict" \
   "sc_check_code_hint::the Sonnet prompt and the post files are named at the end" \
-  "sc_finish_line::the velo-gate-finish line names the reports the plan has: both, either one, or none"
+  "sc_finish_line::the velo-gate-finish line names the reports the plan has: both, either one, or none" \
+  "sc_advisory_hint::--check-code-by deepseek|glm is accepted and its report named ADVISORY" \
+  "sc_reap_after_codex::a second opinion still running past the grace is killed, children too, once Codex is done" \
+  "sc_reap_grace::a second opinion that finishes within the grace is left to finish" \
+  "sc_reap_on_failure::a failed round does not leave the second opinion running" \
+  "sc_reap_previous_round::last round's second opinion is gone before this round's gates run" \
+  "sc_reap_not_a_runner::a pid file naming some other process kills nothing"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Layer 2 — the real velo-pr-gate: --brief-only, the plan, the base branch
@@ -1126,6 +1233,25 @@ prove_run "finish line: check-code only" sc_finish_line \
   '  elif [[ $have_cc -eq 1 ]]; then' '  elif false; then'
 prove_run "finish line: no report at all" sc_finish_line \
   'no check-code or code-review report to post for this plan' 'a finish line for this plan'
+prove_run "advisory routes accepted" sc_advisory_hint \
+  '    sonnet|opus|deepseek|glm) ;;' '    sonnet|opus) ;;'
+prove_run "advisory report named" sc_advisory_hint \
+  '      deepseek|glm)
+        echo "  check-code  the $by' '      never)
+        echo "  check-code  the $by'
+prove_run "reaped once Codex is done" sc_reap_after_codex \
+  'kill -0 "$pid" 2>/dev/null || { ok "second opinion finished on its own"; return 0; }' 'return 0'
+prove_run "children reaped too" sc_reap_after_codex \
+  'pkill -TERM -P "$pid" 2>/dev/null' ':'
+prove_run "the grace is honoured" sc_reap_grace \
+  'reap_second_opinion "$SECOND_GRACE"' 'reap_second_opinion 0'
+prove_run "reaped on any exit" sc_reap_on_failure \
+  "trap 'reap_second_opinion 0' EXIT" ':'
+prove_run "previous round reaped first" sc_reap_previous_round \
+  'reap_second_opinion 0
+# From here on' '# From here on'
+prove_run "only a runner is killed" sc_reap_not_a_runner \
+  '    *velo-openai-agents-runner*|*velo-openrouter-agent*) ;;' '    *) ;;'
 
 prove_prgate "--brief-only skips check-spec" sc_brief_only \
   'if [[ $BRIEF_ONLY -eq 0 && $NEEDS_SPEC -eq 1 ]]; then' 'if [[ $NEEDS_SPEC -eq 1 ]]; then'
