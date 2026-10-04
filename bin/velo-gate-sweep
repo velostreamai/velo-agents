@@ -1,0 +1,336 @@
+#!/bin/bash
+# velo-gate-sweep — one compact view of every gating PR, in one command.
+#
+#   velo-gate-sweep <pr> [<pr>...]
+#
+# Why this exists: an orchestrator sweeping the open PRs used to read each gate's
+# files separately — codex-verdict.md, review.log, code.log, `gh pr checks` — a
+# handful of tool calls and tens of thousands of tokens per PR, most of it the
+# same report re-read in full. This prints what the sweep actually asks, at most
+# 30 lines per PR:
+#
+#   head sha (9) + state + mergeable, the last GATED sha, and STALE when they differ
+#   the Build & Test CI result
+#   whether a gate is running for that PR right now
+#   the Codex verdict: the Verdict line plus each P* finding title
+#   the advisory check-code headlines from code.log (Verdict + HIGH/MEDIUM/LOW)
+#
+# Read-only: it never writes anything, to the repo or to the gate dir.
+#
+# Sources, in the order the gate scripts write them (see .agents/README.md's
+# gate-state layout): $VELO_STATE/gate/<pr>/codex-verdict.md is Codex's final
+# message as cut by velo-gate-run; when it is absent (a round predating it, or one
+# that died before the cut) the verdict is taken from review.log after the LAST
+# `^codex$` line — the transcript repeats the same report, so lines are
+# de-duplicated. code.log's last `## ` section is the check-code report, advisory.
+#
+# A missing file is not an error and prints "(no gate yet)"; a PR gh cannot see
+# prints an error line and the sweep continues with the next one — the sweep's
+# whole point is that one dead PR must not cost the rest of the view.
+#
+# `gh --repo velostreamai/velostream` is explicit so the command works from any
+# cwd, including a worktree on a branch with no upstream.
+
+set -uo pipefail
+REPO="velostreamai/velostream"
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
+
+[[ $# -ge 1 ]] || { echo "usage: velo-gate-sweep <pr> [<pr>...]" >&2; exit 2; }
+
+# ---- the Codex report reduction (one definition, both sources) ----------------
+#
+# De-duplicate (velo-gate-run writes codex-verdict.md from the final message of a
+# transcript that already contains it, so the same report arrives twice), keep the
+# Verdict line plus each P* finding title and the "no findings" phrasings, cap at
+# 6 lines and cut each at 260 columns.
+#
+# <drop_verdict: 0|1>: drop the Verdict line as well. Used for every INCOMPLETE
+# case, so an unfilled template line (`**Verdict:** approve | approve-with-findings
+# | blocked`) or a non-canonical verdict word can never reach the view looking
+# like a decision that was made.
+#
+# The `-viE` spelling catches the bold template form, the bare `Verdict:` form and
+# the placeholder text itself — the third matters because a local model sometimes
+# echoes the template's three words on its own line.
+cx_reduce() {  # <drop_verdict> <text>
+  awk '!s[$0]++' <<<"$2" \
+    | { if [[ "$1" == 1 ]]; then grep -viE 'verdict:'; else cat; fi; } \
+    | grep -E 'Verdict|^\*\*Verdict|^- \*?\*?\[?P[0-9]|^- \*\*P[0-9]|No (actionable|newly)|approve|blocked' \
+    | head -6 | cut -c1-260
+}
+
+# ---- is there a Codex verdict at all? (#2358 P2) ------------------------------
+#
+# A verdict is a DECISION, so the sweep prints one only when the report states one
+# of the three canonical words. When velo-gate-run's Codex leg did not finish, the
+# file it leaves behind can be: the unfilled brief template (literally
+# `**Verdict:** approve | approve-with-findings | blocked`, which the old reduction
+# printed as a verdict beginning "approve"), an empty file, a report with no
+# Verdict line, or a report whose verdict word is none of the three ("needs-changes").
+# Each of those is "no verdict", and each used to print as if one existed — which
+# is how an unfinished review reaches a merge as an approve. Echoes the classifier
+# in velo-orch-lib.sh's verdict_of (same normalisation: lowercase, truncate at the
+# first space or dot, so "**Verdict:** blocked." parses) and velo-gate-run:441's
+# placeholder guard. Difference: verdict_of returns "" and the caller escalates;
+# the sweep is a read, so it names the reason instead.
+#
+# Prints "canonical" (a verdict exists), "INCOMPLETE (unreadable <err>)" (a
+# verdict file that cannot be read — never "empty"), or "INCOMPLETE (<reason>)".
+cx_classify() {  # <text-present:0|1> <text> <read-error-text>
+  local present="$1" text="$2" err="$3" line val
+  [[ "$present" == 1 ]] || { echo "INCOMPLETE (unreadable ${err//$'\n'/ })"; return; }
+  [[ -n "${text//[[:space:]]/}" ]] || { echo "INCOMPLETE (empty)"; return; }
+  line=$(grep -im1 -- 'verdict:' <<<"$text") || line=""
+  [[ -n "$line" ]] || { echo "INCOMPLETE (no verdict line)"; return; }
+  # The placeholder test runs on the PARSED Verdict line, never the whole report
+  # (#2358 P2): a completed canonical report that QUOTES `approve |
+  # approve-with-findings | blocked` inside a finding or a refutation was read as
+  # an unfilled template, so its real verdict was suppressed and a finished review
+  # shown as unfinished. velo-gate-run's template puts the Verdict before any
+  # finding, so the first `verdict:` line IS the decision line.
+  if grep -qF 'approve | approve-with-findings | blocked' <<<"$line"; then
+    echo "INCOMPLETE (template placeholder — Codex wrote no report; read the file)"
+    return
+  fi
+  # Strip a trailing ** first so a bold `**Verdict:**` label cannot leave `**` as
+  # the verdict word, then take everything up to the first separator.
+  val=$(sed -E 's/.*[Vv]erdict:[*[:space:]]*//' <<<"$line" \
+          | tr '[:upper:]' '[:lower:]' | sed -E 's/[.,[:space:]].*$//')
+  case "$val" in
+    approve|approve-with-findings|blocked) echo "canonical" ;;
+    "") echo "INCOMPLETE (no verdict line)" ;;
+    *) echo "INCOMPLETE (verdict word '$val' is not one of approve / approve-with-findings / blocked)" ;;
+  esac
+}
+
+for p in "$@"; do
+  d="$VELO_STATE/gate/$p"
+  # One gh view: head + state + mergeable. Same read-honesty rule as `gh pr
+  # checks` below (#2358 P1 class): a FAILED view read — network down, API 5xx —
+  # used to print "not found", which is a different fact. rc!=0 prints the gh
+  # error as UNREADABLE; rc==0 with no output is the genuinely-empty case.
+  # Both still print the `#<pr> ERROR` prefix and the sweep continues: one dead
+  # PR must not cost the rest of the view.
+  view_errf=$(mktemp "${TMPDIR:-/tmp}/velo-gate-sweep-err.XXXXXX") || view_errf=""
+  if [[ -z "$view_errf" ]]; then
+    head=$(gh pr view "$p" --repo "$REPO" --json headRefOid,state,mergeable \
+             -q '.headRefOid[0:9]+" "+.state+" "+.mergeable' 2>/dev/null); view_rc=$?
+    view_err="could not create a scratch file for gh's stderr (TMPDIR unwritable)"
+  else
+    head=$(gh pr view "$p" --repo "$REPO" --json headRefOid,state,mergeable \
+             -q '.headRefOid[0:9]+" "+.state+" "+.mergeable' 2>"$view_errf"); view_rc=$?
+    view_err=$(head -1 "$view_errf" 2>/dev/null); rm -f "$view_errf"
+  fi
+  if [[ $view_rc -ne 0 ]]; then
+    echo "=== #$p ERROR: unreadable (gh failed to read PR #$p: ${view_err:-gh pr view exited $view_rc with no message}) — skipping"
+    continue
+  fi
+  if [[ -z "$head" ]]; then
+    echo "=== #$p ERROR: not found (gh read PR #$p but returned no view) — skipping"
+    continue
+  fi
+  # The redirect failure of a missing file is a SHELL stderr message, not tr's,
+  # so the existence test comes first — a sweep must stay silent about a PR that
+  # was simply never gated. A file that EXISTS but cannot be read is the opposite:
+  # reading it as empty would print gated=none AND suppress the STALE flag while
+  # still printing the on-disk verdict below — an unreadable sha read as "fresh".
+  # The group's own redirect installs before the inner one runs, so the shell's
+  # redirect error is captured with tr's rather than leaking to the sweep's stderr.
+  gated=""
+  if [[ -f "$d/gated.sha" ]]; then
+    # UNREADABLE (the redirect fails), EMPTY (a gate that wrote nothing) and
+    # MALFORMED (a non-hex blob) are three different failed reads, each of which
+    # used to collapse into one message or into gated=none; all three make the
+    # STALE comparison impossible, so the header says STALE? rather than reading
+    # as current.
+    if ! gated=$( { tr -d '[:space:]' < "$d/gated.sha"; } 2>&1 ); then
+      gated="ERROR(unreadable: $(head -1 <<<"$gated"))"
+    elif [[ -z "$gated" ]]; then
+      gated="ERROR(empty: no sha written)"
+    elif [[ "$gated" != *[0-9a-fA-F]* ]]; then
+      gated="ERROR(malformed: '${gated:0:16}')"
+    fi
+  fi
+  gated="${gated:-none}"
+  # STALE: the verdict on disk is for a commit that is no longer head. This is the
+  # one flag the sweep exists to surface — a fresh-looking approve for a sha that
+  # no longer exists is how an unreviewed commit reaches the merge. So the flag is
+  # never dropped for the case that needs it most: when the gated sha could not be
+  # read at all the comparison is impossible, and the header says STALE? — "not
+  # verified" — rather than silently reading as a current verdict.
+  stale=""
+  [[ "$gated" == ERROR\(* ]] && stale=" STALE?"
+  [[ "$gated" != "none" && "$gated" != ERROR\(* \
+     && "${gated:0:9}" != "${head:0:9}" ]] && stale=" STALE"
+  # `gh pr checks` is tab-separated and the check name contains spaces, so the
+  # result is column 2, not the second word.
+  #
+  # P1 (#2358): a FAILED read must never print as "clean". The old form piped gh
+  # through grep with 2>/dev/null, so on a network/API failure the error was
+  # discarded and the empty result printed as ci=none — byte-identical to a
+  # fresh PR whose checks have not reported. So gh runs alone (its exit status
+  # is its own, not grep's "no line matched", which also exits 1), stderr lands
+  # in a scratch file — stdout and stderr cannot both reach variables in one
+  # pass without a fork losing one of them — and the three states print apart:
+  #   ci=ERROR(<first stderr line>)  the read itself failed
+  #   ci=none                        the read succeeded and no check matched
+  #   ci=<result>                    Build & Test reported a result
+  # mktemp is per-PR and unlinked at once; nothing is written into the repo or
+  # the gate dir (the sweep stays read-only there).
+  ci_errf=$(mktemp "${TMPDIR:-/tmp}/velo-gate-sweep-err.XXXXXX") || ci_errf=""
+  if [[ -z "$ci_errf" ]]; then
+    # No scratch file means stderr cannot be separated; a read whose exit status
+    # is 0 is still trustworthy, anything else must be an ERROR, not a "none".
+    ci=$(gh pr checks "$p" --repo "$REPO" 2>/dev/null); ci_rc=$?
+    ci_err="could not create a scratch file for gh's stderr (TMPDIR unwritable)"
+  else
+    ci=$(gh pr checks "$p" --repo "$REPO" 2>"$ci_errf"); ci_rc=$?
+    # The unlink happens BEFORE reading, so an error path (a `head` failing on
+    # a truncated file, a SIGINT) can never leak the scratch file.
+    ci_err=$(head -1 "$ci_errf" 2>/dev/null); rm -f "$ci_errf"
+  fi
+  # tab (0x09) is what really separates gh's columns; the awk -F'\t' above has
+  # to stay in sync with that.
+  ci_line=""
+  [[ -n "$ci" ]] && ci_line=$(grep -E '^Build & Test' <<<"$ci" | awk -F'\t' '{print $2}')
+  if [[ $ci_rc -ne 0 ]]; then
+    ci="ERROR(${ci_err:-gh pr checks exited $ci_rc with no message})"
+  else
+    ci="${ci_line:-none}"
+  fi
+  # ---- is a gate running for THIS PR right now? (#2358 P2) --------------------
+  #
+  # The old form was `ps aux | grep "velo-(pr-gate|gate-run) $p "`: it matched
+  # ANY process whose arguments merely contain that text — a tail -f of the
+  # gate dir, an editor with the lock open, the sweep itself run by hand with
+  # that PR in its argv — and macOS `ps aux` truncates long command lines, so a
+  # real gate whose line got long was not counted at all. Both directions lie:
+  # gate-running=1 when nothing gates, and 0 when something does.
+  #
+  # The authoritative answer is the per-PR lock velo-pr-gate TAKES (velo-pr-gate
+  # mkdir's $GATE_DIR/.lock and writes the pid there; velo-gate-run refuses if
+  # that pid is alive). Lock held and holder alive → 1. No lock dir → 0, clean.
+  # A lock whose holder is dead is STALE — velo-pr-gate reclaims it, but the
+  # sweep is a read, so it only flags it: STALE-LOCK in the header.
+  #
+  # A live pid alone is not enough: pids get recycled, and a lock dir can
+  # outlive its process. So the holder is checked the way velo-gate-run checks
+  # the second-opinion pid — kill -0 for liveness, then the command line (ps
+  # -ww, the no-truncation spelling, vs the truncated `ps aux` that caused the
+  # original miscount) must be a gate script. A recycled pid running something
+  # unrelated is gate-running=0 with a STALE-LOCK flag, never a phantom gate.
+  gate_running=0; stale_lock=""
+  if [[ -d "$d/.lock" ]]; then
+    # #2354 class, the lock's own reads: an UNREADABLE pid file used to fall
+    # through to "no live holder pid" — the FAILED read wearing the dead-holder
+    # state's message, saying something about the holder it could not possibly
+    # know. Empty (written nothing) and unreadable (cat failed / file absent
+    # inside a lock dir that exists) are separate states, and a ps that FAILS
+    # for a live pid is separate from a ps that answers with a non-gate command.
+    if ! lock_pid=$( { cat "$d/.lock/pid"; } 2>&1 ); then
+      gate_running="ERROR(lock pid file unreadable: $(head -1 <<<"$lock_pid"))"
+    elif [[ -z "${lock_pid//[[:space:]]/}" ]]; then
+      stale_lock=" STALE-LOCK(pid file empty: no holder written)"
+    elif [[ "${lock_pid//[[:space:]]/}" =~ ^[0-9]+$ ]] && kill -0 "${lock_pid//[[:space:]]/}" 2>/dev/null; then
+      lock_pid="${lock_pid//[[:space:]]/}"
+      if ! lock_cmd=$( { ps -ww -o command= -p "$lock_pid"; } 2>&1 ); then
+        stale_lock=" STALE-LOCK(pid $lock_pid: ps read failed: $(head -1 <<<"$lock_cmd"))"
+      else
+        case "$lock_cmd" in
+          *velo-pr-gate*|*velo-gate-run*) gate_running=1 ;;
+          *) stale_lock=" STALE-LOCK(pid $lock_pid: not a gate process)" ;;
+        esac
+      fi
+    elif [[ "${lock_pid//[[:space:]]/}" =~ ^[0-9]+$ ]]; then
+      stale_lock=" STALE-LOCK(no live holder pid)"
+    else
+      stale_lock=" STALE-LOCK(pid file malformed: '${lock_pid//[[:space:]]/}')"
+    fi
+  fi
+  echo "=== #$p head=$head gated=$gated${stale} ci=$ci gate-running=$gate_running${stale_lock}"
+
+  if [[ -f "$d/codex-verdict.md" ]]; then
+    # One read, stderr captured with it (the gated.sha idiom above): a verdict
+    # file that EXISTS but cannot be read must print INCOMPLETE (unreadable …),
+    # never INCOMPLETE (empty) — an unread read and an empty report are different
+    # facts, and only one of them means Codex said nothing.
+    cx_err=""
+    if ! cx=$( { cat "$d/codex-verdict.md"; } 2>&1 ); then
+      cx_err="$cx"; cx=""
+    fi
+    cls=$(cx_classify "$([[ -z "$cx_err" ]] && echo 1 || echo 0)" "$cx" "$cx_err")
+    if [[ "$cls" == "canonical" ]]; then
+      echo "-- codex:"
+      cx_reduce 0 "$cx"
+    else
+      # INCOMPLETE: the reason first, then whatever the report DOES say minus any
+      # verdict line — the finding titles are still this sweep's business, the
+      # unfinished "verdict" is not. (Nothing to reduce for unreadable/empty.)
+      echo "-- codex: $cls"
+      [[ "$cls" == "INCOMPLETE (empty)" ]] || cx_reduce 1 "$cx"
+    fi
+  elif [[ -f "$d/review.log" ]]; then
+    # #2354 class: awk's failure on an UNREADABLE review.log (rc 2, n left empty)
+    # used to fall into the no-marker branch and print "(no gate yet)" — a failed
+    # read wearing the absent state's message, with awk's own error discarded.
+    # The group's redirect installs before awk runs, so awk's error is captured
+    # with its output; only rc==0 entitles the sweep to the "(no gate yet)" that
+    # a genuinely marker-less transcript still prints (test 3012).
+    rl_ok=1
+    if ! n=$( { awk '/^codex$/{n=NR} END{print n+0}' "$d/review.log"; } 2>&1 ); then
+      echo "-- codex: ERROR(unreadable review.log: $(head -1 <<<"$n"))"
+      rl_ok=0
+    fi
+    if [[ $rl_ok == 1 && "$n" -gt 0 ]]; then
+      echo "-- codex (review.log tail):"
+      # The unfilled-template line is never printed from the transcript path
+      # either. The keyword fallbacks (prose "blocked", "No newly actionable")
+      # stay: the tail path exists precisely for rounds predating
+      # codex-verdict.md, where prose is the only record — the strict one-of-three
+      # classification applies only to codex-verdict.md, velo-gate-run's own cut
+      # of the final message, which is the file the sweep is asked to judge.
+      tail -n +"$n" "$d/review.log" | awk '!s[$0]++' \
+        | grep -vF 'approve | approve-with-findings | blocked' \
+        | grep -E 'No (actionable|newly)|\[P[0-9]\]|approve|blocked|Verdict' \
+        | head -5 | cut -c1-260
+    elif [[ $rl_ok == 1 ]]; then
+      # The read SUCCEEDED and the transcript has no ^codex$ marker (test 3012)
+      # — only this state is entitled to "(no gate yet)".
+      echo "-- codex: (no gate yet)"
+    fi
+  else
+    echo "-- codex: (no gate yet)"
+  fi
+
+  if [[ -f "$d/code.log" ]]; then
+    # Same three states as review.log above (#2354): grep's failure on an
+    # UNREADABLE code.log left n empty and printed "(no gate yet)" for the
+    # advisory leg — the read failed, and the message claimed there was no gate.
+    # grep's own status separates the states (the old pipeline ended in `cut`,
+    # whose exit status was always 0, so a read failure was indistinguishable
+    # from a log with no sections): 0 = sections found, 1 = the file read fine
+    # and has no '## ' section (the dead-run code.log of test 3013 — genuinely
+    # "(no gate yet)"), >=2 = could not read the file — ERROR, never "no gate".
+    cc=$( { grep -n '^## ' "$d/code.log"; } 2>&1 ); cc_rc=$?
+    if [[ $cc_rc -ge 2 ]]; then
+      echo "-- check-code (advisory): ERROR(unreadable code.log: $(head -1 <<<"$cc"))"
+    else
+      n=$(printf '%s\n' "$cc" | tail -1 | cut -d: -f1)
+      if [[ -n "$n" ]]; then
+        echo "-- check-code (advisory):"
+        sed -n "${n},\$p" "$d/code.log" \
+          | grep -E '^\*\*Verdict|^\*\*(HIGH|MEDIUM|LOW)|^(HIGH|MEDIUM|LOW) ' \
+          | head -8 | cut -c1-200
+      else
+        echo "-- check-code (advisory): (no gate yet)"
+      fi
+    fi
+  else
+    echo "-- check-code (advisory): (no gate yet)"
+  fi
+done
+
+# Informational view: an unreadable PR is reported inline, it is not this
+# command's failure. Explicit so a mid-loop `head` closing a pipe (SIGPIPE under
+# pipefail) cannot make a successful sweep exit nonzero.
+exit 0

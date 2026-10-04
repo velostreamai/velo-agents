@@ -105,6 +105,7 @@ suite test_gate_check_code_mode.sh bash "$HERE/test_gate_check_code_mode.sh"
 suite test_gate_substitution.sh bash "$HERE/test_gate_substitution.sh"
 suite test_gate_run.sh bash "$HERE/test_gate_run.sh"
 suite test_gate_finish.sh bash "$HERE/test_gate_finish.sh"
+suite test_gate_sweep.sh bash "$HERE/test_gate_sweep.sh"
 echo
 echo "── dispatch preflight (end-to-end) ────────────────────"
 suite test_dispatch_preflight.sh bash "$HERE/test_dispatch_preflight.sh"

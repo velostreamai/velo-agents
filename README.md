@@ -25,6 +25,7 @@ and the tests** — never from the worker's self-report.
     velo-gate-post                 post a reviewer's report on its behalf
     velo-gate-run                  one gate round: plan, brief, ATTACK fill, dispatch, wait, Codex verdict
     velo-gate-finish               post a round's reports at the gated sha, then record the verdict
+    velo-gate-sweep                one compact view of every gating PR — sweep it instead of reading each gate's files
     velo-merge                     merge only if gated against the CURRENT head
     velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
     velo-spec-review               attest a spec was read; --check has Codex REVIEW it
@@ -54,6 +55,7 @@ and the tests** — never from the worker's self-report.
     test_gate_substitution.sh      a substituted check-code reviewer is declared on the comment and the label
     test_gate_run.sh               velo-gate-run: ATTACK fill, last-marker verdict, retry, --brief-only, one e2e round
     test_gate_finish.sh            velo-gate-finish: post order, gated sha, idempotence, retry, no label over a missing report
+    test_gate_sweep.sh             velo-gate-sweep: STALE flag, last-block verdict, per-leg caps, no-gate / gh-failure handling
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_status.sh                 velo-status worker naming
@@ -1145,6 +1147,45 @@ velo-gate-finish <pr> <sha> --pass|--block [--check-code <file>] [--code-review 
 `code.log`, so a PR whose plan includes check-code is never auto-passed and this
 command is the explicit finish. The substitution is declared from `check-code.by`
 exactly as when `velo-gate-post` is run by hand.
+
+---
+
+## `velo-gate-sweep` — every gating PR in one view
+
+```bash
+velo-gate-sweep <pr> [<pr>...]
+```
+
+Sweep the gates with `velo-gate-sweep` instead of reading each gate's files: at
+most 30 lines per PR for the head sha + state + mergeable, the last gated sha
+(`STALE` when it differs from head — the verdict on disk is for a commit that no
+longer exists), `Build & Test`, whether a gate is running, the Codex verdict with
+its P* finding titles, and the advisory check-code headlines; read-only, missing
+files print `(no gate yet)`, and a PR `gh` cannot see is an error line that does
+not stop the sweep.
+
+**Failure honesty (#2354):** a read that FAILS never prints as a clean state, and
+every read distinguishes three states — ABSENT (the file does not exist: only
+this state may print `(no gate yet)`), UNREADABLE/FAILED (the file exists but
+the read failed, or the command exited non-zero: `ERROR(<what failed>)`), and
+EMPTY/INCOMPLETE. A failed `gh pr checks` prints `ci=ERROR(<gh's first stderr
+line>)` — `ci=none` means the read SUCCEEDED and no check matched; likewise a
+failed view read prints `ERROR: unreadable (…)` while `ERROR: not found` means
+gh answered with nothing. `gate-running` is the per-PR lock
+(`gate/<pr>/.lock/pid`), counted only when the pid is alive AND its command line
+(`ps -ww`, untruncated) is a gate process — a dead or recycled holder prints `0`
+with a `STALE-LOCK(…)` flag (empty / malformed / unreadable pid file each name
+their own state; an unreadable one prints `gate-running=ERROR(…)`), never a
+phantom gate. A Codex verdict prints only when `codex-verdict.md` states one of
+the three canonical words; an unfilled template, an empty or unreadable file, or
+an off-format verdict word prints `-- codex: INCOMPLETE (<reason>)` with the
+finding titles still shown. The placeholder check reads the parsed **Verdict
+line only** — a completed report that quotes `approve | approve-with-findings |
+blocked` inside a finding is not an unfilled template. A `review.log` /
+`code.log` that exists but cannot be read prints `ERROR(unreadable …: <reason>)`
+per leg, never `(no gate yet)`; an unreadable, empty, or non-hex `gated.sha`
+prints `gated=ERROR(…)` with `STALE?` ("comparison impossible"), never
+`gated=none` with a possibly-stale verdict below it.
 
 ---
 
