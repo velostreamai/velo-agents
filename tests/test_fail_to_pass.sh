@@ -23,6 +23,9 @@
 # grep while gating exactly as little as #1958's names-nothing case. So the
 # dispatch check WARNS, and velo-pr-gate BLOCKS at merge, where it can also see
 # the already-passing case the grep never could.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH="$(cd "$HERE/.." && pwd)/bin/velo-dispatch"

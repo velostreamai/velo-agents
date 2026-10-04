@@ -347,24 +347,31 @@ CODE_PID=""
 # and the script went on to print `ok gate:running`. Same failure #2005 was filed
 # for — the gate says it ran — in the branch the original fix did not cover.
 GATE_DISPATCHED=0
+# The window. 10s separates a quota/auth death (seconds) from a real review
+# (minutes). Overridable only so the tests' stub reviewers need not sit out the
+# full window on every invocation: it cost the .agents suite ~5 minutes a run.
+# Fractions allowed (tests use 0.5); checked every 0.1s.
+HEALTH_SECS="${VELO_GATE_HEALTH_SECS:-10}"
+[[ "$HEALTH_SECS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "VELO_GATE_HEALTH_SECS must be a number of seconds, got '$HEALTH_SECS'"
+HEALTH_TICKS=$(awk -v s="$HEALTH_SECS" 'BEGIN { printf "%d", s * 10 }')
 gate_health_check() {   # $1 = pid, $2 = log, $3 = gate name
   local pid="$1" log="$2" name="$3" i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for ((i = 0; i < HEALTH_TICKS; i++)); do
     kill -0 "$pid" 2>/dev/null || break
-    sleep 1
+    sleep 0.1
   done
   if kill -0 "$pid" 2>/dev/null; then
-    ok "$name still running after 10s — dispatched for real"
+    ok "$name still running after ${HEALTH_SECS}s — dispatched for real"
     return 0
   fi
-  # Exited within 10s: too fast to be a review of anything.
+  # Exited within the window: too fast to be a review of anything.
   # Classify from the TAIL only, and with phrases that cannot appear in a brief.
   # The brief is echoed into the log before the model is called, and it contains
   # the word "authorized" — so a bare `auth` match reported AUTH FAILURE for
   # every fast exit regardless of cause (#2027 P2). Scanning the whole log means
   # scanning our own prompt.
   local tail_only; tail_only=$(tail -25 "$log" 2>/dev/null)
-  local why="exited in under 10s"
+  local why="exited in under ${HEALTH_SECS}s"
   # Phrases from BOTH CLIs. This watches `codex review` and `claude -p` since
   # check-code moved to opus:high, and a quota message that only matches one of
   # them reports a real out-of-quota exit as a generic "exited in under 10s".

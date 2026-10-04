@@ -9,6 +9,9 @@
 # The script is what actually dispatches, so it is the definition. CLAUDE.md and
 # the script's header are documentation OF it, and this suite fails when they
 # disagree with what the dispatch line does.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"

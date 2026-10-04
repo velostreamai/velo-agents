@@ -18,6 +18,9 @@
 # with that one behaviour mutated out (the MUTATION-PROOF cases at the end). The
 # mutants are COPIES in a temp dir — the repo's script is never edited, so an
 # interrupted run cannot leave it mutated.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"

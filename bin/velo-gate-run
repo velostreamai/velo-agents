@@ -184,7 +184,7 @@ mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
 # a pid file can outlive its process, and the pid be reused by something else.
 SECOND_GRACE="${VELO_SECOND_OPINION_GRACE:-120}"
 reap_second_opinion() {   # <grace-seconds>: let it finish within that, then kill it
-  local pidf="$GATE_DIR/second-opinion.log.pid" pid cmd waited=0 i
+  local pidf="$GATE_DIR/second-opinion.log.pid" pid cmd deadline i
   [[ -f "$pidf" ]] || return 0
   pid=$(tr -d '[:space:]' < "$pidf")
   [[ "$pid" =~ ^[0-9]+$ ]] || { warn "$pidf does not hold a pid: '$pid' — nothing reaped"; return 0; }
@@ -196,8 +196,10 @@ reap_second_opinion() {   # <grace-seconds>: let it finish within that, then kil
   esac
   if [[ $1 -gt 0 ]]; then
     echo "second opinion (pid $pid) still running — giving it up to ${1}s to finish"
-    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt $1 ]]; do
-      sleep "$POLL"; waited=$((waited + POLL))
+    # A deadline, not a sum of POLLs: POLL may be fractional (the tests use 0.1).
+    deadline=$((SECONDS + $1))
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+      sleep "$POLL"
     done
   fi
   kill -0 "$pid" 2>/dev/null || { ok "second opinion finished on its own"; return 0; }

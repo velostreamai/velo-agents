@@ -20,6 +20,9 @@
 # /tmp/gate-<pr>-review-brief.md. An earlier cut of this file did not, and two
 # cases passed only because they were reusing a brief left behind by a live run —
 # green for a reason that had nothing to do with the code under test.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$(cd "$HERE/.." && pwd)/bin/velo-pr-gate"
@@ -150,12 +153,17 @@ EOF
 SCOPE="$TMPD/scope.md"
 printf '# Scope\n\nReal scope text for the gate-health test.\n' > "$SCOPE"
 
+stubs_gone() {   # until the killed stubs are gone; up to 1s, not a fixed 1s
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -f "$MARKER" >/dev/null || return 0; sleep 0.1; done
+}
+
 invoke() {
   rm -f "$FLAG"
   HOME="$TMPD/home" PATH="$TMPD/bin:$PATH" \
     bash "$GATE" "$TPR" "$SCOPE" >"$TMPD/out.txt" 2>&1
   pkill -f "$MARKER" 2>/dev/null
-  sleep 1
+  stubs_gone
 }
 
 fill_attack() {
@@ -348,7 +356,7 @@ fi
 # silently matched NOTHING until the marker moved into argv[0] via `exec -a`:
 # the string was only ever written to stdout, so every run leaked its stubs for
 # 400s (#2027 round 8, P2). Assert the cleanup rather than trusting it.
-sleep 1
+stubs_gone
 LEAKED=$(pgrep -f "$MARKER" 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$LEAKED" == "0" ]]; then
   echo "  PASS  no stub reviewers leaked"

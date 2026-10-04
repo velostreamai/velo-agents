@@ -12,6 +12,9 @@
 # velo-pr-gate's gate_health_check caught it and nothing downstream consulted
 # the verdict. A hand-relayed report bypasses it completely — which is the path
 # that most needs the check.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GP="$HERE/../bin/velo-gate-post"

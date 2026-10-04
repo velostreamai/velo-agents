@@ -105,7 +105,10 @@ check "a re-pinned deepseek model still names velo-deepseek" \
 
 # And the whole command must still run. It reads real worktrees, so assert only
 # that it succeeds and prints its header — not on the rows, which vary.
-OUT=$("$BIN/velo-status" 2>&1)
+# gh stubbed to fail at once: the real one made this check 8s of live GitHub
+# calls, and velo-status already degrades to "(gh unavailable)" without it.
+mkdir -p "$TMPD/stub"; printf '#!/bin/bash\nexit 1\n' > "$TMPD/stub/gh"; chmod +x "$TMPD/stub/gh"
+OUT=$(PATH="$TMPD/stub:$PATH" "$BIN/velo-status" 2>&1)
 if grep -q 'ISSUE.*WORKER.*STATE' <<<"$OUT"; then
   echo "  PASS  velo-status runs and prints its table"
 else

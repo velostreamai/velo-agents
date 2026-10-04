@@ -31,7 +31,8 @@ fi
 SPEC="$SPEC_ROOT/$ISSUE.json"
 
 export VELO_STATE="$TMPD/state"
-export VELO_SPEC_TIMEOUT=15
+# Test-mode timeouts (VELO_SPEC_TIMEOUT=2: the timeout case stubs a 60s codex).
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
 mkdir -p "$TMPD/stub"
 export PATH="$TMPD/stub:$PATH"
 

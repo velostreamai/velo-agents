@@ -9,6 +9,9 @@
 # this script — same reason test_pr_gate_wait.sh gives: isolating each run so
 # nothing here can leak state (a stray GATE_PIDS entry, a leftover die()
 # trap) between cases.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRGATE="$(cd "$HERE/.." && pwd)/bin/velo-pr-gate"

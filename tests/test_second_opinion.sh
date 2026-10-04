@@ -6,6 +6,9 @@
 # that pattern would silently move Codex's next range past code Codex never saw.
 # Both halves are extracted from the script itself, so renaming the leg or
 # widening the regex is caught here rather than on a PR.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/../bin/velo-pr-gate"

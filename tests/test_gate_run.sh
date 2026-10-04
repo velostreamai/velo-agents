@@ -17,6 +17,9 @@
 # with that one behaviour mutated out (the MUTATION-PROOF cases at the end). The
 # mutants are copies in a temp dir — the repo's scripts are never edited, so an
 # interrupted run cannot leave one mutated.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"
@@ -38,7 +41,17 @@ unset VELO_CHECK_CODE
 GATE_DIR="$VELO_STATE/gate/$TPR"
 STUB_DIR="$TMPD/stub"; export STUB_DIR
 STUB="$TMPD/stub-bin/velo-pr-gate"
-cleanup() { pkill -f "$TMPD/" 2>/dev/null; rm -rf "$TMPD"; }
+# Every fake lives under $TMPD, so its command line names it — but the fakes'
+# own `sleep` children do not, and survive a bare pkill -f (3 x sleep 600 leaked
+# per run). Kill each match's children first, then the match.
+cleanup() {
+  local p
+  for p in $(pgrep -f "$TMPD/"); do pkill -P "$p"; kill "$p"; done 2>/dev/null
+  for p in $(cat "$TMPD/second.children" 2>/dev/null); do
+    [[ $(ps -o command= -p "$p" 2>/dev/null) == sleep* ]] && kill "$p" 2>/dev/null
+  done
+  rm -rf "$TMPD"
+}
 trap cleanup EXIT
 
 SC_FAILS=""
@@ -144,9 +157,9 @@ BRIEF
         printf '%s\n' "$p" > "$GD/review.log.pid" ;;
       running)
         # The `--wait` that returned early: the reviewer is still alive, and its
-        # final message lands two seconds later.
+        # final message lands half a second later.
         cat "$STUB_DIR/review.partial" > "$GD/review.log"
-        ( sleep 2; cat "$STUB_DIR/review.final" >> "$GD/review.log" ) >/dev/null 2>&1 &
+        ( sleep 0.5; cat "$STUB_DIR/review.final" >> "$GD/review.log" ) >/dev/null 2>&1 &
         printf '%s\n' "$!" > "$GD/review.log.pid" ;;
       badpid)
         cat "$STUB_DIR/review.full" > "$GD/review.log"
@@ -164,6 +177,10 @@ cat > "$TMPD/stub-bin/velo-openrouter-agent" <<'EOF'
 #!/bin/bash
 sleep "${1:-600}" &
 echo "$!" > "$STUB_DIR/second.child"
+# Also outside STUB_DIR (wiped by every reset): the test's cleanup reaps every
+# child ever started. A runner killed without its child (the mutation proofs do
+# exactly that) leaves an orphan whose argv does not name $TMPD.
+echo "$!" >> "$STUB_DIR/../second.children"
 wait
 echo "second opinion report"
 EOF
@@ -268,7 +285,7 @@ EOF
 
 RUN_UNDER_TEST="$RUN_REAL"
 run_wrapper() {   # [args...] -> $OUT $RC
-  OUT=$(VELO_PR_GATE_BIN="$STUB" VELO_GATE_POLL=1 VELO_GATE_RETRY_DELAY=0 bash "$RUN_UNDER_TEST" "$@" 2>&1); RC=$?
+  OUT=$(VELO_PR_GATE_BIN="$STUB" bash "$RUN_UNDER_TEST" "$@" 2>&1); RC=$?
   printf '%s\n' "$OUT" > "$TMPD/wrapper.out"
 }
 
@@ -813,7 +830,7 @@ sc_reap_after_codex() {
 sc_reap_grace() {
   SC_FAILS=""
   reset
-  echo 2 > "$STUB_DIR/second.secs"
+  echo 1 > "$STUB_DIR/second.secs"
   VELO_SECOND_OPINION_GRACE=20 run_wrapper "$TPR" "$SCOPE"
   [[ $RC -eq 0 ]];                                   sc_check exits-0 $?
   has "$TMPD/wrapper.out" "second opinion finished on its own"; sc_check finished-within-grace $?
@@ -941,12 +958,12 @@ cat > "$TMPD/bin/claude" <<EOF
 echo invoked >> "$TMPD/claude.called"
 exit 1
 EOF
-# The e2e reviewer: alive past the 10s liveness window, then a multi-turn transcript.
+# The e2e reviewer: alive past the liveness window (VELO_GATE_HEALTH_SECS=0.5), then a multi-turn transcript.
 cat > "$TMPD/bin/codex" <<EOF
 #!/bin/bash
 echo invoked >> "$TMPD/codex.called"
 cat >/dev/null
-sleep 14
+sleep 1
 cat "$TMPD/e2e.transcript"
 EOF
 export STUB_WRAPPER="$TMPD/bin/velo-openrouter-agent-stub"
@@ -1083,7 +1100,7 @@ EOF
   echo "## Codex review — PR $TPR @ $REPO_HEAD"; echo "**Verdict:** approve"; echo; echo "### Findings"; echo "none"
 } > "$TMPD/e2e.transcript"
 rm -f "$TMPD/claude.called" "$TMPD/codex.called" "$TMPD/wrapper.called" "$TMPD/running.flag"
-E2E_OUT=$(cd "$REPO" && HOME="$TMPD/home" PATH="$HEALTHY_PATH" VELO_GATE_POLL=1 VELO_GATE_RETRY_DELAY=0 bash "$RUN_REAL" "$TPR" "$TMPD/e2e.scope.md" 2>&1); E2E_RC=$?
+E2E_OUT=$(cd "$REPO" && HOME="$TMPD/home" PATH="$HEALTHY_PATH" bash "$RUN_REAL" "$TPR" "$TMPD/e2e.scope.md" 2>&1); E2E_RC=$?
 printf '%s\n' "$E2E_OUT" > "$TMPD/e2e.out"
 if [[ $E2E_RC -eq 0 ]]; then ok "exits 0"; else fail "the round failed (rc=$E2E_RC): $(tail -5 "$TMPD/e2e.out")"; fi
 V="$GATE_DIR/codex-verdict.md"

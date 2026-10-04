@@ -7,6 +7,9 @@
 # Piped JSON in, exit code (+ stderr) out — this drives the REAL hook script
 # under the REAL Claude Code PreToolUse contract (stdin JSON, exit 2 =
 # block), not a re-implementation of its regex.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$(cd "$HERE/.." && pwd)/hooks/require-wait.sh"

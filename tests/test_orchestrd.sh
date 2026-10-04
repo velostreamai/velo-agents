@@ -7,6 +7,9 @@
 # Drives the REAL script under a stubbed `gh` and a sandboxed VELO_STATE, not
 # a reimplementation of its logic — same reason test_merge_gates.sh and
 # test_gate_post_sha.sh do it this way.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"
@@ -22,7 +25,14 @@ FIX="$T/fixtures"; mkdir -p "$FIX"
 CALLS_LOG="$T/calls.log"
 STATE="$T/state"
 LIVE_PIDS=""
-kill_live() { for p in $LIVE_PIDS; do kill "$p" 2>/dev/null; done; }
+# spawn_live_worker runs inside $(...), so its LIVE_PIDS+= never reaches this
+# shell; reap by path instead. Every fake runner lives under $T, and its own
+# `sleep` child does not name $T, so kill children first (4 x sleep 120 leaked
+# per run).
+kill_live() {
+  local p
+  for p in $LIVE_PIDS $(pgrep -f "$T/"); do pkill -P "$p"; kill "$p"; done 2>/dev/null
+}
 trap 'kill_live; rm -rf "$T"' EXIT
 
 mkdir -p "$T/bin"

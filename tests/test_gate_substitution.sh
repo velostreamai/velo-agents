@@ -14,6 +14,9 @@
 # is pinned twice: green on the real script and RED on a copy with that one
 # behaviour mutated out (the MUTATION-PROOF cases at the end). The mutants are
 # copies in a temp dir; the repo's scripts are never edited.
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"

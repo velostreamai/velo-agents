@@ -19,6 +19,9 @@
 # `wait "$gp"` calls are genuine waits on real children — no cross-shell
 # "not a child of this shell" problem either (test_dispatch_wait.sh hit that
 # one; documented there).
+# Test-mode timeouts (health window, polls, grace, retries): see test-timeouts.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRGATE="$(cd "$HERE/.." && pwd)/bin/velo-pr-gate"
