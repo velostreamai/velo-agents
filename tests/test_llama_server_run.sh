@@ -44,6 +44,7 @@ cat > "$SERVER" <<'EOF'
 echo "ARGS: $*"
 echo "ENV_BUDGET: ${LLAMA_ARG_THINK_BUDGET:-unset}"
 echo "ENV_MESSAGE: ${LLAMA_ARG_THINK_BUDGET_MESSAGE:-unset}"
+echo "ENV_EFFORT: ${LLAMA_ARG_REASONING_EFFORT:-unset}"
 EOF
 chmod +x "$SERVER"
 touch "$GDIR/$SHARD"
@@ -66,5 +67,18 @@ check "ngram-mod is not also passed"  "$(grep -c -- 'ngram-mod' <<<"$OUT")" "0"
 has "thinking cap exported"           "ENV_BUDGET: 4096" "$OUT"
 has "cap message asks for the next ACTION" "emit your next tool call now" "$OUT"
 check "cap message does not ask for a final answer" "$(grep -ciE 'best answer' <<<"$OUT")" "0"
+has "reasoning effort medium exported" "ENV_EFFORT: medium" "$OUT"
+has "prometheus metrics endpoint"     "--metrics" "$OUT"
+
+echo "a reasoning effort the template does not accept is refused"
+# `high` is valid for the server but this template remaps it; `max` it rejects.
+for bad in high max ""; do
+  sed "s|^VELO_LLAMA_REASONING_EFFORT=.*|VELO_LLAMA_REASONING_EFFORT=$bad|" "$BIN/velo-local.conf" \
+    | sed 's|^VELO_LMSTUDIO_BASE_URL=.*|VELO_LMSTUDIO_BASE_URL=http://127.0.0.1:9/v1|' > "$T/bin/velo-local.conf"
+  OUT=$(run); RC=$?
+  check "effort '$bad' exits non-zero" "$([[ $RC -ne 0 ]] && echo nonzero)" "nonzero"
+  has "effort '$bad' names the allowed values" "must be xhigh, medium or low" "$OUT"
+  check "effort '$bad' never starts the server" "$(grep -c '^ARGS:' <<<"$OUT")" "0"
+done
 
 exit $FAIL

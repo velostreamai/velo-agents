@@ -78,6 +78,12 @@ case "${1:-}" in
     # llama.cpp's own env vars, because the message has spaces (see velo-local.conf).
     export LLAMA_ARG_THINK_BUDGET="$VELO_LLAMA_THINK_BUDGET"
     export LLAMA_ARG_THINK_BUDGET_MESSAGE="$VELO_LLAMA_THINK_BUDGET_MESSAGE"
+    # Validated against the model's template, not the server's list: the server
+    # also takes minimal/high/max, which this template rejects or remaps.
+    case "$VELO_LLAMA_REASONING_EFFORT" in
+      xhigh|medium|low) export LLAMA_ARG_REASONING_EFFORT="$VELO_LLAMA_REASONING_EFFORT" ;;
+      *) die "VELO_LLAMA_REASONING_EFFORT must be xhigh, medium or low (velo-local.conf), got '$VELO_LLAMA_REASONING_EFFORT'" ;;
+    esac
     "$VELO_LLAMA_SERVER" --version 2>&1 | grep -m1 '^version'
     # One copy of the model in memory. At login LM Studio may reload its last
     # models (it remembers this one); two 84 GB copies do not fit, and a failed
