@@ -28,10 +28,17 @@ if [[ -z "$ISSUE" ]]; then
   echo "  SKIP  no task spec under $SPEC_ROOT to exercise --check against"
   exit 0
 fi
-SPEC="$SPEC_ROOT/$ISSUE.json"
+# Review a PRIVATE copy via --worktree. This test edits the spec (the streak-reset
+# case); it used to edit the real file in the canonical checkout, so two agents'
+# runs on one host changed each other's spec mid-streak, and a run killed between
+# the edit and the restore left a corrupted spec on master's tree.
+REVIEW_WT="$TMPD/review-root"
+mkdir -p "$REVIEW_WT/.agents/tasks"
+cp "$SPEC_ROOT/$ISSUE.json" "$REVIEW_WT/.agents/tasks/"
+SPEC="$REVIEW_WT/.agents/tasks/$ISSUE.json"
 
 export VELO_STATE="$TMPD/state"
-# Test-mode timeouts (VELO_SPEC_TIMEOUT=2: the timeout case stubs a 60s codex).
+# Test-mode timeouts (VELO_SPEC_TIMEOUT=5: the timeout case stubs a 60s codex).
 . "$(dirname "${BASH_SOURCE[0]}")/test-timeouts.sh"
 mkdir -p "$TMPD/stub"
 export PATH="$TMPD/stub:$PATH"
@@ -44,7 +51,7 @@ emit() {   # write a stub codex whose stdout is exactly $1 plus a newline
     > "$TMPD/stub/codex"
   chmod +x "$TMPD/stub/codex"
 }
-run() { "$BIN/velo-spec-review" "$ISSUE" --check >"$TMPD/out.txt" 2>&1; echo $?; }
+run() { "$BIN/velo-spec-review" "$ISSUE" --check --worktree "$REVIEW_WT" >"$TMPD/out.txt" 2>&1; echo $?; }
 check() {  # label, got, want
   if [[ "$2" == "$3" ]]; then echo "  PASS  $1"
   else echo "  FAIL  $1: got $2, want $3"; FAILURES=$((FAILURES+1)); fi
@@ -81,7 +88,7 @@ check "no VERDICT line -> fail closed, exit 2" "$(run)" 2
 
 { echo '#!/bin/bash'; echo 'cat >/dev/null; sleep 60'; } > "$TMPD/stub/codex"
 chmod +x "$TMPD/stub/codex"
-"$BIN/velo-spec-review" "$ISSUE" --check >"$TMPD/out.txt" 2>&1
+"$BIN/velo-spec-review" "$ISSUE" --check --worktree "$REVIEW_WT" >"$TMPD/out.txt" 2>&1
 check "timeout -> exit 2" "$?" 2
 
 # The ledger is the audit trail: without it "was this spec ever reviewed?" is

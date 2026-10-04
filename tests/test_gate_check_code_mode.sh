@@ -97,7 +97,10 @@ EOF
 # (it resolves it under $HOME, which run_gate points here). Records its argv.
 cat > "$TMPD/home/.agents/bin/velo-openrouter-agent" <<EOF
 #!/bin/bash
-printf '%s\n' "\$@" > "$TMPD/oragent.args"
+# Written aside then renamed: the reader never sees a half-written argv. The
+# brief makes this several KB, and under load (other agents' runs on the host)
+# the test read it mid-write.
+printf '%s\n' "\$@" > "$TMPD/oragent.args.part" && mv "$TMPD/oragent.args.part" "$TMPD/oragent.args"
 exec -a $MARKER sleep 400
 EOF
 chmod +x "$TMPD/bin/gh" "$TMPD/nocodex/gh" "$TMPD/home/.agents/bin/velo-gate" "$TMPD/bin/claude" "$TMPD/bin/codex" \
@@ -253,6 +256,8 @@ sc_openrouter_route() {   # <route> <model id>
   plan_with_code; prime_and_fill; rm -f "$TMPD/claude.called" "$A"
   printf 'old prompt\n' > "$GATE_DIR/check-code-agent-prompt.md"
   run_gate "$FAST_PATH" --check-code-by "$by"
+  # The runner is detached: velo-pr-gate returning does not mean it has started.
+  local i; for i in $(seq 50); do [[ -s "$A" ]] && break; sleep 0.1; done
   [[ -s "$A" ]];                                         sc_check runner-launched $?
   [[ "$(cat "$GATE_DIR/check-code.by" 2>/dev/null)" == "$by" ]]; sc_check route-recorded $?
   [[ "$(grep -A1 -x -- '--model' "$A" 2>/dev/null | tail -1)" == "$model" ]]; sc_check pinned-model $?

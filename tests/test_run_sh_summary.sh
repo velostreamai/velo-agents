@@ -53,15 +53,18 @@ last=$(tail -1 <<<"$out")
 # A suite that exits but leaves a background process behind is a leak: named,
 # killed, and failed, even though the suite itself exited 0.
 : > "$T/test_status.sh"; : > "$T/test_tool_contract.py"
-echo 'sleep 61 >/dev/null 2>&1 & exit 0' > "$T/test_record.sh"   # off the pipe, so $(...) does not wait for it
+# The sleep's argument is unique to this run, so a concurrent run on the same
+# host (other agents' worktrees) can never match or kill it.
+LEAK_SECS="61.$$"
+echo "sleep $LEAK_SECS >/dev/null 2>&1 & exit 0" > "$T/test_record.sh"   # off the pipe, so $(...) does not wait for it
 out=$(VELO_TEST_PYTHON="$P3" VELO_OAI_PY="$P3" bash "$T/run.sh" 2>&1); rc=$?
 grep -q '^  LEAK test_record.sh left 1 process(es) running:$' <<<"$out" && ok "a leaked process is reported against its suite" \
   || bad "no LEAK line for test_record.sh"
-grep -qE '^ +[0-9]+ sleep 61$' <<<"$out" && ok "the leaked process is named" || bad "leaked process not listed"
+grep -qE "^ +[0-9]+ sleep $LEAK_SECS\$" <<<"$out" && ok "the leaked process is named" || bad "leaked process not listed"
 [[ $(tail -1 <<<"$out") == "❌ .agents tests FAILED (1): test_record.sh" ]] && ok "a leaking suite fails the run" \
   || bad "leak summary: $(tail -1 <<<"$out")"
 sleep 0.2
-pgrep -f '^sleep 61$' >/dev/null && { bad "the leaked process was left running"; pkill -f '^sleep 61$'; } \
+pgrep -f "^sleep $LEAK_SECS\$" >/dev/null && { bad "the leaked process was left running"; pkill -f "^sleep $LEAK_SECS\$"; } \
   || ok "the leaked process was killed"
 
 echo

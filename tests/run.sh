@@ -17,6 +17,21 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Test mode: production waits shortened for stubs, inherited by every suite.
 . "$HERE/test-timeouts.sh"
+# A private agent-state dir per run. Several agents run this suite at once on one
+# host; a suite that forgets its own sandbox must not write the live
+# ~/.agents/state the dispatched workers read, nor another run's.
+#
+# Temp files go in THIS worktree, not the system temp dir: every mktemp (and
+# python tempfile) in every suite follows TMPDIR. Two agents' runs can never
+# share a path, a leftover shows which worktree and run made it, and removing
+# the worktree removes it. Gitignored (.agents/tests/.tmp/) so a run never
+# makes the tree look dirty to velo-dispatch's records or the zg index.
+RUN_TMP="$HERE/.tmp/run-$$"
+rm -rf "$RUN_TMP"; mkdir -p "$RUN_TMP"
+export TMPDIR="$RUN_TMP"
+RUN_STATE="$RUN_TMP/agent-state"
+export VELO_STATE="$RUN_STATE/state"
+mkdir -p "$VELO_STATE"
 
 # The runners import open_agent_sdk, which lives in the worker venv rather than
 # the system interpreter.
@@ -44,6 +59,7 @@ echo "run.sh started $RUN_START"
 # suite once ran for 43 minutes and slowed the local model it shared cores with.
 CUR=""
 trap '[[ -n $CUR ]] && kill -- -"$CUR" 2>/dev/null; exit 130' INT TERM
+trap 'rm -rf "$RUN_TMP"' EXIT
 suite() {  # <name> <command...>
   local name=$1 t0=$SECONDS w0 rc left; w0=$(utc); shift
   set -m; "$@" & CUR=$!; set +m

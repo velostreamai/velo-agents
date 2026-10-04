@@ -17,7 +17,9 @@ FAILURES=0
 check() { if [[ "$2" == "$3" ]]; then printf '  PASS  %s: %s\n' "$1" "$2"
           else printf '  FAIL  %s: got %s, want %s\n' "$1" "$2" "$3"; FAILURES=$((FAILURES+1)); fi; }
 
-python3 - "$ROOT/bin/velo-dispatch" > /tmp/bh-test.sh <<'PYX' || exit 1
+# Per run, not a fixed /tmp path: several agents run this suite at once on one host.
+BH=$(mktemp); trap 'rm -f "$BH"' EXIT
+python3 - "$ROOT/bin/velo-dispatch" > "$BH" <<'PYX' || exit 1
 import pathlib, sys
 # Extraction is by name and that is brittle: a helper the extracted functions
 # CALL but which is not listed here stays undefined, so they return empty — a
@@ -35,7 +37,7 @@ for fn in wanted:
     print(src[i:j])
 PYX
 
-source /tmp/bh-test.sh
+source "$BH"
 
 echo "heading form — all five tracked briefs must parse to a TOKEN, not a sentence"
 for n in 1934 1937 1946 1948 1949; do

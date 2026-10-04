@@ -958,12 +958,12 @@ cat > "$TMPD/bin/claude" <<EOF
 echo invoked >> "$TMPD/claude.called"
 exit 1
 EOF
-# The e2e reviewer: alive past the liveness window (VELO_GATE_HEALTH_SECS=0.5), then a multi-turn transcript.
+# The e2e reviewer: alive past the liveness window (VELO_GATE_HEALTH_SECS=1), then a multi-turn transcript.
 cat > "$TMPD/bin/codex" <<EOF
 #!/bin/bash
 echo invoked >> "$TMPD/codex.called"
 cat >/dev/null
-sleep 1
+sleep 2
 cat "$TMPD/e2e.transcript"
 EOF
 export STUB_WRAPPER="$TMPD/bin/velo-openrouter-agent-stub"
