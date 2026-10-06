@@ -157,16 +157,22 @@ GATE_DIR3="$VELO_STATE/gate/$PR3"
 mkdir -p "$GATE_DIR3"
 printf '%s' "$GATEDSHA" > "$GATE_DIR3/gated.sha"
 
+# The guard looks at the marker TWICE: before the lock (the fast path) and again once the
+# lock is held (a caller that was delayed between the two). Either alone keeps a
+# sequential repeat from posting twice — so this proof removes BOTH; each look on its own
+# is pinned by section 5.
 BACKUP="$TMPD/velo-gate-post.backup"
 cp "$POST" "$BACKUP"
 python3 - "$POST" <<'PYEOF'
 import sys
 p = sys.argv[1]
 t = open(p).read()
-old = 'if [[ -f "$POST_DONE" ]]; then\n  ok "\'$NAME\' @ ${SHA:0:9} already posted ($(cat "$POST_DONE" 2>/dev/null)) — skipping (idempotent)"\n  exit 0\nfi\n'
+old = 'if [[ -f "$POST_DONE" ]]; then\n  read_marker "$POST_DONE"\n  ok "\'$NAME\' @ ${SHA:0:9} already posted ($MARKER_TEXT) — skipping (idempotent)"\n  exit 0\nfi\n'
+old2 = 'if [[ -f "$POST_DONE" ]]; then\n  read_marker "$POST_DONE"\n  ok "\'$NAME\' @ ${SHA:0:9} was posted concurrently ($MARKER_TEXT) — skipping"\n  exit 0\nfi\n'
 new = 'if false; then\n  ok "mutated out for test"\n  exit 0\nfi\n'
 assert old in t, "post-once done-marker check not found verbatim — did it change shape?"
-open(p, "w").write(t.replace(old, new, 1))
+assert old2 in t, "post-once second look at the done-marker not found verbatim — did it change shape?"
+open(p, "w").write(t.replace(old, new, 1).replace(old2, new, 1))
 PYEOF
 : > "$CALLS_LOG"   # reset the call count for a clean before/after read
 OUT_MUT1=$("$POST" "$PR3" code-review "$REPORT" 2>&1)
@@ -179,7 +185,7 @@ else
   fail "velo-gate-post did NOT restore cleanly — check $POST by hand"
 fi
 if [[ "$MUT_CALLS" -ge 2 ]]; then
-  ok "MUTATION-PROOF red: with the done-marker check disabled, the same (pr,name,sha) posts twice ($MUT_CALLS calls)"
+  ok "MUTATION-PROOF red: with both done-marker checks disabled, the same (pr,name,sha) posts twice ($MUT_CALLS calls)"
 else
   fail "mutation-proof did not go RED: expected >=2 pr-comment calls with the guard disabled, got $MUT_CALLS"
 fi
@@ -200,6 +206,203 @@ else
   fail "restored file still double-posts: $RESTORED_CALLS calls — restore did not take"
 fi
 
+# ---- 5: the done-marker is checked AGAIN once the lock is held (#2380 r2) ----
+# Section 3 is a caller that finds the lock HELD. This is the other order: a caller
+# that checked the marker (absent), was delayed, and takes the lock only AFTER the first
+# one finished — marker written, lock released. Nothing in the script lets a test stand
+# between its marker check and its mkdir, so `mkdir` is a stub that models exactly that:
+# asked for the LOCK, it first writes the marker (the other caller finishing), then makes
+# the directory. A script that does not look again posts the same comment twice.
+PR5=559
+GATE_DIR5="$VELO_STATE/gate/$PR5"
+mkdir -p "$GATE_DIR5" "$TMPD/mkstub"
+printf '%s' "$GATEDSHA" > "$GATE_DIR5/gated.sha"
+cat > "$TMPD/mkstub/mkdir" <<'EOF'
+#!/bin/bash
+last=""; for a in "$@"; do last="$a"; done
+if [[ "$last" == *.posting-*.lock && -n "${RACE_MARKER:-}" ]]; then
+  printf 'pid other-caller at race\n' > "$RACE_MARKER"
+fi
+exec /bin/mkdir "$@"
+EOF
+chmod +x "$TMPD/mkstub/mkdir"
+: > "$CALLS_LOG"
+OUT5=$(PATH="$TMPD/mkstub:$PATH" RACE_MARKER="$GATE_DIR5/.posted-code-review-${GATEDSHA:0:9}" \
+       "$POST" "$PR5" code-review "$REPORT" 2>&1); RC5=$?
+if [[ $RC5 -eq 0 ]]; then ok "a caller that takes the lock after the first finished exits 0"
+else fail "late-lock caller exited $RC5: $(tr '\n' ' ' <<<"$OUT5" | cut -c1-200)"; fi
+if grep -qi 'posted concurrently' <<<"$OUT5"; then
+  ok "and says it found the comment already posted, not silent"
+else
+  fail "late-lock caller gave no concurrency message: $(tr '\n' ' ' <<<"$OUT5" | cut -c1-200)"
+fi
+if [[ "$(pr_comment_calls)" == "0" ]]; then
+  ok "and made NO 'gh pr comment' call: the comment is posted exactly once"
+else
+  fail "late-lock caller posted the comment AGAIN: $(pr_comment_calls) call(s)"
+fi
+if [[ ! -d "$GATE_DIR5/.posting-code-review-${GATEDSHA:0:9}.lock" ]]; then
+  ok "and released the lock it took"
+else
+  fail "late-lock caller left its lock behind"
+fi
+
+# MUTATION-PROOF: the second look alone is what covers this order.
+BACKUP5="$TMPD/velo-gate-post.backup5"
+cp "$POST" "$BACKUP5"
+python3 - "$POST" <<'PYEOF'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = 'if [[ -f "$POST_DONE" ]]; then\n  read_marker "$POST_DONE"\n  ok "\'$NAME\' @ ${SHA:0:9} was posted concurrently ($MARKER_TEXT) — skipping"\n  exit 0\nfi\n'
+new = 'if false; then\n  ok "mutated out for test"\n  exit 0\nfi\n'
+assert t.count(old) == 1, "post-once second look at the done-marker not found verbatim — did it change shape?"
+open(p, "w").write(t.replace(old, new, 1))
+PYEOF
+PR6=560
+GATE_DIR6="$VELO_STATE/gate/$PR6"
+mkdir -p "$GATE_DIR6"
+printf '%s' "$GATEDSHA" > "$GATE_DIR6/gated.sha"
+: > "$CALLS_LOG"
+PATH="$TMPD/mkstub:$PATH" RACE_MARKER="$GATE_DIR6/.posted-code-review-${GATEDSHA:0:9}" "$POST" "$PR6" code-review "$REPORT" >/dev/null 2>&1
+MUT5_CALLS=$(pr_comment_calls)
+cp "$BACKUP5" "$POST"
+if diff -q "$BACKUP5" "$POST" >/dev/null; then
+  ok "velo-gate-post restored byte-identical after the second mutation"
+else
+  fail "velo-gate-post did NOT restore cleanly — check $POST by hand"
+fi
+if [[ "$MUT5_CALLS" -ge 1 ]]; then
+  ok "MUTATION-PROOF red: without the second look, a late-lock caller posts a comment that is already there ($MUT5_CALLS call)"
+else
+  fail "mutation-proof did not go RED: expected >=1 pr-comment call without the second look, got $MUT5_CALLS"
+fi
+PR7=561
+GATE_DIR7="$VELO_STATE/gate/$PR7"
+mkdir -p "$GATE_DIR7"
+printf '%s' "$GATEDSHA" > "$GATE_DIR7/gated.sha"
+: > "$CALLS_LOG"
+PATH="$TMPD/mkstub:$PATH" RACE_MARKER="$GATE_DIR7/.posted-code-review-${GATEDSHA:0:9}" "$POST" "$PR7" code-review "$REPORT" >/dev/null 2>&1
+if [[ "$(pr_comment_calls)" == "0" ]]; then
+  ok "MUTATION-PROOF green: the restored file makes no comment call in that order"
+else
+  fail "the restored file still posts in the late-lock order: $(pr_comment_calls) call(s)"
+fi
+
+# ---- 8: a done-marker that EXISTS but cannot be read is an error, not a success (#2380 r3) --
+#
+# The guards act on the marker's existence; its content is the "who and when" in the skip
+# line. The content used to be read with `$(cat "$POST_DONE" 2>/dev/null)`: a failed read
+# printed "already posted ()" and exited 0 — a success line for a record never read. The
+# three states are told apart now: absent (the guard does not fire), unreadable (refuse,
+# naming the file and cat's own error), empty (still proof the comment was posted: skip,
+# and say the marker was empty rather than print "()").
+#
+# `cat` is a stub for the unreadable case because root reads a chmod 000 file and this suite
+# runs under any uid; it stands for EIO, a stale NFS handle, a state dir owned by another user.
 echo
-[[ $FAILED -eq 0 ]] && echo "all gate-post once-only checks passed" || echo "FAILURES"
+echo "8. a done-marker that exists but cannot be read is an error, not a success"
+CATSTUB="$TMPD/catstub"; mkdir -p "$CATSTUB"
+cat > "$CATSTUB/cat" <<'EOF'
+#!/bin/bash
+for a in "$@"; do
+  if [[ "$a" == */.posted-* ]]; then
+    echo "cat: $a: Input/output error" >&2
+    exit 1
+  fi
+done
+exec /bin/cat "$@"
+EOF
+chmod +x "$CATSTUB/cat"
+# A `mkdir` that reports the lock as held by someone else, whose marker is already written:
+# the order that sends a caller into the poll loop.
+HOLDSTUB="$TMPD/holdstub"; mkdir -p "$HOLDSTUB"
+cat > "$HOLDSTUB/mkdir" <<'EOF'
+#!/bin/bash
+last=""; for a in "$@"; do last="$a"; done
+if [[ "$last" == *.posting-*.lock ]]; then
+  [[ -n "${RACE_MARKER:-}" ]] && printf 'pid other-caller at race\n' > "$RACE_MARKER"
+  echo "mkdir: $last: File exists" >&2
+  exit 1
+fi
+exec /bin/mkdir "$@"
+EOF
+chmod +x "$HOLDSTUB/mkdir"
+has()   { if grep -qF -- "$3" <<<"$2"; then ok "$1"; else fail "$1: wanted '$3' in: $(tr '\n' ' ' <<<"$2" | cut -c1-320)"; fi; }
+lacks() { if grep -qF -- "$3" <<<"$2"; then fail "$1: did NOT want '$3' in: $(tr '\n' ' ' <<<"$2" | cut -c1-320)"; else ok "$1"; fi; }
+marker_of() { printf '%s' "$VELO_STATE/gate/$1/.posted-code-review-${GATEDSHA:0:9}"; }   # <pr>
+lock_of()   { printf '%s' "$VELO_STATE/gate/$1/.posting-code-review-${GATEDSHA:0:9}.lock"; }   # <pr>
+prep_pr()   { mkdir -p "$VELO_STATE/gate/$1"; printf '%s' "$GATEDSHA" > "$VELO_STATE/gate/$1/gated.sha"; }   # <pr>
+plant_marker() { prep_pr "$1"; printf '%s' "$2" > "$(marker_of "$1")"; }   # <pr> <exact content>
+# Run velo-gate-post for <pr> under the given PATH prefix. Sets OUT and RC; clears the call log.
+post_with() {   # <pr> <PATH prefix or ''>
+  local pr="$1" pre="$2"
+  : > "$CALLS_LOG"
+  OUT=$(PATH="${pre:+$pre:}$PATH" "$POST" "$pr" code-review "$REPORT" 2>&1); RC=$?
+}
+refused_unreadable() {   # <label> <pr>: the shared expectations of an unreadable marker
+  [[ $RC -ne 0 ]] && ok "$1: refuses (exit $RC)" || fail "$1: exit 0 — a success for a record never read"
+  has   "$1: named as an unreadable done-marker"  "$OUT" "unreadable done-marker"
+  has   "$1: names the marker file"               "$OUT" ".posted-code-review-${GATEDSHA:0:9}"
+  has   "$1: shows cat's own error"               "$OUT" "Input/output error"
+  lacks "$1: NOT reported as already posted"      "$OUT" "already posted"
+  lacks "$1: NOT reported as posted concurrently" "$OUT" "posted concurrently"
+  [[ "$(pr_comment_calls)" == "0" ]] && ok "$1: no 'gh pr comment' call" || fail "$1: gh pr comment ran: $(pr_comment_calls) call(s)"
+  [[ ! -d "$(lock_of "$2")" ]] && ok "$1: no lock left behind" || fail "$1: left $(lock_of "$2") behind"
+}
+
+plant_marker 951 $'pid 4242 at 2026-10-05T00:00:00Z\n'
+post_with 951 ""
+[[ $RC -eq 0 ]] && ok "readable marker: exits 0" || fail "readable marker: exit $RC: $(tr '\n' ' ' <<<"$OUT" | cut -c1-300)"
+has "readable marker: the skip line shows the marker's own content" "$OUT" "'code-review' @ ${GATEDSHA:0:9} already posted (pid 4242 at 2026-10-05T00:00:00Z)"
+[[ "$(pr_comment_calls)" == "0" ]] && ok "readable marker: no 'gh pr comment' call" || fail "readable marker: gh pr comment ran"
+
+plant_marker 952 ''
+post_with 952 ""
+[[ $RC -eq 0 ]] && ok "empty marker: exits 0 (the comment was posted: the marker is written after it)" || fail "empty marker: exit $RC: $(tr '\n' ' ' <<<"$OUT" | cut -c1-300)"
+has   "empty marker: says the marker was empty"  "$OUT" "'code-review' @ ${GATEDSHA:0:9} already posted (empty marker)"
+lacks "empty marker: no blank '()' in the line"  "$OUT" "()"
+[[ "$(pr_comment_calls)" == "0" ]] && ok "empty marker: no 'gh pr comment' call" || fail "empty marker: gh pr comment ran"
+
+plant_marker 953 $'pid 4242 at 2026-10-05T00:00:00Z\n'
+post_with 953 "$CATSTUB"
+refused_unreadable "unreadable marker (fast path)" 953
+
+# The same marker under a real permission failure, where the uid makes one possible.
+plant_marker 954 $'pid 4242 at 2026-10-05T00:00:00Z\n'
+chmod 000 "$(marker_of 954)"
+if /bin/cat "$(marker_of 954)" >/dev/null 2>&1; then
+  ok "(uid $(id -u) reads a chmod 000 file: the stubbed read failure above is the proof under this uid)"
+else
+  post_with 954 ""
+  [[ $RC -ne 0 ]] && ok "chmod 000 marker: refuses (exit $RC)" || fail "chmod 000 marker: exit 0 — a success for a record never read"
+  has   "chmod 000 marker: named as an unreadable done-marker" "$OUT" "unreadable done-marker"
+  has   "chmod 000 marker: shows the OS's own error"           "$OUT" "Permission denied"
+  lacks "chmod 000 marker: NOT reported as already posted"     "$OUT" "already posted"
+  [[ "$(pr_comment_calls)" == "0" ]] && ok "chmod 000 marker: no 'gh pr comment' call" || fail "chmod 000 marker: gh pr comment ran"
+fi
+chmod 644 "$(marker_of 954)"
+
+# The second look, once the lock is held (section 5's order).
+prep_pr 955
+RACE_MARKER="$(marker_of 955)" post_with 955 "$TMPD/mkstub"
+[[ $RC -eq 0 ]] && ok "second look, readable marker: exits 0" || fail "second look, readable marker: exit $RC: $(tr '\n' ' ' <<<"$OUT" | cut -c1-300)"
+has "second look, readable marker: the skip line shows the marker's content" "$OUT" "posted concurrently (pid other-caller at race)"
+[[ "$(pr_comment_calls)" == "0" ]] && ok "second look, readable marker: no 'gh pr comment' call" || fail "second look, readable marker: gh pr comment ran"
+prep_pr 956
+RACE_MARKER="$(marker_of 956)" post_with 956 "$TMPD/mkstub:$CATSTUB"
+refused_unreadable "unreadable marker (second look under the lock)" 956
+
+# The poll loop: the lock is held by another caller, whose marker is there on the first look.
+prep_pr 957
+RACE_MARKER="$(marker_of 957)" post_with 957 "$HOLDSTUB"
+[[ $RC -eq 0 ]] && ok "lock held, readable marker: exits 0" || fail "lock held, readable marker: exit $RC: $(tr '\n' ' ' <<<"$OUT" | cut -c1-300)"
+has "lock held, readable marker: the skip line shows the marker's content" "$OUT" "posted concurrently (pid other-caller at race)"
+[[ "$(pr_comment_calls)" == "0" ]] && ok "lock held, readable marker: no 'gh pr comment' call" || fail "lock held, readable marker: gh pr comment ran"
+prep_pr 958
+RACE_MARKER="$(marker_of 958)" post_with 958 "$HOLDSTUB:$CATSTUB"
+refused_unreadable "unreadable marker (poll loop)" 958
+
+echo
+[[ $FAILED -eq 0 ]] && echo "all gate-post once-only and done-marker-read checks passed" || echo "FAILURES"
 exit $FAILED

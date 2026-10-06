@@ -19,6 +19,23 @@ VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
+# The done-marker is the record that the comment was already posted: its EXISTENCE is what
+# the guards below act on, its content is only the "who and when" shown to the operator. A
+# read that FAILS is a different fact from a marker that is absent or empty, and none of the
+# three may be reported as another — `$(cat "$POST_DONE" 2>/dev/null)` turned an unreadable
+# marker into "already posted ()", a success line vouching for a record this script never
+# read. Called in the main shell, never inside `$(...)`, where a die would exit only the
+# subshell. Sets MARKER_TEXT; dies on an unreadable marker, naming it and cat's own error.
+read_marker() {  # <marker file>
+  local out
+  out=$(cat -- "$1" 2>&1) \
+    || die "unreadable done-marker $1 — it exists, so it records that '$NAME' @ ${SHA:0:9} was posted to #$PR, but it cannot be read:
+  $(head -n 1 <<<"$out")
+  Not posting again on a record this script cannot read, and not reporting success for it.
+  Fix the file's permissions, or remove it if it is stale: rm $1"
+  MARKER_TEXT="${out:-empty marker}"
+}
+
 PR="${1:-}"; NAME="${2:-}"; FILE="${3:-}"; shift 3 2>/dev/null || true
 SHA=""
 while [[ $# -gt 0 ]]; do
@@ -210,7 +227,8 @@ POST_KEY="$NAME-${SHA:0:9}"
 POST_DONE="$POST_DIR/.posted-$POST_KEY"
 POST_LOCK="$POST_DIR/.posting-$POST_KEY.lock"
 if [[ -f "$POST_DONE" ]]; then
-  ok "'$NAME' @ ${SHA:0:9} already posted ($(cat "$POST_DONE" 2>/dev/null)) — skipping (idempotent)"
+  read_marker "$POST_DONE"
+  ok "'$NAME' @ ${SHA:0:9} already posted ($MARKER_TEXT) — skipping (idempotent)"
   exit 0
 fi
 if ! mkdir "$POST_LOCK" 2>/dev/null; then
@@ -218,13 +236,25 @@ if ! mkdir "$POST_LOCK" 2>/dev/null; then
   # case is seconds from writing a done-marker, not a stuck process — poll
   # briefly rather than racing a second `gh pr comment`.
   for _i in 1 2 3 4 5 6 7 8 9 10; do
-    [[ -f "$POST_DONE" ]] && { ok "'$NAME' @ ${SHA:0:9} was posted concurrently — skipping"; exit 0; }
+    if [[ -f "$POST_DONE" ]]; then
+      read_marker "$POST_DONE"
+      ok "'$NAME' @ ${SHA:0:9} was posted concurrently ($MARKER_TEXT) — skipping"
+      exit 0
+    fi
     sleep 1
   done
   die "another velo-gate-post for '$NAME' @ ${SHA:0:9} on #$PR has held $POST_LOCK for 10s with no done-marker.
   Check for a stuck process, then: rm -rf $POST_LOCK"
 fi
 trap 'rm -rf "$POST_LOCK"' EXIT
+# The marker was checked BEFORE the lock was taken. A concurrent caller that finished in
+# between wrote its marker and released the lock, and this one has just acquired a lock
+# nobody holds any more: without this second look it would post the same comment twice.
+if [[ -f "$POST_DONE" ]]; then
+  read_marker "$POST_DONE"
+  ok "'$NAME' @ ${SHA:0:9} was posted concurrently ($MARKER_TEXT) — skipping"
+  exit 0
+fi
 
 URL=$(gh pr comment "$PR" --repo "$REPO" --body "$FULL" 2>&1 | tail -1) \
   || die "could not post to #$PR: $URL"

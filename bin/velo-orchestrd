@@ -166,7 +166,11 @@ step_workers() {
 # gate_track_pid to "<log>.pid" right after launch) has exited. A gate whose
 # pid file does not exist is NOT assumed finished — it predates the
 # pid-persistence, or was dispatched by something else — so it is left alone
-# rather than guessed at from the log's mtime.
+# rather than guessed at from the log's mtime. Neither is one whose pid file
+# cannot name a pid (empty, not a number, unreadable): "no live pid" is only
+# "finished" when the pid is KNOWN, because judging a log that is still being
+# written posts a partial review under the gate header, and the post-once
+# guard then keeps the real report off the PR. That state is logged each tick.
 #
 # Posting always uses the sha recorded in "$GATE_DIR/gated.sha" — written by
 # velo-pr-gate at LAUNCH, before any gate is dispatched (#2285 Round 2). Its
@@ -180,6 +184,21 @@ step_workers() {
 # INSIDE velo-gate-post now (#2285 Round 2) — this loop's own
 # "does a header already exist" check below is a cheap pre-filter that saves
 # calling velo-gate-post at all in the common case, not the enforcement.
+
+# Records the verdict through velo-gate, and says it was recorded only if it was. velo-gate REFUSES
+# on purpose — a stale gate, gate comments it cannot read, a label it cannot set — and its message
+# is the reason. Sending it to /dev/null and logging "gate:passed" regardless reported a verdict
+# that was never recorded, on every tick, with nothing escalated: a PR left at gate:running behind
+# a log that said it had passed.
+record_verdict() {   # <pr> <head sha> <--pass|--block> <label it sets>
+  local pr="$1" head="$2" mode="$3" label="$4" out
+  if out=$("$VELO_GATE" "$pr" "$mode" 2>&1); then
+    log "$label #$pr"
+  elif attention_append "gate-label-failed:$pr:$head:$label" "gate-label-failed" "$pr" "" "$head" \
+         "velo-gate $mode refused or failed for #$pr @ ${head:0:9}, so $label was NOT recorded: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; then
+    log "ESCALATE gate-label-failed #$pr $label"
+  fi
+}
 
 step_gates() {
   local prs pr
@@ -204,7 +223,13 @@ step_gates() {
 
       if [[ -f "$pid_file" ]]; then
         local pid; pid=$(cat "$pid_file" 2>/dev/null)
-        if [[ -n "$pid" ]] && orch_pid_alive "$pid"; then
+        pid="${pid//[[:space:]]/}"
+        if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+          all_approve=0
+          log "gate '$name' for #$pr: $pid_file holds no readable pid ('${pid:0:40}') — not treated as finished"
+          continue   # empty, not a pid, or unreadable: it cannot say the reviewer is gone
+        fi
+        if orch_pid_alive "$pid"; then
           all_approve=0
           continue   # still running
         fi
@@ -270,11 +295,9 @@ step_gates() {
     done
 
     if [[ "$any_blocked" -eq 1 ]]; then
-      "$VELO_GATE" "$pr" --block >/dev/null 2>&1
-      log "gate:blocked #$pr"
+      record_verdict "$pr" "$head" --block gate:blocked
     elif [[ "$all_approve" -eq 1 ]]; then
-      "$VELO_GATE" "$pr" --pass >/dev/null 2>&1
-      log "gate:passed #$pr"
+      record_verdict "$pr" "$head" --pass gate:passed
     fi
   done
 }
@@ -332,6 +355,11 @@ step_merge() {
 # unconditionally so a malformed or now-mismatched entry cannot wedge every
 # later one behind it. The two things pinned at queue time — the worker label
 # and the brief's sha256 — are re-checked against live state before dispatch.
+#
+# An entry that is popped and NOT dispatched — malformed, labels unreadable,
+# several worker labels, a pin that moved, or velo-dispatch itself refusing —
+# is escalated every time, under an id of its own attempt: the operator who
+# queued it is told the dispatch did not happen, and why.
 
 list_active_worktrees() {   # -> one worktree path per line with a live worker pid
   local d pid
@@ -349,6 +377,13 @@ free_disk_gb() { df -g "$HOME" 2>/dev/null | awk 'NR==2{print $4}'; }
 queue_pop_head() {
   local rest; rest=$(tail -n +2 "$QUEUE_FILE" 2>/dev/null)
   if [[ -n "$rest" ]]; then printf '%s\n' "$rest" > "$QUEUE_FILE"; else : > "$QUEUE_FILE"; fi
+}
+
+# One escalation id per ATTEMPT. step_dispatch pops the entry before it checks or runs anything, so no
+# tick ever sees the same entry twice; an id of (issue, brief) that dedupes forever could only swallow
+# the NEXT time someone re-queues the same entry — a dispatch that did not happen, and nobody told.
+dispatch_attempt_id() {   # <kind> <issue, or "none"> -> an id no other attempt shares
+  printf '%s:%s:%s-%s' "$1" "$2" "$(date -u +%FT%TZ)" "$$"
 }
 
 step_dispatch() {
@@ -380,19 +415,57 @@ step_dispatch() {
   worker=$(jq -r '.worker // ""' <<<"$line" 2>/dev/null)
   brief_sha256=$(jq -r '.brief_sha256 // ""' <<<"$line" 2>/dev/null)
 
-  if [[ -z "$issue" || -z "$brief" || ! -f "$brief" ]]; then
-    log "dispatch: malformed/unreadable queue head, dropped: $(printf '%s' "$line" | cut -c1-200)"
+  # An entry that cannot be dispatched at all is dropped — it was popped above, so one bad entry cannot
+  # wedge the queue — but whoever queued it was expecting a worker, so it is escalated too. The issue
+  # must be a NUMBER: attention_append reads it with `tonumber`, and when that fails it returns the
+  # same status as "already escalated", so an event naming a non-numeric issue vanished without a trace.
+  local bad=""
+  if ! [[ "$issue" =~ ^[0-9]+$ ]]; then bad="no numeric issue"
+  elif [[ -z "$brief" ]]; then bad="no brief path"
+  elif [[ ! -f "$brief" ]]; then bad="no brief file at $brief"
+  fi
+  if [[ -n "$bad" ]]; then
+    log "dispatch: malformed/unreadable queue head, dropped ($bad): $(printf '%s' "$line" | cut -c1-200)"
+    local bad_issue=""; [[ "$issue" =~ ^[0-9]+$ ]] && bad_issue="$issue"
+    if attention_append "$(dispatch_attempt_id dispatch-malformed "${bad_issue:-none}")" "dispatch-malformed" "" "$bad_issue" "" \
+         "queue entry dropped, nothing dispatched — $bad: $(printf '%s' "$line" | cut -c1-200)"; then
+      log "ESCALATE dispatch-malformed ($bad)"
+    fi
     return 0
   fi
 
-  local cur_labels cur_worker cur_sha256
-  cur_labels=$(gh issue view "$issue" --repo "$REPO" --json labels --jq '[.labels[].name]|join(",")' 2>/dev/null)
-  cur_worker=$(tr ',' '\n' <<<"$cur_labels" | grep '^worker:' | head -1)
-  cur_worker="${cur_worker#worker:}"
+  local cur_labels cur_worker cur_sha256 errf why workers n_workers
+  # A read that FAILS is not an issue with no worker label. The entry is dropped either way (it was
+  # popped above, so one bad entry cannot wedge the queue), but whoever re-queues it is told the true
+  # reason: a dropped connection used to be reported as "the issue now has worker:<none>".
+  errf=$(mktemp "${TMPDIR:-/tmp}/velo-orchestrd-gh.XXXXXX" 2>/dev/null) || errf=/dev/null
+  if ! cur_labels=$(gh issue view "$issue" --repo "$REPO" --json labels --jq '[.labels[].name]|join(",")' 2>"$errf"); then
+    why=$(head -n 1 "$errf" 2>/dev/null | cut -c1-200)
+    [[ "$errf" == /dev/null ]] || rm -f "$errf"
+    if attention_append "$(dispatch_attempt_id dispatch-unreadable "$issue")" "dispatch-unreadable" "" "$issue" "$brief_sha256" \
+         "could not read the labels of #$issue to re-check the pinned worker=$worker: ${why:-gh exited non-zero with no message} — dropped, re-queue once gh answers."; then
+      log "ESCALATE dispatch-unreadable #$issue"
+    fi
+    return 0
+  fi
+  [[ "$errf" == /dev/null ]] || rm -f "$errf"
+  # ONE worker is derived from the issue's labels, and an issue with several has none: velo-dispatch
+  # refuses it ("at most one"), so naming the FIRST as the worker passed a pin the dispatch itself
+  # would reject, and the refusal reached only the daemon log.
+  workers=$(tr ',' '\n' <<<"$cur_labels" | grep '^worker:' || true)
+  n_workers=$(grep -c . <<<"$workers" || true)
+  if [[ "$n_workers" -gt 1 ]]; then
+    if attention_append "$(dispatch_attempt_id dispatch-mismatch "$issue")" "dispatch-mismatch" "" "$issue" "$brief_sha256" \
+         "queue pinned worker=$worker but #$issue now has $n_workers worker labels ($(tr '\n' ' ' <<<"$workers" | sed 's/ $//')) — velo-dispatch refuses more than one; dropped, re-queue after resolving."; then
+      log "ESCALATE dispatch-mismatch #$issue ($n_workers worker labels)"
+    fi
+    return 0
+  fi
+  cur_worker="${workers#worker:}"
   cur_sha256=$(shasum -a 256 "$brief" 2>/dev/null | awk '{print $1}')
 
   if [[ "$cur_worker" != "$worker" || "$cur_sha256" != "$brief_sha256" ]]; then
-    if attention_append "dispatch-mismatch:$issue:$brief_sha256" "dispatch-mismatch" "" "$issue" "$brief_sha256" \
+    if attention_append "$(dispatch_attempt_id dispatch-mismatch "$issue")" "dispatch-mismatch" "" "$issue" "$brief_sha256" \
          "queue pinned worker=$worker sha256=${brief_sha256:0:12} but the issue now has worker:${cur_worker:-<none>} and the brief now hashes to ${cur_sha256:0:12} — dropped, re-queue after resolving."; then
       log "ESCALATE dispatch-mismatch #$issue"
     fi
@@ -400,7 +473,22 @@ step_dispatch() {
   fi
 
   log "dispatch: #$issue -> worker:$worker (wip $wip/$WIP_CAP)"
+  # velo-dispatch refuses on purpose — stale anchors, a brief that fails its lint, no disk, a dirty tree —
+  # and says why on its output. That output stays in the log, and its STATUS decides: the entry is already
+  # popped, so a refusal that reached only the log was a dispatch the operator queued and nobody was told
+  # had not happened. The output goes to the log FILE, never a pipe (the supervisor it detaches would hold
+  # a pipe open and hang the tick); the reason is read back from what was appended.
+  local d_from d_rc d_why
+  d_from=$(wc -c < "$LOG_FILE" | tr -d ' ')
   "$VELO_DISPATCH" "$issue" "$brief" >> "$LOG_FILE" 2>&1
+  d_rc=$?
+  if [[ $d_rc -ne 0 ]]; then
+    d_why=$(tail -c "+$((d_from + 1))" "$LOG_FILE" | grep -v '^[[:space:]]*$' | tail -n 6 | tr '\n' ' ' | tail -c 400)
+    if attention_append "$(dispatch_attempt_id dispatch-failed "$issue")" "dispatch-failed" "" "$issue" "$brief_sha256" \
+         "velo-dispatch failed for #$issue (worker:$worker; exit $d_rc) — nothing was dispatched and the entry is already popped, so re-queue it after resolving. Its last output: ${d_why:-<none>}"; then
+      log "ESCALATE dispatch-failed #$issue (exit $d_rc)"
+    fi
+  fi
 }
 
 # ---- wedge + STOP detection -------------------------------------------------------

@@ -124,6 +124,130 @@ if grep -qE '^[0-9]+ +[a-z-]+-20[0-9][0-9]' <<<"$OUT"; then
 else
   echo "  PASS  no worker column shows a raw log filename"
 fi
+# gh failing at once must still be NAMED, not shown as an empty list of PRs.
+if grep -qF '(gh unavailable)' <<<"$OUT"; then
+  echo "  PASS  a gh that fails is reported as unavailable"
+else
+  echo "  FAIL  a gh that fails was not reported as unavailable"; FAILURES=$((FAILURES+1))
+fi
+
+# ── open PRs: the CI column is ONE state from EVERY check row ───────────────
+# It printed `statusCheckRollup[0].conclusion` — whichever row sorts first. An optional lane that
+# was skipped sorts first and says nothing, so a PR with a failing build showed SKIPPED, and one
+# with a check still running showed the first finished row's SUCCESS. The state now comes from
+# velo-ci-rollup.jq, the definition velo-merge refuses on, so the display and the gate cannot
+# disagree about one PR.
+echo
+echo "velo-status open PRs: one CI state from every row"
+CK='{"__typename":"CheckRun","name":"Build","status":"COMPLETED","conclusion":"SUCCESS"}'
+SK='{"__typename":"CheckRun","name":"Optional","status":"COMPLETED","conclusion":"SKIPPED"}'
+OPEN_PRS='[
+ {"number":101,"title":"skipped lane first, build failed","mergeable":"MERGEABLE","statusCheckRollup":[
+    '"$SK"',{"__typename":"CheckRun","name":"Build","status":"COMPLETED","conclusion":"FAILURE"}]},
+ {"number":102,"title":"green first, build still running","mergeable":"MERGEABLE","statusCheckRollup":[
+    '"$CK"',{"__typename":"CheckRun","name":"Slow","status":"IN_PROGRESS","conclusion":""}]},
+ {"number":103,"title":"skipped lane first, build green","mergeable":"MERGEABLE","statusCheckRollup":['"$SK"','"$CK"']},
+ {"number":104,"title":"no checks at all","mergeable":"CONFLICTING","statusCheckRollup":[]},
+ {"number":105,"title":"failed commit status first","mergeable":"MERGEABLE","statusCheckRollup":[
+    {"__typename":"StatusContext","context":"ci/legacy","state":"FAILURE"},'"$CK"']}
+]'
+mkdir -p "$TMPD/stubpr"
+cat > "$TMPD/stubpr/gh" <<'EOF'
+#!/bin/bash
+# The open-PR list is served from $STUB_OPEN_PRS (the caller's own --jq applied if it passes one);
+# every other call finds nothing.
+case "$*" in
+  *"pr list"*"statusCheckRollup"*)
+    [[ -n "${STUB_GH_FAIL:-}" ]] && exit 1
+    jqx=""; prev=""
+    for a in "$@"; do [[ "$prev" == "--jq" ]] && jqx="$a"; prev="$a"; done
+    if [[ -n "$jqx" ]]; then jq -r "$jqx" <<<"$STUB_OPEN_PRS"; else printf '%s\n' "$STUB_OPEN_PRS"; fi
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$TMPD/stubpr/gh"
+run_status() {   # <directory holding velo-status> -> $OPEN_OUT
+  OPEN_OUT=$(STUB_OPEN_PRS="$OPEN_PRS" PATH="$TMPD/stubpr:$PATH" "$1/velo-status" 2>&1)
+}
+pr_line() { grep -E "^  #$1 " <<<"$OPEN_OUT" | head -n 1; }   # <pr number>
+run_status "$BIN"
+check "a failed build behind a skipped first lane is FAILING" "$(pr_line 101)" "  #101 MERGEABLE FAILING  skipped lane first, build failed"
+check "a check still running behind a green first row is pending" "$(pr_line 102)" "  #102 MERGEABLE pending  green first, build still running"
+check "a skipped first lane does not hide a green build"  "$(pr_line 103)" "  #103 MERGEABLE SUCCESS  skipped lane first, build green"
+check "a PR with no checks is none, not pending"          "$(pr_line 104)" "  #104 CONFLICTING none  no checks at all"
+check "a failed commit status first is FAILING"           "$(pr_line 105)" "  #105 MERGEABLE FAILING  failed commit status first"
+
+# Every behaviour above is pinned both ways: the same scenario on a copy of the tooling with that
+# one behaviour mutated out must go red, and for the pinned reason. The copy is of the whole bin/
+# directory — velo-status reads its libraries and the rollup definition from beside itself.
+mutant_bin() {   # <file> <anchor> <replacement> -> a private copy of bin/ in which <file> has <anchor> replaced, once
+  local d; d=$(mktemp -d "$TMPD/bincopy.XXXXXX") && cp -R "$BIN/." "$d/" || return 1
+  python3 - "$d/$1" "$2" "$3" <<'PY' || return 1
+import sys
+path, old, new = sys.argv[1:]
+t = open(path).read()
+assert t.count(old) == 1, f"mutation anchor must occur exactly once, found {t.count(old)}: {old!r}"
+open(path, "w").write(t.replace(old, new, 1))
+PY
+  printf '%s' "$d"
+}
+prove_red() {   # <label> <pr line to look at> <the line the real script prints> <mutant bin dir>
+  local label="$1" pr="$2" want="$3" mdir="$4" got
+  [[ -n "$mdir" ]] || { echo "  FAIL MUTATION-PROOF $label: the mutant could not be built (anchor not found?)"; FAILURES=$((FAILURES+1)); return; }
+  run_status "$mdir"; got="$(pr_line "$pr")"
+  if [[ "$got" == "$want" ]]; then
+    echo "  FAIL MUTATION-PROOF $label: stayed GREEN with the behaviour removed"; FAILURES=$((FAILURES+1))
+  else
+    echo "  PASS  MUTATION-PROOF $label: red with the behaviour removed (got '$got')"
+  fi
+}
+prove_red "the state is read from every row, not the first" 101 "  #101 MERGEABLE FAILING  skipped lane first, build failed" \
+  "$(mutant_bin velo-status '(.statusCheckRollup | ci_rollup) as $ci' '({state: ((.statusCheckRollup[0].conclusion) // "pending")}) as $ci')"
+prove_red "the state is read through the shared definition" 105 "  #105 MERGEABLE FAILING  failed commit status first" \
+  "$(mutant_bin velo-ci-rollup.jq '"SUCCESS": "pass", "FAILURE": "fail", "ERROR": "fail", "PENDING"' '"SUCCESS": "pass", "PENDING"')"
+
+# A definition that cannot be read, or cannot run, is NAMED on the PR list — never an empty list.
+echo "  -- a rollup definition that is missing or broken"
+NOJQ=$(mktemp -d "$TMPD/bincopy.XXXXXX") && cp -R "$BIN/." "$NOJQ/" && rm -f "$NOJQ/velo-ci-rollup.jq"
+run_status "$NOJQ"
+if grep -qF '(cannot read the CI rollup definition' <<<"$OPEN_OUT" && ! grep -qE '^  #10[0-9] ' <<<"$OPEN_OUT"; then
+  echo "  PASS  a missing definition is named, and no PR is shown with a guessed state"
+else
+  echo "  FAIL  a missing definition was not named, or PRs were shown without it: $(grep -A1 'open PRs:' <<<"$OPEN_OUT" | tr '\n' ' ' | cut -c1-200)"; FAILURES=$((FAILURES+1))
+fi
+BROKEN=$(mktemp -d "$TMPD/bincopy.XXXXXX") && cp -R "$BIN/." "$BROKEN/" && printf 'def ci_rollup: this is not jq ;\n' > "$BROKEN/velo-ci-rollup.jq"
+run_status "$BROKEN"
+if grep -qF "(could not classify the open PRs' checks" <<<"$OPEN_OUT" && ! grep -qE '^  #10[0-9] ' <<<"$OPEN_OUT"; then
+  echo "  PASS  a definition that cannot run is named, and no PR is shown with a guessed state"
+else
+  echo "  FAIL  a broken definition was not named, or PRs were shown without it: $(grep -A1 'open PRs:' <<<"$OPEN_OUT" | tr '\n' ' ' | cut -c1-200)"; FAILURES=$((FAILURES+1))
+fi
+# Each message removed in turn: the check that looks for it goes red.
+named_in() {   # <bin dir> <needle> ; runs with the stub gh, which fails the PR list when STUB_GH_FAIL is set
+  run_status "$1"; grep -qF -- "$2" <<<"$OPEN_OUT"
+}
+M1=$(mutant_bin velo-status '  echo "  (cannot read the CI rollup definition' '  : "  (cannot read the CI rollup definition') && rm -f "$M1/velo-ci-rollup.jq"
+if [[ -n "$M1" ]] && ! named_in "$M1" '(cannot read the CI rollup definition'; then
+  echo "  PASS  MUTATION-PROOF the unreadable-definition message: gone from the output with the line removed"
+else
+  echo "  FAIL  MUTATION-PROOF the unreadable-definition message: still printed (or the mutant could not be built)"; FAILURES=$((FAILURES+1))
+fi
+M2=$(mutant_bin velo-status "  echo \"  (could not classify the open PRs' checks" "  : \"  (could not classify the open PRs' checks") && printf 'def ci_rollup: this is not jq ;\n' > "$M2/velo-ci-rollup.jq"
+if [[ -n "$M2" ]] && ! named_in "$M2" "(could not classify the open PRs' checks"; then
+  echo "  PASS  MUTATION-PROOF the cannot-run message: gone from the output with the line removed"
+else
+  echo "  FAIL  MUTATION-PROOF the cannot-run message: still printed (or the mutant could not be built)"; FAILURES=$((FAILURES+1))
+fi
+# And a gh that fails is told apart from an empty list: with the line removed the section is blank.
+M3=$(mutant_bin velo-status '  echo "  (gh unavailable)"' '  : "  (gh unavailable)"')
+export STUB_GH_FAIL=1
+if [[ -n "$M3" ]] && named_in "$BIN" '(gh unavailable)' && ! named_in "$M3" '(gh unavailable)'; then
+  echo "  PASS  MUTATION-PROOF the gh-unavailable message: printed by the real script, gone with the line removed"
+else
+  echo "  FAIL  MUTATION-PROOF the gh-unavailable message: not printed by the real script, or still printed by the mutant"; FAILURES=$((FAILURES+1))
+fi
+unset STUB_GH_FAIL
 
 echo
 [[ $FAILURES -gt 0 ]] && { echo "FAILED: $FAILURES"; exit 1; }

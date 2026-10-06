@@ -10,7 +10,7 @@
 # 30 lines per PR:
 #
 #   head sha (9) + state + mergeable, the last GATED sha, and STALE when they differ
-#   the Build & Test CI result
+#   the CI state: the worst of every check (fail > pending > pass), failing checks named
 #   whether a gate is running for that PR right now
 #   the Codex verdict: the Verdict line plus each P* finding title
 #   the advisory check-code headlines from code.log (Verdict + HIGH/MEDIUM/LOW)
@@ -59,6 +59,61 @@ cx_reduce() {  # <drop_verdict> <text>
     | head -6 | cut -c1-260
 }
 
+# ---- the CI state: ONE conservative answer from EVERY row ---------------------
+#
+# `gh pr checks` prints one row per check: name, status, elapsed, url, tab-separated.
+# A PR is as green as its worst check, so the rows reduce to a single state before
+# anything is formatted: fail > unrecognised > pending > pass. `skipping` rows say
+# nothing either way and are ignored; a table of nothing BUT skipped checks is
+# `skipping`, not `pass` (nothing ran). `cancel` is a failure — gh itself exits 1
+# for it — and a status gh does not document is never read as green.
+#
+# Prints, one per line: the number of check rows (a line with no status column is
+# not a row), the state (none | skipping | pass | pending | unknown | fail), the
+# names behind it (the first <maxn> failing checks, or the first unrecognised
+# status), then one `-- ci:` detail line per check that is not passing, at most
+# <maxd>. Every row counts: the first-listed row, or the Build & Test row, is not
+# the PR's state.
+ci_aggregate() {  # <gh pr checks stdout>
+  awk -F'\t' -v maxn=3 -v maxd=5 -v q="'" '
+    NF < 2 { next }
+    {
+      rows++
+      name = $1; st = $2
+      if (st == "skipping") next
+      if (st == "pass") { passed++; next }
+      if (st == "fail" || st == "cancel") {
+        failed++
+        if (failed <= maxn) fnames = fnames (failed > 1 ? ", " : "") name (st == "cancel" ? " [cancelled]" : "")
+      } else if (st == "pending") {
+        pending++
+      } else {
+        unknown++
+        if (unknown == 1) udesc = "status " q st q " on " q name q
+      }
+      ndet++
+      if (ndet <= maxd) det = det "-- ci: " name " " st "\n"
+    }
+    END {
+      state = "none"
+      if (rows > 0) {
+        if (failed) state = "fail"
+        else if (unknown) state = "unknown"
+        else if (pending) state = "pending"
+        else if (passed) state = "pass"
+        else state = "skipping"
+      }
+      names = fnames
+      if (failed > maxn) names = names ", +" (failed - maxn) " more"
+      if (state == "unknown") names = udesc
+      print rows + 0
+      print state
+      print names
+      printf "%s", det
+      if (ndet > maxd) printf "-- ci: (+%d more checks that are not passing)\n", ndet - maxd
+    }' <<<"$1"
+}
+
 # ---- is there a Codex verdict at all? (#2358 P2) ------------------------------
 #
 # A verdict is a DECISION, so the sweep prints one only when the report states one
@@ -75,13 +130,35 @@ cx_reduce() {  # <drop_verdict> <text>
 # the sweep is a read, so it names the reason instead.
 #
 # Prints "canonical" (a verdict exists), "INCOMPLETE (unreadable <err>)" (a
-# verdict file that cannot be read — never "empty"), or "INCOMPLETE (<reason>)".
+# verdict file that cannot be read — never "empty"), "INCOMPLETE (<reason>)", or
+# "PROSE (no verdict line)": a non-empty report that states its outcome in words
+# ("No actionable defects found") instead of the template's `**Verdict:**` line,
+# and carries no unfilled template line (a line that IS the three-word alternation;
+# a sentence that merely quotes it is not one). PROSE is a label, never a verdict —
+# the report's finding lines still print under it and the reader judges.
 cx_classify() {  # <text-present:0|1> <text> <read-error-text>
   local present="$1" text="$2" err="$3" line val
   [[ "$present" == 1 ]] || { echo "INCOMPLETE (unreadable ${err//$'\n'/ })"; return; }
   [[ -n "${text//[[:space:]]/}" ]] || { echo "INCOMPLETE (empty)"; return; }
   line=$(grep -im1 -- 'verdict:' <<<"$text") || line=""
-  [[ -n "$line" ]] || { echo "INCOMPLETE (no verdict line)"; return; }
+  if [[ -z "$line" ]]; then
+    # An unfilled template with no Verdict line is the unfinished shape: a local
+    # model echoing the template's three words as a line of their own. It counts
+    # only when the alternation IS the line (markdown decoration — bullets, bold,
+    # backticks, a trailing full stop — aside), the same restriction the parsed path
+    # below puts on the Verdict line: a report that merely QUOTES the three words
+    # inside a sentence or a finding is a finished report, and scanning the whole
+    # text for them read it as an unfilled template.
+    # (Output captured rather than `grep -q`: under pipefail a -q that exits on the
+    # first match can SIGPIPE a large report's sed and flip the result.)
+    if [[ -n "$(sed -E 's/^[[:space:]*_`>+-]+//; s/[[:space:]*_`.]+$//' <<<"$text" \
+                  | grep -xF 'approve | approve-with-findings | blocked')" ]]; then
+      echo "INCOMPLETE (no verdict line)"
+    else
+      echo "PROSE (no verdict line)"
+    fi
+    return
+  fi
   # The placeholder test runs on the PARSED Verdict line, never the whole report
   # (#2358 P2): a completed canonical report that QUOTES `approve |
   # approve-with-findings | blocked` inside a finding or a refutation was read as
@@ -163,24 +240,36 @@ for p in "$@"; do
   [[ "$gated" != "none" && "$gated" != ERROR\(* \
      && "${gated:0:9}" != "${head:0:9}" ]] && stale=" STALE"
   # `gh pr checks` is tab-separated and the check name contains spaces, so the
-  # result is column 2, not the second word.
+  # status is column 2, not the second word.
   #
-  # P1 (#2358): a FAILED read must never print as "clean". The old form piped gh
-  # through grep with 2>/dev/null, so on a network/API failure the error was
-  # discarded and the empty result printed as ci=none — byte-identical to a
-  # fresh PR whose checks have not reported. So gh runs alone (its exit status
-  # is its own, not grep's "no line matched", which also exits 1), stderr lands
-  # in a scratch file — stdout and stderr cannot both reach variables in one
-  # pass without a fork losing one of them — and the three states print apart:
-  #   ci=ERROR(<first stderr line>)  the read itself failed
-  #   ci=none                        the read succeeded and no check matched
-  #   ci=<result>                    Build & Test reported a result
+  # The header's ci= is ONE state for the whole PR, reduced from EVERY row before
+  # anything is printed (ci_aggregate): fail > pending > pass, skipped checks
+  # ignored. It is not the Build & Test row's state — a PR whose Build & Test passed
+  # while another check failed is red, and reading one row (or the first of two
+  # matrix rows) printed it green.
+  #
+  # A FAILED read must never print as "clean" (#2358 P1): gh runs alone (its exit
+  # status is its own, not a grep's "no line matched"), stderr lands in a scratch
+  # file — stdout and stderr cannot both reach variables in one pass without a
+  # fork losing one of them — and the states print apart:
+  #   ci=ERROR(<first stderr line>)  the read itself failed: gh printed NO table
+  #   ci=none                        the read succeeded and no check has reported
+  #   ci=<state>                     what the rows say: fail(<checks>) | pending |
+  #                                  pass | skipping, with the not-passing checks
+  #                                  listed under the header
+  # gh also ENCODES the PR's CI state in its exit status and still prints the table:
+  # 0 = every check passed, 8 = some check is pending, 1 = some check failed. A
+  # non-zero exit WITH rows is a successful read of a PR whose CI is not green, not a
+  # failed read; and the exit status is a floor under the rows (1 is never lighter
+  # than fail, 8 never lighter than pending), so a table that lost its failing row
+  # cannot print green.
   # mktemp is per-PR and unlinked at once; nothing is written into the repo or
   # the gate dir (the sweep stays read-only there).
   ci_errf=$(mktemp "${TMPDIR:-/tmp}/velo-gate-sweep-err.XXXXXX") || ci_errf=""
   if [[ -z "$ci_errf" ]]; then
-    # No scratch file means stderr cannot be separated; a read whose exit status
-    # is 0 is still trustworthy, anything else must be an ERROR, not a "none".
+    # No scratch file means stderr cannot be separated, but stdout is intact: a
+    # table on it is read as usual, and a non-zero exit with NO table is an ERROR,
+    # never a "none".
     ci=$(gh pr checks "$p" --repo "$REPO" 2>/dev/null); ci_rc=$?
     ci_err="could not create a scratch file for gh's stderr (TMPDIR unwritable)"
   else
@@ -189,14 +278,41 @@ for p in "$@"; do
     # a truncated file, a SIGINT) can never leak the scratch file.
     ci_err=$(head -1 "$ci_errf" 2>/dev/null); rm -f "$ci_errf"
   fi
-  # tab (0x09) is what really separates gh's columns; the awk -F'\t' above has
-  # to stay in sync with that.
-  ci_line=""
-  [[ -n "$ci" ]] && ci_line=$(grep -E '^Build & Test' <<<"$ci" | awk -F'\t' '{print $2}')
-  if [[ $ci_rc -ne 0 ]]; then
-    ci="ERROR(${ci_err:-gh pr checks exited $ci_rc with no message})"
+  ci_n=0; ci_state=none; ci_names=""; ci_detail=""
+  if [[ -n "$ci" ]]; then
+    if ci_out=$(ci_aggregate "$ci"); then
+      { IFS= read -r ci_n; IFS= read -r ci_state; IFS= read -r ci_names; ci_detail=$(cat); } <<<"$ci_out"
+    else
+      ci_n=""
+    fi
+  fi
+  if [[ ! "$ci_n" =~ ^[0-9]+$ ]]; then
+    ci="ERROR(could not reduce the check table: ci_aggregate produced no row count)"
+  elif [[ $ci_n -eq 0 ]]; then
+    if [[ -n "${ci//[[:space:]]/}" ]]; then
+      # gh printed something, but none of it is a check row: not a table to read.
+      ci="ERROR(gh pr checks printed no check rows: '$(head -1 <<<"$ci" | cut -c1-60)')"
+    elif [[ $ci_rc -ne 0 ]]; then
+      # No table at all: the read FAILED (or gh exited non-zero having said nothing),
+      # and a state cannot be read from nothing.
+      ci="ERROR(${ci_err:-gh pr checks exited $ci_rc with no message})"
+    else
+      ci="none"
+    fi
   else
-    ci="${ci_line:-none}"
+    # The exit status is a floor under the rows. Any other non-zero status is not one
+    # gh documents; with rows in hand the rows alone decide.
+    case $ci_rc in
+      1) if [[ $ci_state != fail ]]; then
+           ci_state=fail; ci_names="gh pr checks exited 1 with no failing row listed"
+         fi ;;
+      8) if [[ $ci_state == pass || $ci_state == skipping ]]; then ci_state=pending; fi ;;
+    esac
+    case $ci_state in
+      fail)    ci="fail($ci_names)" ;;
+      unknown) ci="ERROR(unrecognised check $ci_names)" ;;
+      *)       ci="$ci_state" ;;
+    esac
   fi
   # ---- is a gate running for THIS PR right now? (#2358 P2) --------------------
   #
@@ -248,6 +364,8 @@ for p in "$@"; do
     fi
   fi
   echo "=== #$p head=$head gated=$gated${stale} ci=$ci gate-running=$gate_running${stale_lock}"
+  # The checks behind a non-green ci=, after the header that already says so.
+  [[ -z "$ci_detail" ]] || echo "$ci_detail"
 
   if [[ -f "$d/codex-verdict.md" ]]; then
     # One read, stderr captured with it (the gated.sha idiom above): a verdict
@@ -263,9 +381,10 @@ for p in "$@"; do
       echo "-- codex:"
       cx_reduce 0 "$cx"
     else
-      # INCOMPLETE: the reason first, then whatever the report DOES say minus any
-      # verdict line — the finding titles are still this sweep's business, the
-      # unfinished "verdict" is not. (Nothing to reduce for unreadable/empty.)
+      # INCOMPLETE or PROSE: the label first, then whatever the report DOES say
+      # minus any verdict line — the finding titles are still this sweep's
+      # business, an unfinished "verdict" is not. (Nothing to reduce for
+      # unreadable/empty.)
       echo "-- codex: $cls"
       [[ "$cls" == "INCOMPLETE (empty)" ]] || cx_reduce 1 "$cx"
     fi

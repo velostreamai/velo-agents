@@ -83,6 +83,9 @@ check_not() {
 # GH_CHECKS_FAIL  space-separated PRs whose `pr checks` read FAILS (network/API
 #                 error): stderr + exit 1, so a failed read can never be confused
 #                 with a successful read that returned no checks (#2358 P1)
+# GH_CHECKS_RC_<pr>  the exit status `pr checks` ends with, after printing its rows
+#                 (default 0). gh exits 8 while checks are PENDING, with the table
+#                 on stdout (#2380).
 cat > "$TMPD/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 pair="$1 $2"; prn="$3"
@@ -109,6 +112,7 @@ case "$pair" in
       exit 1
     fi
     var="GH_CHECKS_$prn"; printf '%b\n' "${!var:-}"
+    rcvar="GH_CHECKS_RC_$prn"; exit "${!rcvar:-0}"
     ;;
   *) exit 0 ;;
 esac
@@ -247,7 +251,9 @@ EOF
 # verdict. codex-verdict.md is velo-gate-run's cut of Codex's final message, so
 # a verdict is printed ONLY when the file states one of the three canonical
 # words. 3007: prose with no Verdict line — the outcome is still surfaced by the
-# keyword reduction, but it is labelled INCOMPLETE. 3010/3011: a Verdict line
+# keyword reduction, but it is labelled PROSE (#2380; it was INCOMPLETE before: a
+# non-empty report with no unfilled template line is not an unfinished one).
+# 3010/3011: a Verdict line
 # whose word is none of the three ("needs-changes") — the verdict line is
 # WITHHELD (an off-format word must not be printed as if it decided anything)
 # while the finding titles still are. 3011 is the same without the bold template.
@@ -427,7 +433,8 @@ check     "Build & Test failure is reported"        "$OUT" "ci=fail"
 echo
 echo "#2358 P2: an unfinished / off-format Codex verdict is INCOMPLETE, never a verdict"
 OUT=$(sweep 3007)
-check     "no Verdict line -> INCOMPLETE reason"    "$OUT" "codex: INCOMPLETE (no verdict line)"
+check     "no Verdict line, prose only -> PROSE"    "$OUT" "codex: PROSE (no verdict line)"
+check_not "prose only is not INCOMPLETE (#2380)"    "$OUT" "INCOMPLETE"
 check     "'blocked' in prose is still surfaced"    "$OUT" "Codex: blocked — 2 findings"
 OUT=$(sweep 3010)
 check     "off-format word -> INCOMPLETE names it"  "$OUT" "INCOMPLETE (verdict word 'needs-changes'"
@@ -500,6 +507,177 @@ check_not "failed read never prints as ci=none"     "$OUT" "ci=none"
 check_not "only the FIRST stderr line is printed"   "$OUT" "second stderr line"
 
 echo
+echo "#2380: gh pr checks exit 8 is PENDING (a state, table on stdout), not a failed read"
+# gh exits 8 while any check is pending and still prints the table. The sweep read
+# every non-zero exit as a failed read, so a PR whose CI was merely running printed
+# ci=ERROR(gh pr checks exited 8 with no message) — the real state hidden behind a
+# claim that the read failed. Probed live: `gh pr checks 2378` (pending) printed
+# `Build & Test<TAB>pending<TAB>0<TAB><url><TAB>` and exited 8.
+PENDING_ROWS='Build & Test\tpending\t0\thttps://example.test/run/1\t\nIntegration Tests\tskipping\t0\thttps://example.test/run/2\t'
+OTHER_ONLY_ROWS='Integration Tests\tpending\t0\thttps://example.test/run/2\t'
+MIXED_ROWS='Build & Test\tpass\t41m12s\thttps://example.test/run/1\t\nIntegration Tests\tpending\t0\thttps://example.test/run/2\t'
+for p in 3030 3031 3032 3033 3034; do
+  export "GH_VIEW_$p=$(view_json "$HEAD40" OPEN MERGEABLE)"
+done
+export GH_CHECKS_3030="$PENDING_ROWS";    export GH_CHECKS_RC_3030=8
+export GH_CHECKS_3031="$OTHER_ONLY_ROWS"; export GH_CHECKS_RC_3031=8
+export GH_CHECKS_3032="$MIXED_ROWS";      export GH_CHECKS_RC_3032=8
+export GH_CHECKS_3033="";                 export GH_CHECKS_RC_3033=8
+export GH_CHECKS_3034="";                 export GH_CHECKS_RC_3034=1
+OUT=$(sweep 3030)
+check     "exit 8 + rows: prints the Build & Test state" "$OUT" "ci=pending"
+check_not "exit 8 + rows is not an ERROR"                "$OUT" "ci=ERROR"
+OUT=$(sweep 3031)
+check     "exit 8 + rows without a Build & Test row: pending" "$OUT" "ci=pending"
+check_not "…and not an ERROR, and not 'none'"            "$OUT" "ci=ERROR"
+check_not "…and not ci=none"                             "$OUT" "ci=none"
+OUT=$(sweep 3032)
+check     "exit 8 + Build & Test passed + another check pending: pending, the worst row" "$OUT" "ci=pending"
+check_not "…a pending check is not hidden behind the passing Build & Test row" "$OUT" "ci=pass"
+OUT=$(sweep 3033)
+check     "exit 8 with NOTHING on stdout stays an ERROR" "$OUT" "ci=ERROR(gh pr checks exited 8 with no message)"
+check_not "exit 8 with nothing is not read as pending"   "$OUT" "ci=pending"
+OUT=$(sweep 3034)
+check     "exit 1 with nothing stays an ERROR"           "$OUT" "ci=ERROR(gh pr checks exited 1 with no message)"
+# exit 1 WITH a stderr message is the existing 3016 case just above
+# (ci=ERROR(HTTP 502: bad gateway ...)).
+
+echo
+echo "#2380 r2: ANY non-zero gh pr checks exit WITH rows reads the state from the table, not ERROR"
+# gh encodes the PR's CI state in its exit status and still prints the table: 8 =
+# a check is pending, 1 = a check FAILED. Probed live: `gh pr checks 2351` (a failed
+# check) printed `Build & Test<TAB>fail<TAB>...` and exited 1 with an empty stderr.
+# Carving out exit 8 alone left that real CI failure printing
+# ci=ERROR(gh pr checks exited 1 with no message), the row that said "fail" already
+# extracted and thrown away.
+FAIL_ROWS='Build & Test\tfail\t2m4s\thttps://example.test/run/1\tjob exited 101\nIntegration Tests\tskipping\t0\thttps://example.test/run/2\t'
+OTHER_FAIL_ROWS='Integration Tests\tfail\t1m0s\thttps://example.test/run/2\t'
+PASS_OTHER_FAIL_ROWS='Build & Test\tpass\t41m12s\thttps://example.test/run/1\t\nIntegration Tests\tfail\t1m0s\thttps://example.test/run/2\t'
+PEND_OTHER_FAIL_ROWS='Build & Test\tpending\t0\thttps://example.test/run/1\t\nIntegration Tests\tfail\t1m0s\thttps://example.test/run/2\t'
+for p in 3060 3061 3062 3063 3064; do
+  export "GH_VIEW_$p=$(view_json "$HEAD40" OPEN MERGEABLE)"
+done
+export GH_CHECKS_3060="$FAIL_ROWS";            export GH_CHECKS_RC_3060=1
+export GH_CHECKS_3061="$OTHER_FAIL_ROWS";      export GH_CHECKS_RC_3061=1
+export GH_CHECKS_3062="$PASS_OTHER_FAIL_ROWS"; export GH_CHECKS_RC_3062=1
+export GH_CHECKS_3063="$PEND_OTHER_FAIL_ROWS"; export GH_CHECKS_RC_3063=1
+export GH_CHECKS_3064="$OTHER_FAIL_ROWS";      export GH_CHECKS_RC_3064=4
+OUT=$(sweep 3060)
+check     "exit 1 + a failed Build & Test row: ci=fail"  "$OUT" "ci=fail"
+check_not "...a real CI failure is not an ERROR"          "$OUT" "ci=ERROR"
+OUT=$(sweep 3061)
+check     "exit 1 + rows with no Build & Test row: the exit status names the state" "$OUT" "ci=fail"
+check_not "...not an ERROR"                               "$OUT" "ci=ERROR"
+check_not "...and not ci=none"                            "$OUT" "ci=none"
+OUT=$(sweep 3062)
+check     "exit 1 + Build & Test passed + another check failed: fail, naming it" "$OUT" "ci=fail(Integration Tests)"
+check_not "...a red PR is not printed green by its passing Build & Test row" "$OUT" "ci=pass"
+OUT=$(sweep 3063)
+check     "exit 1 + Build & Test pending + another check failed: fail outranks pending" "$OUT" "ci=fail(Integration Tests)"
+check_not "...not read as pending"                        "$OUT" "ci=pending"
+OUT=$(sweep 3064)
+check     "an undocumented exit + rows: the rows decide, it is not an ERROR" "$OUT" "ci=fail(Integration Tests)"
+check_not "...no ERROR for a table that was read"         "$OUT" "ci=ERROR"
+
+echo
+echo "#2380 r3: the CI header is ONE conservative state over EVERY row — fail > pending > pass, skipping ignored"
+# A PR is as green as its worst check. The header used to be the Build & Test row's
+# own state, so Build & Test passing while another check FAILED printed ci=pass — a red
+# PR shown green — and two Build & Test matrix rows printed a two-line value.
+rows() {  # "name:status"... -> the \t-escaped rows gh pr checks would print (the stub expands them)
+  local out="" r n=1 nl='\n'
+  for r in "$@"; do
+    out="${out}${r%:*}"'\t'"${r##*:}"'\t1m0s\thttps://example.test/run/'"$n"'\t'"$nl"; n=$((n + 1))
+  done
+  printf '%s' "${out%"$nl"}"
+}
+mkci() {  # <pr> <exit status> "name:status"...
+  local p="$1" rc="$2"; shift 2
+  export "GH_VIEW_$p=$(view_json "$HEAD40" OPEN MERGEABLE)"
+  export "GH_CHECKS_$p=$(rows "$@")"
+  export "GH_CHECKS_RC_$p=$rc"
+}
+hdr() { sed -n '1p' <<<"$1"; }
+mkci 3100 1 'Build & Test:pass' 'Integration Tests:fail'
+OUT=$(sweep 3100)
+check     "Build & Test passed, another check failed: the header says fail and names it" "$(hdr "$OUT")" "ci=fail(Integration Tests) gate-running"
+check_not "...a red PR is never printed green"             "$OUT" "ci=pass"
+check     "...the failing check is listed UNDER the header"  "$(sed -n '2p' <<<"$OUT")" "-- ci: Integration Tests fail"
+mkci 3101 1 'Build & Test (ubuntu):pass' 'Build & Test (macos):fail'
+OUT=$(sweep 3101)
+check     "two Build & Test matrix rows, pass then fail: fail, naming the failing one" "$(hdr "$OUT")" "ci=fail(Build & Test (macos)) gate-running"
+check_not "...not the first row's pass"                    "$OUT" "ci=pass"
+mkci 3102 1 'Build & Test (ubuntu):fail' 'Build & Test (macos):pass'
+OUT=$(sweep 3102)
+check     "...the order of the rows does not matter (fail first)" "$(hdr "$OUT")" "ci=fail(Build & Test (ubuntu)) gate-running"
+mkci 3103 1 'Build & Test:pass' 'Build & Test:fail'
+OUT=$(sweep 3103)
+check     "two rows with the SAME name, pass then fail: fail" "$(hdr "$OUT")" "ci=fail(Build & Test) gate-running"
+mkci 3104 1 'Build & Test:fail' 'Build & Test:pass'
+OUT=$(sweep 3104)
+check     "...and fail then pass: fail"                    "$(hdr "$OUT")" "ci=fail(Build & Test) gate-running"
+mkci 3105 8 'Build & Test:pass' 'Integration Tests:pending'
+OUT=$(sweep 3105)
+check     "a pending check beside a passing one: pending"  "$(hdr "$OUT")" "ci=pending gate-running"
+check     "...the pending check is listed under the header" "$(sed -n '2p' <<<"$OUT")" "-- ci: Integration Tests pending"
+mkci 3106 0 'Build & Test:pass' 'Integration Tests:pending'
+OUT=$(sweep 3106)
+check     "...the rows decide when the exit status says 0" "$(hdr "$OUT")" "ci=pending gate-running"
+mkci 3107 0 'Build & Test:pass' 'Integration Tests:pass'
+OUT=$(sweep 3107)
+check     "every check passed: pass"                       "$(hdr "$OUT")" "ci=pass gate-running"
+check_not "...and nothing is listed under a green header"  "$OUT" "-- ci:"
+mkci 3108 0 'Build & Test:pass' 'Integration Tests:skipping'
+OUT=$(sweep 3108)
+check     "pass + skipping: the state of the rest, pass"   "$(hdr "$OUT")" "ci=pass gate-running"
+check_not "...a skipped check is not listed as a problem"  "$OUT" "-- ci:"
+mkci 3109 1 'Build & Test:fail' 'Integration Tests:skipping'
+OUT=$(sweep 3109)
+check     "fail + skipping: fail"                          "$(hdr "$OUT")" "ci=fail(Build & Test) gate-running"
+mkci 3110 8 'Build & Test:pending' 'Integration Tests:skipping'
+OUT=$(sweep 3110)
+check     "pending + skipping: pending"                    "$(hdr "$OUT")" "ci=pending gate-running"
+mkci 3111 0 'Build & Test:skipping' 'Integration Tests:skipping'
+OUT=$(sweep 3111)
+check     "nothing BUT skipped checks: skipping, nothing ran" "$(hdr "$OUT")" "ci=skipping gate-running"
+check_not "...never pass, never none"                      "$OUT" "ci=pass"
+mkci 3112 1 'Build & Test:pass' 'Integration Tests:pass'
+OUT=$(sweep 3112)
+check     "exit 1 is a floor: a table with no failing row still says fail" "$(hdr "$OUT")" "ci=fail(gh pr checks exited 1 with no failing row listed) gate-running"
+check_not "...never pass"                                  "$OUT" "ci=pass"
+mkci 3113 8 'Build & Test:pass' 'Integration Tests:pass'
+OUT=$(sweep 3113)
+check     "exit 8 is a floor: a table with no pending row still says pending" "$(hdr "$OUT")" "ci=pending gate-running"
+mkci 3114 0 'Build & Test:fail' 'Integration Tests:pass'
+OUT=$(sweep 3114)
+check     "a failing row wins over exit 0"                 "$(hdr "$OUT")" "ci=fail(Build & Test) gate-running"
+mkci 3115 4 'Build & Test:pass' 'Integration Tests:pass'
+OUT=$(sweep 3115)
+check     "an undocumented exit with rows that all passed: the rows decide" "$(hdr "$OUT")" "ci=pass gate-running"
+mkci 3116 1 'Build & Test:pass' 'Lint:cancel'
+OUT=$(sweep 3116)
+check     "a cancelled check is a failure, named as cancelled" "$(hdr "$OUT")" "ci=fail(Lint [cancelled]) gate-running"
+mkci 3117 0 'Build & Test:pass' 'Lint:neutral'
+OUT=$(sweep 3117)
+check     "a status gh does not document is never read as green" "$(hdr "$OUT")" "ci=ERROR(unrecognised check status 'neutral' on 'Lint') gate-running"
+check_not "...not pass"                                    "$OUT" "ci=pass"
+mkci 3118 1 'Build & Test:fail' 'Lint:neutral'
+OUT=$(sweep 3118)
+check     "...but a known failure outranks it"             "$(hdr "$OUT")" "ci=fail(Build & Test) gate-running"
+export GH_VIEW_3119="$(view_json "$HEAD40" OPEN MERGEABLE)"
+export GH_CHECKS_3119='this is not a check table'; export GH_CHECKS_RC_3119=0
+OUT=$(sweep 3119)
+check     "output with no check rows is not a table: ERROR, not none" "$(hdr "$OUT")" "ci=ERROR(gh pr checks printed no check rows: 'this is not a check table') gate-running"
+mkci 3120 1 'Check A:fail' 'Check B:fail' 'Check C:fail' 'Check D:fail' 'Check E:fail' 'Check F:fail' 'Check G:pending' 'Check H:pending'
+OUT=$(sweep 3120)
+check     "six failing checks: the header names three and counts the rest" "$(hdr "$OUT")" "ci=fail(Check A, Check B, Check C, +3 more) gate-running"
+check     "...the detail is capped, and says how many it left out" "$OUT" "-- ci: (+3 more checks that are not passing)"
+check_not "...the sixth failing check is not listed"       "$OUT" "-- ci: Check F"
+NL=$(wc -l <<<"$OUT" | tr -d ' ')
+if [[ "$NL" -le 30 ]]; then echo "  PASS  ...and the PR still fits the 30-line budget ($NL lines)"
+else echo "  FAIL  ...but the PR overran the 30-line budget: $NL lines"; RC=1; fi
+
+echo
 echo "#2358 P2: template placeholder / empty / unreadable verdict files"
 # 3016 is reused above for ci; these use 3017-3019.
 d="$STATE/gate/3017"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
@@ -561,6 +739,95 @@ check_not "a quoted template is not INCOMPLETE"      "$OUT" "INCOMPLETE (templat
 # MUTATION-PROOF: reverting cx_classify to whole-report placeholder grep turns
 # the first check red ("wanted '**Verdict:** approve'") — verified by hand.
 chmod 644 "$d/codex-verdict.md"
+
+echo
+echo "#2380: a prose-only Codex report is PROSE, not INCOMPLETE — unless it carries an unfilled template line"
+# Codex sometimes answers in words ("No actionable defects found") and writes no
+# `**Verdict:**` line at all. That is a finished review stating its outcome, not an
+# unfinished one, so it is labelled PROSE (never promoted to a verdict) and its
+# lines still print. A report with NO Verdict line AND the template's unfilled
+# alternation on a line of its own is the unfinished shape — still INCOMPLETE.
+d="$STATE/gate/3040"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf 'No actionable defects found in this range.\n' > "$d/codex-verdict.md"
+d="$STATE/gate/3041"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf '## Codex review — PR 3041 @ a1b2c3d4e\napprove | approve-with-findings | blocked\n' > "$d/codex-verdict.md"
+for p in 3040 3041; do
+  export "GH_VIEW_$p=$(view_json "$HEAD40" OPEN MERGEABLE)"; export "GH_CHECKS_$p=$CC_CHECKS"
+done
+OUT=$(sweep 3040)
+check     "prose-only report -> PROSE label"          "$OUT" "-- codex: PROSE (no verdict line)"
+check_not "prose-only report is not INCOMPLETE"       "$OUT" "INCOMPLETE"
+check     "the prose outcome still prints"            "$OUT" "No actionable defects found"
+OUT=$(sweep 3041)
+check     "no Verdict line + unfilled template line stays INCOMPLETE" "$OUT" "-- codex: INCOMPLETE (no verdict line)"
+check_not "…and is not PROSE"                         "$OUT" "PROSE"
+
+echo
+echo "#2380 r2: only a line that IS the template is an unfilled template — quoting its three words is not"
+# The PROSE decision scanned the WHOLE report for the template's three words, so a
+# finished prose report that merely quotes them (in a sentence, or in a finding about
+# the output template) read as an unfilled template and was shown INCOMPLETE. The
+# restriction the parsed path got in #2358 P2 applies here too: only the decision
+# line itself counts, i.e. a line that is the alternation (bullets, bold, backticks and
+# a trailing full stop aside).
+d="$STATE/gate/3070"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf 'No actionable defects found. The template line approve | approve-with-findings | blocked was quoted here, not left unfilled.\n' > "$d/codex-verdict.md"
+d="$STATE/gate/3071"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf -- '- [P2] the output template approve | approve-with-findings | blocked is ambiguous — src/t.rs:9\nNo newly actionable findings.\n' > "$d/codex-verdict.md"
+d="$STATE/gate/3072"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf -- '## Codex review — PR 3072\n- `approve | approve-with-findings | blocked`\n' > "$d/codex-verdict.md"
+d="$STATE/gate/3073"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf '**approve | approve-with-findings | blocked**.\n' > "$d/codex-verdict.md"
+for p in 3070 3071 3072 3073; do
+  export "GH_VIEW_$p=$(view_json "$HEAD40" OPEN MERGEABLE)"; export "GH_CHECKS_$p=$CC_CHECKS"
+done
+OUT=$(sweep 3070)
+check     "the three words quoted inside a sentence -> PROSE"  "$OUT" "-- codex: PROSE (no verdict line)"
+check_not "...not an unfilled template"                        "$OUT" "INCOMPLETE"
+OUT=$(sweep 3071)
+check     "the three words quoted inside a finding -> PROSE"   "$OUT" "-- codex: PROSE (no verdict line)"
+check_not "...not an unfilled template"                        "$OUT" "INCOMPLETE"
+OUT=$(sweep 3072)
+check     "a bulleted, backticked bare template line stays INCOMPLETE" "$OUT" "-- codex: INCOMPLETE (no verdict line)"
+check_not "...and is not PROSE"                                "$OUT" "PROSE"
+OUT=$(sweep 3073)
+check     "a bold bare template line with a full stop stays INCOMPLETE" "$OUT" "-- codex: INCOMPLETE (no verdict line)"
+check_not "...and is not PROSE"                                "$OUT" "PROSE"
+
+echo
+echo "#2379: the scope.<UTC>.md copies velo-gate-run saves in the gate dir are never read"
+# velo-gate-run keeps the WHOLE scope file next to the gate's own files. A scope is
+# prose ABOUT a review — it can quote a verdict, a finding or a sha — so a sweep
+# that read any *.md in the dir would print the scope's words as the gate's state.
+# The sweep opens named files only. Two invariants: a PR's output is identical with
+# and without the copies, and a dir holding nothing but copies (a round that died in
+# the plan) is still "no gate yet".
+d="$STATE/gate/3050"; mkdir -p "$d"; printf '%s\n' "$HEAD9" > "$d/gated.sha"
+printf '## Codex review — PR 3050 @ %s\n**Verdict:** approve\n\n### Findings\nNone.\n' "$HEAD9" > "$d/codex-verdict.md"
+printf '## check-code — PR 3050 @ %s\n**Verdict:** approve\n' "$HEAD9" > "$d/code.log"
+for p in 3050 3051; do
+  export "GH_VIEW_$p=$(view_json "$HEAD40" OPEN MERGEABLE)"; export "GH_CHECKS_$p=$CC_CHECKS"
+done
+SCOPE_BEFORE=$(sweep 3050)
+for f in scope.20261005T120000Z.md scope.20261005T120000Z.2.md; do
+  printf '# Scope — a re-review of PR 3050\n**Verdict:** blocked\n- [P1] SCOPE-FINDING-SENTINEL — src/never.rs:1\nCodex says: blocked.\n%s is the sha this round gated\n' "$OLD9" > "$d/$f"
+  touch -t 203001010000 "$d/$f"   # newer than every real gate file
+done
+OUT=$(sweep 3050)
+if [[ "$OUT" == "$SCOPE_BEFORE" ]]; then echo "  PASS  the sweep's output is identical with the scope copies present"
+else echo "  FAIL  scope copies changed the sweep: $(tr '\n' ' ' <<<"$OUT" | cut -c1-300)"; RC=1; fi
+check     "the real verdict is still the one printed"   "$OUT" "**Verdict:** approve"
+check_not "a scope's quoted verdict is not the gate's"  "$OUT" "**Verdict:** blocked"
+check_not "a scope's finding title is not swept"        "$OUT" "SCOPE-FINDING-SENTINEL"
+d="$STATE/gate/3051"; mkdir -p "$d"
+printf '# Scope\n**Verdict:** blocked\n- [P1] SCOPE-ONLY-SENTINEL — src/never.rs:2\n' > "$d/scope.20261005T120000Z.md"
+touch -t 203001010000 "$d/scope.20261005T120000Z.md"
+OUT=$(sweep 3051)
+check     "only scope copies: the codex leg is no gate yet"      "$OUT" "-- codex: (no gate yet)"
+check     "only scope copies: the check-code leg is no gate yet" "$OUT" "-- check-code (advisory): (no gate yet)"
+check     "only scope copies: gated=none"                        "$OUT" "gated=none"
+check_not "only scope copies: never flagged STALE"               "$OUT" "STALE"
+check_not "only scope copies: the scope's finding is not swept"  "$OUT" "SCOPE-ONLY-SENTINEL"
 
 echo
 echo "#2354 class: UNREADABLE review.log / code.log / gated.sha, never '(no gate yet)'"

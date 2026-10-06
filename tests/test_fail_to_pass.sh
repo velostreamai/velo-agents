@@ -64,6 +64,195 @@ else
   done
 fi
 
+# ---- the merge-time half, RUN -----------------------------------------------------------------
+#
+# The needles above only prove the block is still there. It is also run here, extracted verbatim,
+# against a real two-commit repo with gh / warn / ok / die standing in for the script's own. Every
+# read the block makes can fail — the PR's title, its base branch, the spec file, git itself — and
+# each of those used to leave the check with nothing to verify and nothing to say: a failed read is
+# not "no names", and the gate that enforces the acceptance tests must not go quiet because it
+# could not look.
+if [[ -n "$MBLOCK" ]]; then
+  MREPO="$TMPD/mrepo"
+  git init -q "$MREPO"
+  mg() { git -C "$MREPO" -c user.name=t -c user.email=t@t.invalid -c commit.gpgsign=false "$@"; }
+  mkdir -p "$MREPO/tests" "$MREPO/.agents/tasks" "$TMPD/notrepo/.agents/tasks"
+  printf 'fn old_test() {}\n' > "$MREPO/tests/a.rs"
+  mg add tests/a.rs; mg commit -q -m base
+  mg update-ref refs/remotes/origin/master HEAD       # the base: old_test exists, new_test does not
+  printf 'fn new_test() {}\n' >> "$MREPO/tests/a.rs"
+  mg add tests/a.rs; mg commit -q -m head              # the PR's head: both exist
+
+  # <block text>; reads $MSPEC (the spec file's content) and the MR_* knobs from the environment.
+  mrun() {
+    local wt="${MR_WTPATH:-$MREPO}"
+    printf '%s\n' "$MSPEC" > "$wt/.agents/tasks/9999.json"
+    (
+      PR=1; REPO=x/y; WTPATH="$wt"; WT="${MR_WT:-fix/9999-thing}"
+      warn() { echo "WARN: $1"; }
+      ok()   { echo "OK: $1"; }
+      die()  { echo "DIED: $1"; exit 1; }
+      gh() {   # the two reads the block makes: the base branch and the title's issue number
+        case "$*" in
+          *baseRefName*) [[ -z "${MR_BASE_FAIL:-}" ]] || { echo "gh: HTTP 502" >&2; return 1; }
+                         printf '%s\n' "${MR_BASE:-master}" ;;
+          *title*)       [[ -z "${MR_TITLE_FAIL:-}" ]] || { echo "gh: HTTP 502" >&2; return 1; }
+                         printf '%s\n' "${MR_TITLE_N:-}" ;;
+          *)             echo "unexpected gh call: $*" >&2; return 1 ;;
+        esac
+      }
+      eval "$1"
+    ) 2>&1
+    echo "RC=$?"
+  }
+  msay() { grep -qF -- "$2" <<<"$1"; }     # <output> <needle>
+  mfail() { MFAILS="$MFAILS $1"; }
+  mreport() {   # <label>: the case just run, judged by MFAILS
+    if [[ -z "$MFAILS" ]]; then echo "  PASS  $1"; else echo "  FAIL  $1:$MFAILS"; FAILURES=$((FAILURES+1)); fi
+  }
+
+  # What the block does today, pinned: these must not change.
+  case_new_name() {   # a name defined at the head only: accepted, nothing said about the base
+    MSPEC='{"tests":{"fail_to_pass":["new_test"]}}'
+    local o; o=$(mrun "$1"); MFAILS=""
+    msay "$o" "OK: fail_to_pass: 1 name(s), all defined at PR head [spec from worktree]" || mfail accepted
+    msay "$o" "RC=0"                                                                     || mfail exits-0
+    ! msay "$o" "already existed"                                                        || mfail not-called-predating
+  }
+  case_absent_name() {   # a name defined nowhere: the gate refuses
+    MSPEC='{"tests":{"fail_to_pass":["nope_test"]}}'
+    local o; o=$(mrun "$1"); MFAILS=""
+    msay "$o" "BLOCK: fail_to_pass names test(s) that do not exist" || mfail blocks
+    msay "$o" "nope_test"                                           || mfail names-it
+    msay "$o" "RC=1"                                                || mfail exits-1
+  }
+  case_predating_name() {   # a name that already existed at the base: said, not refused
+    MSPEC='{"tests":{"fail_to_pass":["old_test"]}}'
+    local o; o=$(mrun "$1"); MFAILS=""
+    msay "$o" "already existed at origin/master" || mfail says-it-predates
+    msay "$o" "RC=0"                             || mfail exits-0
+  }
+  case_no_names() {   # a spec that parses and names nothing: nothing to verify, nothing to say
+    MSPEC='{"tests":{}}'
+    local o; o=$(mrun "$1"); MFAILS=""
+    ! msay "$o" "WARN:" || mfail no-warning
+    ! msay "$o" "OK:"   || mfail no-verdict
+    msay "$o" "RC=0"    || mfail exits-0
+  }
+  case_title_names_the_issue() {   # no issue in the branch name: the PR title's number finds the spec
+    MSPEC='{"tests":{"fail_to_pass":["new_test"]}}'
+    local o; o=$(MR_WT=feature-branch MR_TITLE_N=9999 mrun "$1"); MFAILS=""
+    msay "$o" "OK: fail_to_pass: 1 name(s), all defined at PR head" || mfail spec-found-through-the-title
+  }
+  case_title_names_nothing() {   # no issue in the branch name or the title: no spec, legitimately
+    MSPEC='{"tests":{"fail_to_pass":["nope_test"]}}'
+    local o; o=$(MR_WT=feature-branch MR_TITLE_N= mrun "$1"); MFAILS=""
+    ! msay "$o" "WARN:"  || mfail no-warning
+    ! msay "$o" "BLOCK:" || mfail nothing-to-block
+    msay "$o" "RC=0"     || mfail exits-0
+  }
+  # Reads that can fail: said, never read as "nothing to verify".
+  case_title_unreadable() {
+    MSPEC='{"tests":{"fail_to_pass":["nope_test"]}}'
+    local o; o=$(MR_WT=feature-branch MR_TITLE_FAIL=1 mrun "$1"); MFAILS=""
+    msay "$o" "WARN: could not read the title of #1"         || mfail says-the-title-read-failed
+    msay "$o" "fail_to_pass is NOT being verified"           || mfail says-nothing-was-verified
+    msay "$o" "gh: HTTP 502"                                 || mfail shows-ghs-own-words
+    ! msay "$o" "BLOCK:"                                     || mfail not-a-verdict
+  }
+  case_spec_unparseable() {
+    MSPEC='{"tests": {"fail_to_pass": ['
+    local o; o=$(mrun "$1"); MFAILS=""
+    msay "$o" "WARN: could not read the names from"          || mfail says-the-spec-is-unreadable
+    msay "$o" "9999.json"                                    || mfail names-the-file
+    msay "$o" "fail_to_pass is NOT being verified"           || mfail says-nothing-was-verified
+    ! msay "$o" "OK: fail_to_pass"                           || mfail not-called-verified
+  }
+  case_base_unreadable() {
+    MSPEC='{"tests":{"fail_to_pass":["old_test"]}}'
+    local o; o=$(MR_BASE_FAIL=1 mrun "$1"); MFAILS=""
+    msay "$o" "DIED: could not read base branch for #1"      || mfail refuses-in-the-retryable-shape
+    msay "$o" "RC=1"                                         || mfail exits-1
+    ! msay "$o" "OK: fail_to_pass"                           || mfail not-called-verified
+  }
+  case_base_unsearchable() {   # the base branch reads fine but git has no such ref
+    MSPEC='{"tests":{"fail_to_pass":["new_test"]}}'
+    local o; o=$(MR_BASE=gone mrun "$1"); MFAILS=""
+    msay "$o" "DIED: git could not search origin/gone"       || mfail says-git-could-not-search
+    msay "$o" "new_test"                                     || mfail names-the-test
+    msay "$o" "RC=1"                                         || mfail exits-1
+    ! msay "$o" "OK: fail_to_pass"                           || mfail not-called-verified
+  }
+  case_head_unsearchable() {   # git cannot search the head (not a repo): not "the tests do not exist"
+    MSPEC='{"tests":{"fail_to_pass":["new_test"]}}'
+    local o; o=$(GIT_CEILING_DIRECTORIES="$TMPD" MR_WTPATH="$TMPD/notrepo" mrun "$1"); MFAILS=""
+    msay "$o" "DIED: git could not search HEAD"              || mfail says-git-could-not-search
+    msay "$o" "RC=1"                                         || mfail exits-1
+    ! msay "$o" "do not exist"                               || mfail not-called-nonexistent
+  }
+
+  for spec in "a name defined at the head is accepted:case_new_name" \
+              "a name defined nowhere is refused:case_absent_name" \
+              "a name that predates the PR is said, not refused:case_predating_name" \
+              "a spec that names nothing is skipped without a word:case_no_names" \
+              "the PR title finds the spec when the branch name carries no issue:case_title_names_the_issue" \
+              "no issue anywhere means no spec, with no warning:case_title_names_nothing" \
+              "a title that cannot be read says the check was not made:case_title_unreadable" \
+              "a spec that cannot be read says the check was not made:case_spec_unparseable" \
+              "a base branch that cannot be read refuses the round (retryable):case_base_unreadable" \
+              "a base ref git cannot search refuses, naming the test:case_base_unsearchable" \
+              "a head git cannot search refuses, and does not call the tests missing:case_head_unsearchable"; do
+    "${spec##*:}" "$MBLOCK"
+    mreport "merge-time check: ${spec%:*}"
+  done
+
+  # MUTATION-PROOF, on COPIES of the extracted block: each fix is taken out in turn and the case that
+  # pins it must go red, naming the check it pins.
+  mutant_block() {   # <anchor> <replacement> -> MUT_BLOCK (the anchor must occur exactly once)
+    MUT_BLOCK=$(python3 -c '
+import sys
+t, old, new = sys.stdin.read(), sys.argv[1], sys.argv[2]
+assert t.count(old) == 1, "anchor must occur exactly once, found %d: %r" % (t.count(old), old)
+sys.stdout.write(t.replace(old, new, 1))
+' "$1" "$2" <<<"$MBLOCK") || return 1
+  }
+  mprove() {   # <label> <case fn> <names that must be red> <anchor> <replacement>
+    local label="$1" fn="$2" want="$3" n missing=""
+    if ! mutant_block "$4" "$5"; then
+      echo "  FAIL  MUTATION-PROOF $label: could not build the mutant (anchor missing or repeated — did the block change shape?)"
+      FAILURES=$((FAILURES+1)); return
+    fi
+    "$fn" "$MUT_BLOCK"
+    for n in $want; do [[ " $MFAILS " == *" $n "* ]] || missing="$missing $n"; done
+    if [[ -z "$missing" ]]; then
+      echo "  PASS  MUTATION-PROOF $label: red for$MFAILS"
+    else
+      echo "  FAIL  MUTATION-PROOF $label: stayed GREEN for$missing (red for:$MFAILS)"; FAILURES=$((FAILURES+1))
+    fi
+  }
+  mprove "a title that cannot be read is said (the warning removed)" case_title_unreadable \
+    "says-the-title-read-failed says-nothing-was-verified" \
+    'warn "could not read the title of #$PR' ': "could not read the title of #$PR'
+  mprove "a title that cannot be read shows gh's own words (stderr hidden again)" case_title_unreadable \
+    "shows-ghs-own-words" \
+    $'| .n\'); then' $'| .n\' 2>/dev/null); then'
+  mprove "a spec that cannot be read is said (the failing status dropped)" case_spec_unparseable \
+    "says-the-spec-is-unreadable names-the-file says-nothing-was-verified" \
+    'sys.exit(1)' 'sys.exit(0)'
+  # Only the message is this guard's own: with it removed the empty base becomes `origin/`, which git
+  # cannot search, so the guard below it still refuses (exits-1, not-called-verified stay green) — but
+  # with git's error, not the `could not read base branch` words velo-gate-run knows to retry.
+  mprove "a base branch that cannot be read refuses in the retryable shape (the guard removed)" case_base_unreadable \
+    "refuses-in-the-retryable-shape" \
+    '[[ -n "$FTP_BASE" ]] || die "could not read base branch for #$PR"' ':'
+  mprove "a base ref git cannot search refuses (git's exit status ignored)" case_base_unsearchable \
+    "says-git-could-not-search names-the-test exits-1 not-called-verified" \
+    '[[ $rc -le 1 ]] || die' 'true || die'
+  mprove "a head git cannot search is not 'the tests do not exist' (git's exit status ignored)" case_head_unsearchable \
+    "says-git-could-not-search not-called-nonexistent" \
+    '[[ $rc -le 1 ]] || die' 'true || die'
+fi
+
 BASE_SHA=$(git -C "$ROOT" rev-parse origin/master 2>/dev/null)
 if [[ -z "$BASE_SHA" ]]; then echo "  SKIP  no origin/master to resolve names against"; exit 0; fi
 

@@ -108,6 +108,9 @@ fi
 
 if [[ "$1" == "issue" && "$2" == "view" ]]; then
   NUM="$3"
+  # GH_ISSUE_FAIL_<n>=1 makes the read of issue <n> fail the way a dropped connection does.
+  FAILVAR="GH_ISSUE_FAIL_${NUM}"
+  if [[ -n "${!FAILVAR:-}" ]]; then echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
   BASE=$(cat "$FIX/issue_${NUM}.json" 2>/dev/null || echo '{}')
   FILT=$(get_flag --jq "$@")
   if [[ -n "$FILT" ]]; then jq -r "$FILT" <<<"$BASE"; else echo "$BASE"; fi
@@ -194,9 +197,9 @@ reset_state() {
 
 gate_dir() { mkdir -p "$STATE/gate/$1"; printf '%s' "$STATE/gate/$1"; }
 
-run_tick() {
+run_tick() {   # ORCHD_UNDER_TEST: a mutant copy of the daemon, for the in-suite mutation proofs
   VELO_STATE="$STATE" VELO_ORCH_WORKTREE_GLOB="${VELO_ORCH_WORKTREE_GLOB:-$T/worktrees/velostream-*}" \
-    "$ORCHD" tick
+    "${ORCHD_UNDER_TEST:-$ORCHD}" tick
 }
 
 calls_of() { grep -c "$1" "$CALLS_LOG" 2>/dev/null || true; }   # substring -> count
@@ -515,6 +518,379 @@ if ! grep -q "pr edit 1111.*--add-label gate:passed" "$CALLS_LOG"; then
 else
   fail "a blocked gate was also marked passed"
 fi
+
+echo
+echo "== 13. a report that states two different verdicts is neither passed nor blocked =="
+reset_state
+GD=$(gate_dir 1212)
+# An early `approve` (a restated header) followed by a later `blocked`: the first line used to
+# decide, so the daemon labelled this PR gate:passed over a reviewer who also said blocked.
+printf '## Codex review — PR 1212 @ %s\n**Verdict:** approve\n\n### Re-check\n**Verdict:** blocked\n' "$HEADSHA" > "$GD/review.log"
+printf '%s' "$(dead_pid)" > "$GD/review.log.pid"
+printf '%s' "$HEADSHA" > "$GD/gated.sha"
+mkpr 1212 "$HEADSHA" '[".agents/bin/foo"]' '["gate:running"]' '[]'
+list_prs gate:running 1212
+list_prs gate:passed
+: > "$CALLS_LOG"
+run_tick >/dev/null 2>&1
+if ! grep -q "pr edit 1212.*gate:passed" "$CALLS_LOG"; then
+  ok "an approve that a later line contradicts does not pass the PR"
+else
+  fail "a report that also said blocked was passed on its first line"
+fi
+if ! grep -q "pr edit 1212.*gate:blocked" "$CALLS_LOG"; then
+  ok "nor is it blocked on its later line — a contradictory report asks a human"
+else
+  fail "a contradictory report was blocked automatically"
+fi
+if grep -q '"kind":"gate-malformed"' "$STATE/orch/attention.jsonl"; then
+  ok "the contradictory report escalates as malformed, for a human to read"
+else
+  fail "a contradictory report did not escalate"
+fi
+
+echo
+echo "== 14. dispatch: several worker labels, and an unreadable issue, are neither the first label nor 'no label' =="
+reset_state
+mkdir -p "$STATE/orch" "$T/worktrees"
+BRIEF3="$T/brief-1313.md"; printf 'do a third thing\n' > "$BRIEF3"
+SHA3=$(shasum -a 256 "$BRIEF3" | awk '{print $1}')
+export VELO_ORCH_WORKTREE_GLOB="$T/worktrees/velostream-*"
+list_prs gate:running; list_prs gate:passed
+queue_one() {   # <issue> <worker pinned at queue time>
+  jq -cn --arg issue "$1" --arg brief "$BRIEF3" --arg worker "$2" --arg s "$SHA3" \
+    '{issue:($issue|tonumber), brief:$brief, worker:$worker, brief_sha256:$s}' > "$STATE/orch/queue.jsonl"
+}
+# The pinned worker is one of the issue's two worker labels, and it is the FIRST: the first-label
+# read called that a match and handed the issue to velo-dispatch, which refuses an issue with more
+# than one worker label — the daemon log was the only place anyone would have seen it.
+queue_one 1313 deepseek
+jq -cn '{labels:[{name:"worker:deepseek"},{name:"worker:glm"}]}' > "$FIX/issue_1313.json"
+: > "$CALLS_LOG"
+run_tick >/dev/null 2>&1
+if ! grep -q "FAKE-DISPATCH 1313" "$STATE/orch/orchestrd.log" 2>/dev/null; then
+  ok "an issue with two worker labels is not dispatched on the strength of the first"
+else
+  fail "dispatched #1313 although it carries two worker labels"
+fi
+if grep -q '"kind":"dispatch-mismatch"' "$STATE/orch/attention.jsonl" 2>/dev/null \
+   && grep -q 'worker:deepseek' "$STATE/orch/attention.jsonl" && grep -q 'worker:glm' "$STATE/orch/attention.jsonl"; then
+  ok "the escalation names both labels"
+else
+  fail "no escalation naming both worker labels: $(cat "$STATE/orch/attention.jsonl" 2>/dev/null)"
+fi
+# An issue that could not be READ is not an issue with no worker label.
+reset_state
+mkdir -p "$STATE/orch" "$T/worktrees"
+list_prs gate:running; list_prs gate:passed
+queue_one 1414 deepseek
+jq -cn '{labels:[{name:"worker:deepseek"}]}' > "$FIX/issue_1414.json"
+: > "$CALLS_LOG"
+GH_ISSUE_FAIL_1414=1 run_tick >/dev/null 2>&1
+if ! grep -q "FAKE-DISPATCH 1414" "$STATE/orch/orchestrd.log" 2>/dev/null; then
+  ok "an unreadable issue is not dispatched"
+else
+  fail "dispatched #1414 although its labels could not be read"
+fi
+if grep -q '"kind":"dispatch-unreadable"' "$STATE/orch/attention.jsonl" 2>/dev/null \
+   && grep -q 'HTTP 502' "$STATE/orch/attention.jsonl"; then
+  ok "the escalation says the read failed, with gh's own words"
+else
+  fail "no dispatch-unreadable escalation carrying gh's message: $(cat "$STATE/orch/attention.jsonl" 2>/dev/null)"
+fi
+if ! grep -q 'worker:<none>' "$STATE/orch/attention.jsonl" 2>/dev/null; then
+  ok "and does not claim the issue has no worker label"
+else
+  fail "an unreadable issue was reported as having no worker label"
+fi
+
+echo
+echo "== 15. a verdict that velo-gate refuses to record is not logged as recorded =="
+# A velo-gate that cannot record a verdict: --pass / --block refuse the way the real one does (a
+# stale gate, comments it cannot read, a label it cannot set); the plan is the real thing. The
+# daemon sent velo-gate's output and status to /dev/null and logged "gate:passed" anyway, on
+# every tick, with nothing escalated — a PR stuck at gate:running behind a log that said it passed.
+cat > "$T/bin/velo-gate-refusing" <<STUBEOF
+#!/bin/bash
+case "\$2" in
+  --pass|--block)
+    printf '\n\033[31mERROR:\033[0m refusing to mark passed: head is %s, but:\n    check-code ran at 2222222\n  Re-run the gate against the current head.\n\n' "\$1" >&2
+    exit 1 ;;
+esac
+exec "$BIN/velo-gate" "\$@"
+STUBEOF
+chmod +x "$T/bin/velo-gate-refusing"
+reset_state
+GD=$(gate_dir 1515)
+printf '## Codex review — PR 1515 @ %s\n**Verdict:** approve\n' "$HEADSHA" > "$GD/review.log"
+printf '%s' "$(dead_pid)" > "$GD/review.log.pid"
+printf '%s' "$HEADSHA" > "$GD/gated.sha"
+mkpr 1515 "$HEADSHA" '[".agents/bin/foo"]' '["gate:running"]' '[]'
+GD1616=$(gate_dir 1616)
+printf '## Codex review — PR 1616 @ %s\n**Verdict:** blocked\n' "$HEADSHA" > "$GD1616/review.log"
+printf '%s' "$(dead_pid)" > "$GD1616/review.log.pid"
+printf '%s' "$HEADSHA" > "$GD1616/gated.sha"
+mkpr 1616 "$HEADSHA" '[".agents/bin/foo"]' '["gate:running"]' '[]'
+list_prs gate:running 1515 1616
+list_prs gate:passed
+: > "$CALLS_LOG"
+VELO_GATE_BIN="$T/bin/velo-gate-refusing" run_tick >/dev/null 2>&1
+if ! grep -q "gate:passed #1515" "$STATE/orch/orchestrd.log" 2>/dev/null; then
+  ok "a --pass that velo-gate refused is not logged as gate:passed"
+else
+  fail "the daemon logged gate:passed #1515 although velo-gate refused to record it"
+fi
+if ! grep -q "gate:blocked #1616" "$STATE/orch/orchestrd.log" 2>/dev/null; then
+  ok "a --block that velo-gate refused is not logged as gate:blocked"
+else
+  fail "the daemon logged gate:blocked #1616 although velo-gate refused to record it"
+fi
+if [[ "$(grep -c '"kind":"gate-label-failed"' "$STATE/orch/attention.jsonl" 2>/dev/null)" == "2" ]] \
+   && grep -q 'refusing to mark passed' "$STATE/orch/attention.jsonl"; then
+  ok "each refusal escalates, carrying velo-gate's own reason"
+else
+  fail "expected two gate-label-failed escalations carrying the reason: $(cat "$STATE/orch/attention.jsonl" 2>/dev/null)"
+fi
+VELO_GATE_BIN="$T/bin/velo-gate-refusing" run_tick >/dev/null 2>&1
+if [[ "$(grep -c '"kind":"gate-label-failed"' "$STATE/orch/attention.jsonl" 2>/dev/null)" == "2" ]]; then
+  ok "a second tick over the same refusals does not re-escalate"
+else
+  fail "the refusals were escalated again on the next tick"
+fi
+# The control: when velo-gate does record it, the log says so (sections 1, 5, 6 and 12 pin the
+# label calls themselves).
+reset_state
+GD=$(gate_dir 1717)
+printf '## Codex review — PR 1717 @ %s\n**Verdict:** approve\n' "$HEADSHA" > "$GD/review.log"
+printf '%s' "$(dead_pid)" > "$GD/review.log.pid"
+printf '%s' "$HEADSHA" > "$GD/gated.sha"
+mkpr 1717 "$HEADSHA" '[".agents/bin/foo"]' '["gate:running"]' '[]'
+list_prs gate:running 1717
+list_prs gate:passed
+: > "$CALLS_LOG"
+run_tick >/dev/null 2>&1
+if grep -q "gate:passed #1717" "$STATE/orch/orchestrd.log" 2>/dev/null; then
+  ok "a verdict velo-gate records is logged as recorded"
+else
+  fail "the daemon did not log a recorded gate:passed #1717"
+fi
+
+echo
+echo "== 16. a gate whose pid file cannot say whether its reviewer is still running is not finished =="
+# The reviewer's pid was read as `cat pid 2>/dev/null` and "no live pid" was the whole test for
+# "finished", so a pid file that was empty, held no pid or could not be read was a finished reviewer:
+# its log — possibly still being written — was judged and POSTED under the gate header, and the
+# post-once guard then kept the real report off the PR. Only a pid KNOWN to be gone is a finished
+# gate; any other state is left for the next tick, as an absent pid file already was.
+UNREADABLE_OK=1
+echo ok > "$T/readable.probe"; chmod 000 "$T/readable.probe"
+if cat "$T/readable.probe" >/dev/null 2>&1; then UNREADABLE_OK=0; fi   # root reads everything
+chmod 600 "$T/readable.probe"
+
+gate_with_pid() {   # <pr>: a gate that looks finished — an approve report and a recorded sha — for PR <pr>
+  local pr="$1" gd; gd=$(gate_dir "$pr")
+  printf '## Codex review — PR %s @ %s\n**Verdict:** approve\n' "$pr" "$HEADSHA" > "$gd/review.log"
+  printf '%s' "$HEADSHA" > "$gd/gated.sha"
+  mkpr "$pr" "$HEADSHA" '[".agents/bin/foo"]' '["gate:running"]' '[]'
+}
+GP_UNKNOWN="1801 1802 1803"      # a pid file that names no reviewer: empty, blank, not a pid
+[[ $UNREADABLE_OK -eq 0 ]] || GP_UNKNOWN="$GP_UNKNOWN 1806"   # ... and one that cannot be read
+GP_FAILS=""
+run_gate_pid_tick() {   # one tick of the daemon named by ORCHD_UNDER_TEST (default: the real one)
+  reset_state
+  gate_with_pid 1801; : > "$STATE/gate/1801/review.log.pid"
+  gate_with_pid 1802; printf '  \n' > "$STATE/gate/1802/review.log.pid"
+  gate_with_pid 1803; printf 'not-a-pid\n' > "$STATE/gate/1803/review.log.pid"
+  gate_with_pid 1804; printf '%s\n' "$$" > "$STATE/gate/1804/review.log.pid"                 # a reviewer still running
+  gate_with_pid 1805; printf '%s' "$(dead_pid)" > "$STATE/gate/1805/review.log.pid"          # a reviewer that is gone
+  local running="1801 1802 1803 1804 1805"
+  if [[ $UNREADABLE_OK -eq 1 ]]; then
+    gate_with_pid 1806; printf '%s\n' "$$" > "$STATE/gate/1806/review.log.pid"
+    chmod 000 "$STATE/gate/1806/review.log.pid"
+    running="$running 1806"
+  fi
+  list_prs gate:running $running
+  list_prs gate:passed
+  : > "$CALLS_LOG"
+  VELO_GATE_BIN="$BIN/velo-gate" VELO_GATE_POST_BIN="$BIN/velo-gate-post" VELO_MERGE_BIN="$BIN/velo-merge" run_tick >/dev/null 2>&1
+}
+check_gate_pid_tick() {   # -> GP_FAILS: the checks that did not hold
+  local pr
+  GP_FAILS=""
+  for pr in $GP_UNKNOWN; do
+    [[ "$(calls_of "pr comment $pr")" -eq 0 ]]                          || GP_FAILS="$GP_FAILS not-posted[$pr]"
+    ! grep -q "pr edit $pr.*gate:passed" "$CALLS_LOG"                    || GP_FAILS="$GP_FAILS not-passed[$pr]"
+    grep -q "for #$pr: .*review.log.pid holds no readable pid" "$STATE/orch/orchestrd.log" 2>/dev/null \
+                                                                         || GP_FAILS="$GP_FAILS says-why[$pr]"
+  done
+  [[ "$(calls_of 'pr comment 1804')" -eq 0 ]]                            || GP_FAILS="$GP_FAILS running-not-posted"
+  ! grep -q "pr edit 1804.*gate:passed" "$CALLS_LOG"                     || GP_FAILS="$GP_FAILS running-not-passed"
+  ! grep -q "for #1804: " "$STATE/orch/orchestrd.log" 2>/dev/null        || GP_FAILS="$GP_FAILS running-is-not-an-anomaly"
+  [[ "$(calls_of 'pr comment 1805')" -eq 1 ]]                            || GP_FAILS="$GP_FAILS finished-posted"
+  grep -q "pr edit 1805.*gate:passed" "$CALLS_LOG"                       || GP_FAILS="$GP_FAILS finished-passed"
+}
+run_gate_pid_tick
+check_gate_pid_tick
+if [[ -z "$GP_FAILS" ]]; then
+  ok "a pid file that is empty, blank, not a pid or unreadable is not a finished gate: nothing posted or passed, and the log says why"
+  ok "a reviewer still running is left alone, silently; one that is gone is posted and passed"
+else
+  fail "gate pid file handling:$GP_FAILS"
+fi
+
+# MUTATION-PROOF, on a COPY of the daemon: with the guard turned off (the old behaviour — an unreadable
+# pid is the same as no live pid) the four unknown-pid gates are posted and passed.
+mutant_orchd() {   # <anchor> <replacement> -> $T/mut/velo-orchestrd, with its libraries beside it
+  mkdir -p "$T/mut"
+  python3 - "$ORCHD" "$T/mut/velo-orchestrd" "$1" "$2" <<'PY' || return 1
+import sys
+src, dst, old, new = sys.argv[1:5]
+t = open(src).read()
+assert t.count(old) == 1, f"mutation anchor must occur exactly once, found {t.count(old)}: {old!r}"
+open(dst, "w").write(t.replace(old, new, 1))
+PY
+  cp "$BIN/velo-orch-lib.sh" "$BIN/velo-worktree-lib.sh" "$T/mut/" && chmod +x "$T/mut/velo-orchestrd"
+}
+if mutant_orchd '        if ! [[ "$pid" =~ ^[0-9]+$ ]]; then' '        if false; then'; then
+  ORCHD_UNDER_TEST="$T/mut/velo-orchestrd" run_gate_pid_tick
+  check_gate_pid_tick
+  MISSING=""
+  for pr in $GP_UNKNOWN; do
+    [[ "$GP_FAILS" == *"not-posted[$pr]"* && "$GP_FAILS" == *"not-passed[$pr]"* && "$GP_FAILS" == *"says-why[$pr]"* ]] \
+      || MISSING="$MISSING $pr"
+  done
+  if [[ -z "$MISSING" ]]; then
+    ok "MUTATION-PROOF an unreadable pid is not a finished gate: red with the guard off ($GP_FAILS )"
+  else
+    fail "MUTATION-PROOF an unreadable pid is not a finished gate: the mutant stayed green for$MISSING (red: $GP_FAILS )"
+  fi
+else
+  fail "MUTATION-PROOF an unreadable pid is not a finished gate: could not build the mutant (anchor missing — did step_gates change shape?)"
+fi
+
+echo
+echo "== 17. a dispatch that does not happen is escalated, once per ATTEMPT, not left in the log =="
+# step_dispatch pops the queue entry BEFORE it checks or runs anything, so an entry that does not
+# become a dispatch is gone, and what the operator is told is all they will ever know of it. Each of
+# these used to reach only the daemon log, or nobody:
+#   - velo-dispatch refuses (stale anchors, a brief that fails its lint, no disk): its status was
+#     never looked at
+#   - the entry cannot be dispatched at all: no numeric issue, no brief, a brief that is not there
+#   - the issue's labels cannot be read, it has several worker labels, or the pinned worker moved:
+#     escalated, but under an id of (issue, brief) that dedupes FOREVER — queue the same entry again
+#     and the second drop was silent.
+cat > "$T/bin/velo-dispatch-refusing" <<'STUBEOF'
+#!/bin/bash
+echo "preflight: anchors"
+printf '\n\033[31mNOT READY:\033[0m %s\n\n' "${REFUSAL_REASON:-stale anchor in the brief: src/foo.rs:12 no longer matches}" >&2
+exit 1
+STUBEOF
+chmod +x "$T/bin/velo-dispatch-refusing"
+BRIEF_MISSING="$T/no-such-brief.md"
+DR_FAILS=""
+count_events() { grep -c "\"kind\":\"$1\"" "$STATE/orch/attention.jsonl" 2>/dev/null || true; }
+events_of() {   # <kind> <issue> -> how many escalations of that kind name that issue
+  jq -c --arg k "$1" --argjson i "$2" 'select(.kind == $k and .issue == $i)' "$STATE/orch/attention.jsonl" 2>/dev/null | grep -c . || true
+}
+dispatch_scenario() {   # the whole story, one tick per step; the daemon is ORCHD_UNDER_TEST (default: the real one)
+  reset_state
+  mkdir -p "$STATE/orch" "$T/worktrees"
+  export VELO_ORCH_WORKTREE_GLOB="$T/worktrees/velostream-*"
+  list_prs gate:running; list_prs gate:passed
+  export VELO_GATE_BIN="$BIN/velo-gate" VELO_GATE_POST_BIN="$BIN/velo-gate-post" VELO_MERGE_BIN="$BIN/velo-merge"
+  local n
+  for n in 1818 1919 1414; do jq -cn '{labels:[{name:"worker:deepseek"}]}' > "$FIX/issue_$n.json"; done
+  jq -cn '{labels:[{name:"worker:deepseek"},{name:"worker:glm"}]}' > "$FIX/issue_1313.json"
+  jq -cn '{labels:[{name:"worker:glm"}]}' > "$FIX/issue_2020.json"
+  # velo-dispatch refuses #1818, twice, for different reasons ...
+  queue_one 1818 deepseek
+  VELO_DISPATCH_BIN="$T/bin/velo-dispatch-refusing" run_tick >/dev/null 2>&1
+  queue_one 1818 deepseek
+  REFUSAL_REASON="no room: 3GB free" VELO_DISPATCH_BIN="$T/bin/velo-dispatch-refusing" run_tick >/dev/null 2>&1
+  # ... and accepts #1919
+  queue_one 1919 deepseek
+  run_tick >/dev/null 2>&1
+  # the SAME entry queued twice and dropped twice: labels unreadable / two worker labels / pinned worker moved
+  for n in 1 2; do queue_one 1414 deepseek; GH_ISSUE_FAIL_1414=1 run_tick >/dev/null 2>&1; done
+  for n in 1 2; do queue_one 1313 deepseek; run_tick >/dev/null 2>&1; done
+  for n in 1 2; do queue_one 2020 deepseek; run_tick >/dev/null 2>&1; done
+  # an entry that cannot be dispatched at all: a brief that is not there (twice), a line that is not
+  # JSON, an issue that is not a number
+  for n in 1 2; do
+    jq -cn --arg b "$BRIEF_MISSING" '{issue:2121, brief:$b, worker:"deepseek", brief_sha256:"abc"}' > "$STATE/orch/queue.jsonl"
+    run_tick >/dev/null 2>&1
+  done
+  printf 'this is not json\n' > "$STATE/orch/queue.jsonl"; run_tick >/dev/null 2>&1
+  jq -cn --arg b "$BRIEF3" '{issue:"abc", brief:$b, worker:"deepseek", brief_sha256:"abc"}' > "$STATE/orch/queue.jsonl"
+  run_tick >/dev/null 2>&1
+  unset VELO_GATE_BIN VELO_GATE_POST_BIN VELO_MERGE_BIN
+}
+check_dispatch_scenario() {   # -> DR_FAILS: the checks that did not hold
+  DR_FAILS=""
+  local att="$STATE/orch/attention.jsonl" dlog="$STATE/orch/orchestrd.log" ev
+  # velo-dispatch refuses
+  [[ "$(events_of dispatch-failed 1818)" == "2" ]]            || DR_FAILS="$DR_FAILS refusal-escalated-per-attempt"
+  ev=$(jq -r 'select(.kind == "dispatch-failed") | .evidence' "$att" 2>/dev/null)
+  grep -q 'stale anchor in the brief' <<<"$ev"                || DR_FAILS="$DR_FAILS refusal-carries-its-reason"
+  grep -q 'no room: 3GB free' <<<"$ev"                        || DR_FAILS="$DR_FAILS second-refusal-carries-its-reason"
+  grep -q 'exit 1' <<<"$ev"                                   || DR_FAILS="$DR_FAILS refusal-carries-the-status"
+  grep -q 'stale anchor in the brief' "$dlog" 2>/dev/null     || DR_FAILS="$DR_FAILS refusal-still-in-the-log"
+  # velo-dispatch accepts
+  grep -q "FAKE-DISPATCH 1919" "$dlog" 2>/dev/null            || DR_FAILS="$DR_FAILS accepted-dispatch-logged"
+  [[ "$(events_of dispatch-failed 1919)" == "0" ]]            || DR_FAILS="$DR_FAILS accepted-dispatch-not-escalated"
+  # the same entry queued twice, dropped twice: two escalations, not one
+  [[ "$(events_of dispatch-unreadable 1414)" == "2" ]]        || DR_FAILS="$DR_FAILS unreadable-per-attempt"
+  [[ "$(events_of dispatch-mismatch 1313)" == "2" ]]          || DR_FAILS="$DR_FAILS several-labels-per-attempt"
+  [[ "$(events_of dispatch-mismatch 2020)" == "2" ]]          || DR_FAILS="$DR_FAILS moved-pin-per-attempt"
+  # an entry that cannot be dispatched at all
+  [[ "$(events_of dispatch-malformed 2121)" == "2" ]]         || DR_FAILS="$DR_FAILS missing-brief-per-attempt"
+  [[ "$(count_events dispatch-malformed)" == "4" ]]           || DR_FAILS="$DR_FAILS four-bad-entries-four-events"
+  ev=$(jq -r 'select(.kind == "dispatch-malformed") | .evidence' "$att" 2>/dev/null)
+  grep -q "no brief file at $BRIEF_MISSING" <<<"$ev"          || DR_FAILS="$DR_FAILS missing-brief-says-which"
+  grep -q 'this is not json' <<<"$ev"                         || DR_FAILS="$DR_FAILS not-json-shows-the-line"
+  grep -q 'no numeric issue' <<<"$ev"                         || DR_FAILS="$DR_FAILS non-numeric-issue-says-why"
+}
+dispatch_scenario
+check_dispatch_scenario
+if [[ -z "$DR_FAILS" ]]; then
+  ok "a dispatch velo-dispatch refuses escalates as dispatch-failed with its status and last output; the output is still in the log"
+  ok "a refusal for a second, different reason of the same entry is a second escalation"
+  ok "a dispatch that succeeds is logged and not escalated"
+  ok "the same entry dropped twice (labels unreadable / several worker labels / pin moved) escalates twice"
+  ok "an entry with no brief file, no JSON or no numeric issue escalates as dispatch-malformed, saying which"
+else
+  fail "dispatch escalation:$DR_FAILS"
+fi
+
+# MUTATION-PROOF, each on a COPY of the daemon with one fix reverted; the checks named must go red.
+dispatch_proof() {   # <what is pinned> <anchor> <replacement> <the checks that must go red...>
+  local what="$1" anchor="$2" repl="$3" missing="" c
+  shift 3
+  if mutant_orchd "$anchor" "$repl"; then
+    ORCHD_UNDER_TEST="$T/mut/velo-orchestrd" dispatch_scenario
+    check_dispatch_scenario
+    for c in "$@"; do [[ " $DR_FAILS " == *" $c "* ]] || missing="$missing $c"; done
+    if [[ -z "$missing" ]]; then
+      ok "MUTATION-PROOF $what: red with it reverted ($DR_FAILS )"
+    else
+      fail "MUTATION-PROOF $what: the mutant stayed green for$missing (red: $DR_FAILS )"
+    fi
+  else
+    fail "MUTATION-PROOF $what: could not build the mutant (anchor missing — did step_dispatch change shape?)"
+  fi
+}
+dispatch_proof "velo-dispatch's status is looked at" \
+  '  if [[ $d_rc -ne 0 ]]; then' '  if false; then' \
+  refusal-escalated-per-attempt refusal-carries-its-reason second-refusal-carries-its-reason refusal-carries-the-status
+dispatch_proof "an escalation id is per attempt" \
+  "  printf '%s:%s:%s-%s' \"\$1\" \"\$2\" \"\$(date -u +%FT%TZ)\" \"\$\$\"" "  printf '%s:%s' \"\$1\" \"\$2\"" \
+  refusal-escalated-per-attempt unreadable-per-attempt several-labels-per-attempt moved-pin-per-attempt missing-brief-per-attempt four-bad-entries-four-events
+dispatch_proof "an entry that cannot be dispatched is escalated" \
+  '    if attention_append "$(dispatch_attempt_id dispatch-malformed' '    if false && attention_append "$(dispatch_attempt_id dispatch-malformed' \
+  missing-brief-per-attempt four-bad-entries-four-events missing-brief-says-which not-json-shows-the-line non-numeric-issue-says-why
+dispatch_proof "an issue that is not a number is a bad entry, not a read to try" \
+  '  if ! [[ "$issue" =~ ^[0-9]+$ ]]; then bad="no numeric issue"' '  if [[ -z "$issue" ]]; then bad="no numeric issue"' \
+  four-bad-entries-four-events
 
 echo
 [[ $RC -eq 0 ]] && echo "all velo-orchestrd checks passed" || echo "FAILURES"

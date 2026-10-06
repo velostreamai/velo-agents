@@ -27,6 +27,7 @@ and the tests** — never from the worker's self-report.
     velo-gate-finish               post a round's reports at the gated sha, then record the verdict
     velo-gate-sweep                one compact view of every gating PR — sweep it instead of reading each gate's files
     velo-merge                     merge only if gated against the CURRENT head
+    velo-ci-rollup.jq              ONE definition of "how green is a PR": velo-merge refuses on it, velo-status shows it. Must sit beside them (install.sh copies bin/ whole)
     velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
     velo-spec-review               attest a spec was read; --check has Codex REVIEW it
     velo-orchestrd                 always-on LLM-free checker (#2285 PR2): detect/post/merge/dispatch/escalate
@@ -66,6 +67,10 @@ and the tests** — never from the worker's self-report.
     test_worker_env.py             the worker can run the tools its policy names
     test_orchestrd.sh              velo-orchestrd: detect, post, merge, dispatch, escalate, idempotency
     test_attention.sh              velo-attention: list/ack, dedup, acked ids stay acked
+    test_merge_aggregate.sh        velo-merge: one verdict from many gate labels, ONE CI state from every check row, one gate-comment grammar
+    test_gate_comments.sh          velo-gate: a failed gate-comment or issue read is not "nothing recorded"; --pass judges every gate
+    test_verdict_of.sh             verdict_of: one verdict from every **Verdict:** line, not the first
+    test_fence_parity.py           the three code-fence readers (brief lint, ATTACK fill, acceptance-bar counter) read ONE grammar
   launchd/
     ai.velostream.orchestrd.plist  source template for the velo-orchestrd launchd agent
   rules/
@@ -100,6 +105,7 @@ Runtime state lives **outside the repo**, under `$VELO_STATE` (default
     check-code.by          which route check-code used this run (`sonnet`); velo-gate-post and velo-gate read it
     codex-verdict.md       Codex's final message, cut out of review.log by velo-gate-run
     attack-body.md         the ATTACK text velo-gate-run took from the scope file
+    scope.<UTC>.md         the WHOLE scope file, one copy per velo-gate-run round; never read back (velo-gate-sweep and velo-status open named files only)
     gate-run.<step>.out    velo-gate-run's own record of each velo-pr-gate step (plan, brief, run)
     gate-finish.<step>.out velo-gate-finish's record of each step: check-code, code-review, verdict
     .lock                  one gate per PR at a time
@@ -125,7 +131,11 @@ machine-global while worktrees are not, has no ownership semantics, and is
 simultaneously too persistent (three-day-old files read as current) and not
 persistent enough (macOS purges it). One directory per subject makes the
 directory the unit of ownership, of locking, and of pruning; gate artefacts
-older than 7 days are pruned by the tool that wrote them.
+older than 7 days are pruned by the tool that wrote them. The prune takes the
+per-PR directories only (`find -mindepth 1`): the `gate/` root is itself "older
+than 7 days" whenever nothing was created directly in it for a week, and pruning
+it would remove every PR's briefs, logs, verdicts and locks, this run's own lock
+included.
 
 ## Installation
 
@@ -602,7 +612,10 @@ velo-dispatch 1898 /tmp/brief-1898.txt             # only after the dry run is c
 anchors, computed blast radius, brief completeness, disk — and creates no
 worktree, assigns nothing, launches nothing. A brief that is missing a STOP
 condition or a grammar reference is caught here rather than by a wasted
-dispatch attempt.
+dispatch attempt. The validation rule (spec §7) and the `## Branch` / `## Worktree`
+headings are read with fenced code blocks (``` and ~~~) masked: a `## ANALYSIS ONLY`
+or `## Validation` that a brief merely quotes inside a fence declares nothing, while a
+fenced block of commands under a real `## Validation` heading still counts as its content.
 
 The gates refuse before any side effect either way, so skipping the dry run is
 not dangerous — just slower and noisier.
@@ -841,7 +854,17 @@ ERROR: a gate is already running for #2027 (pid 41233).
   review logs — so the second would overwrite files the first is still writing.
 ```
 
-A dead holder's lock is reclaimed; the lock is released on every exit path,
+A lock is reclaimed only when its holder is **known to be gone** — the pid file
+names a pid and no such process exists. A holder that cannot be told is not a dead
+one: a pid file that holds no pid, or cannot be read, is refused at once with the
+reason and the lock is left where it is, because removing it is how a second gate
+starts over a first that has only just begun. The owner makes the directory first
+and writes its pid a moment later, so a pid file that is missing or empty is read
+again for a short grace — 10 polls, `VELO_GATE_LOCK_POLL` seconds apart (default
+0.2) — before it is believed. `velo-gate-run`'s early check reads the holder with
+the same function (a test pins the two copies byte-identical), and a pid that
+cannot be written releases the lock and refuses, rather than leaving a lock nobody
+can name. The lock is released on every exit path of the gate that took it,
 including refusals, so a refused gate cannot wedge the PR. Uniquifying the paths
 would have been the obvious fix and the wrong one — the brief path is
 deliberately stable so a hand-filled ATTACK section survives a re-run.
@@ -997,12 +1020,20 @@ It also:
 
 - **refuses without a scope file** — a gate briefed only on a diff reports
   dimensions rather than findings, which is how that bad review happened
-- **computes the review diff range** from the last recorded
-  `gate: codex-review @ <sha>`, so a re-review scopes to the delta and tells the
-  reviewer what it already cleared
+- **computes the review diff range** from the last recorded review gate
+  (`gate: <…>review @ <sha>`), so a re-review scopes to the delta. The brief's
+  SCOPE sentence says which of four things is true, because the range alone
+  cannot: *delta* ("Everything below `<sha>` you have already reviewed and
+  cleared"), *first review* ("This is the first review of this PR"), *orphaned*
+  (the recorded sha is no longer an ancestor of head after a rebase: the whole
+  branch is in range and nothing below it can be taken as cleared) or *unreadable*
+  (the gate comments could not be read, so what was already reviewed is unknown:
+  the whole branch, nothing cleared). A failed read is a warning carrying gh's own
+  message — it is never the first review
 - **refuses an empty range** — if nothing landed since the last review, there is
   nothing to review, and an empty diff comes back `approve`: a vacuous gate
-  wearing a green tick
+  wearing a green tick. A `git diff` that *fails* (say `origin/<base>` was never
+  fetched) dies naming the range; it is not an empty one
 - **generates the Codex brief** with everything invariant filled in — worktree,
   range, read-only clause, output format — leaving only the `## ATTACK` section
   blank
@@ -1047,6 +1078,71 @@ recorded, and refuses when any is missing — a finding that never reached the P
 is indistinguishable from a gate that never ran, and the printed handoff used to
 name only `code-review`, so two could be silently dropped. `velo-pr-gate` now
 prints a `velo-gate-post` line per gate it dispatched.
+
+**The merge gate counts; it does not pick.** The merge decision rests on three
+states, and GitHub hands each over as a list. Each is reduced from *every*
+element, conservatively — never read from the first, the newest or the one that
+happens to sort first:
+
+- **The verdict is one label, read from many.** A PR can carry several `gate:*`
+  labels (a `--remove-label` that failed, a label added by hand), and a
+  `gate:passed` among them used to outvote a `gate:blocked` beside it. A gated PR
+  with more than one is refused (`--force` proceeds with a warning; `--wait`
+  treats it as definitive, not transient); a docs-only PR has no verdict to be
+  ambiguous about. `velo-gate --show` names the ambiguity and exits 1, and the
+  label writer dies when an old label cannot be removed instead of adding the new
+  one beside it.
+- **CI is one state from every check row**, by one definition shared with
+  `velo-status`: `.agents/bin/velo-ci-rollup.jq`, worst first — FAILING > unknown >
+  pending > SUCCESS > none. A row is pending when its status is not COMPLETED
+  however the absent conclusion is spelled (a running check has none); a commit
+  status (the legacy API) has a `state` and no conclusion; `STARTUP_FAILURE`,
+  `ACTION_REQUIRED` and `STALE` are failures; a conclusion or row type nobody has
+  heard of is `unknown` and is refused — never green, and waiting does not make it
+  recognised. A definition that cannot be read or run is a refusal that names it,
+  not a pass. The file must sit beside the scripts; `install.sh` copies `bin/` whole.
+- **The gate comments are read once, by one grammar.** The freshest comment per gate
+  name, `gate: <[a-z0-9-]+> @ <sha>`, feeds both "is each needed gate recorded?" and
+  "is each one current?" — two greps with two grammars had let `gate: check-code @
+  pending` satisfy the first and never be compared to head. A header with no
+  readable sha names no commit and is not current. A *failed* read is reported in the
+  same kinds as the PR read (a blip is retried by `--wait`; a dead token, or an
+  answer that is not a gate list, is definitive). `velo-gate --pass` uses the same
+  grammar and fails closed: it refuses unless **every** gate's freshest sha is head
+  (not the newest comment's) and dies, changing nothing, when the comments cannot be
+  read; `--show` says it could not tell — never "nothing has been recorded".
+- **`--plan` reads every issue the PR closes**, not the first. `check-spec` is planned
+  when any of them has three or more acceptance bars, and one that cannot be read
+  refuses the plan and is named (`--show` prints the plan it has, says it is
+  INCOMPLETE and exits 1). GitHub closes on `close`/`fix`/`resolve` and their
+  inflections in any case, not on two keywords.
+- **A done-marker that exists but cannot be read** is a refusal naming the file, not
+  an `already merged ()` success line. `velo-merge` and `velo-gate-post` tell
+  *absent* (the guard stays unfired), *unreadable* (dies: no second merge or post) and
+  *empty* (still proof the side effect ran) apart, at every place they look.
+
+**A read that fails is said, never read as nothing.** A guard keys on a value it
+read, and a read that failed used to be the same empty value as a read that found
+nothing — so the guard went quiet exactly when what it guards was unknowable.
+Absent, empty, unreadable and failed are four different states, and none may be
+quietly converted into another. In `velo-pr-gate`:
+
+- **the plan** — a `velo-gate --plan` that cannot be made shows `velo-gate`'s own
+  reason and exit status. It used to be reported as `PR #N not found`, which
+  `velo-gate-run` retries as a dropped connection, so the round ran the plan three
+  more times and gave up with the same wrong sentence.
+- **the merge-time `fail_to_pass` check**, the only enforcement of a spec's
+  acceptance tests: a PR title or spec that cannot be read warns
+  `fail_to_pass is NOT being verified for this gate` (a title with no `[#N]` is a PR
+  with no spec, and has nothing to say); a base branch that cannot be read dies in
+  the `could not read base branch for #N` shape `velo-gate-run` retries (it used to
+  build `origin/`, and the predates check never fired); a `git grep` that *errors*
+  dies naming the ref and the test, instead of reading as "not defined" (a BLOCK
+  with the wrong message) or "not predated" (a silent pass).
+- **the `gate:running` label** — if `velo-gate --running` is refused the round does not
+  abort (the reviewers are already running, and the lock would be released with them
+  still going), but it warns that the PR is NOT labelled, with `velo-gate`'s message
+  and the command to set it by hand: `velo-orchestrd` follows only `gate:running` PRs.
 
 **Orchestration counts as code.** Anything under `.agents/{bin,rules,skills,tasks}/`
 or `install|update.sh` requires `code-review` and is gated at merge, even though
@@ -1104,6 +1200,21 @@ It replaces the hand-run sequence, each step of which went wrong in some round:
    than an agent runner kills nothing. `VELO_SECOND_OPINION_TIMEOUT` (default
    3600s) is the runner's own bound when nothing else ends it.
 
+Before step 1 it copies the **whole** scope file to `gate/<pr>/scope.<UTC>.md` —
+one file per round, never overwritten (a second round in the same second becomes
+`scope.<UTC>.2.md`), kept until `velo-pr-gate` drops the idle gate dir after 7 days.
+The name is taken with an exclusive create (noclobber), not looked up and then
+created, so two rounds that start in the same second each keep their own copy; a gate
+dir that cannot be written stops the round, naming the file and showing the shell's
+own error, rather than retrying suffixes.
+`attack-body.md` keeps only the ATTACK text; the scope's header (delta range, what
+changed, what the last round found) used to live only in the file you passed, which
+may be somewhere a reboot clears, so a launch that died left nothing to re-run from.
+The copy comes after every refusal (a bad scope, a gate already running leave
+nothing behind) and before every step, so a round that dies in the plan, the brief or
+the launch still has it; if it cannot be written the round stops. `velo-pr-gate` is
+still handed the original path.
+
 It ends by printing the `velo-gate-finish` line for this plan. The wrapper holds a
 session for the length of a review, so launch it with `run_in_background: true`; with
 the default check-code route the one launch line for the Sonnet agent appears in its
@@ -1111,9 +1222,12 @@ output as soon as the gates are dispatched.
 
 A transient gh failure inside `velo-pr-gate` (`PR #N not found`, `could not read
 head/base branch`) is retried up to 3 times; local-state failures (no worktree, a
-gate already running, an unfilled ATTACK) fail on the first attempt. Last round's
-`review.log`, its pid and verdict are moved aside before the run, so nothing from an
-earlier round can be read as this one's.
+gate already running, an unfilled ATTACK) fail on the first attempt — and so does a
+plan that cannot be made for any other reason: it is shown at once with
+`velo-gate`'s own message, not retried under a sentence that was never true. A gate
+lock whose holder cannot be identified is refused before anything moves (see "One
+gate per PR"). Last round's `review.log`, its pid and verdict are moved aside before
+the run, so nothing from an earlier round can be read as this one's.
 
 ### `velo-gate-finish` — post the reports, then record the verdict
 
@@ -1159,8 +1273,8 @@ velo-gate-sweep <pr> [<pr>...]
 Sweep the gates with `velo-gate-sweep` instead of reading each gate's files: at
 most 30 lines per PR for the head sha + state + mergeable, the last gated sha
 (`STALE` when it differs from head — the verdict on disk is for a commit that no
-longer exists), `Build & Test`, whether a gate is running, the Codex verdict with
-its P* finding titles, and the advisory check-code headlines; read-only, missing
+longer exists), the PR's one CI state (`ci=`), whether a gate is running, the Codex
+verdict with its P* finding titles, and the advisory check-code headlines; read-only, missing
 files print `(no gate yet)`, and a PR `gh` cannot see is an error line that does
 not stop the sweep.
 
@@ -1186,6 +1300,34 @@ blocked` inside a finding is not an unfilled template. A `review.log` /
 per leg, never `(no gate yet)`; an unreadable, empty, or non-hex `gated.sha`
 prints `gated=ERROR(…)` with `STALE?` ("comparison impossible"), never
 `gated=none` with a possibly-stale verdict below it.
+
+The header's `ci=` is **one state for the whole PR, reduced from every row** of
+`gh pr checks` — never the state of one row. Worst first: `fail` > unrecognised >
+`pending` > `pass`, with skipped checks ignored (a table of nothing but skipped
+checks prints `ci=skipping`, not `pass`: nothing ran) and a cancelled check counted
+as a failure. A PR whose `Build & Test` passed beside a failed `Integration Tests`
+is `ci=fail(Integration Tests)`; it used to print `ci=pass` — a red PR shown green —
+and two `Build & Test` matrix rows printed a two-line value. A status gh does not
+document is `ci=ERROR(unrecognised check <name> …)`, never green. The failing
+checks are named in the header (up to three) and every non-passing check is listed
+under it (up to five).
+
+`gh pr checks` also encodes the PR's CI state in its exit status and still prints the
+table on stdout: 0 every check passed, 8 some check is PENDING, 1 some check FAILED.
+A non-zero exit **with rows** is therefore a successful read of a PR whose CI is not
+green, not a failed one, and the exit status is a **floor** under the rows (1 is
+never lighter than `fail`, 8 never lighter than `pending`), so a table that lost its
+failing row cannot print green. `ci=ERROR(…)` is for a non-zero exit with **no** rows
+on stdout, and for output that is not a table at all. A
+`codex-verdict.md` that is prose only — non-empty, no `Verdict:` line — prints
+`-- codex: PROSE (no verdict line)`; `INCOMPLETE` is reserved for the unfilled
+template, an empty file or an unreadable one. Only a line that **is** the template's
+`approve | approve-with-findings | blocked` (markdown decoration such as a bullet,
+bold or backticks aside) counts as the unfilled template — a sentence that merely
+quotes the three words is prose.
+The sweep opens named files only (`gated.sha`, `.lock/pid`, `codex-verdict.md`,
+`review.log`, `code.log`), so the `scope.<UTC>.md` copies `velo-gate-run` leaves in the
+gate dir cannot be read as a verdict, a log or a sha.
 
 ---
 
@@ -1226,7 +1368,12 @@ one-command way to stop it.
    reviewer's pid (persisted to `<log>.pid` by `velo-pr-gate`'s
    `gate_track_pid` — the single write-site it shares with PR1's in-process
    `GATE_PIDS`, so the two records can never drift apart at a launch site
-   that forgets one half) has exited. Posting always uses the sha recorded in
+   that forgets one half) has exited — a pid *known* to be gone. A pid file
+   that cannot name a pid (empty, not a number, unreadable) is **not** a
+   finished gate, any more than an absent one: judging a log that is still
+   being written posts a partial review under the gate header, and the
+   post-once guard then keeps the real report off the PR. The log says so on
+   every tick. Posting always uses the sha recorded in
    `gate/<pr>/gated.sha`, written by `velo-pr-gate` **at launch, before any
    gate is dispatched** — its absence still escalates (`gate-nosha`) rather
    than risk stamping coverage the gate never had, but that is now the
@@ -1245,6 +1392,16 @@ one-command way to stop it.
      label untouched. Real local-model output has drifted to `request-changes`
      and to `blocked.` (with a trailing period) — the parser is strict, not
      the report format.
+   - one verdict from **every** `**Verdict:**` line: they must all agree and all
+     parse. A report that opens with `approve` and later says `blocked` (a
+     restated header, a re-check section, a quoted earlier round) is not an
+     approve — it escalates `gate-malformed` for a human to read. It used to be
+     the first line's verdict.
+   - a verdict `velo-gate` **refuses to record** (a stale gate, gate comments it
+     cannot read, a label it cannot set) escalates `gate-label-failed`, once per
+     PR/head/label, carrying `velo-gate`'s own message. It is not logged as
+     `gate:passed` — which is what it used to be, on every tick, behind a PR still
+     labelled `gate:running`.
 6. **Merge** — for every `gate:passed` PR: refuse (and escalate
    `agents-only-merge`) if every changed file is under `.agents/` — by
    POLICY, not because the tool can't: `velo-merge` itself now accepts an
@@ -1266,7 +1423,20 @@ one-command way to stop it.
    `VELO_ORCH_MIN_DISK_GB` (default 25) is free. The pinned worker label and
    brief sha256 are **re-checked against live state** before dispatch — a
    mismatch drops the entry and escalates `dispatch-mismatch` rather than
-   retrying a decision that is now wrong on every future tick.
+   retrying a decision that is now wrong on every future tick. The entry is
+   popped before anything is checked, so **every way it can fail to become a
+   dispatch is escalated**, and the event says why:
+   - `dispatch-malformed` — no numeric issue, no brief path, or no file at the
+     brief path (the issue must be a number: an event is only recorded for one)
+   - `dispatch-unreadable` — the issue's labels could not be read; carries gh's
+     own message, and is not reported as "no worker label"
+   - `dispatch-mismatch` — the pinned worker is not the issue's, the brief
+     changed, or the issue has **more than one** `worker:` label (all are named:
+     `velo-dispatch` refuses such an issue, so its first label is not "the"
+     worker)
+   - `dispatch-failed` — `velo-dispatch` itself refused (stale anchors, a brief
+     that fails its lint, no disk, a dirty tree): carries the exit status and the
+     last of its output, which also stays in `orchestrd.log`
 8. **Wedge / STOP** — for every live worktree (`VELO_ORCH_WORKTREE_GLOB`,
    default `~/RustroverProjects/velostream-*`) whose worker pid is still
    alive: a STOP-trigger line in `agent.log` escalates `stop`; no `agent.log`
@@ -1279,7 +1449,11 @@ one-command way to stop it.
 line per event: `{id, kind, pr, issue, sha, evidence, ts}`. The `id` — built
 as `<kind>:<pr-or-issue>:<sha>` — is the only dedup key: appending the same id
 twice is a no-op, so a fact that hasn't changed is never re-escalated, and a
-new commit / new outcome naturally produces a new id.
+new commit / new outcome naturally produces a new id. Dispatch events are the
+one exception to the shape: a queue entry is popped after a single look, so a
+re-queued entry is a new fact, and its id carries that attempt's own timestamp
+and the daemon's pid instead of a sha — an id that deduped forever would have
+swallowed the second drop of the same entry without a word.
 
 ```bash
 velo-attention list          # every UNACKED event, oldest first
@@ -1325,7 +1499,9 @@ unified behind one `gate_track_pid` call per launch site:
   side effect (`gh pr comment`, `gh pr merge`) actually happens. Every caller
   — a human relaying a `--wait` report by hand, a `--wait` loop re-polling,
   or this daemon's own tick — is covered by construction, with nothing left
-  for a caller to remember.
+  for a caller to remember. Each guard looks at its done-marker twice: before
+  the lock, and again once it holds it, so a caller delayed between the two
+  cannot act on a fact the other has already acted on.
 - **The `.agents`-only merge exception** — shipped in `velo-merge` itself (a
   `.agents/`-only PR with no CI now merges with a warn, not a die — gating
   still applies, only the CI expectation is waived, since ci.yml's
@@ -1371,6 +1547,13 @@ the `triage-needed` guard, and that is exactly what an audit wants to see.
 | reviewer returns a report but nothing appears on the PR | its sandbox could not reach api.github.com. Reviewers should RETURN the report; relay it with `velo-gate-post` |
 | `velo-merge` refuses with `CI is 'SKIPPED'` | fixed: it evaluates ALL checks now. Optional lanes report SKIPPED and used to mask a green required build |
 | `velo-merge` says STALE GATE | correct — commits landed after the review. Re-gate against the current head; do not `--force` |
+| `velo-merge` says `could not read PR #N (network\|rate-limit\|auth\|other)` | `gh pr view` FAILED — it is not "PR not found" (that is only gh's `Could not resolve to a PullRequest`). The message carries gh's own stderr. `--wait` retries network and rate-limit and stops on auth and other; a bad token (`gh auth login`) is never fixed by waiting |
+| `velo-merge` says `could not read PR #N (payload)` | the opposite case: gh EXITED 0 but printed something that is not a PR — nothing, truncated JSON, an error page, `null`, an object missing a field it was asked for. The message says which and shows the first 200 bytes. gh did not fail, so this is no blip: `--wait` stops on it like `other` |
+| `velo-merge` says `has ambiguous gate labels` | the PR carries two `gate:*` labels, so it has no verdict: one is stale (a `--remove-label` that failed, or a label added by hand). Re-record the verdict, which replaces them: `velo-gate <pr> --pass\|--block` |
+| `velo-merge` says `CI has a check this script cannot classify` | a conclusion, status or check type `velo-ci-rollup.jq` does not recognise (GitHub added one). It is never read as green and waiting does not make it recognised: teach that file about it |
+| `velo-merge` or `velo-status` says `cannot read the CI rollup definition` | `velo-ci-rollup.jq` is missing from beside the script. `install.sh` copies `bin/` whole — reinstall |
+| `velo-pr-gate` or `velo-gate-run` says `the gate lock for #N … exists, but its holder cannot be identified` | the lock's pid file is empty, holds no pid or cannot be read, and the 10-poll grace (`VELO_GATE_LOCK_POLL`) produced none. It is deliberately NOT taken over: a gate that has only just started has not written its pid yet. If no gate is running for the PR, remove the lock directory the message names |
+| `velo-attention list` shows `dispatch-failed` | `velo-dispatch` refused a queued dispatch. The event carries its exit status and the last of its output (all of it is in `orchestrd.log`); the entry was already popped, so fix the cause and queue it again |
 | `velo-status` names the wrong worker | fixed: a running worker is named from its live process, not from a log matched by mtime |
 | every worker shows `done` immediately | check the process is actually detached (`nohup … &`) |
 

@@ -12,6 +12,14 @@
 # treated as "not yet" and retried, bounded by a 6h timeout. Without --wait
 # this runs once, exactly as before.
 #
+# A FAILED READ of the PR is told apart from a missing PR (see gh_failure_kind
+# below): only "no such PR" is "not found". A network blip or a rate limit is
+# transient and --wait retries it; an auth failure, or an error this script does
+# not recognise, will not fix itself and stops the wait with gh's own message.
+# A read that SUCCEEDS but returns something that is not a PR (an empty or truncated
+# body, an error page, `null`, an object missing a field) is named as such —
+# `could not read PR #N (payload)` — and stops the wait like an unrecognised error.
+#
 # This is the enforcement point. Everything else records state; this refuses to
 # act on bad state. Three things must hold:
 #
@@ -32,6 +40,23 @@ VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die()  { printf '\n\033[31mREFUSING TO MERGE:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
+
+# The done-marker is the record that the merge already ran: its EXISTENCE is what the guards
+# below act on, its content is only the "who and when" shown to the operator. A read that
+# FAILS is a different fact from a marker that is absent or empty, and none of the three may
+# be reported as another — `$(cat "$MERGE_DONE" 2>/dev/null)` turned an unreadable marker
+# into "already merged ()", a success line vouching for a record this script never read.
+# Called in the main shell, never inside `$(...)`, where a die would exit only the subshell.
+# Sets MARKER_TEXT; dies on an unreadable marker, naming it and cat's own error.
+read_marker() {  # <marker file>
+  local out
+  out=$(cat -- "$1" 2>&1) \
+    || die "unreadable done-marker $1 — it exists, so it records that #$PR @ $SHORT was merged, but it cannot be read:
+  $(head -n 1 <<<"$out")
+  Not running 'gh pr merge' again on a record this script cannot read, and not reporting
+  success for it. Fix the file's permissions, or remove it if it is stale: rm $1"
+  MARKER_TEXT="${out:-empty marker}"
+}
 
 PR="${1:-}"; FORCE=0; WAIT=0
 # Unrecognized 2nd+ args are silently ignored, matching the single check this
@@ -72,8 +97,19 @@ if [[ $WAIT -eq 1 ]]; then
     # DEFINITIVE — waiting cannot make these true. The three the brief names
     # (CI failed, gate:blocked, head moved past the gated sha) plus a real
     # merge conflict and a PR that is closed/merged/nonexistent, on the same
-    # footing: none of these resolve by the clock ticking.
-    if grep -qE 'CI FAILING against|gate:blocked|STALE GATE|mergeable=CONFLICTING| is CLOSED| is MERGED|PR #[0-9]+ not found' <<<"$WOUT"; then
+    # footing: none of these resolve by the clock ticking. Two read failures
+    # join them: auth (a dead token stays dead) and a gh error this script does
+    # not recognise (retrying it for 6h would hide it). A network blip or a rate
+    # limit — `could not read PR #N (network|rate-limit)` — is NOT here: those
+    # clear on their own, and a blip once ended a wait on an open PR (#2281).
+    # `(payload)` — gh exited 0 yet printed something that is not a PR — is here
+    # with `other`: gh did not fail, so it is no blip, and polling it for 6h would
+    # hide whatever changed. An `unreadable done-marker` (permissions or I/O on the state
+    # directory) is here too: it stays unreadable until someone fixes the file. So are
+    # `ambiguous gate labels`: two verdict labels on one PR stay two until someone re-records it.
+    # So is a CI row it `cannot classify` (an unrecognised conclusion does not become recognised),
+    # and a rollup definition that cannot be read or run.
+    if grep -qE 'CI FAILING against|gate:blocked|STALE GATE|mergeable=CONFLICTING| is CLOSED| is MERGED|PR #[0-9]+ not found|could not read PR #[0-9]+ \((auth|other|payload)\)|unreadable done-marker|ambiguous gate labels|cannot classify|cannot read the CI rollup definition|could not classify the CI rows' <<<"$WOUT"; then
       echo
       warn "--wait: definitive failure on attempt $ATTEMPT — not retrying. See above."
       exit 1
@@ -88,25 +124,140 @@ if [[ $WAIT -eq 1 ]]; then
 fi
 # <<< velo-merge-wait
 
-M=$(gh pr view "$PR" --repo "$REPO" \
-     --json headRefOid,labels,files,state,title,mergeable,statusCheckRollup 2>/dev/null) \
-  || die "PR #$PR not found"
+# ---- read the PR: WHY a read failed is part of the answer ----------------------
+#
+# `gh pr view` exits non-zero for a PR that does not exist AND for a dead network,
+# an exhausted rate limit, an expired token and a 5xx. Its stderr went to
+# /dev/null and every one of them was reported as "PR #N not found", which --wait
+# above treats as DEFINITIVE: a network blip ended a wait on an open PR whose CI
+# was merely pending (#2281, attempt 17). Now gh's own stderr decides, it is always
+# printed, and a failure that is not recognisably "no such PR" is never called one.
+#
+# Kinds, and what --wait does with each:
+#   not-found   "Could not resolve to a PullRequest"      definitive
+#   auth        401 / bad credentials / not logged in      definitive (waiting will not fix it)
+#   rate-limit  "rate limit" / 429                         retried
+#   network     5xx, dial/DNS/TLS/timeout/EOF              retried
+#   other       anything else, including no stderr at all  definitive (unrecognised: stop and show it)
+#   payload     gh exited 0 but printed no PR (below)      definitive (gh did not fail: not a blip)
+gh_failure_kind() {   # <gh stderr> -> not-found | auth | rate-limit | network | other
+  local t
+  t=$(tr '[:upper:]' '[:lower:]' <<<"$1")
+  case "$t" in
+    *"could not resolve to a pullrequest"*) echo not-found ;;
+    *"rate limit"*|*"http 429"*) echo rate-limit ;;
+    *"http 401"*|*"http 403"*|*"bad credentials"*|*"gh auth login"*|*"gh_token"*) echo auth ;;
+    *"http 5"[0-9][0-9]*|*"error connecting"*|*"dial tcp"*|*"no such host"*|*"timeout"*|*"timed out"*|\
+    *"deadline exceeded"*|*"connection reset"*|*"connection refused"*|*"tls handshake"*|*": eof"*|\
+    *"temporary failure"*|*"network is unreachable"*|*"broken pipe"*) echo network ;;
+    *) echo other ;;
+  esac
+}
+PR_FIELDS="headRefOid,labels,files,state,title,mergeable,statusCheckRollup"
+view_pr() {
+  gh pr view "$PR" --repo "$REPO" --json "$PR_FIELDS"
+}
+# stdout and stderr cannot both reach variables in one pass without a fork losing
+# one of them, so stderr lands in a scratch file that is removed at once (the
+# velo-gate-sweep idiom). With no scratch file the read still runs; a failure is
+# then "other" (stderr unavailable), which is never "not found".
+M_ERRF=$(mktemp "${TMPDIR:-/tmp}/velo-merge-err.XXXXXX") || M_ERRF=""
+if [[ -n "$M_ERRF" ]]; then
+  M=$(view_pr 2>"$M_ERRF"); M_RC=$?
+  # An unreadable scratch file must not be reported as "gh printed nothing".
+  if M_ERR=$(cat "$M_ERRF" 2>&1); then
+    M_ERR=$(tr '\n' ' ' <<<"$M_ERR" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-400)
+  else
+    M_ERR="(gh's stderr could not be read back: $(head -1 <<<"$M_ERR"))"
+  fi
+  rm -f "$M_ERRF"
+else
+  M=$(view_pr 2>/dev/null); M_RC=$?
+  M_ERR="(stderr unavailable: could not create a scratch file in ${TMPDIR:-/tmp})"
+fi
+if [[ $M_RC -ne 0 ]]; then
+  M_ERR="${M_ERR:-gh printed nothing on stderr}"
+  case "$(gh_failure_kind "$M_ERR")" in
+    not-found)  die "PR #$PR not found — gh said: $M_ERR" ;;
+    auth)       die "could not read PR #$PR (auth): gh authentication failed — waiting will not fix this. gh said: $M_ERR" ;;
+    rate-limit) die "could not read PR #$PR (rate-limit): GitHub API rate limit — transient, retry later (--wait does). gh said: $M_ERR" ;;
+    network)    die "could not read PR #$PR (network): GitHub unreachable or answering 5xx — transient, retry later (--wait does). gh said: $M_ERR" ;;
+    *)          die "could not read PR #$PR (other): gh pr view exited $M_RC with an error this script does not recognise. gh said: $M_ERR" ;;
+  esac
+fi
+
+# ---- a read that exited 0 must still return a PR ---------------------------------
+#
+# An empty body, a truncated one, a proxy's HTML error page, `null`, an object missing
+# a field it was asked for: none of them is a failed read to gh, and every one of them
+# reached the jq reads below. Those fail in jq's own words, or print nothing and are
+# taken as an empty value — "PR #N is " with a blank state — and --wait, finding no
+# definitive text in that, polls it for six hours. The whole shape is checked ONCE,
+# here, and what is wrong is named. The keys required are the ones view_pr asked gh for
+# (PR_FIELDS, one list); the jq program only adds what type each must have.
+PAYLOAD_JQ='
+  {state:["string"], headRefOid:["string"], title:["string"], mergeable:["string"],
+   labels:["array"], files:["array"], statusCheckRollup:["array","null"]} as $shape
+  | if length == 0 then "printed nothing"
+    elif length > 1 then "printed \(length) JSON values where one PR object was expected"
+    else
+      .[0] as $p
+      | if ($p | type) != "object" then "printed a JSON \($p | type), not a PR object"
+        else
+          [ ($fields | split(","))[] as $k
+            | if ($p | has($k) | not) then "\($k) is missing"
+              elif ($shape[$k] != null) and ((any($shape[$k][]; . == ($p[$k] | type))) | not)
+                then "\($k) has type \($p[$k] | type)"
+              else empty end ] as $bad
+          | if ($bad | length) > 0 then "printed an object that is not a PR payload: \($bad | join(", "))" else empty end
+        end
+    end'
+payload_problem() {   # <gh stdout> -> what is wrong with it; nothing at all if it is a usable PR
+  local out rc
+  out=$(jq -rs --arg fields "$PR_FIELDS" "$PAYLOAD_JQ" <<<"$1" 2>&1); rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "printed output that could not be parsed (jq said: $(head -1 <<<"$out" | cut -c1-200))"
+  else
+    echo "$out"
+  fi
+}
+M_PROBLEM=$(payload_problem "$M")
+if [[ -n "$M_PROBLEM" ]]; then
+  die "could not read PR #$PR (payload): gh pr view exited 0, but it $M_PROBLEM.
+  gh did not fail, so this is no dropped connection or rate limit — --wait stops here
+  rather than polling it. What gh printed (first 200 bytes): $(printf '%s' "$M" | head -c 200 | tr '\n\r' '  ')"
+fi
 
 STATE=$(jq -r .state <<<"$M")
 [[ "$STATE" == "OPEN" ]] || die "PR #$PR is $STATE"
 TITLE=$(jq -r .title <<<"$M")
 HEAD=$(jq -r .headRefOid <<<"$M"); SHORT="${HEAD:0:9}"
 MERGEABLE=$(jq -r .mergeable <<<"$M")
-# Evaluate ALL checks, not just the first. Optional lanes report SKIPPED and
-# can sort first, which would otherwise mask a green required build.
-FAILED=$(jq -r '[.statusCheckRollup[]?|select(.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT")|.name]|unique|join(", ")' <<<"$M")
-PASSED=$(jq -r '[.statusCheckRollup[]?|select(.conclusion=="SUCCESS")|.name]|unique|join(", ")' <<<"$M")
-PENDING=$(jq -r '[.statusCheckRollup[]?|select(.conclusion==null)|.name]|unique|join(", ")' <<<"$M")
-if   [[ -n "$FAILED"  ]]; then CI="FAILING"
-elif [[ -n "$PENDING" ]]; then CI="pending"
-elif [[ -n "$PASSED"  ]]; then CI="SUCCESS"
-else CI="none"; fi
+# CI is a list of rows and the PR is as green as its WORST one, so EVERY row is read: optional
+# lanes report SKIPPED and can sort first, a check still running has no conclusion, a commit
+# status has no conclusion at all. The classification is velo-ci-rollup.jq — one definition,
+# which velo-status uses too. A definition that cannot be read or run is a refusal: with no
+# classification there is no "nothing failed".
+CI_ROLLUP_JQ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/velo-ci-rollup.jq"
+CI_ROLLUP_DEFS=$(cat -- "$CI_ROLLUP_JQ" 2>&1) \
+  || die "cannot read the CI rollup definition $CI_ROLLUP_JQ — it is what decides whether CI is green:
+  $(head -n 1 <<<"$CI_ROLLUP_DEFS")
+  Refusing rather than reading the checks without it. Reinstall the tooling: .agents/install.sh"
+CI_ROLLUP=$(jq -c "$CI_ROLLUP_DEFS"' .statusCheckRollup | ci_rollup' <<<"$M" 2>&1) \
+  || die "could not classify the CI rows of #$PR (jq said: $(head -n 1 <<<"$CI_ROLLUP" | cut -c1-200)).
+  The rollup definition is $CI_ROLLUP_JQ; refusing rather than reading the checks as green."
+CI=$(jq -r .state <<<"$CI_ROLLUP")
+FAILED=$(jq -r .fail <<<"$CI_ROLLUP")
+PASSED=$(jq -r .pass <<<"$CI_ROLLUP")
+PENDING=$(jq -r .pending <<<"$CI_ROLLUP")
+UNKNOWN=$(jq -r .unknown <<<"$CI_ROLLUP")
 LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$M")
+# The gate's verdict is ONE label, read from MANY: a PR can carry several `gate:*` labels at once
+# (a `gh pr edit --remove-label` that failed, or a label added by hand in the UI), and a
+# `gate:passed` among them must not outvote a `gate:blocked` or `gate:running` beside it. So they
+# are counted, and the PR has a verdict only when it has exactly one.
+GATE_LABELS=$(tr ',' '\n' <<<"$LABELS" | grep '^gate:' || true)
+N_GATE_LABELS=$(grep -c . <<<"$GATE_LABELS" || true)
 FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$M")
 # Orchestration counts as CODE for gating purposes. `.agents/` has no src/ or
 # tests/ path, so the old sum scored it 0 and this script printed
@@ -148,6 +299,9 @@ case "$CI" in
   SUCCESS) ok "CI green on current head: $PASSED" ;;
   FAILING) die "CI FAILING against $SHORT: $FAILED" ;;
   pending) die "CI still pending against $SHORT: $PENDING" ;;
+  unknown) die "CI has a check this script cannot classify against $SHORT: $UNKNOWN
+  An unrecognised row is never read as green, and waiting does not make it recognised. If
+  GitHub has added a conclusion or a check type, teach .agents/bin/velo-ci-rollup.jq about it." ;;
   none)
     # No lane ran. For a docs/tooling-only PR that is BY DESIGN — ci.yml carries
     # `paths-ignore: ['docs/**', '*.md', …]`, so a docs change triggers nothing
@@ -169,16 +323,28 @@ case "$CI" in
       die "no CI checks reported against $SHORT — nothing has verified this build."
     fi
     ;;
+  *) die "could not classify the CI rows of #$PR: the rollup returned the state '$CI', which this script does not know — refusing rather than letting it fall through as green. Definition: $CI_ROLLUP_JQ" ;;
 esac
 
 if [[ "$CODE" -eq 0 ]]; then
   ok "docs only — no code, no orchestration; gate not required"
 else
+  # Read only for a PR that is gated: a docs-only PR has no verdict to be ambiguous about.
+  if [[ "$N_GATE_LABELS" -gt 1 ]]; then
+    [[ $FORCE -eq 1 ]] || die "#$PR has ambiguous gate labels: $(tr '\n' ' ' <<<"$GATE_LABELS" | sed 's/ $//') — at most one.
+  The label is the gate's verdict, and two of them is no verdict: one of them is stale (a
+  label that could not be removed, or one added by hand). Re-record the verdict, which
+  replaces them:  velo-gate $PR --pass | --block"
+    warn "ambiguous gate labels ($(tr '\n' ' ' <<<"$GATE_LABELS" | sed 's/ $//')) — proceeding under --force"
+  fi
+  GATE_PASSED=0
   if [[ ",$LABELS," == *",gate:passed,"* ]]; then
+    GATE_PASSED=1
     # `gate:passed` is one label, but a src/ PR runs MORE THAN ONE gate. The
     # printed handoff only ever named code-review, so a check-code finding could
     # be dropped and nothing would notice — the label would still say passed.
-    # Require a recorded comment per gate the plan demanded.
+    # Require a recorded comment per gate the plan demanded (checked below, once
+    # the gate comments have been read).
     # FAIL CLOSED. `velo-gate --plan` dies with no stdout on a gh failure, so an
     # empty NEEDED used to mean "nothing demanded" and merged silently — the
     # exact check this block adds, skipped on the very transient failure it
@@ -204,8 +370,125 @@ else
 $PLAN_OUT"
       warn "gate plan parsed to nothing — proceeding under --force"
     fi
-    RECORDED=$(gh pr view "$PR" --repo "$REPO" --json comments \
-      --jq '[.comments[].body | capture("gate: *(?<n>[a-z0-9-]+) *@")] | map(.n) | unique | join(" ")' 2>/dev/null)
+  else
+    # At most one gate label here: more than one was refused above (--force carries on, and then
+    # the first listed is only the one named in the message).
+    CUR=$(head -n 1 <<<"$GATE_LABELS"); [[ -n "$CUR" ]] || CUR="gate:none"
+    [[ $FORCE -eq 1 ]] || die "#$PR touches $CODE code file(s) and is '$CUR', not gate:passed.
+  Run the gate, then: velo-gate $PR --pass
+  Verifying it yourself is not the gate — that is how an ungated PR gets
+  described as ready."
+  fi
+
+  # The stale-gate check: a gate result is only valid for the commit it ran on,
+  # and EVERY gate must be valid — not just the most recent comment.
+  #
+  # This used to end `| last | .s`, validating only the newest gate comment. So:
+  #
+  #     gate: check-code  @ H1        <- posted
+  #     (commits pushed, head becomes H2)
+  #     gate: code-review @ H2        <- posted
+  #
+  # passed, because only the code-review line was ever compared to HEAD. The PR
+  # merged carrying a check-code result for a commit that no longer existed —
+  # the exact failure `gate: <name> @ <sha>` exists to prevent, and the shape
+  # that once let a PR look green against code already replaced.
+  #
+  # The comments are read ONCE and parsed ONCE, and both questions the merge asks of them are
+  # answered from that one parse: which gates are CURRENT (here) and which are RECORDED (the plan's
+  # gates, checked after this block). They were two reads with two grammars — a gate name with a
+  # digit, or a header with no readable sha, was "recorded" to one and invisible to the other, so it
+  # counted as a report that nothing ever compared to head. Now both read the freshest comment per
+  # gate name; a header with no readable sha is `-` (a gate that names no commit is not current);
+  # and `[a-z0-9-]+` is the name grammar velo-gate-post mints.
+  #
+  # A read that FAILS is not "no gate comment": it is reported as a failed read, in the kinds the
+  # PR read above uses, so that --wait retries a blip and stops on a dead token.
+  GATE_JQ='[.comments[].body | capture("gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]
+           | reduce .[] as $g ({}; .[$g.n] = ($g.s // "-")) | to_entries[] | "\(.key) \(.value)"'
+  GATE_LINE_RE='^[a-z0-9-]+ ([0-9a-f]{7,40}|-)$'
+  GATES_ERRF=$(mktemp "${TMPDIR:-/tmp}/velo-merge-gates.XXXXXX") || GATES_ERRF=""
+  if [[ -n "$GATES_ERRF" ]]; then
+    GATES=$(gh pr view "$PR" --repo "$REPO" --json comments --jq "$GATE_JQ" 2>"$GATES_ERRF"); GATES_RC=$?
+    if GATES_ERR=$(cat "$GATES_ERRF" 2>&1); then
+      GATES_ERR=$(tr '\n' ' ' <<<"$GATES_ERR" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-400)
+    else
+      GATES_ERR="(gh's stderr could not be read back: $(head -n 1 <<<"$GATES_ERR"))"
+    fi
+    rm -f "$GATES_ERRF"
+  else
+    GATES=$(gh pr view "$PR" --repo "$REPO" --json comments --jq "$GATE_JQ" 2>/dev/null); GATES_RC=$?
+    GATES_ERR="(stderr unavailable: could not create a scratch file in ${TMPDIR:-/tmp})"
+  fi
+  # Why the read is not usable: a kind from gh_failure_kind when gh failed, `payload` when gh
+  # exited 0 but what it printed is not a gate list (a proxy's error page). Empty when it is usable.
+  GATES_KIND=""
+  if [[ $GATES_RC -ne 0 ]]; then
+    GATES_ERR="${GATES_ERR:-gh printed nothing on stderr}"
+    GATES_KIND=$(gh_failure_kind "$GATES_ERR")
+  else
+    while IFS= read -r GLINE; do
+      [[ -z "$GLINE" ]] && continue
+      [[ "$GLINE" =~ $GATE_LINE_RE ]] && continue
+      GATES_KIND=payload
+      GATES_ERR="gh answered with something that is not a gate list: '${GLINE:0:60}'"
+      break
+    done <<< "$GATES"
+  fi
+  if [[ -n "$GATES_KIND" ]]; then
+    if [[ $FORCE -eq 1 ]]; then
+      warn "could not read the gate comments for #$PR — proceeding under --force. gh said: $GATES_ERR"
+      GATES=""
+    else
+      case "$GATES_KIND" in
+        not-found)  die "PR #$PR not found — gh said: $GATES_ERR" ;;
+        auth)       die "could not read PR #$PR (auth): the gate comments could not be read — gh authentication failed, waiting will not fix this. gh said: $GATES_ERR" ;;
+        rate-limit) die "could not read PR #$PR (rate-limit): the gate comments could not be read — GitHub API rate limit, transient, retry later (--wait does). gh said: $GATES_ERR" ;;
+        network)    die "could not read PR #$PR (network): the gate comments could not be read — GitHub unreachable or answering 5xx, transient, retry later (--wait does). gh said: $GATES_ERR" ;;
+        payload)    die "could not read PR #$PR (payload): the gate comments could not be read — $GATES_ERR. gh did not fail, so this is no blip: --wait stops here." ;;
+        *)          die "could not read PR #$PR (other): the gate comments could not be read — gh exited $GATES_RC with an error this script does not recognise. gh said: $GATES_ERR" ;;
+      esac
+    fi
+  fi
+
+  if [[ -z "$GATES" ]]; then
+    [[ $FORCE -eq 1 ]] || die "no 'gate: <name> @ <sha>' comment on #$PR.
+  Gate comments must name the commit they ran against, else staleness is
+  unverifiable."
+  else
+    # $GATES is already the FRESHEST entry per gate name (the jq above reduces the comments,
+    # oldest first, so a later comment for a name replaces the earlier): a gate that was re-run
+    # posts a second comment, and the old one must not condemn it — otherwise re-gating could
+    # never clear a PR.
+    STALE=""
+    NGATES=0
+    while read -r GNAME GS; do
+      [[ -z "$GNAME" ]] && continue
+      NGATES=$((NGATES + 1))
+      if [[ "$GS" == "-" ]]; then
+        STALE="$STALE
+    $GNAME names no commit (its 'gate: $GNAME @' header carries no readable sha, so it cannot be compared to head)"
+      elif [[ "$HEAD" != "$GS"* ]]; then
+        STALE="$STALE
+    $GNAME ran at $GS"
+      fi
+    done <<< "$GATES"
+
+    if [[ -n "$STALE" ]]; then
+      [[ $FORCE -eq 1 ]] || die "STALE GATE — head is now $SHORT, but:$STALE
+  Commits landed after those gates ran. Re-gate against the current head:
+    velo-gate $PR --running   # then re-run the reviewers
+  This is the exact case where a PR looked green against code that had
+  already been replaced."
+    else
+      ok "all $NGATES gate(s) ran against current head ($SHORT)"
+    fi
+  fi
+
+  # The plan's gates must each be RECORDED, read from the same parse as "current" above: a gate
+  # counts through its freshest comment, the one just compared to head.
+  if [[ $GATE_PASSED -eq 1 ]]; then
+    RECORDED=$(awk '{print $1}' <<<"$GATES" | sort | tr '\n' ' ' | sed 's/ $//')
     MISSING=""
     for g in $NEEDED; do
       # Match the gate FAMILY, not the exact string. A review is legitimately
@@ -243,65 +526,6 @@ $PLAN_OUT"
     else
       ok "gate:passed (reports recorded:${RECORDED:+ $RECORDED})"
     fi
-  else
-    CUR=$(tr ',' '\n' <<<"$LABELS" | grep '^gate:' | head -1); [[ -n "$CUR" ]] || CUR="gate:none"
-    [[ $FORCE -eq 1 ]] || die "#$PR touches $CODE code file(s) and is '$CUR', not gate:passed.
-  Run the gate, then: velo-gate $PR --pass
-  Verifying it yourself is not the gate — that is how an ungated PR gets
-  described as ready."
-  fi
-
-  # The stale-gate check: a gate result is only valid for the commit it ran on,
-  # and EVERY gate must be valid — not just the most recent comment.
-  #
-  # This used to end `| last | .s`, validating only the newest gate comment. So:
-  #
-  #     gate: check-code  @ H1        <- posted
-  #     (commits pushed, head becomes H2)
-  #     gate: code-review @ H2        <- posted
-  #
-  # passed, because only the code-review line was ever compared to HEAD. The PR
-  # merged carrying a check-code result for a commit that no longer existed —
-  # the exact failure `gate: <name> @ <sha>` exists to prevent, and the shape
-  # that once let a PR look green against code already replaced.
-  GATES=$(gh pr view "$PR" --repo "$REPO" --json comments \
-          --jq '[.comments[].body | capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})")]
-                | .[] | "\(.n) \(.s)"' 2>/dev/null)
-
-  if [[ -z "$GATES" ]]; then
-    [[ $FORCE -eq 1 ]] || die "no 'gate: <name> @ <sha>' comment on #$PR.
-  Gate comments must name the commit they ran against, else staleness is
-  unverifiable."
-  else
-    # Keep the FRESHEST sha per gate name. A gate that was re-run posts a second
-    # comment, and the old line must not condemn it — otherwise re-gating could
-    # never clear a PR. Comments arrive oldest-first, so a later line for the
-    # same name replaces the earlier.
-    FRESH=""
-    while read -r GNAME GS; do
-      [[ -z "$GNAME" ]] && continue
-      FRESH=$(printf '%s\n' "$FRESH" | grep -v "^$GNAME " || true)
-      FRESH=$(printf '%s\n%s %s' "$FRESH" "$GNAME" "$GS")
-    done <<< "$GATES"
-
-    STALE=""
-    NGATES=0
-    while read -r GNAME GS; do
-      [[ -z "$GNAME" ]] && continue
-      NGATES=$((NGATES + 1))
-      [[ "$HEAD" == "$GS"* ]] || STALE="$STALE
-    $GNAME ran at $GS"
-    done <<< "$FRESH"
-
-    if [[ -n "$STALE" ]]; then
-      [[ $FORCE -eq 1 ]] || die "STALE GATE — head is now $SHORT, but:$STALE
-  Commits landed after those gates ran. Re-gate against the current head:
-    velo-gate $PR --running   # then re-run the reviewers
-  This is the exact case where a PR looked green against code that had
-  already been replaced."
-    else
-      ok "all $NGATES gate(s) ran against current head ($SHORT)"
-    fi
   fi
 fi
 
@@ -323,20 +547,34 @@ mkdir -p "$MERGE_DIR"
 MERGE_DONE="$MERGE_DIR/.merged-$SHORT"
 MERGE_LOCK="$MERGE_DIR/.merging-$SHORT.lock"
 if [[ -f "$MERGE_DONE" ]]; then
-  ok "already merged @ $SHORT ($(cat "$MERGE_DONE" 2>/dev/null)) — skipping (idempotent)"
+  read_marker "$MERGE_DONE"
+  ok "already merged @ $SHORT ($MARKER_TEXT) — skipping (idempotent)"
   exit 0
 fi
 if ! mkdir "$MERGE_LOCK" 2>/dev/null; then
   # The common case is seconds from a done-marker, not a stuck process — poll
   # briefly rather than racing a second `gh pr merge` against the same head.
   for _i in 1 2 3 4 5 6 7 8 9 10; do
-    [[ -f "$MERGE_DONE" ]] && { ok "merged concurrently @ $SHORT — skipping"; exit 0; }
+    if [[ -f "$MERGE_DONE" ]]; then
+      read_marker "$MERGE_DONE"
+      ok "merged concurrently @ $SHORT ($MARKER_TEXT) — skipping"
+      exit 0
+    fi
     sleep 1
   done
   die "another velo-merge for #$PR @ $SHORT has held $MERGE_LOCK for 10s with no done-marker.
   Check for a stuck process, then: rm -rf $MERGE_LOCK"
 fi
 trap 'rm -rf "$MERGE_LOCK"' EXIT
+# The marker was checked BEFORE the lock was taken. A concurrent caller that finished in
+# between wrote its marker and released the lock, and this one has just acquired a lock
+# nobody holds any more: without this second look it would run `gh pr merge` on the same
+# head again.
+if [[ -f "$MERGE_DONE" ]]; then
+  read_marker "$MERGE_DONE"
+  ok "merged concurrently @ $SHORT ($MARKER_TEXT) — skipping"
+  exit 0
+fi
 
 gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
   && { printf 'pid %s at %s\n' "$$" "$(date -u +%FT%TZ)" > "$MERGE_DONE"; ok "merged #$PR"; } \

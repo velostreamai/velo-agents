@@ -103,6 +103,7 @@ suite test_spec_review_worker.sh bash "$HERE/test_spec_review_worker.sh"
 suite test_gate_routing.sh bash "$HERE/test_gate_routing.sh"
 suite test_gate_check_code_mode.sh bash "$HERE/test_gate_check_code_mode.sh"
 suite test_gate_substitution.sh bash "$HERE/test_gate_substitution.sh"
+suite test_gate_comments.sh bash "$HERE/test_gate_comments.sh"
 suite test_gate_run.sh bash "$HERE/test_gate_run.sh"
 suite test_gate_finish.sh bash "$HERE/test_gate_finish.sh"
 suite test_gate_sweep.sh bash "$HERE/test_gate_sweep.sh"
@@ -126,6 +127,9 @@ suite test_pr_gate_launch.sh bash "$HERE/test_pr_gate_launch.sh"
 echo
 echo "── brief fields ───────────────────────────────────────"
 suite test_brief_fields.sh bash "$HERE/test_brief_fields.sh"
+echo
+echo "── fence grammar parity (brief_prose awk vs extract_attack python) ──"
+suite test_fence_parity.py python3 "$HERE/test_fence_parity.py"
 echo
 echo "── sdk patches ────────────────────────────────────────"
 suite test_sdk_patches.py "$PY" "$HERE/test_sdk_patches.py"
@@ -158,6 +162,7 @@ echo
 echo "── merge gate staleness ───────────────────────────────"
 suite test_merge_gates.sh bash "$HERE/test_merge_gates.sh"
 suite test_merge_once.sh bash "$HERE/test_merge_once.sh"
+suite test_merge_aggregate.sh bash "$HERE/test_merge_aggregate.sh"
 echo
 echo "── routing: label vs spec ─────────────────────────────"
 suite test_routing.sh bash "$HERE/test_routing.sh"
@@ -180,6 +185,7 @@ echo
 echo "── orchestrator daemon (#2285 PR2 + Round 2 integration) ─"
 suite test_orchestrd.sh bash "$HERE/test_orchestrd.sh"
 suite test_attention.sh bash "$HERE/test_attention.sh"
+suite test_verdict_of.sh bash "$HERE/test_verdict_of.sh"
 suite test_watch_attention.sh bash "$HERE/test_watch_attention.sh"
 suite test_session_start_attention.sh bash "$HERE/test_session_start_attention.sh"
 echo

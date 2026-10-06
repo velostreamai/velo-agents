@@ -102,11 +102,13 @@ mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
 # ---- what counts as transient ------------------------------------------------------
 #
 # `PR #N not found` is how both velo-gate-post and velo-gate report gh failing to
-# answer; `could not set gate:...` is velo-gate's label edit failing; a post that
-# `could not post` is transient only when gh's own last line reads like the wire
-# (a 422 or a 401 is not going to improve).
+# answer; `could not read the gate comments for #N:` is velo-gate --pass failing to
+# read the comments it checks head against (it refuses rather than guess); `could not
+# set gate:...` is velo-gate's label edit failing; a post that `could not post` is
+# transient only when gh's own last line reads like the wire (a 422 or a 401 is not
+# going to improve).
 is_transient() {   # <output file>
-  grep -qiE "PR #$PR not found|could not set gate:|could not post to #$PR:.*(timeout|timed out|deadline exceeded|error connecting|connection|dial tcp|no such host|temporary failure|HTTP 5[0-9][0-9]|EOF|reset by peer|TLS)" "$1"
+  grep -qiE "PR #$PR not found|could not read the gate comments for #$PR:|could not set gate:|could not post to #$PR:.*(timeout|timed out|deadline exceeded|error connecting|connection|dial tcp|no such host|temporary failure|HTTP 5[0-9][0-9]|EOF|reset by peer|TLS)" "$1"
 }
 
 # Is `gate: <name> @ <sha>` already a comment on the PR? The PR is the source of

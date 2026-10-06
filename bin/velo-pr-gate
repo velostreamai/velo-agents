@@ -194,7 +194,12 @@ case "$CHECK_CODE_BY" in
   *)        CODE_MODEL_ID='' ;;
 esac
 
-PLAN=$(~/.agents/bin/velo-gate "$PR" --plan 2>/dev/null) || die "PR #$PR not found"
+# velo-gate says WHY it could not plan — a PR it cannot read, a linked issue it cannot read, a
+# payload that is not a PR — on its own stderr, which is left to reach the caller. That used to be
+# discarded and every failure reported as "PR #N not found": a lie for all but one of them, and
+# velo-gate-run retries that text as a dropped connection.
+PLAN=$(~/.agents/bin/velo-gate "$PR" --plan) \
+  || die "could not plan the gates for #$PR: velo-gate $PR --plan failed (exit $?); whatever it said is above"
 echo "$PLAN"
 echo
 
@@ -260,9 +265,42 @@ ok "worktree: $WTPATH"
 GATE_DIR="$VELO_STATE/gate/$PR"
 mkdir -p "$GATE_DIR"
 GATE_LOCK="$GATE_DIR/.lock"
-if ! mkdir "$GATE_LOCK" 2>/dev/null; then
-  HOLDER=$(cat "$GATE_LOCK/pid" 2>/dev/null || echo "")
-  if [[ -n "$HOLDER" ]] && kill -0 "$HOLDER" 2>/dev/null; then
+# Who holds the lock? A holder is KNOWN or it is not, and only a holder KNOWN to be gone makes the
+# lock stale. The owner makes the directory first and writes its pid a moment later, so a missing or
+# empty pid file is read again for a short grace (10 polls, VELO_GATE_LOCK_POLL seconds apart) before
+# it is believed; a pid file that holds no pid, or cannot be read, is not waited for. The old read
+# was `cat pid 2>/dev/null || echo ""` with "no live holder pid" as the whole stale test, so every
+# one of those states was a dead holder and its lock was removed from under a gate that was starting.
+#   -> HOLDER (a pid), return 0;  or HOLDER_WHY (why no pid can be named), return 1.
+# (velo-gate-run carries the same function for its early check: keep the two in step.)
+HOLDER=""; HOLDER_WHY=""
+read_lock_holder() {   # <lock dir>
+  local f="$1/pid" i out
+  HOLDER=""; HOLDER_WHY=""
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if out=$(cat "$f" 2>&1); then
+      out="${out//[[:space:]]/}"
+      if [[ "$out" =~ ^[0-9]+$ ]]; then HOLDER="$out"; return 0; fi
+      if [[ -n "$out" ]]; then HOLDER_WHY="holds '${out:0:40}' in its pid file, which is not a pid"; return 1; fi
+      HOLDER_WHY="has an empty pid file"
+    elif [[ -e "$f" ]]; then
+      HOLDER_WHY="has a pid file that cannot be read: $(head -n 1 <<<"$out")"; return 1
+    else
+      HOLDER_WHY="has no pid file"
+    fi
+    sleep "${VELO_GATE_LOCK_POLL:-0.2}"
+  done
+  return 1
+}
+if ! LOCK_ERR=$(mkdir "$GATE_LOCK" 2>&1); then
+  [[ -d "$GATE_LOCK" ]] || die "could not take the gate lock at $GATE_LOCK: ${LOCK_ERR:-mkdir failed with no message}"
+  if ! read_lock_holder "$GATE_LOCK"; then
+    die "the gate lock for #$PR at $GATE_LOCK exists, but its holder cannot be identified: it $HOLDER_WHY.
+  Not taking it over: a gate that has only just started has not written its pid yet, and removing its
+  lock would let a second gate start over it. If no gate is running for #$PR, clear it:
+    rm -rf $GATE_LOCK"
+  fi
+  if kill -0 "$HOLDER" 2>/dev/null; then
     die "a gate is already running for #$PR (pid $HOLDER).
   Two gates on one PR share $GATE_DIR — the brief, both code and review
   logs — so the second would overwrite files the first is still writing and
@@ -270,11 +308,12 @@ if ! mkdir "$GATE_LOCK" 2>/dev/null; then
     tail -f $GATE_DIR/review.log"
   fi
   # Holder is gone: a previous gate was killed before releasing. Take it over.
-  warn "removing a stale gate lock for #$PR (holder ${HOLDER:-unknown} is not running)"
+  warn "removing a stale gate lock for #$PR (holder $HOLDER is not running)"
   rm -rf "$GATE_LOCK"
   mkdir "$GATE_LOCK" 2>/dev/null || die "could not take the gate lock at $GATE_LOCK"
 fi
-echo $$ > "$GATE_LOCK/pid"
+# A pid that cannot be written leaves a lock nobody can name: release it rather than strand the PR.
+echo $$ > "$GATE_LOCK/pid" || { rm -rf "$GATE_LOCK"; die "could not write this gate's pid into $GATE_LOCK/pid"; }
 # Released on EVERY exit path, including the die()s below — a lock that leaks on
 # refusal would block the PR until someone noticed the directory.
 trap 'rm -rf "$GATE_LOCK"' EXIT
@@ -289,7 +328,11 @@ trap 'rm -rf "$GATE_LOCK"' EXIT
 # The trailing slash is load-bearing, which is exactly why it is commented.
 # One directory per PR, so pruning is a directory walk with no glob to get
 # wrong — and no symlink between here and the files.
-find "$VELO_STATE/gate" -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+# -mindepth 1 is load-bearing: the START directory is itself a directory within -maxdepth 1,
+# and its mtime moves only when an entry is created or removed directly in it — so after a week
+# of re-gating PRs that already have a directory the ROOT is "older than 7 days", and without it
+# this deleted every PR's gate state, the lock taken above included.
+find "$VELO_STATE/gate" -maxdepth 1 -mindepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 
 # >>> velo-gated-sha (extracted verbatim by tests/test_pr_gate_launch.sh)
 # Recorded at LAUNCH, before any gate is dispatched — not derived later from
@@ -552,8 +595,16 @@ write_check_code_agent_prompt() {   # [out-file] [reviewer] -> $1 (default $CODE
 # velo-merge refuses a PR that is not gate:passed, so this is enforced, not
 # advisory.
 FTP_ISSUE=$(sed -nE 's|^[a-z]+/([0-9]+)-.*|\1|p' <<<"${WT:-}" | head -1)
-[[ -n "$FTP_ISSUE" ]] || FTP_ISSUE=$(gh pr view "$PR" --repo "$REPO" --json title \
-    --jq '.title | capture("\\[#(?<n>[0-9]+)\\]") | .n' 2>/dev/null)
+if [[ -z "$FTP_ISSUE" ]]; then
+  # A title with no [#N] is a PR with no spec, and has nothing to say. A title that could not be READ
+  # is not that — the check is skipped either way, so only the second must say so.
+  if FTP_TITLE_N=$(gh pr view "$PR" --repo "$REPO" --json title \
+      --jq '.title | capture("\\[#(?<n>[0-9]+)\\]") | .n'); then
+    FTP_ISSUE="$FTP_TITLE_N"
+  else
+    warn "could not read the title of #$PR to find its spec (gh exited $?; its own message is above) — fail_to_pass is NOT being verified for this gate"
+  fi
+fi
 # The spec is read from the PR's own worktree FIRST, not the canonical checkout:
 # a PR that ADDS or edits its spec must be gated against the version it ships.
 #
@@ -608,25 +659,45 @@ if [[ -n "$FTP_ISSUE" && ! -f "$FTP_SPEC" ]]; then
 fi
 
 if [[ -n "$FTP_ISSUE" && -f "$FTP_SPEC" ]]; then
-  FTP_NAMES=$(python3 -c "
+  # A spec that cannot be read is not a spec that names nothing: the first leaves the acceptance gate
+  # unenforced and must say so; the second is an empty gate, which dispatch already refuses.
+  if ! FTP_NAMES=$(python3 -c "
 import json,sys
 try:
     v = json.load(open(sys.argv[1])).get('tests',{}).get('fail_to_pass') or []
-except Exception:
-    v = []
-print('\n'.join(str(t) for t in v))
-" "$FTP_SPEC" 2>/dev/null)
+    names = [str(t) for t in v]
+except Exception as e:
+    sys.stderr.write(type(e).__name__ + ': ' + str(e) + '\n')
+    sys.exit(1)
+print('\n'.join(names))
+" "$FTP_SPEC"); then
+    warn "could not read the names from $FTP_SPEC (above) — fail_to_pass is NOT being verified for this gate"
+    FTP_NAMES=""
+  fi
 
   if [[ -n "$FTP_NAMES" ]]; then
-    FTP_BASE_REF="origin/$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName 2>/dev/null)"
+    # The same read and the same words as the base-branch lookup below, which velo-gate-run retries:
+    # a failed read built `origin/`, and the predates check below never fired.
+    FTP_BASE=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
+    [[ -n "$FTP_BASE" ]] || die "could not read base branch for #$PR"
+    FTP_BASE_REF="origin/$FTP_BASE"
+    # `git grep` exits 1 for "no match" and 128 when it could not search at all: only the first is an
+    # answer. An error read as "not defined" blocked with the wrong message; read as "not predated"
+    # it passed with nothing checked.
+    ftp_defined_at() {   # <ref> <name> -> 0 defined there, 1 not; dies when git cannot say
+      local rc
+      git -C "$WTPATH" grep -qE "fn[[:space:]]+$2[[:space:]]*\(" "$1" -- tests src; rc=$?
+      [[ $rc -le 1 ]] || die "git could not search $1 in $WTPATH for fail_to_pass name '$2' (git grep exited $rc; its own message is above)"
+      return "$rc"
+    }
     FTP_ABSENT=(); FTP_PREDATES=()
     while IFS= read -r t; do
       [[ -n "$t" ]] || continue
       # Match the DEFINITION, not a mention — a name in a comment or another
       # test's body is not a test. Same rule the dispatch grep used.
-      if ! git -C "$WTPATH" grep -qE "fn[[:space:]]+${t}[[:space:]]*\(" HEAD -- tests src 2>/dev/null; then
+      if ! ftp_defined_at HEAD "$t"; then
         FTP_ABSENT+=("$t")
-      elif git -C "$WTPATH" grep -qE "fn[[:space:]]+${t}[[:space:]]*\(" "$FTP_BASE_REF" -- tests src 2>/dev/null; then
+      elif ftp_defined_at "$FTP_BASE_REF" "$t"; then
         FTP_PREDATES+=("$t")
       fi
     done <<<"$FTP_NAMES"
@@ -690,21 +761,36 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # when Codex was unavailable — left GSHA empty and the range silently widened
   # to the whole branch. A reviewer then re-derives everything already cleared
   # and reports it as new. Silent, and it wastes the expensive gate.
+  #
+  # A failed READ is not "no review yet", and used to be the same empty value: the range silently
+  # became the whole branch and the brief called it the first review. gh's own message is left
+  # visible, and SCOPE_NOTE (the brief's SCOPE sentence) says what is actually known.
+  SCOPE_NOTE="This is the first review of this PR."
+  GSHA_RC=0
   GSHA=$(gh pr view "$PR" --repo "$REPO" --json comments \
-          --jq '[.comments[].body | capture("gate: *[a-z0-9-]*review *@ *(?<s>[0-9a-f]{7,40})")] | last | .s' 2>/dev/null)
+          --jq '[.comments[].body | capture("gate: *[a-z0-9-]*review *@ *(?<s>[0-9a-f]{7,40})")] | last | .s') || GSHA_RC=$?
+  if [[ $GSHA_RC -ne 0 ]]; then
+    GSHA=""
+    SCOPE_NOTE="The earlier gate comments could not be read, so what was already reviewed is unknown: the whole branch is in range and nothing below it can be taken as cleared."
+    warn "could not read the gate comments of #$PR to find the last reviewed sha (gh exited $GSHA_RC; its own message is above) — reviewing the whole branch"
+  fi
 
   # A recorded sha can be ORPHANED by a rebase: the review really happened, but
   # its commit is no longer an ancestor of HEAD, so `$GSHA..$HEAD` replays every
   # rebased commit as if unreviewed. Verify reachability and say so out loud
   # rather than handing the reviewer a range that quietly means something else.
+  # (A non-zero status is "not an ancestor" or "no such commit here": either way no delta can be
+  # built from it, and the whole branch is the answer.)
   if [[ "$GSHA" != "null" && -n "$GSHA" ]]; then
     if git -C "$WTPATH" merge-base --is-ancestor "$GSHA" HEAD 2>/dev/null; then
       RANGE="$GSHA..$HEAD"
+      SCOPE_NOTE="Everything below $GSHA you have already reviewed and cleared — do not re-derive it."
     else
       warn "last recorded gate sha $GSHA is NOT an ancestor of $HEAD — orphaned by a rebase."
       warn "Falling back to the full branch range; the reviewer will re-derive cleared work."
       warn "If that is wasteful, re-record a gate against a live sha first."
       RANGE="origin/$BASE...HEAD"
+      SCOPE_NOTE="The last review was recorded at $GSHA, which a rebase orphaned: the whole branch is in range and nothing below it can be taken as cleared."
     fi
   else
     RANGE="origin/$BASE...HEAD"
@@ -713,7 +799,11 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # An empty range is a review of nothing, and it comes back "approve" — a
   # vacuous gate wearing a green tick. Refuse instead. This fires when the last
   # review already ran at the current head, i.e. nothing new has landed yet.
-  if [[ -z "$(git -C "$WTPATH" diff --name-only $RANGE 2>/dev/null)" ]]; then
+  # A git that could not diff the range (say origin/<base> was never fetched) is not an empty range:
+  # it used to read as "nothing has landed" and end the round with exit 0 and the cause hidden.
+  RANGE_FILES=$(git -C "$WTPATH" diff --name-only $RANGE) \
+    || die "git could not diff $RANGE in $WTPATH (its own message is above) — not reading that as an empty range"
+  if [[ -z "$RANGE_FILES" ]]; then
     warn "diff range $RANGE is EMPTY — nothing has landed since the last review."
     warn "Not generating a review brief: reviewing an empty diff yields a vacuous approve."
     echo "  Wait for the worker to push, then re-run."
@@ -798,7 +888,7 @@ WORKTREE: $WTPATH (head $HEAD)
     git -C $WTPATH diff $RANGE
     gh pr view $PR --repo $REPO --comments
 
-SCOPE: exactly that range. $( [[ "$RANGE" == *".."* && "$RANGE" != *"..."* ]] && echo "Everything below $GSHA you have already reviewed and cleared — do not re-derive it." || echo "This is the first review of this PR." )
+SCOPE: exactly that range. $SCOPE_NOTE
 
 --- WHAT IT DOES -------------------------------------------------------------
 $(cat "$SCOPE")
@@ -1075,7 +1165,17 @@ if [[ "${GATE_RUNNING_PENDING:-0}" -eq 1 ]]; then
     warn "yourself and DECLARE the substitution in the gate comment."
     exit 1
   fi
-  ~/.agents/bin/velo-gate "$PR" --running >/dev/null 2>&1 && ok "gate:running"
+  # The reviewers ARE running by now, so a label that cannot be set does not abort the round (the
+  # lock would be released with them still going) — but it is said, with velo-gate's reason. It
+  # used to vanish: the only trace was a missing "ok gate:running", and velo-orchestrd follows only
+  # gate:running PRs, so nobody would have picked these results up.
+  if RUNNING_OUT=$(~/.agents/bin/velo-gate "$PR" --running 2>&1); then
+    ok "gate:running"
+  else
+    warn "could not record gate:running for #$PR — the reviewers are running, but the PR is NOT labelled, so velo-orchestrd will not pick their results up."
+    warn "velo-gate said: $(printf '%s' "$RUNNING_OUT" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-300)"
+    warn "Set it by hand: velo-gate $PR --running"
+  fi
 fi
 
 # >>> velo-pr-gate-wait (extracted verbatim by tests/test_pr_gate_wait.sh)

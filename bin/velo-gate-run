@@ -30,6 +30,11 @@
 # heading, or an empty one, is refused before anything is touched — velo-pr-gate
 # would refuse the stub anyway, later and more obscurely.
 #
+# The WHOLE scope file is also copied to $VELO_STATE/gate/<pr>/scope.<UTC>.md, one
+# per round, before any step runs: a round that dies early can be re-run from it
+# (the file passed in may live somewhere a reboot clears), and a re-review can see
+# what the previous reviewer was told. Nothing reads these copies back.
+#
 # Why the prime is `--brief-only` rather than the old `<pr> <scope> --plan`: that
 # spelling only dodged the require-wait hook. The script treats it as a plain run,
 # so it launched check-spec before reaching the unfilled-ATTACK refusal, and the
@@ -111,28 +116,40 @@ import re, sys
 with open(sys.argv[1], encoding="utf-8") as f:
     lines = f.read().replace("\r\n", "\n").split("\n")
 
-fence = None      # the fence marker that opened the current fenced block
+fence = None      # (character, length) of the fence that opened the current fenced block
 depth = None      # heading depth of the ATTACK heading, once found
 body = []
 for line in lines:
-    m = re.match(r"^[ \t]*(`{3,}|~{3,})", line)
-    if m:
-        if fence is None:
-            fence = m.group(1)[0]
-        elif m.group(1)[0] == fence:
+    # The fence grammar is CommonMark's, the same one velo-dispatch's brief_prose uses: an
+    # opener is up to three SPACES of indent then 3+ backticks or tildes (a backtick
+    # opener cannot carry a backtick in its info string, so an inline ```x``` is prose);
+    # only a line of the SAME character, at least as long, with nothing after it but
+    # spaces, tabs (and the CR of a CRLF line) closes it. Reading any run of 3+ as both
+    # opener and closer would let a shorter fence line or an info-string line end a block
+    # early and expose the headings still inside it; so would str.strip() with no argument,
+    # which counts a non-breaking space or a form feed as blank. Indentation is counted in
+    # columns and a TAB reaches column 4 at once, so a line with a tab in its leading
+    # whitespace is indented code — never an opener or a closer — exactly like four spaces.
+    m = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+    if fence is not None:
+        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not m.group(2).strip(" \t\r"):
             fence = None
         if depth is not None:
             body.append(line)
         continue
-    if fence is None:
-        h = re.match(r"^(#{1,6})[ \t]+(.*)$", line)
-        if h:
-            if depth is None:
-                if re.match(r"ATTACK\b", h.group(2)):
-                    depth = len(h.group(1))
-                continue
-            if len(h.group(1)) <= depth:
-                break
+    if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+        fence = (m.group(1)[0], len(m.group(1)))
+        if depth is not None:
+            body.append(line)
+        continue
+    h = re.match(r"^(#{1,6})[ \t]+(.*)$", line)
+    if h:
+        if depth is None:
+            if re.match(r"ATTACK\b", h.group(2)):
+                depth = len(h.group(1))
+            continue
+        if len(h.group(1)) <= depth:
+            break
     if depth is not None:
         body.append(line)
 
@@ -164,14 +181,107 @@ esac
 # a running gate's logs out from under it is worse than a refusal.
 GATE_DIR="$VELO_STATE/gate/$PR"
 LOCK="$GATE_DIR/.lock"
+# Who holds the lock? KNOWN or not: only a pid that names a live process is a running gate, only a
+# pid that names a dead one is a stale lock, and a lock whose pid cannot be told (not written yet,
+# empty, no pid in it, unreadable) is neither — the old read (`cat pid 2>/dev/null || true`) took it
+# for "nobody is running" and carried on to move a live gate's logs aside. A missing or empty pid
+# file is read again for a short grace first (10 polls, VELO_GATE_LOCK_POLL seconds apart): the owner
+# makes the directory before it writes its pid. The same function lives in velo-pr-gate, which takes
+# the lock: keep the two in step.
+#   -> HOLDER (a pid), return 0;  or HOLDER_WHY (why no pid can be named), return 1.
+HOLDER=""; HOLDER_WHY=""
+read_lock_holder() {   # <lock dir>
+  local f="$1/pid" i out
+  HOLDER=""; HOLDER_WHY=""
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if out=$(cat "$f" 2>&1); then
+      out="${out//[[:space:]]/}"
+      if [[ "$out" =~ ^[0-9]+$ ]]; then HOLDER="$out"; return 0; fi
+      if [[ -n "$out" ]]; then HOLDER_WHY="holds '${out:0:40}' in its pid file, which is not a pid"; return 1; fi
+      HOLDER_WHY="has an empty pid file"
+    elif [[ -e "$f" ]]; then
+      HOLDER_WHY="has a pid file that cannot be read: $(head -n 1 <<<"$out")"; return 1
+    else
+      HOLDER_WHY="has no pid file"
+    fi
+    sleep "${VELO_GATE_LOCK_POLL:-0.2}"
+  done
+  return 1
+}
 if [[ -d "$LOCK" ]]; then
-  HOLDER=$(cat "$LOCK/pid" 2>/dev/null || true)
-  if [[ -n "$HOLDER" ]] && kill -0 "$HOLDER" 2>/dev/null; then
+  if ! read_lock_holder "$LOCK"; then
+    die "the gate lock for #$PR at $LOCK exists, but its holder cannot be identified: it $HOLDER_WHY.
+  Not moving anything aside under a gate that may be running. If no gate is running for #$PR, clear it:
+    rm -rf $LOCK"
+  fi
+  if kill -0 "$HOLDER" 2>/dev/null; then
     die "a gate is already running for #$PR (pid $HOLDER).
   Wait for it, or read its output:  tail -f $GATE_DIR/review.log"
   fi
 fi
 mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
+
+# ---- the scope file is kept whole, one copy per round (#2379) -------------------
+#
+# Only the `## ATTACK` body reaches the brief (attack-body.md). The rest of the scope
+# — the delta range, what changed, what the previous round found — lived only in the
+# file the caller passed, which is often under a scratchpad that a reboot clears: a
+# launch that failed after that left nothing to re-run from, and a later re-review
+# had no record of what the reviewer was told beyond the ATTACK list.
+#
+# The copy is made before ANY step runs, so a round that dies in the plan, the brief
+# or the launch still has it, and after every refusal above, so a round that never
+# started (a bad scope, a live gate) leaves nothing in the gate dir. One file per
+# round, stamped like velo-pr-gate's review-brief.md.superseded.*, never overwritten
+# (a second round in the same second takes a numeric suffix) and never pruned one by
+# one — velo-pr-gate drops a whole gate dir that has been idle for 7 days.
+#
+# Nothing reads these back: velo-gate-sweep and velo-status open named files only,
+# so a PR's gate dir can hold any number of them. velo-pr-gate is still handed the
+# ORIGINAL path — the copy is a record, not an input.
+#
+# Invariant: a name `scope.<UTC>[.N].md` that exists holds the WHOLE scope. The copy is
+# written to a hidden temp file in the same directory and PUBLISHED under its final name
+# with a hard link: link(2) is atomic and fails EEXIST for any name that exists, a dangling
+# symlink included. A round killed mid-copy (SIGKILL, an OOM kill, a power cut) leaves at
+# most a hidden `.scope-copy.<pid>.tmp` that nothing reads — never a half-written record
+# under the name a later round would step past. The publish is also what TAKES the name:
+# of two rounds started in the same second (two terminals, a re-run on top of a hung one)
+# exactly one wins `scope.<UTC>.md` and the other takes the next suffix, which "is the
+# name free?" followed by "create it" cannot promise.
+#
+# A publish counts only if the name IS the temp file (same device and inode). `ln` into a
+# name that is a directory, or a symlink to one, links INSIDE it and exits 0 — a record
+# "saved" under a name that holds nothing. That link is removed again (dying if it cannot
+# be) and the name is stepped past like any other taken one: a taken name is not only a
+# regular file.
+#
+# A failed publish is a COLLISION only if the name now exists. If it does not, the dir is
+# unwritable or gone (or takes no hard links), and moving to the next suffix would fail the
+# same way forever — so it stops, with the shell's own error.
+SCOPE_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+SCOPE_TMP="$GATE_DIR/.scope-copy.$$.tmp"
+cp "$SCOPE" "$SCOPE_TMP" \
+  || { rm -f "$SCOPE_TMP"; die "could not save a copy of the scope file: cp to $SCOPE_TMP failed.
+  Is $GATE_DIR writable? Nothing was saved and no step ran."; }
+SCOPE_COPY="$GATE_DIR/scope.$SCOPE_STAMP.md"
+SCOPE_N=1
+while :; do
+  if SCOPE_ERR=$(ln "$SCOPE_TMP" "$SCOPE_COPY" 2>&1); then
+    [[ "$SCOPE_COPY" -ef "$SCOPE_TMP" ]] && break
+    rm -f -- "$SCOPE_COPY/${SCOPE_TMP##*/}" \
+      || die "could not remove $SCOPE_COPY/${SCOPE_TMP##*/}: a link this round made INSIDE a
+  directory that has the scope copy's name. Remove it by hand. Nothing was saved and no step ran."
+  elif [[ ! -e "$SCOPE_COPY" && ! -L "$SCOPE_COPY" ]]; then
+    rm -f "$SCOPE_TMP"
+    die "could not save the scope file as $SCOPE_COPY: ${SCOPE_ERR:-no error text}
+  Is $GATE_DIR writable, on a filesystem that takes hard links? Nothing was saved and no step ran."
+  fi
+  SCOPE_N=$((SCOPE_N + 1))
+  SCOPE_COPY="$GATE_DIR/scope.$SCOPE_STAMP.$SCOPE_N.md"
+done
+rm -f "$SCOPE_TMP"
+echo "scope file saved: $SCOPE_COPY"
 
 # ---- the second opinion is reaped, never waited for (#2350) ---------------------
 #

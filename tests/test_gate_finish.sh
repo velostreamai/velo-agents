@@ -344,6 +344,12 @@ sc_retry_verdict() {
   printf '1 could not set gate:passed\n' > "$STUB_DIR/fail.gate"
   run_finish "$PR" "$SHA" --pass "$CC" "$CR"
   [[ $RC -eq 0 && "$(ncalls 'gate ')" == "2" ]];    sc_check label-edit-failure-retried $?
+  # velo-gate --pass refuses when it cannot READ the comments it checks head against; a read
+  # that failed on the wire is retried like any other failure to get an answer from gh.
+  reset
+  printf '2 could not read the gate comments for #%s: HTTP 502: Bad Gateway\n' "$PR" > "$STUB_DIR/fail.gate"
+  run_finish "$PR" "$SHA" --pass "$CC" "$CR"
+  [[ $RC -eq 0 && "$(ncalls 'gate ')" == "3" ]];    sc_check unreadable-comments-read-retried $?
   reset
   printf '99 PR #%s not found\n' "$PR" > "$STUB_DIR/fail.gate"
   run_finish "$PR" "$SHA" --pass "$CC" "$CR"
@@ -351,7 +357,7 @@ sc_retry_verdict() {
   has "$TMPD/finish.out" "the label was NOT set";  sc_check says-the-label-was-not-set $?
   # A head that moved: velo-gate refuses, and that is not going to change.
   reset
-  printf '9 refusing to mark passed: the last gate comment names abc but head is def.\n' > "$STUB_DIR/fail.gate"
+  printf '9 refusing to mark passed: head is def, but: check-code ran at abc\n' > "$STUB_DIR/fail.gate"
   run_finish "$PR" "$SHA" --pass "$CC" "$CR"
   [[ $RC -ne 0 && "$(ncalls 'gate ')" == "1" ]];    sc_check stale-head-refusal-not-retried $?
   has "$TMPD/finish.out" "refusing to mark passed"; sc_check shows-the-refusal $?
@@ -395,7 +401,7 @@ cat > "$TMPD/real-bin/gh" <<'EOF'
 #!/bin/bash
 # A PR faithful enough to be believed. Posted comments persist (flat text for greps,
 # a JSON array for jq), and `--json comments --jq <expr>` runs the CALLER'S own jq
-# over them — so velo-gate's "last gate comment" lookup and velo-gate-finish's header
+# over them — so velo-gate's freshest-comment-per-gate lookup and velo-gate-finish's header
 # check are computed from what was really posted, never canned. The head is
 # STUB_HEAD, which a scenario can move.
 jqexpr() { local prev="" a; for a in "$@"; do [[ "$prev" == "--jq" ]] && { printf '%s' "$a"; return; }; prev="$a"; done; }
@@ -545,9 +551,11 @@ prove "retry up to 3 times" sc_retry_post \
 prove "only 3 retries" sc_retry_post \
   'MAX_RETRIES=3' 'MAX_RETRIES=9'
 prove "only transient failures are retried" sc_retry_post \
-  '  grep -qiE "PR #$PR not found|could not set gate:|could not post' '  grep -qE ".|could not post'
+  '  grep -qiE "PR #$PR not found|could not read the gate comments for #$PR:|could not set gate:|could not post' '  grep -qE ".|could not post'
 prove "a label-edit failure is transient" sc_retry_verdict \
-  'PR #$PR not found|could not set gate:|' 'PR #$PR not found|'
+  '|could not set gate:|' '|'
+prove "an unreadable gate-comments read is transient" sc_retry_verdict \
+  '|could not read the gate comments for #$PR:|' '|'
 prove "a deterministic post failure stops the run before the label" sc_fail_fast \
   '    die "velo-gate-post failed for $name' '    warn "velo-gate-post failed for $name'
 prove "a lost post response is not posted twice" sc_lost_response \

@@ -96,7 +96,7 @@ attention_unhandled() {   # -> one JSON line per event whose id is not acked
 # #2285 review calls out by name — MUST escalate, never silently pass or
 # block.
 verdict_of() {   # <report text> -> approve|approve-with-findings|blocked|"" (empty = unparseable/missing)
-  local text="$1" line val
+  local text="$1" line val verdict=""
   # The unfilled brief template literally contains this line — velo-gate-post
   # already refuses to POST it, but a caller may inspect a log before posting
   # ever runs, so guard here too rather than reading "approve" out of the
@@ -105,14 +105,24 @@ verdict_of() {   # <report text> -> approve|approve-with-findings|blocked|"" (em
     echo ""
     return
   fi
-  line=$(grep -iE '\*\*Verdict:\*\*' <<<"$text" | head -1)
-  [[ -n "$line" ]] || { echo ""; return; }
-  val=$(sed -E 's/.*\*\*[Vv]erdict:\*\*[[:space:]]*//' <<<"$line" \
-        | tr '[:upper:]' '[:lower:]' | sed -E 's/[.[:space:]].*$//')
-  case "$val" in
-    approve|approve-with-findings|blocked) echo "$val" ;;
-    *) echo "" ;;
-  esac
+  # ONE verdict is derived from EVERY `**Verdict:**` line, not the first. A report that states two
+  # different verdicts — or one and then a word this cannot parse — has not stated a verdict, and ""
+  # makes the caller escalate (never silently pass or block). Taking the first let an early
+  # `approve` (a restated header, a quoted earlier round) outvote a later `blocked`.
+  while IFS= read -r line; do
+    val=$(sed -E 's/.*\*\*[Vv]erdict:\*\*[[:space:]]*//' <<<"$line" \
+          | tr '[:upper:]' '[:lower:]' | sed -E 's/[.[:space:]].*$//')
+    case "$val" in
+      approve|approve-with-findings|blocked) ;;
+      *) echo ""; return ;;
+    esac
+    if [[ -z "$verdict" ]]; then
+      verdict="$val"
+    elif [[ "$verdict" != "$val" ]]; then
+      echo ""; return
+    fi
+  done < <(grep -iE '\*\*Verdict:\*\*' <<<"$text")
+  echo "$verdict"
 }
 
 # ---- gate-plan / gate-dir helpers --------------------------------------------

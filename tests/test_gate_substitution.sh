@@ -55,7 +55,9 @@ case "$1 $2" in
   "pr view")
     case "$*" in
       *"--json headRefOid --jq"*)   echo "$STUB_HEAD"; exit 0 ;;
-      *"--json comments"*)          echo "${STUB_GSHA:-null}"; exit 0 ;;
+      # The caller's jq prints one "<name> <sha>" line per gate and nothing when no gate
+      # comment exists; STUB_GSHA=null stands for that empty answer.
+      *"--json comments"*)          [[ "${STUB_GSHA:-null}" == "null" ]] || echo "$STUB_GSHA"; exit 0 ;;
       *"--json headRefOid,labels"*) cat "$STUB_META"; exit 0 ;;
     esac ;;
   "pr comment")

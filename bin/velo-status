@@ -479,10 +479,22 @@ echo "             heartbeats the policy requires. Both mean the report will be 
 # ---- open PRs ---------------------------------------------------------------
 echo
 echo "open PRs:"
-gh pr list --repo "$REPO" --state open --limit 10 \
-  --json number,title,mergeable,statusCheckRollup \
-  --jq '.[] | "  #\(.number) \(.mergeable // "?") \((.statusCheckRollup[0].conclusion) // "pending")  \(.title[0:66])"' \
-  2>/dev/null || echo "  (gh unavailable)"
+# The CI column is ONE state reduced from EVERY check row, by the definition velo-merge refuses
+# on (velo-ci-rollup.jq): the first row is not the PR's state — a skipped optional lane sorts
+# first and says nothing — and a definition that cannot be read or run is said so, never shown
+# as an empty list or a guessed state.
+CI_ROLLUP_JQ="$(dirname "${BASH_SOURCE[0]}")/velo-ci-rollup.jq"
+if ! PRS_JSON=$(gh pr list --repo "$REPO" --state open --limit 10 \
+      --json number,title,mergeable,statusCheckRollup 2>/dev/null); then
+  echo "  (gh unavailable)"
+elif ! CI_ROLLUP_DEFS=$(cat -- "$CI_ROLLUP_JQ" 2>&1); then
+  echo "  (cannot read the CI rollup definition $CI_ROLLUP_JQ: $(head -n 1 <<<"$CI_ROLLUP_DEFS"))"
+elif ! PR_LINES=$(jq -r "$CI_ROLLUP_DEFS"' .[] | (.statusCheckRollup | ci_rollup) as $ci
+      | "  #\(.number) \(.mergeable // "?") \($ci.state)  \(.title[0:66])"' <<<"$PRS_JSON" 2>&1); then
+  echo "  (could not classify the open PRs' checks: $(head -n 1 <<<"$PR_LINES" | cut -c1-200))"
+else
+  [[ -z "$PR_LINES" ]] || echo "$PR_LINES"
+fi
 
 # ---- parent efforts ---------------------------------------------------------
 # Most work here belongs to an umbrella issue, signalled by a "[#NNNN]" title
