@@ -26,6 +26,7 @@
 # Worker selection comes from the issue's `worker:*` label:
 #   worker:local     -> $VELO_LOCAL_MODEL_DEFAULT (velo-local.conf) via LM Studio (free)
 #   worker:deepseek  -> deepseek/deepseek-v4-flash-0731           (very cheap)
+#   worker:haiku     -> anthropic/claude-haiku-5.5                (cheap, Claude leg)
 #   worker:glm       -> z-ai/glm-5.3-flash                        (pricier)
 
 set -uo pipefail
@@ -219,6 +220,8 @@ ROUTE="$LABEL_WORKER"
     Add one of:
       worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
       worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
+      worker:haiku     cheap, Claude leg. Scoped impl when a DeepSeek-shaped
+                       route should run on Anthropic's cheap model instead.
       worker:glm       pricier. Multi-step reasoning / per-case judgement.
       worker:codex     most capable, most expensive. Architecture-weight work:
                        anything where a WRONG answer costs more than the run.
@@ -244,10 +247,11 @@ case "$ROUTE" in
   # convention, and the exception is what a reader has to memorise.
   local)      NAME="velo-local";      LOGTAG="local" ;;
   deepseek)   NAME="velo-deepseek";   LOGTAG="deepseek" ;;
+  haiku)      NAME="velo-haiku";      LOGTAG="haiku" ;;
   glm)        NAME="velo-glm";        LOGTAG="glm" ;;
   codex)      NAME="velo-codex";      LOGTAG="codex" ;;
   *) die "unroutable worker '$ROUTE' (from ${LABEL_WORKER:+label}${LABEL_WORKER:-spec}).
-    Routable: local, deepseek, glm, codex. See #2062 for opus/fable." ;;
+    Routable: local, deepseek, haiku, glm, codex. See #2062 for opus/fable." ;;
 esac
 ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 
@@ -277,7 +281,7 @@ ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 # carry worker "codex", and an unrecognised name ranks -1, which history_verdict
 # reports as `unknown` — so without the alias the guard would quietly stop
 # comparing tiers on every past codex run.
-TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-glm) echo 2 ;; velo-codex|codex) echo 3 ;; *) echo -1 ;; esac; }
+TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-haiku) echo 2 ;; velo-glm) echo 3 ;; velo-codex|codex) echo 4 ;; *) echo -1 ;; esac; }
 
 # The decision is a FUNCTION so the test can execute this code rather than a
 # copy of it. An earlier draft of the test re-implemented the comparison and
@@ -459,7 +463,7 @@ for r in rows:
         *)
           if [[ "$L_COMMITS" -gt 0 || "$L_TURNS" -ge 20 ]]; then
             ADVICE="it failed AFTER producing work (commits=$L_COMMITS turns=$L_TURNS), which is a
-    capability signal. Escalate to a higher tier: local < deepseek < glm < codex."
+    capability signal. Escalate to a higher tier: local < deepseek < haiku < glm < codex."
           else
             ADVICE="it failed WITHOUT producing work (commits=$L_COMMITS turns=$L_TURNS), so the brief is
     the more likely problem than the model. Fix the brief, then --same-tier '<reason>'."
@@ -481,7 +485,8 @@ for r in rows:
       NEXT_TIER=""
       case "$L_WORKER" in
         velo-local)    NEXT_TIER="worker:deepseek" ;;
-        velo-deepseek) NEXT_TIER="worker:glm" ;;
+        velo-deepseek) NEXT_TIER="worker:haiku" ;;
+        velo-haiku)    NEXT_TIER="worker:glm" ;;
         velo-glm)      NEXT_TIER="worker:codex" ;;
       esac
       if [[ -n "$NEXT_TIER" ]]; then
@@ -1112,7 +1117,7 @@ if [[ "$NAME" == "velo-codex" ]]; then
   ok "check-code skill: not applicable to the codex route (no --skill flag)"
 else
   [[ -f "$CHECK_CODE_SKILL" ]] || die "the /check-code skill is missing: $CHECK_CODE_SKILL
-  Every SDK worker route (local, deepseek, glm) inlines it via --skill, and the
+  Every SDK worker route (local, deepseek, haiku, glm) inlines it via --skill, and the
   policy's pre-push gate requires it. Install it or point VELO_CHECK_CODE_SKILL
   at the file. Refusing to dispatch WITHOUT it is deliberate — a worker that
   silently skips the gate reports a green run that never ran the gate."
@@ -1635,6 +1640,17 @@ case "$NAME" in
     # frequently breaks under scrutiny", with state-tracking failures across
     # multi-step logic. Worth watching on long detached runs.
     MODEL_ID='deepseek/deepseek-v4.1-flash'
+    CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
+          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --max-budget-usd "$MAX_BUDGET_USD"
+          --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
+    ;;
+  velo-haiku)
+    # #2423: the cheap Anthropic leg, slotted between deepseek and glm.
+    # $0.10/M in, $0.50/M out — DeepSeek-class cost on a Claude model, so a task
+    # that a DeepSeek-shaped brief describes but wants the Claude leg for can
+    # take it without paying glm rates.
+    MODEL_ID='anthropic/claude-haiku-5.5'
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"

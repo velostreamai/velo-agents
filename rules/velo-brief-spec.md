@@ -1,7 +1,7 @@
 # Velostream worker brief — required contents
 
-Every brief handed to a delegated worker (`velo-deepseek`, `velo-glm`,
-`velo-local`) MUST contain the sections below. A brief missing any of them has
+Every brief handed to a delegated worker (`velo-deepseek`, `velo-haiku`,
+`velo-glm`, `velo-local`) MUST contain the sections below. A brief missing any of them has
 caused a real failed run; each rule here is paid for.
 
 ## 1. Target and isolation

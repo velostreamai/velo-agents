@@ -34,6 +34,7 @@ echo "velo-status worker naming"
 check "codex run"           "$(derive codex-20260908T035158Z.log)"       "codex"
 check "deepseek run"        "$(derive deepseek-20260908T035158Z.log)"    "deepseek"
 check "glm run"             "$(derive glm-20260908T035158Z.log)"         "glm"
+check "haiku run"           "$(derive haiku-20260908T035158Z.log)"       "haiku"
 # The one a naive "cut at the first hyphen" gets wrong.
 check "velo-local keeps its hyphen" "$(derive velo-local-20260908T035158Z.log)" "velo-local"
 
@@ -92,6 +93,14 @@ cmd_worker() { worker_from_cmd "$1"; }
 check "an empty local endpoint does not claim every run" \
   "$(VELO_LMSTUDIO_BASE_URL='' VELO_LLAMA_SERVER_URL='' worker_from_cmd 'codex exec --cd /x')" "velo-codex"
 check "live glm names velo-glm"        "$(cmd_worker '--model z-ai/glm-5.3-flash')"          "velo-glm"
+# #2423: the haiku route is matched on the anthropic/ model id, not a z-ai/ one.
+check "live haiku names velo-haiku"    "$(cmd_worker '--model anthropic/claude-haiku-5.5')"  "velo-haiku"
+check_not_haiku() { [[ "$(cmd_worker "$1")" != "velo-haiku" ]]; }
+if check_not_haiku '--model z-ai/glm-5.3-flash'; then
+  echo "  PASS  a glm run is not mis-named velo-haiku"
+else
+  echo "  FAIL  the haiku arm swallowed a glm model"; FAILURES=$((FAILURES+1))
+fi
 check "live codex names velo-codex"    "$(cmd_worker 'codex exec --cd /x')"                  "velo-codex"
 check "live local names velo-local"    "$(cmd_worker '--model qwen3.8-flash-next-ud --base-url http://127.0.0.1:8091/v1')" "velo-local"
 # The route is the LM Studio endpoint, not a model name: any local model matches.

@@ -25,8 +25,8 @@ ends by printing "Detached — no completion event", which is exactly true:
   flags on every invocation, prints them, and discards them.
 
 So the routing table in `velo-dispatch:12-14` — `worker:local` free,
-`worker:deepseek` very cheap, `worker:glm` pricier — is a set of labels, not a
-set of measurements. We cannot answer:
+`worker:deepseek` very cheap, `worker:haiku` cheap, `worker:glm` pricier — is a
+set of labels, not a set of measurements. We cannot answer:
 
 - Which worker actually lands work, per unit of cost?
 - Is the free worker cheaper once rework is counted? (#1973 → #1975 is one
@@ -59,7 +59,7 @@ reader tell whether two rows are comparable at all.
 ## Non-goals
 
 - No change to **worker** routing policy. This spec measures the current
-  worker table — local / deepseek / glm / codex — it does not re-decide it.
+  worker table — local / deepseek / haiku / glm / codex — it does not re-decide it.
 
   **Narrowed 2026-09-06 (#2007 F1).** This originally read "no change to routing
   policy", which is broad enough to forbid pinning a PROVIDER ENDPOINT — a

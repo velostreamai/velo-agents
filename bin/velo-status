@@ -97,6 +97,9 @@ worker_from_cmd() {   # $1 = the process argv
   done
   case "$1" in
     *deepseek/deepseek*)      echo "velo-deepseek" ;;
+    # #2423: the haiku route is Anthropic, so it matches on the anthropic/ id
+    # rather than a z-ai/ one. Same one-arm-per-ROUTE rule as the rest.
+    *anthropic/claude-haiku*)  echo "velo-haiku" ;;
     *z-ai/glm*)               echo "velo-glm" ;;
     # The LM Studio endpoint IS the local route — a model-name arm broke
     # the moment the model changed (a live Flash-Next run showed `running?`).

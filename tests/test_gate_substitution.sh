@@ -174,7 +174,7 @@ sc_post_under_existing_header() {
 sc_post_advisory() {
   SC_FAILS=""
   local by
-  for by in deepseek glm; do
+  for by in deepseek haiku glm; do
     post_report check-code "$by" "$REPORT"
     [[ $RC -eq 0 ]];                                                sc_check "$by-posts" $?
     [[ "$(nth "$STUB_POSTED" 1)" == "gate: check-code @ $SHORT" ]]; sc_check "$by-header-first" $?
@@ -216,7 +216,7 @@ sc_gate_declares() {
 sc_gate_advisory() {
   SC_FAILS=""
   local by m
-  for by in deepseek glm; do
+  for by in deepseek haiku glm; do
     for m in --pass --block --running; do
       gate_run "$m" "$by"
       [[ $RC -eq 0 ]]; sc_check "$by$m-succeeds" $?
@@ -262,7 +262,7 @@ sc_post_under_existing_header
 [[ -z "$SC_FAILS" ]] && ok "a report with its own gate header keeps it first, with the note directly under" \
                      || fail "the declaration displaced or doubled the gate header:$SC_FAILS"
 sc_post_advisory
-[[ -z "$SC_FAILS" ]] && ok "deepseek/glm marker: the report is declared ADVISORY, Codex named as the gating leg" \
+[[ -z "$SC_FAILS" ]] && ok "deepseek/haiku/glm marker: the report is declared ADVISORY, Codex named as the gating leg" \
                      || fail "an OpenRouter check-code is posted without its advisory declaration:$SC_FAILS"
 
 echo
@@ -271,7 +271,7 @@ sc_gate_declares
 [[ -z "$SC_FAILS" ]] && ok "--pass/--block/--running/--show state the substitution (and still set the label)" \
                      || fail "the label records a gate result without declaring the substitution:$SC_FAILS"
 sc_gate_advisory
-[[ -z "$SC_FAILS" ]] && ok "deepseek/glm marker: --pass/--block/--running/--show state the check-code is ADVISORY" \
+[[ -z "$SC_FAILS" ]] && ok "deepseek/haiku/glm marker: --pass/--block/--running/--show state the check-code is ADVISORY" \
                      || fail "velo-gate records an OpenRouter check-code without declaring it advisory:$SC_FAILS"
 sc_gate_silent_when_not_sonnet
 [[ -z "$SC_FAILS" ]] && ok "no marker or an opus marker: velo-gate output is unchanged" \
@@ -329,11 +329,11 @@ prove "gate: label line" gate sc_gate_declares \
 prove "gate: --show line" gate sc_gate_declares \
   '[[ -n "$SUBST_SHOW" ]] && echo "  check-code :' '[[ -n "$SUBST_SHOW" ]] && : "  check-code :'
 prove "post: advisory routes declared" post sc_post_advisory \
-  '      deepseek|glm)
+  '      deepseek|haiku|glm)
         #' '      never)
         #'
 prove "gate: advisory routes declared" gate sc_gate_advisory \
-  '  deepseek|glm)
+  '  deepseek|haiku|glm)
     # #2350' '  never)
     # #2350'
 

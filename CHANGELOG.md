@@ -6,6 +6,17 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — the haiku worker tier (#2423)
+
+`worker:haiku` routes to `velo-haiku` on `anthropic/claude-haiku-5.5` ($0.10/M
+in, $0.50/M out), slotted between `worker:deepseek` and `worker:glm` in the tier
+order, and `--check-code-by haiku` joins the advisory OpenRouter check-code
+routes (`velo-gate-run`, `velo-pr-gate`, the `velo-gate` / `velo-gate-post`
+declarations, `velo-status`'s worker derivation). **Prevents:** the leap from
+DeepSeek straight to glm rates — a DeepSeek-shaped task that wants the Claude
+family had no cheap rung, and an escalation off a refused DeepSeek run jumped
+over the cheap Anthropic leg.
+
 ### Added — check-code on OpenRouter (advisory); the second opinion is reaped, not waited for (#2350)
 
 `velo-pr-gate` / `velo-gate-run --check-code-by deepseek|glm` runs the check-code

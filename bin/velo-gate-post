@@ -186,7 +186,7 @@ if [[ "$NAME" == "check-code" ]]; then
     case "$CC_BY" in
       sonnet)
         SUBST_NOTE="Reviewer substitution (declared): check-code was NOT run by its routed reviewer (opus --effort high — that leg has never produced a report; it times out). It was run by a read-only Sonnet agent launched by the orchestrator from the prompt velo-pr-gate wrote. Read this result as a Sonnet-grade check-code." ;;
-      deepseek|glm)
+      deepseek|haiku|glm)
         # The OpenRouter routes (#2350) have not earned a gating verdict: the
         # report is posted, and declared ADVISORY so it never reads as a Claude
         # review.

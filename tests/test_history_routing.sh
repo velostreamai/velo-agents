@@ -44,10 +44,11 @@ done
 
 # ── tier ordering ──────────────────────────────────────────────────────────
 # The whole guard reduces to this comparison, so pin it directly.
-# Renumbered when velo-deepseek41 was added between deepseek and glm. Ranks are
-# derived from the worker NAME on every call and never stored, so this cannot
-# invalidate a historical result.jsonl row.
-for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-glm:2' 'velo-codex:3'; do
+# Renumbered twice: for velo-deepseek41 between deepseek and glm, then for
+# velo-haiku (#2423) between deepseek and glm. Ranks are derived from the worker
+# NAME on every call and never stored, so neither renumbering can invalidate a
+# historical result.jsonl row.
+for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-haiku:2' 'velo-glm:3' 'velo-codex:4'; do
   GOT=$(TIER_RANK "${PAIR%%:*}"); WANT="${PAIR##*:}"
   if [[ "$GOT" == "$WANT" ]]; then
     ok "tier rank ${PAIR%%:*} = $GOT"
@@ -71,6 +72,19 @@ if [[ "$(decide velo-deepseek failed velo-deepseek "")" == "refuse" ]]; then
   ok "#2000 shape: same tier after a failure is refused"
 else
   fail "#2000 shape allowed — the 253-turn re-dispatch would happen again"
+fi
+
+# #2423: the escalation rung off deepseek is velo-haiku, and haiku is itself a
+# tier — a failed haiku run must not be re-dispatched to haiku.
+if [[ "$(decide velo-deepseek failed velo-haiku "")" == "allow" ]]; then
+  ok "#2423 shape: escalating deepseek -> haiku after a failure proceeds"
+else
+  fail "the deepseek -> haiku escalation was refused — #2423's rung is unreachable"
+fi
+if [[ "$(decide velo-haiku failed velo-haiku "")" == "refuse" ]]; then
+  ok "haiku is its own tier: a same-tier haiku re-dispatch after a failure is refused"
+else
+  fail "haiku did not rank as its own tier — it would collide with deepseek or glm"
 fi
 
 # Same tier at the TOP tier: nowhere to escalate, but still refused.

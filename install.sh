@@ -102,7 +102,7 @@ ok "chmod +x on $(find "$DEST/bin" -type f | wc -l | tr -d ' ') scripts"
 # Expose the orchestrator-facing skills to Claude Code. Review skills
 # (check-code, check-spec) are NOT linked here — workers get them inlined via
 # `--skill`, and the orchestrator already resolves them from ~/.claude/commands.
-for s in velo-deepseek velo-glm velo-local; do
+for s in velo-deepseek velo-haiku velo-glm velo-local; do
   [[ -f "$DEST/skills/$s/SKILL.md" ]] || continue
   mkdir -p "$SKILLS/$s"
   ln -sf "$DEST/skills/$s/SKILL.md" "$SKILLS/$s/SKILL.md"

@@ -13,7 +13,7 @@
 #
 # Two things are asserted about the launch block, and they are different claims:
 #   * each SDK arm passes the skill, and
-#   * all three pass the SAME variable, resolved once — a path written per route
+#   * all four pass the SAME variable, resolved once — a path written per route
 #     is a path that drifts per route, which is the defect the brief named.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,27 +56,27 @@ launch() { NAME="$1" bash "$TMPD/arms.sh" 2>&1; }
 
 echo
 echo "the SDK-runner routes carry the skill"
-for route in velo-local velo-deepseek velo-glm; do
+for route in velo-local velo-deepseek velo-haiku velo-glm; do
   OUT=$(launch "$route")
   check "$route names the --skill flag"  "$OUT" "--skill"
   check "$route passes the shared path"  "$OUT" "$TMPD/check-code.md"
 done
 
 echo
-echo "all three resolve the SAME variable — one path, not three literals"
+echo "all four resolve the SAME variable — one path, not four literals"
 # Extracted per arm so the check survives a reformat. Three arms each holding
 # their own literal is exactly the drift the brief asked against.
 SAME=$(python3 - "$DISPATCH" <<'PYEOF'
 import re, sys, pathlib
 src = pathlib.Path(sys.argv[1]).read_text()
-arms = dict(re.findall(r'(velo-(?:local|deepseek|glm))\)(.*?);;\n', src, re.DOTALL))
+arms = dict(re.findall(r'(velo-(?:local|deepseek|haiku|glm))\)(.*?);;\n', src, re.DOTALL))
 vals = {k: sorted(set(re.findall(r'--skill\s+"([^"]+)"', v))) for k, v in arms.items()}
-print("MISSING-ARM" if len(vals) != 3 else
+print("MISSING-ARM" if len(vals) != 4 else
       (list(vals.values())[0][0] if len({tuple(v) for v in vals.values()}) == 1
        and all(len(v) == 1 for v in vals.values()) else "DRIFTED: %s" % vals))
 PYEOF
 )
-check "one --skill value across all three SDK arms" "$SAME" '$CHECK_CODE_SKILL'
+check "one --skill value across all four SDK arms" "$SAME" '$CHECK_CODE_SKILL'
 # Asserted against the VARIABLE, not an expanded path: three arms each carrying
 # the same literal string would satisfy "one value" while still being three
 # literals that drift the first time one is edited.
@@ -140,7 +140,7 @@ check   "refusing rather than dropping" "$OUT" "silently skips the gate"
 # Empty is the other silent shape: the flag is satisfied, the gate is not.
 refuses "an empty skill fails loud" "$(run_pf velo-glm "$TMPD/empty.md")" "EMPTY"
 
-for route in velo-local velo-deepseek velo-glm; do
+for route in velo-local velo-deepseek velo-haiku velo-glm; do
   run_pf "$route" "$TMPD/absent.md" > /dev/null
   refuses "$route refuses a missing skill" "$(cat "$TMPD/pf.out")" "is missing"
 done

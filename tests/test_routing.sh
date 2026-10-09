@@ -62,6 +62,10 @@ check_not "does not refuse"             "$OUT" "DIE:"
 echo
 echo "agreement routes"
 OUT=$(run "worker:glm" "glm");       check "label+spec agree"   "$OUT" "OK: routed to velo-glm"
+# #2423: haiku is a route like any other — label only, spec only, and agreement.
+OUT=$(run "worker:haiku" "haiku");   check "label+spec agree (haiku)" "$OUT" "OK: routed to velo-haiku"
+OUT=$(run "worker:haiku" "");        check "label only (haiku)"  "$OUT" "OK: routed to velo-haiku"
+OUT=$(run "" "haiku");               check "spec alone does NOT route (haiku)" "$OUT" "no 'worker:*' label"
 
 # The new rung must route like any other label, and — more importantly — an
 # UNROUTABLE value must still be refused. Adding a route widens the accepted set
@@ -109,7 +113,7 @@ check "two worker labels rejected" "$OUT" "at most one"
 echo
 echo "every routed NAME has a dispatch arm"
 DISP="$(dirname "$0")/../bin/velo-dispatch"
-for N in velo-local velo-deepseek velo-glm velo-codex; do
+for N in velo-local velo-deepseek velo-haiku velo-glm velo-codex; do
   if grep -qE "^  $N\\)" "$DISP"; then
     echo "  PASS  $N has a dispatch arm"
   else

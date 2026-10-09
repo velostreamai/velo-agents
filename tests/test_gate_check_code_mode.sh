@@ -93,7 +93,7 @@ cat > "$TMPD/bin/codex" <<EOF
 cat >/dev/null
 exec -a $MARKER sleep 400
 EOF
-# The OpenRouter runner velo-pr-gate launches for --check-code-by deepseek|glm
+# The OpenRouter runner velo-pr-gate launches for --check-code-by deepseek|haiku|glm
 # (it resolves it under $HOME, which run_gate points here). Records its argv.
 cat > "$TMPD/home/.agents/bin/velo-openrouter-agent" <<EOF
 #!/bin/bash
@@ -246,7 +246,7 @@ sc_refused_run_writes_nothing() {
   [[ ! -e "$GATE_DIR/check-code.by" ]];              sc_check no-stale-route-after-a-refusal $?
 }
 
-# ── scenario: --check-code-by deepseek|glm runs the prompt on OpenRouter (#2350) ──
+# ── scenario: --check-code-by deepseek|haiku|glm runs the prompt on OpenRouter (#2350) ──
 # The route is dispatched by velo-pr-gate itself, read-only, with the sonnet
 # route's prompt and output shape, and recorded so it is declared ADVISORY.
 # Runs on FAST_PATH (no codex), so the leg under test is the only dispatch.
@@ -303,9 +303,13 @@ sc_openrouter_route deepseek deepseek/deepseek-v4.1-flash
 sc_openrouter_route glm z-ai/glm-5.3-flash
 [[ -z "$SC_FAILS" ]] && ok "--check-code-by glm: read-only OpenRouter leg, pinned model, same prompt, route recorded" \
                      || fail "glm route:$SC_FAILS"
+# #2423: haiku is a sibling of deepseek/glm on the same leg, not a new code path.
+sc_openrouter_route haiku anthropic/claude-haiku-5.5
+[[ -z "$SC_FAILS" ]] && ok "--check-code-by haiku: read-only OpenRouter leg, pinned model, same prompt, route recorded" \
+                     || fail "haiku route:$SC_FAILS"
 # The pins must be velo-dispatch's: a report from a model the worker records do
 # not describe is a reviewer nobody has measured.
-for r in deepseek glm; do
+for r in deepseek haiku glm; do
   want=$(awk -v arm="  velo-$r)" '$0 == arm {f=1} f && /MODEL_ID=/ {gsub(/.*MODEL_ID=.|.$/, ""); print; exit}' "$BIN/velo-dispatch")
   got=$(awk -v arm="  $r)" 'index($0, arm) == 1 && /CODE_MODEL_ID=/ {gsub(/.*CODE_MODEL_ID=.|. ;;$/, ""); print; exit}' "$GATE")
   if [[ -n "$want" && "$want" == "$got" ]]; then
@@ -411,9 +415,12 @@ else
 fi
 
 # ── 6. a bad route is refused before anything happens ────────────────────────
+# #2423: 'haiku' used to be the unrouted token here; it is a route now, so the
+# probes use 'gemini'. The assertions are unchanged in kind — refused, and the
+# allowed set named.
 rm -rf "$GATE_DIR"
-run_gate "$FAST_PATH" --check-code-by haiku
-if [[ $RC -ne 0 ]] && grep -q "must be 'sonnet', 'opus', 'deepseek' or 'glm', got 'haiku'" "$TMPD/out.txt"; then
+run_gate "$FAST_PATH" --check-code-by gemini
+if [[ $RC -ne 0 ]] && grep -q "must be 'sonnet', 'opus', 'deepseek', 'haiku' or 'glm', got 'gemini'" "$TMPD/out.txt"; then
   ok "an unknown route is refused and the allowed values are named"
 else
   fail "unknown route accepted or unexplained (rc=$RC): $(tail -2 "$TMPD/out.txt")"
@@ -424,18 +431,26 @@ if [[ $RC -ne 0 ]] && grep -q "needs a value" "$TMPD/out.txt"; then
 else
   fail "a dangling --check-code-by was accepted (rc=$RC)"
 fi
-VELO_CHECK_CODE=haiku run_gate "$FAST_PATH"
-if [[ $RC -ne 0 ]] && grep -q "got 'haiku'" "$TMPD/out.txt"; then
+VELO_CHECK_CODE=gemini run_gate "$FAST_PATH"
+if [[ $RC -ne 0 ]] && grep -q "got 'gemini'" "$TMPD/out.txt"; then
   ok "an unknown VELO_CHECK_CODE is refused"
 else
-  fail "VELO_CHECK_CODE=haiku was accepted (rc=$RC)"
+  fail "VELO_CHECK_CODE=gemini was accepted (rc=$RC)"
 fi
 # `=` form.
-run_gate "$FAST_PATH" --check-code-by=haiku
-if [[ $RC -ne 0 ]] && grep -q "got 'haiku'" "$TMPD/out.txt"; then
+run_gate "$FAST_PATH" --check-code-by=gemini
+if [[ $RC -ne 0 ]] && grep -q "got 'gemini'" "$TMPD/out.txt"; then
   ok "--check-code-by=VALUE is parsed too"
 else
-  fail "--check-code-by=haiku was accepted (rc=$RC)"
+  fail "--check-code-by=gemini was accepted (rc=$RC)"
+fi
+# #2423: the route the probes vacated is accepted, not merely parsed — asserted
+# statically here so this section still leaves no gate state behind (the gate's
+# own end-to-end haiku run is sc_openrouter_route above).
+if grep -qF "  sonnet|opus|deepseek|haiku|glm) ;;" "$GATE"; then
+  ok "--check-code-by haiku is inside the accepted set"
+else
+  fail "haiku is not in the accepted route set — haiku would be refused"
 fi
 if [[ ! -e "$GATE_DIR" ]]; then
   ok "a refused route leaves no gate state behind"

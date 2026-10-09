@@ -9,10 +9,10 @@
 #                                       --wait this returns the moment the
 #                                       gates are launched, exactly as before.
 #   velo-pr-gate <pr> --plan           show what would run, dispatch nothing
-#   velo-pr-gate <pr> <scope-file> --check-code-by sonnet|opus|deepseek|glm
+#   velo-pr-gate <pr> <scope-file> --check-code-by sonnet|opus|deepseek|haiku|glm
 #                                      choose check-code's route (default sonnet;
 #                                      env VELO_CHECK_CODE; the flag wins).
-#                                      deepseek|glm are ADVISORY (see below)
+#                                      deepseek|haiku|glm are ADVISORY (see below)
 #   velo-pr-gate <pr> <scope-file> --brief-only
 #                                      generate (or reuse) the review brief and
 #                                      STOP: nothing is dispatched and an unfilled
@@ -65,7 +65,7 @@
 #                              "do not write" is a guarantee rather than a
 #                              request. velo-glm committed on 2 of its 3
 #                              read-only dispatches (#1987, #1994).
-#   check-code   -> deepseek|glm  OPT-IN, ADVISORY (--check-code-by deepseek|glm):
+#   check-code   -> deepseek|haiku|glm  OPT-IN, ADVISORY (--check-code-by deepseek|haiku|glm):
 #                              the cheap route. The sonnet leg costs ~90-115k
 #                              Claude tokens a PR; this runs the SAME prompt on an
 #                              OpenRouter model through velo-openrouter-agent, read-
@@ -173,23 +173,24 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
     --brief-only) BRIEF_ONLY=1 ;;
     --check-code-by)
       i=$((i + 1))
-      [[ $i -lt ${#ARGS[@]} ]] || die "--check-code-by needs a value: sonnet | opus | deepseek | glm"
+      [[ $i -lt ${#ARGS[@]} ]] || die "--check-code-by needs a value: sonnet | opus | deepseek | haiku | glm"
       CHECK_CODE_BY="${ARGS[$i]}" ;;
     --check-code-by=*) CHECK_CODE_BY="${a#--check-code-by=}" ;;
     *)      [[ -z "$SCOPE" ]] && SCOPE="$a" ;;
   esac
   i=$((i + 1))
 done
-[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] [--brief-only] [--check-code-by sonnet|opus|deepseek|glm] | <pr> --plan"
+[[ "$PR" =~ ^[0-9]+$ ]] || die "usage: velo-pr-gate <pr> <scope-file> [--exec] [--wait] [--brief-only] [--check-code-by sonnet|opus|deepseek|haiku|glm] | <pr> --plan"
 case "$CHECK_CODE_BY" in
-  sonnet|opus|deepseek|glm) ;;
-  *) die "check-code route must be 'sonnet', 'opus', 'deepseek' or 'glm', got '$CHECK_CODE_BY' (--check-code-by / VELO_CHECK_CODE)" ;;
+  sonnet|opus|deepseek|haiku|glm) ;;
+  *) die "check-code route must be 'sonnet', 'opus', 'deepseek', 'haiku' or 'glm', got '$CHECK_CODE_BY' (--check-code-by / VELO_CHECK_CODE)" ;;
 esac
 # The OpenRouter routes' models: the SAME pins as velo-dispatch's velo-deepseek /
 # velo-glm arms (tests/test_gate_check_code_openrouter.sh fails if they drift), so
 # a check-code report is from the model the worker records already describe.
 case "$CHECK_CODE_BY" in
   deepseek) CODE_MODEL_ID='deepseek/deepseek-v4.1-flash' ;;
+  haiku)    CODE_MODEL_ID='anthropic/claude-haiku-5.5' ;;
   glm)      CODE_MODEL_ID='z-ai/glm-5.3-flash' ;;
   *)        CODE_MODEL_ID='' ;;
 esac

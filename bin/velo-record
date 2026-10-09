@@ -7,7 +7,8 @@
 #
 # Why this exists (issue #1992): every gate in this directory validates what
 # happens BEFORE a worker runs. Nothing recorded what happened after, so the
-# routing table in velo-dispatch — local free / deepseek cheap / glm pricier —
+# routing table in velo-dispatch — local free / deepseek cheap / haiku cheap /
+# glm pricier —
 # was a set of labels rather than a set of measurements. We could not say which
 # worker lands work per unit cost, nor whether the cheap path stays cheap once
 # rework is counted (#1973 -> #1975 says it does not always).

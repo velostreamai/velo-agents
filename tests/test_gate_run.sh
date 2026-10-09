@@ -187,8 +187,10 @@ BRIEF
       fi
     fi
     [[ -f "$STUB_DIR/sonnet" ]] && printf 'prompt\n' > "$GD/check-code-agent-prompt.md"
-    if [[ -f "$STUB_DIR/deepseek" ]]; then
-      printf 'report\n' > "$GD/code.log"; printf 'deepseek\n' > "$GD/check-code.by"
+    if [[ -f "$STUB_DIR/deepseek" ]] || [[ -f "$STUB_DIR/haiku" ]]; then
+      printf 'report\n' > "$GD/code.log"
+      if [[ -f "$STUB_DIR/haiku" ]]; then printf 'haiku\n' > "$GD/check-code.by"
+      else printf 'deepseek\n' > "$GD/check-code.by"; fi
     fi
     case "$(cat "$STUB_DIR/codex.mode" 2>/dev/null || echo finished)" in
       none) ;;
@@ -389,10 +391,13 @@ sc_usage() {
   [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "scope file not found"; sc_check missing-scope-file $?
   run_wrapper "$TPR" "$SCOPE" --bogus
   [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "unknown argument: --bogus"; sc_check unknown-flag $?
-  run_wrapper "$TPR" "$SCOPE" --check-code-by haiku
-  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "must be 'sonnet', 'opus', 'deepseek' or 'glm', got 'haiku'"; sc_check bad-route $?
-  run_wrapper "$TPR" "$SCOPE" --check-code-by=haiku
-  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "got 'haiku'"; sc_check bad-route-equals-form $?
+  # #2423: the invalid-token probe moved off 'haiku' — haiku is a route now, so it
+  # could no longer prove the rejection path. The assertions are unchanged in kind:
+  # an unrouted token is refused AND the message lists the whole accepted set.
+  run_wrapper "$TPR" "$SCOPE" --check-code-by gemini
+  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "must be 'sonnet', 'opus', 'deepseek', 'haiku' or 'glm', got 'gemini'"; sc_check bad-route $?
+  run_wrapper "$TPR" "$SCOPE" --check-code-by=gemini
+  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "got 'gemini'"; sc_check bad-route-equals-form $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by
   [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "needs a value"; sc_check dangling-route-flag $?
   [[ ! -e "$STUB_DIR/calls.log" ]]; sc_check velo-pr-gate-never-called $?
@@ -988,8 +993,15 @@ sc_advisory_hint() {
   [[ $RC -eq 0 ]];                                 sc_check deepseek-route-accepted $?
   has "$TMPD/wrapper.out" "the deepseek leg's report (ADVISORY — not a gating verdict) is the tail of $GATE_DIR/code.log"; sc_check says-advisory $?
   ! has "$TMPD/wrapper.out" "the opus leg's report"; sc_check not-called-opus $?
+  ! has "$TMPD/wrapper.out" "the haiku leg's report"; sc_check not-called-haiku $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by glm
   [[ $RC -eq 0 ]];                                 sc_check glm-route-accepted $?
+  # #2423: haiku is the sibling of deepseek/glm on the same advisory leg, so it
+  # must be accepted AND named in the hint like the others.
+  : > "$STUB_DIR/haiku"
+  run_wrapper "$TPR" "$SCOPE" --check-code-by haiku
+  [[ $RC -eq 0 ]];                                 sc_check haiku-route-accepted $?
+  has "$TMPD/wrapper.out" "the haiku leg's report (ADVISORY — not a gating verdict) is the tail of $GATE_DIR/code.log"; sc_check says-advisory $?
 }
 
 sc_check_code_hint() {
@@ -1504,7 +1516,7 @@ run_scenarios \
   "sc_empty_range::an empty diff range ends the round without a verdict" \
   "sc_check_code_hint::the Sonnet prompt and the post files are named at the end" \
   "sc_finish_line::the velo-gate-finish line names the reports the plan has: both, either one, or none" \
-  "sc_advisory_hint::--check-code-by deepseek|glm is accepted and its report named ADVISORY" \
+  "sc_advisory_hint::--check-code-by deepseek|haiku|glm is accepted and its report named ADVISORY" \
   "sc_reap_after_codex::a second opinion still running past the grace is killed, children too, once Codex is done" \
   "sc_reap_grace::a second opinion that finishes within the grace is left to finish" \
   "sc_reap_on_failure::a failed round does not leave the second opinion running" \
@@ -1976,9 +1988,9 @@ prove_run "finish line: check-code only" sc_finish_line \
 prove_run "finish line: no report at all" sc_finish_line \
   'no check-code or code-review report to post for this plan' 'a finish line for this plan'
 prove_run "advisory routes accepted" sc_advisory_hint \
-  '    sonnet|opus|deepseek|glm) ;;' '    sonnet|opus) ;;'
+  '    sonnet|opus|deepseek|haiku|glm) ;;' '    sonnet|opus) ;;'
 prove_run "advisory report named" sc_advisory_hint \
-  '      deepseek|glm)
+  '      deepseek|haiku|glm)
         echo "  check-code  the $by' '      never)
         echo "  check-code  the $by'
 prove_run "reaped once Codex is done" sc_reap_after_codex \

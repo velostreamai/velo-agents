@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Velostream worker runner — OpenRouter-routed models (deepseek, glm).
+"""Velostream worker runner — OpenRouter-routed models (deepseek, haiku, glm).
 
 A thin shim over `velo_worker_runner.py`, which holds the whole implementation
 and is parameterised by provider profile (#2007 F7).

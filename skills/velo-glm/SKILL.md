@@ -212,6 +212,7 @@ validation before considering the issue complete.
 |---|---|---|---|
 | `velo-local` | qwen3.8-flash-next-ud (Qwen3.8-Flash-Next, LM Studio) | **free** — runs locally | triage, investigation, check-spec, second-opinion review; slow per task |
 | `velo-deepseek` | deepseek/deepseek-v4-flash-0731 | **very cheap** | fast, scoped implementation against a pinned design |
+| `velo-haiku` | anthropic/claude-haiku-5.5 | **cheap** ($0.10/M in, $0.50/M out) | the DeepSeek-shaped job on the Claude leg — scoped implementation when the Anthropic family is preferred |
 | `velo-glm` | z-ai/glm-5.3-flash | **more expensive, good value** | longer-horizon agentic work, per-case classification judgement |
 
 **Cost-first routing.** Default to `velo-local` — it is free and a capable
@@ -222,7 +223,7 @@ value comes from sustained multi-step reasoning or per-case judgement, where a
 wrong call costs more than the tokens. Do not run GLM on work the other two
 would do correctly.
 
-All three share `~/.agents/rules/velo-impl.md` (implementation policy) and
+All of them share `~/.agents/rules/velo-impl.md` (implementation policy) and
 `~/.agents/rules/velo-brief-spec.md` (what a brief must contain).
 
 They can run CONCURRENTLY — give each its own git worktree and non-overlapping

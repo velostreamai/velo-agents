@@ -85,7 +85,7 @@ case "$CC_BY" in
   sonnet)
     SUBST=" [check-code: SUBSTITUTED reviewer, a read-only Sonnet agent and not opus:high; declared in the gate comment]"
     SUBST_SHOW="run by a SUBSTITUTED reviewer (read-only Sonnet agent, not opus:high) — declared in the gate comment" ;;
-  deepseek|glm)
+  deepseek|haiku|glm)
     # #2350: the OpenRouter routes are advisory, never a gating verdict.
     SUBST=" [check-code: ADVISORY, run by $CC_BY on OpenRouter and not a Claude reviewer; Codex code-review is the gating leg; declared in the gate comment]"
     SUBST_SHOW="ADVISORY — run by $CC_BY on OpenRouter, not a Claude reviewer; Codex code-review is the gating leg — declared in the gate comment" ;;

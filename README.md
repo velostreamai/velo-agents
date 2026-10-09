@@ -78,6 +78,7 @@ and the tests** — never from the worker's self-report.
     velo-brief-spec.md             what a task brief MUST contain, and why
   skills/
     velo-deepseek/SKILL.md         orchestrator-facing routing + usage
+    velo-haiku/SKILL.md
     velo-glm/SKILL.md
     velo-local/SKILL.md
     check-code/SKILL.md            review skills, inlined into a worker via --skill
@@ -174,7 +175,7 @@ carrying.
 
 | need | for |
 |---|---|
-| `OPENROUTER_API_KEY` in the environment | DeepSeek and GLM workers |
+| `OPENROUTER_API_KEY` in the environment | DeepSeek, Haiku and GLM workers |
 | `velo-llama-server setup` (once per machine) | the free local worker: llama-server (Homebrew llama.cpp, launchd) serving the model named in `bin/velo-local.conf`, the default backend. `velo-local use lmstudio\|llama` switches to tuned LM Studio (prepared by `velo-local-setup`) and back; `velo-local status` shows which. Override per run with `VELO_LMSTUDIO_URL`. |
 | `gh`, authenticated | issue/PR validation |
 | `python3`, `jq`, `git`, `cargo`, `cargo-nextest`, `ast-grep` | dispatch + worker runtime |
@@ -306,7 +307,7 @@ what it finds:
 
 | label | effect |
 |---|---|
-| `worker:local` / `worker:deepseek` / `worker:glm` / `worker:codex` | **routing.** Exactly one required — zero or two is a refusal. The label picks the model; the orchestrator does not |
+| `worker:local` / `worker:deepseek` / `worker:haiku` / `worker:glm` / `worker:codex` | **routing.** Exactly one required — zero or two is a refusal. The label picks the model; the orchestrator does not |
 | `needs-design` | refuses. A worker must never choose between design options — pin the design on the issue, or dispatch a READ-ONLY analysis brief that presents options and stops |
 | `blocked` | refuses. Resolve the dependency first |
 | `triage-needed` | refuses without `--force`. Four issues in one session turned out already-fixed; the label means "claims not yet verified against master" |
@@ -473,7 +474,7 @@ arbitrary spend. GLM is set to 131,072; the default is 65,536.
 | role | who | what it can do |
 |---|---|---|
 | **orchestrator** | a Claude Code session (usually), or Codex | runs `velo-dispatch` / `velo-status` / `velo-pr-gate`; writes briefs and specs; never writes the feature code itself |
-| **delegated worker** | `velo-local`, `velo-deepseek`, `velo-glm` via the worker runner (`VELO_AGENT_BACKEND`); `worker:codex` via `codex exec` | implements one scoped task in its own worktree, unattended |
+| **delegated worker** | `velo-local`, `velo-deepseek`, `velo-haiku`, `velo-glm` via the worker runner (`VELO_AGENT_BACKEND`); `worker:codex` via `codex exec` | implements one scoped task in its own worktree, unattended |
 | **review gate** | `codex review` for `code-review`; a read-only Sonnet agent for `check-code` (the orchestrator launches it); `velo-local` for `check-spec` | reads a diff read-only and returns findings |
 
 Codex appears in **two** of those roles and they are not interchangeable:
@@ -502,12 +503,13 @@ log looked like a report because the brief is echoed before the model is called.
 If you substitute a different reviewer, **declare it in the gate comment** — the
 label must not imply a reviewer that never ran.
 
-## The four workers
+## The five workers
 
 | skill | model | cost | pick it for |
 |---|---|---|---|
 | `velo-local` | `qwen3.8-flash-next-ud` (LM Studio, llama.cpp >= 2.46.0, 262K ctx) | **free** | triage, investigation, check-spec, second-opinion review; latency-insensitive only (#2235) |
 | `velo-deepseek` | `deepseek/deepseek-v4-flash-0731` | **very cheap** | fast scoped implementation against a pinned design |
+| `velo-haiku` | `anthropic/claude-haiku-5.5` | **cheap** ($0.10/M in, $0.50/M out) | the DeepSeek-shaped job on the Claude leg — scoped implementation when Anthropic is the preferred family |
 | `velo-glm` | `z-ai/glm-5.3-flash` | **pricier, good value** | multi-step reasoning, per-case classification judgement |
 | `worker:codex` | `codex exec` (CLI) | **most expensive** | architecture-weight work — anything where a WRONG answer costs more than the run |
 
@@ -807,7 +809,7 @@ NOT READY: #2000 last ran on velo-deepseek and ended 'read-only-violation'.
       gh issue edit 2000 --repo … --remove-label worker:deepseek --add-label worker:glm
 ```
 
-Tier order is `local < deepseek < glm < codex`.
+Tier order is `local < deepseek < haiku < glm < codex`.
 
 **The refusal names the label change because that is where the decision lives.**
 The worker is chosen at spec/label time and then never revisited — which is the
@@ -979,14 +981,14 @@ velo-merge    1902                  # refuses unless gate:passed AND gate sha ==
 | gate | model | why this one |
 |---|---|---|
 | `code-review` | **Codex** | found a real defect in every round it ran, including against designs already pinned and code the orchestrator wrote |
-| `check-code` | **read-only Sonnet agent** (default) · opus at `--effort high` (`--check-code-by opus`) · DeepSeek / GLM on OpenRouter, **advisory** (`--check-code-by deepseek\|glm`) | the opus leg has never produced a report — it times out; a bounded Sonnet agent does, at a fraction of the cost; the OpenRouter route costs no Claude tokens but has not earned a gating verdict |
+| `check-code` | **read-only Sonnet agent** (default) · opus at `--effort high` (`--check-code-by opus`) · DeepSeek / Haiku / GLM on OpenRouter, **advisory** (`--check-code-by deepseek\|haiku\|glm`) | the opus leg has never produced a report — it times out; a bounded Sonnet agent does, at a fraction of the cost; the OpenRouter route costs no Claude tokens but has not earned a gating verdict |
 | `check-spec` | velo-local | free; fine at bar-by-bar verification |
 
 Choosing the model per PR by judgement is how the routing drifted: a review once
 went to velo-local and came back `MERGE-READY` while missing a HIGH and asserting
 a fact that was demonstrably false. The routing is now in the script.
 
-**The `check-code` route** is chosen by `--check-code-by sonnet|opus|deepseek|glm`
+**The `check-code` route** is chosen by `--check-code-by sonnet|opus|deepseek|haiku|glm`
 or `VELO_CHECK_CODE=…` (the flag wins; the default is `sonnet`):
 
 - `sonnet` — the script launches **nothing** for this gate. It writes
@@ -1001,7 +1003,7 @@ or `VELO_CHECK_CODE=…` (the flag wins; the default is `sonnet`):
   never implies an opus:high result that did not happen.
 - `opus` — the original dispatched leg (`claude -p --model opus --effort high`,
   read-only by construction, health-checked), no substitution declared.
-- `deepseek` | `glm` — the sonnet route's prompt, run by `velo-openrouter-agent`
+- `deepseek` | `haiku` | `glm` — the sonnet route's prompt, run by `velo-openrouter-agent`
   on the model `velo-dispatch` pins for that worker (a test fails if the two
   drift), read-only via the runner's READ-ONLY marker, report in `code.log`
   (`VELO_CHECK_CODE_TIMEOUT`, default 3600s; `VELO_CHECK_CODE_BUDGET_USD`,
@@ -1169,7 +1171,7 @@ record against an older one.
 ### `velo-gate-run` — one gate round in one command
 
 ```bash
-velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|glm]     # launch with run_in_background: true
+velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm]     # launch with run_in_background: true
 ```
 
 It replaces the hand-run sequence, each step of which went wrong in some round:
