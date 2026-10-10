@@ -19,7 +19,7 @@ has()   { if grep -qF -- "$2" <<<"$3"; then echo "  ok   $1"; else echo "  FAIL 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 mkdir -p "$T/bin"
-cp "$BIN/velo-llama-server" "$T/bin/"
+cp "$BIN/velo-llama-server" "$BIN/velo-launchd-lib.sh" "$T/bin/"
 sed 's|^VELO_LMSTUDIO_BASE_URL=.*|VELO_LMSTUDIO_BASE_URL=http://127.0.0.1:9/v1|' "$BIN/velo-local.conf" > "$T/bin/velo-local.conf"
 
 conf() { HOME="$T" VELO_STATE="$T" bash -c '. "$0/velo-local.conf"; eval "printf %s \"\$$1\""' "$T/bin" "$1"; }

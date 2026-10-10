@@ -59,21 +59,21 @@ if launchctl print "gui/$(id -u)/ai.velostream.velo-llama-server" >/dev/null 2>&
 fi
 
 # 5. load and prove it
-"$LMS" unload "$VELO_LOCAL_MODEL_DEFAULT" >/dev/null 2>&1
-"$LMS" load "$VELO_LOCAL_MODEL_DEFAULT" -y >/dev/null 2>&1 || die "lms load $VELO_LOCAL_MODEL_DEFAULT failed — see LM Studio's server log"
+"$LMS" unload "$VELO_GGUF_MODEL_ID" >/dev/null 2>&1
+"$LMS" load "$VELO_GGUF_MODEL_ID" -y >/dev/null 2>&1 || die "lms load $VELO_GGUF_MODEL_ID failed — see LM Studio's server log"
 "$LMS" ps --json 2>/dev/null | python3 -c "
 import json, sys
-m = next((m for m in json.load(sys.stdin) if m['identifier'] == '$VELO_LOCAL_MODEL_DEFAULT'), None)
+m = next((m for m in json.load(sys.stdin) if m['identifier'] == '$VELO_GGUF_MODEL_ID'), None)
 assert m, 'model not loaded'
 assert m['contextLength'] == $LMSTUDIO_CONTEXT, f\"context {m['contextLength']} != $LMSTUDIO_CONTEXT\"
 assert m['parallel'] == $LMSTUDIO_PARALLEL, f\"parallel {m['parallel']} != $LMSTUDIO_PARALLEL\"
 " || die "loaded, but not with the tuned settings above"
-ok "loaded: $VELO_LOCAL_MODEL_DEFAULT, context $LMSTUDIO_CONTEXT, parallel $LMSTUDIO_PARALLEL"
+ok "loaded: $VELO_GGUF_MODEL_ID, context $LMSTUDIO_CONTEXT, parallel $LMSTUDIO_PARALLEL"
 python3 - <<EOF || die "the model did not answer a tool call at $VELO_LMSTUDIO_BASE_URL"
 import json, urllib.request
 tools = [{"type": "function", "function": {"name": "bash", "description": "Run a shell command",
           "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
-body = {"model": "$VELO_LOCAL_MODEL_DEFAULT", "tools": tools, "max_tokens": 4000,
+body = {"model": "$VELO_GGUF_MODEL_ID", "tools": tools, "max_tokens": 4000,
         "messages": [{"role": "user", "content": "List the files in /tmp using the tool."}]}
 req = urllib.request.Request("$VELO_LMSTUDIO_BASE_URL/chat/completions", json.dumps(body).encode(),
                              {"Content-Type": "application/json"})

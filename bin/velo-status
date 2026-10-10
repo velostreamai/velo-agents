@@ -89,10 +89,10 @@ worker_from_cmd() {   # $1 = the process argv
   # The local endpoint is tested OUTSIDE the case: an unset or empty value would
   # make the pattern `*""*`, which matches every argv and would name a codex run
   # velo-local. Guarded here rather than trusted to the caller's environment.
-  # Both local servers are the local route: the default (LM Studio) and the
-  # llama-server alternative. Either may be the one a run was dispatched to.
+  # Every local server is the local route: LM Studio, llama-server and Sushi.
+  # Any of them may be the one a run was dispatched to.
   local u
-  for u in "${VELO_LMSTUDIO_BASE_URL:-}" "${VELO_LLAMA_SERVER_URL:-}"; do
+  for u in "${VELO_LMSTUDIO_BASE_URL:-}" "${VELO_LLAMA_SERVER_URL:-}" "${VELO_SUSHI_SERVER_URL:-}"; do
     if [[ -n "$u" && "$1" == *"$u"* ]]; then echo "velo-local"; return; fi
   done
   case "$1" in

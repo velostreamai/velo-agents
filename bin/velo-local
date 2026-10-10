@@ -4,16 +4,19 @@
 #   velo-local status              the chosen server, whether it is up, what it serves
 #   velo-local use llama           llama-server: the default, ~12% faster, no UI
 #   velo-local use lmstudio        LM Studio (tuned): opt-in, with its UI
+#   velo-local use sushi           Sushi (MLX): on trial, ~1.7x faster per turn
 #   velo-local use <x> --force     switch even while a local worker is running
 #
 # The choice is machine state in $VELO_LOCAL_BACKEND_FILE, read by velo-local.conf,
 # so every consumer (velo-dispatch, velo-pr-gate, velo-status, the runners)
-# follows it. Switching stops one server BEFORE starting the other: two 84 GB
-# copies of the model do not fit in 128 GB.
+# follows it. Switching stops the other servers BEFORE starting the target: two
+# copies of the model (84 GB GGUF, 64 GB Sushi) do not fit in 128 GB.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+# shellcheck source=velo-launchd-lib.sh
+. "$HERE/velo-launchd-lib.sh" || die "velo-launchd-lib.sh missing next to velo-local"
 # shellcheck source=velo-local.conf
 . "$HERE/velo-local.conf" || die "velo-local.conf missing next to velo-local"
 LMS="$VELO_LMS"
@@ -36,13 +39,13 @@ loaded_in_lmstudio() {  # is the worker model loaded in LM Studio right now?
   [[ -x "$LMS" ]] || return 1
   "$LMS" ps --json 2>/dev/null | python3 -c "
 import json, sys
-sys.exit(0 if any(m.get('identifier') == '$VELO_LOCAL_MODEL_DEFAULT' for m in json.load(sys.stdin)) else 1)"
+sys.exit(0 if any(m.get('identifier') == '$VELO_GGUF_MODEL_ID' for m in json.load(sys.stdin)) else 1)"
 }
 
 refuse_if_worker_running() {  # $1 = --force or empty
   [[ "${1:-}" == "--force" ]] && return 0
   local live
-  live=$(ps -axww -o pid=,command= 2>/dev/null | grep -E "velo-openai-agents-runner\.py.*--base-url (${VELO_LMSTUDIO_BASE_URL}|${VELO_LLAMA_SERVER_URL})" | grep -v grep | awk '{print $1}' | head -3 | tr '\n' ' ')
+  live=$(ps -axww -o pid=,command= 2>/dev/null | grep -E "velo-openai-agents-runner\.py.*--base-url (${VELO_LMSTUDIO_BASE_URL}|${VELO_LLAMA_SERVER_URL}|${VELO_SUSHI_SERVER_URL})" | grep -v grep | awk '{print $1}' | head -3 | tr '\n' ' ')
   [[ -z "$live" ]] || die "a local worker is running (pid ${live% }) — switching would kill its server mid-run. Wait, or pass --force."
 }
 
@@ -55,8 +58,8 @@ wait_up() {  # $1 = url, $2 = label
 case "${1:-status}" in
   status)
     echo "worker:local backend: $VELO_LOCAL_BACKEND  ($VELO_LOCAL_BACKEND_FILE)"
-    [[ -n "${VELO_LOCAL_BASE_URL:-}" ]] || die "unknown backend '$VELO_LOCAL_BACKEND' — run: velo-local use lmstudio|llama"
-    for pair in "lmstudio|$VELO_LMSTUDIO_BASE_URL" "llama|$VELO_LLAMA_SERVER_URL"; do
+    [[ -n "${VELO_LOCAL_BASE_URL:-}" ]] || die "unknown backend '$VELO_LOCAL_BACKEND' — run: velo-local use lmstudio|llama|sushi"
+    for pair in "lmstudio|$VELO_LMSTUDIO_BASE_URL" "llama|$VELO_LLAMA_SERVER_URL" "sushi|$VELO_SUSHI_SERVER_URL"; do
       name="${pair%%|*}"; url="${pair#*|}"; mark=" "
       [[ "$name" == "$VELO_LOCAL_BACKEND" ]] && mark="*"
       if up "$url"; then
@@ -71,30 +74,38 @@ case "${1:-status}" in
     ;;
   use)
     target="${2:-}"; force="${3:-}"
-    [[ "$target" == lmstudio || "$target" == llama ]] || die "usage: velo-local use lmstudio|llama [--force]"
+    [[ "$target" == lmstudio || "$target" == llama || "$target" == sushi ]] \
+      || die "usage: velo-local use lmstudio|llama|sushi [--force]"
     refuse_if_worker_running "$force"
     mkdir -p "$(dirname "$VELO_LOCAL_BACKEND_FILE")"
-    if [[ "$target" == llama ]]; then
-      if loaded_in_lmstudio; then
-        "$LMS" unload "$VELO_LOCAL_MODEL_DEFAULT" >/dev/null 2>&1 || die "could not unload $VELO_LOCAL_MODEL_DEFAULT from LM Studio"
-        ok "unloaded from LM Studio"
-      fi
-      "$HERE/velo-llama-server" setup || die "velo-llama-server setup failed"
-    else
-      if launchctl print "gui/$(id -u)/ai.velostream.velo-llama-server" >/dev/null 2>&1; then
-        "$HERE/velo-llama-server" uninstall
-      fi
-      [[ -x "$LMS" ]] || die "LM Studio not found — install it, then run velo-local-setup"
-      "$LMS" load "$VELO_LOCAL_MODEL_DEFAULT" -y >/dev/null 2>&1 \
-        || die "lms load failed — run velo-local-setup (it writes the tuned load settings first)"
-      wait_up "$VELO_LMSTUDIO_BASE_URL" "LM Studio"
-      ok "loaded in LM Studio"
+    # Stop every server that is not the target FIRST, so the target's load never
+    # meets another copy of the model in memory.
+    if [[ "$target" != sushi ]] && velo_launchd_loaded ai.velostream.velo-sushi-server; then
+      "$HERE/velo-sushi-server" uninstall
     fi
+    if [[ "$target" != llama ]] && velo_launchd_loaded ai.velostream.velo-llama-server; then
+      "$HERE/velo-llama-server" uninstall
+    fi
+    if [[ "$target" != lmstudio ]] && loaded_in_lmstudio; then
+      "$LMS" unload "$VELO_GGUF_MODEL_ID" >/dev/null 2>&1 || die "could not unload $VELO_GGUF_MODEL_ID from LM Studio"
+      ok "unloaded from LM Studio"
+    fi
+    case "$target" in
+      llama) "$HERE/velo-llama-server" setup || die "velo-llama-server setup failed" ;;
+      sushi) "$HERE/velo-sushi-server" setup || die "velo-sushi-server setup failed"
+             wait_up "$VELO_SUSHI_SERVER_URL" "Sushi" ;;
+      lmstudio)
+        [[ -x "$LMS" ]] || die "LM Studio not found — install it, then run velo-local-setup"
+        "$LMS" load "$VELO_GGUF_MODEL_ID" -y >/dev/null 2>&1 \
+          || die "lms load failed — run velo-local-setup (it writes the tuned load settings first)"
+        wait_up "$VELO_LMSTUDIO_BASE_URL" "LM Studio"
+        ok "loaded in LM Studio" ;;
+    esac
     # Written LAST, only once the target server answers: a failed switch leaves
     # the previous choice in place rather than pointing workers at a dead server.
     echo "$target" > "$VELO_LOCAL_BACKEND_FILE"
     ok "worker:local now uses $target"
     exec "$0" status
     ;;
-  *) die "usage: velo-local status | use lmstudio|llama [--force]" ;;
+  *) die "usage: velo-local status | use lmstudio|llama|sushi [--force]" ;;
 esac

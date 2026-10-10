@@ -1,0 +1,86 @@
+#!/bin/bash
+# velo-sushi-server — serve the worker:local model with Sushi (MLX), on trial.
+#
+#   velo-sushi-server setup       one-shot, idempotent: sushi binary + model + service
+#   velo-sushi-server install     write + load the launchd agent (starts now, and at login)
+#   velo-sushi-server uninstall   unload + remove the launchd agent (frees the model's memory)
+#   velo-sushi-server status      is it up, which build, which model
+#   velo-sushi-server run         run in the foreground (what launchd calls)
+#
+# Binary, model, endpoint and flags all come from velo-local.conf, like
+# velo-llama-server. Why Sushi, and the measurements: the Sushi section there.
+# Use `velo-local use sushi` rather than calling setup directly: it stops the
+# other servers first, because two copies of the model do not fit in 128 GB.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
+# shellcheck source=velo-launchd-lib.sh
+. "$HERE/velo-launchd-lib.sh" || { echo "velo-launchd-lib.sh missing next to $0" >&2; exit 1; }
+# shellcheck source=velo-local.conf
+. "$HERE/velo-local.conf" || die "velo-local.conf missing next to velo-sushi-server"
+
+LABEL=ai.velostream.velo-sushi-server
+LOG="${VELO_STATE:-$HOME/.agents/state}/sushi-server.log"
+URL="$VELO_SUSHI_SERVER_URL"
+PORT="${URL##*:}"; PORT="${PORT%%/*}"
+HOST="${URL#*://}"; HOST="${HOST%%:*}"
+# launchd runs with a minimal PATH; Homebrew's prefix is not on it.
+SUSHI=$(PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" command -v sushi)
+
+case "${1:-}" in
+  run)
+    [[ -n "$SUSHI" ]] || die "sushi not found — run: velo-sushi-server setup"
+    [[ -f "$VELO_SUSHI_MODEL_DIR/config.json" ]] || die "model not found: $VELO_SUSHI_MODEL_DIR — run: velo-sushi-server setup"
+    # One copy of the model in memory: 64 GB here plus the GGUF's 84 GB does not
+    # fit in 128 GB. A llama-server that is up is refused, not killed — it may be
+    # serving a worker; `velo-local use sushi` is the switch. LM Studio reloads its
+    # last model at login, so that copy is unloaded, exactly as velo-llama-server
+    # does. Only asked once its server answers: `lms` can start LM Studio itself.
+    if curl -sf -m 3 "$VELO_LLAMA_SERVER_URL/models" >/dev/null 2>&1; then
+      die "llama-server is up at $VELO_LLAMA_SERVER_URL — switch with: velo-local use sushi"
+    fi
+    if curl -sf -m 3 "$VELO_LMSTUDIO_BASE_URL/models" >/dev/null 2>&1 && [[ -x "$VELO_LMS" ]] \
+       && "$VELO_LMS" ps --json 2>/dev/null | python3 -c "
+import json, sys
+sys.exit(0 if any(m.get('identifier') == '$VELO_GGUF_MODEL_ID' for m in json.load(sys.stdin)) else 1)"; then
+      "$VELO_LMS" unload "$VELO_GGUF_MODEL_ID" >/dev/null 2>&1 \
+        && echo "velo-sushi-server: unloaded $VELO_GGUF_MODEL_ID from LM Studio (one copy in memory)" \
+        || die "could not unload $VELO_GGUF_MODEL_ID from LM Studio — two copies would not fit"
+    fi
+    "$SUSHI" --version 2>&1 | head -1
+    # Word-splitting VELO_SUSHI_ARGS is intended: it is a flag list.
+    # shellcheck disable=SC2086
+    exec "$SUSHI" serve --model "$VELO_SUSHI_MODEL_DIR" --host "$HOST" --port "$PORT" $VELO_SUSHI_ARGS
+    ;;
+  setup)
+    # Every step checks before it acts, so re-running is safe and cheap.
+    if [[ -z "$SUSHI" ]]; then
+      echo "  .. installing sushi (brew install beamivalice/tap/sushi)"
+      brew install beamivalice/tap/sushi || die "brew install beamivalice/tap/sushi failed"
+      SUSHI=$(PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" command -v sushi)
+    fi
+    ok "sushi present: $("$SUSHI" --version 2>&1 | head -1)"
+    if [[ -f "$VELO_SUSHI_MODEL_DIR/config.json" ]]; then
+      ok "model present: $VELO_SUSHI_MODEL_ID"
+    else
+      echo "  .. downloading $VELO_SUSHI_MODEL_ID (~160 GB on disk incl. the SSD n-gram table)"
+      "$SUSHI" pull "$VELO_SUSHI_MODEL_ID" || die "sushi pull failed (re-run setup to resume)"
+    fi
+    velo_launchd_install "$LABEL" "$HERE/velo-sushi-server" "$LOG"
+    echo "  .. waiting for the model to load"
+    for _ in $(seq 1 100); do curl -sf "http://$HOST:$PORT/health" >/dev/null && break; sleep 3; done
+    "$0" status
+    ;;
+  install)   velo_launchd_install "$LABEL" "$HERE/velo-sushi-server" "$LOG" ;;
+  uninstall) velo_launchd_uninstall "$LABEL" ;;
+  status)
+    if curl -sf "http://$HOST:$PORT/health" >/dev/null; then
+      ok "up at $URL serving $(curl -s "$URL/models" | python3 -c 'import json,sys;print(",".join(m["id"]+" (effort "+str(m.get("default_reasoning_effort"))+")" for m in json.load(sys.stdin)["data"]))')"
+      ok "binary: $SUSHI ($("$SUSHI" --version 2>&1 | head -1))"
+    else
+      die "not responding at $URL — see $LOG"
+    fi
+    ;;
+  *) die "usage: velo-sushi-server setup | install | uninstall | status | run" ;;
+esac

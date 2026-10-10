@@ -84,6 +84,8 @@ llama.cpp, launchd) at `http://127.0.0.1:8091/v1`: ~12% faster decode than LM
 Studio and the only server that enforces `--reasoning-budget`. Set it up once
 with `velo-llama-server setup` (idempotent). `velo-local use lmstudio` switches to
 tuned LM Studio for its UI (`velo-local-setup` prepares it); `velo-local use
+sushi` switches to Sushi (MLX, `velo-sushi-server`, :8092) — on trial: ~1.7x
+faster per turn on the #2235 replay, but it did ~3x the turns; `velo-local use
 llama` switches back; `velo-local status` shows which is live.
 
 ## Invocation — use `velo-dispatch`, do not hand-roll
