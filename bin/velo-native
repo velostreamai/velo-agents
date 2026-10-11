@@ -1,0 +1,248 @@
+#!/bin/bash
+# velo-native — record in-process (Agent-tool) workers so velo-status can show them.
+#
+# A native worker is a Claude subagent the orchestrator runs with the Agent tool.
+# It lives inside the orchestrator's session: there is no process and no dispatch
+# log. velo-status reads the process table and the dispatch logs, so without a
+# record here a native worker is invisible, and "how many slots are busy" has no
+# one-command answer.
+#
+#   velo-native start <issue> <branch> <worktree> [--model haiku|sonnet] [--agent-id <id>]
+#                     (--model defaults to sonnet); prints the record's token
+#   velo-native done  <issue> [--token <token>] [--outcome ok|stopped|failed]
+#                     (--outcome defaults to ok)
+#   velo-native list  [--all]
+#   velo-native rows  [--all]    tab-separated, one line per record; velo-status reads this
+#
+# Records live at $VELO_STATE/native/<issue>.json, one per issue, under the canonical
+# number: `001` and `1` are the same issue. An issue number is digits, at most 9 once
+# leading zeros are dropped; a longer one is refused, not stored. Starting an issue again
+# overwrites its record. Nothing is deleted: velo-status ignores a finished record whose
+# finish is more than 7 days old (`--all` lists it).
+#
+# THE TOKEN. start writes a fresh token into the record and prints it. A worker that a
+# later start replaced on the same issue can still call done late, and a done with no
+# token finishes the REPLACEMENT's record. `done --token` is refused (exit 1, nothing
+# changed) unless the record still carries that token. `done` without --token is
+# unchanged: it finishes whatever record exists, and is for manual use.
+# Orchestrators pass the token that start printed for that worker.
+
+set -uo pipefail
+VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
+NATIVE_DIR="$VELO_STATE/native"
+# Exit status of `native_store finish` when --token does not match. Shared with the
+# python below, which must exit with the same value.
+TOKEN_MISMATCH=3
+
+LIB="$(dirname "${BASH_SOURCE[0]}")/velo-worktree-lib.sh"
+[[ -f "$LIB" ]] || { echo "velo-native: $LIB missing (install.sh copies bin/ whole)" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$LIB"
+
+die() { echo "velo-native: $*" >&2; exit 1; }
+usage() {
+  echo "usage: velo-native start <issue> <branch> <worktree> [--model haiku|sonnet] [--agent-id <id>]" >&2
+  echo "       velo-native done  <issue> [--token <token>] [--outcome ok|stopped|failed]" >&2
+  echo "       velo-native list  [--all]" >&2
+  echo "       velo-native rows  [--all]" >&2
+  exit 2
+}
+check_issue() {  # <typed issue> -> dies unless it is digits, at most 9 once leading zeros are dropped
+  [[ "$1" =~ ^[0-9]+$ ]] || die "issue must be a number, got '$1'"
+  local canon; canon=$(canon_issue "$1")
+  [[ ${#canon} -le 9 ]] || die "issue must be at most 9 digits (leading zeros do not count), got ${#canon} digits"
+}
+now_utc()     { date -u +%FT%TZ; }
+
+# The one program that reads and writes the records. Modes:
+#   write  <issue> <branch> <worktree> <model> <agent_id> <now>   start a record (overwrites); prints its token
+#   finish <issue> <outcome> <now> <token or "">                   set finished_at and outcome. A non-empty token
+#                                                                  must match the record, else TOKEN_MISMATCH and nothing is written
+#   rows   <all 0|1>                                               TSV for velo-status and list
+# Writes are atomic: a temp file in the same directory, then os.replace.
+# A record that cannot be read is named on stderr and fails the command; the
+# readable ones still print, so one bad file does not hide the rest.
+native_store() {
+  python3 -I - "$NATIVE_DIR" "$@" <<'PY'
+import json, os, sys, tempfile, uuid
+from datetime import datetime, timedelta, timezone
+
+NATIVE_DIR, MODE = sys.argv[1], sys.argv[2]
+ARGS = sys.argv[3:]
+TTL = timedelta(days=7)
+TOKEN_MISMATCH = 3  # same value as the bash TOKEN_MISMATCH: finish wrote nothing
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def parse(text):
+    return datetime.strptime(text, STAMP).replace(tzinfo=timezone.utc)
+
+
+# issue is the canonical digit string. Keep it a string: int() raises on a long digit string.
+def record_path(issue):
+    return os.path.join(NATIVE_DIR, "%s.json" % issue)
+
+
+def write_atomic(path, rec):
+    fd, tmp = tempfile.mkstemp(dir=NATIVE_DIR, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def record_files():
+    if not os.path.isdir(NATIVE_DIR):
+        return []
+    names = [n for n in os.listdir(NATIVE_DIR) if n.endswith(".json") and not n.startswith(".")]
+
+    def key(name):
+        stem = name[: -len(".json")]
+        # canonical digits have no leading zeros, so length then digits is numeric order
+        return (0, len(stem), stem, name) if stem.isdigit() else (1, 0, "", name)
+
+    return [os.path.join(NATIVE_DIR, n) for n in sorted(names, key=key)]
+
+
+if MODE == "write":
+    issue, branch, wt, model, agent_id, now = ARGS
+    os.makedirs(NATIVE_DIR, exist_ok=True)
+    # uuid4, not a timestamp: two starts on one issue in the same second must still differ.
+    token = uuid.uuid4().hex
+    write_atomic(record_path(issue), {
+        "issue": issue, "branch": branch, "worktree": wt, "model": model,
+        "agent_id": agent_id or None, "started_at": now, "finished_at": None, "outcome": None,
+        "token": token,
+    })
+    print(token)
+elif MODE == "finish":
+    issue, outcome, now, expected = ARGS
+    path = record_path(issue)
+    with open(path, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    # An empty token is no guard (done without --token). A non-empty one must be the token
+    # this record was started with, checked on the record read here, before anything is written.
+    if expected and rec.get("token") != expected:
+        sys.stderr.write("velo-native: issue %s: --token does not match the record (a later start replaced it, or the token is wrong); nothing was changed\n" % issue)
+        sys.exit(TOKEN_MISMATCH)
+    rec["finished_at"] = now
+    rec["outcome"] = outcome
+    write_atomic(path, rec)
+elif MODE == "rows":
+    show_all = ARGS[0] == "1"
+    now = datetime.now(timezone.utc)
+    bad = 0
+    for path in record_files():
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            fin = rec["finished_at"]
+            if fin is not None and not show_all and now - parse(fin) > TTL:
+                continue
+            started = parse(rec["started_at"])
+            age = max(0, int((now - started).total_seconds() // 60))
+            cells = [rec["issue"], rec["model"], rec["started_at"], fin, rec["outcome"],
+                     rec["branch"], rec["worktree"], rec["agent_id"], age]
+        except Exception as exc:
+            sys.stderr.write("velo-native: cannot read %s: %s: %s\n" % (path, type(exc).__name__, exc))
+            bad += 1
+            continue
+        print("\t".join("-" if c is None or c == "" else str(c) for c in cells))
+    if bad:
+        sys.exit(1)
+else:
+    sys.exit("velo-native: unknown store mode %r" % MODE)
+PY
+}
+
+cmd_start() {
+  [[ $# -ge 3 ]] || usage
+  local issue="$1" branch="$2" wt="$3" model="sonnet" agent_id=""
+  shift 3
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model)    [[ $# -ge 2 ]] || die "--model needs a value"; model="$2"; shift 2 ;;
+      --agent-id) [[ $# -ge 2 ]] || die "--agent-id needs a value"; agent_id="$2"; shift 2 ;;
+      *) die "unknown argument '$1' for start" ;;
+    esac
+  done
+  check_issue "$issue"
+  issue=$(canon_issue "$issue")
+  [[ -n "$branch" ]] || die "branch is empty"
+  [[ -n "$wt" ]] || die "worktree is empty"
+  case "$model" in haiku|sonnet) ;; *) die "--model must be haiku or sonnet, got '$model'" ;; esac
+  local token
+  token=$(native_store write "$issue" "$branch" "$wt" "$model" "$agent_id" "$(now_utc)") \
+    || die "could not write the record for issue $issue"
+  echo "velo-native: issue $issue started ($model) on $branch"
+  echo "velo-native: issue $issue token $token"
+}
+
+cmd_done() {
+  [[ $# -ge 1 ]] || usage
+  local issue="$1" outcome="ok" token="" rc
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --outcome) [[ $# -ge 2 ]] || die "--outcome needs a value"; outcome="$2"; shift 2 ;;
+      --token)   [[ $# -ge 2 && -n "$2" ]] || die "--token needs a non-empty value"; token="$2"; shift 2 ;;
+      *) die "unknown argument '$1' for done" ;;
+    esac
+  done
+  check_issue "$issue"
+  issue=$(canon_issue "$issue")
+  case "$outcome" in ok|stopped|failed) ;; *) die "--outcome must be ok, stopped or failed, got '$outcome'" ;; esac
+  [[ -f "$NATIVE_DIR/$issue.json" ]] || die "no native record for issue $issue (velo-native start writes one)"
+  native_store finish "$issue" "$outcome" "$(now_utc)" "$token"; rc=$?
+  case $rc in
+    0) ;;
+    "$TOKEN_MISMATCH") exit 1 ;;   # native_store has already said why, and wrote nothing
+    *) die "could not update the record for issue $issue" ;;
+  esac
+  echo "velo-native: issue $issue done ($outcome)"
+}
+
+cmd_rows() {
+  local all=0
+  case "${1:-}" in
+    --all) all=1 ;;
+    "") ;;
+    *) usage ;;
+  esac
+  native_store rows "$all"
+}
+
+cmd_list() {
+  local all=0 rows rc I M FIN OUT WT SA last state
+  case "${1:-}" in
+    --all) all=1 ;;
+    "") ;;
+    *) usage ;;
+  esac
+  rows=$(native_store rows "$all"); rc=$?
+  printf '%-7s %-7s %-8s %-8s %-6s %-8s %s\n' ISSUE MODEL STATE OUTCOME AGE LOG-AGE WORKTREE
+  while IFS=$'\t' read -r I M _ FIN OUT _ WT _ SA; do
+    [[ -n "$I" ]] || continue
+    state="done"
+    [[ "$FIN" == "-" ]] && state=running
+    last=$(wt_agentlog_age_min "$WT")
+    last="${last:+${last}m}"
+    last="${last:--}"
+    printf '%-7s %-7s %-8s %-8s %-6s %-8s %s\n' "$I" "$M" "$state" "$OUT" "${SA}m" "$last" "$WT"
+  done <<<"$rows"
+  [[ $rc -eq 0 ]] || die "some native records could not be read (named above)"
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  done)  shift; cmd_done "$@" ;;
+  list)  shift; cmd_list "$@" ;;
+  rows)  shift; cmd_rows "$@" ;;
+  *)     usage ;;
+esac

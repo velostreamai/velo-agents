@@ -1,7 +1,7 @@
 #!/bin/bash
-# velo-worktree-lib.sh — worktree facts, derived once, in one place.
+# velo-worktree-lib.sh — worktree facts, and the issue-number spelling, derived once, in one place.
 #
-# Sourced by velo-status (live view) and velo-record (durable history).
+# Sourced by velo-native and velo-status (live view) and velo-record (durable history).
 #
 # These derivations were originally inline in velo-status, which printed them
 # and threw them away. velo-record needs the same numbers, and a COPY would be
@@ -108,4 +108,13 @@ WT_STALL_MINUTES=10
 wt_is_stalled() {  # <worktree> -> 0 if agent.log has not moved for WT_STALL_MINUTES
   local age; age=$(wt_agentlog_age_min "$1")
   [[ -n "$age" && "$age" -ge "$WT_STALL_MINUTES" ]]
+}
+
+# One spelling per ISSUE NUMBER: `001` is issue 1. A native record is keyed by the canonical
+# number (velo-native names the record file with it), so a reader that looks it up by the typed
+# spelling misses it. Callers validate that the input is digits FIRST: a die inside $(...)
+# would only exit the subshell. Pure string work, no arithmetic, so a long number cannot overflow.
+canon_issue() {  # <digits> -> the same number without leading zeros ("0" for all zeros)
+  local s="${1#"${1%%[!0]*}"}"
+  printf '%s' "${s:-0}"
 }

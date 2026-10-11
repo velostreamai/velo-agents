@@ -84,6 +84,7 @@ echo
 echo "── velo-status ────────────────────────────────────────"
 suite test_status.sh bash "$HERE/test_status.sh"
 suite test_zg_hidden.sh bash "$HERE/test_zg_hidden.sh"
+suite test_native_workers.sh bash "$HERE/test_native_workers.sh"
 echo
 echo "── spec review loop ───────────────────────────────────"
 suite test_spec_review.sh bash "$HERE/test_spec_review.sh"

@@ -20,6 +20,7 @@ and the tests** — never from the worker's self-report.
   bin/
     velo-dispatch                  validate a ticket, prep the worktree, launch a worker
     velo-status                    one-shot state of every dispatched worker
+    velo-native                    records each in-process (Agent-tool) worker; velo-status draws it
     velo-pr-gate                   run every gate a PR needs, each on the right model
     velo-gate                      record/inspect a PR's gate state (a LABEL, not memory)
     velo-gate-post                 post a reviewer's report on its behalf
@@ -62,6 +63,7 @@ and the tests** — never from the worker's self-report.
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_spec_review_lint.sh       attest refuses what dispatch refuses (brief lint, worker label); dispatch names the model it launched
     test_status.sh                 velo-status worker naming
+    test_native_workers.sh         velo-native records, velo-status native rows, the override rule
     test_tool_contract.py          the tool contract precedes the policy (#2075)
     test_ast_grep_tool.py          ast_grep is registered, and behaves (#2075)
     test_zg_hidden.sh              zg can see .agents/ — both routes, and the index
@@ -275,6 +277,7 @@ when it cannot answer. The loop is:
 | know if a ticket is workable | `velo-dispatch <n> <brief> --dry-run` | eight preflight checks; it names the one that fails |
 | dispatch it | `velo-dispatch <n> <brief>` | the issue's `worker:*` label picks the model — not your judgement |
 | see what is running | `velo-status [-v] [n]` | reads the **process table and git**, never a worker's report |
+| record an in-process (Agent-tool) worker | `velo-native start <n> <branch> <worktree> [--model haiku\|sonnet]` (it prints a token: keep it with that worker), then `velo-native done <n> --token <token> [--outcome ok\|stopped\|failed]` | the process table cannot see it; without the record it is invisible to `velo-status`'s slot count. The token stops a late `done` from an earlier worker finishing a later worker's record |
 | know what a run cost | `velo-status <n>` | the appended `<issue>.result.jsonl` record |
 | gate a PR | `velo-pr-gate <pr> <scope-file>` | `velo-gate --plan` derives the gates **from the diff** |
 | merge | `velo-merge <pr>` | refuses unless the recorded gate names the CURRENT head |

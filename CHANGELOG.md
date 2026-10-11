@@ -6,6 +6,50 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Fixed — `start` refuses an issue number over 9 digits, with the reason
+
+Python's `int()` raises on a digit string of about 4300 digits, so `velo-native start` with a
+long number died inside the store with a traceback and wrote no record. `start` and `done` now
+refuse more than 9 digits (leading zeros do not count) with a clear message, and the store keeps
+the canonical number as a string, with no `int()` on it. **Prevents:** a worker that runs with
+no native record because its id could not be stored, so velo-status never shows it.
+
+### Fixed — `done 001` finds the record `start 001` wrote
+
+An issue number has one spelling. `velo-native start` stored the record under the canonical
+number (`1`), but `done` looked for the typed spelling's file (`001`), reported no record, and
+left the worker's record running. `start`, `done` and the `velo-status <issue>` filter for native
+rows now canonicalize through one helper in `velo-worktree-lib.sh`. **Prevents:** one issue
+reading as two, so a finished worker showed as running because its `done` was refused.
+
+### Fixed — a native record started in the same second as a finished dispatch takes its row
+
+`velo-status` ordered the two stamps strictly, but both are whole seconds, so a native
+record in the same second as a non-live dispatch lost that issue's row to the dispatch. A
+tie now takes the row; a live dispatch still always keeps its row. **Prevents:** a running
+Agent-tool worker hidden behind a finished dispatch for the same issue, so the slot count
+undercounted.
+
+### Fixed — a late `velo-native done` cannot finish a replacement's record
+
+`velo-native start` writes a token into the record and prints it. `velo-native done <n>
+--token <t>` is refused — exit 1, nothing changed — unless the record still carries that
+token; `done` without `--token` is unchanged, for manual use. **Prevents:** a worker that a
+later start replaced, whose late `done` marked the replacement finished while it was still
+running, so the slot count read a live worker as done.
+
+### Added — in-process (Agent-tool) workers in `velo-status`
+
+`velo-native start|done|list` records a native worker, and `velo-status` draws it in
+the same table as WORKER `native-<model>`: STATE `running` (agent.log moved in the
+last 30m), `stalled?` (it has not), or `done`. A `slots: <n> native running, <m>
+dispatched running` line closes the table. A native record takes an issue's row from
+a dispatch row only when the dispatch is not live and the record is newer. **Prevents:**
+an Agent-tool worker invisible to the slot count, so an idle slot reads where a worker
+is running, or a stale dispatch row reads `running` for work already replaced. The
+WORKER column also widens 11 → 13, because `native-sonnet` and `velo-deepseek` were
+being cut short.
+
 ### Added — the haiku worker tier (#2423)
 
 `worker:haiku` routes to `velo-haiku` on `anthropic/claude-haiku-5.5` ($0.10/M

@@ -16,6 +16,11 @@ VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 REPO="velostreamai/velostream"
 ROOT="$HOME/RustroverProjects/velostream"
 WORKTREE_BASE="$HOME/RustroverProjects"
+# Native (Agent-tool) workers are recorded by velo-native, which sits beside this script.
+NATIVE_BIN="$(dirname "${BASH_SOURCE[0]}")/velo-native"
+# A native worker with no agent.log entry for this long is stalled?. Its heartbeat is
+# slower than a dispatched run's (the 10m wedge rule), since it is in-process.
+NATIVE_STALL_MINUTES=30
 
 # Worktree derivations are shared with velo-record. If the live view and the
 # recorded history ever disagreed about what a worktree contained, neither would
@@ -28,11 +33,11 @@ source "$LIB"
 # shellcheck source=velo-local.conf
 source "$(dirname "$LIB")/velo-local.conf" || { echo "velo-local.conf missing next to $LIB" >&2; exit 1; }
 
-VERBOSE=0; ONLY=""
+VERBOSE=0; ONLY=""; ONLY_CANON=""
 for a in "$@"; do
   case "$a" in
     -v|--verbose) VERBOSE=1 ;;
-    [0-9]*) ONLY="$a" ;;
+    [0-9]*) ONLY="$a"; ONLY_CANON=$(canon_issue "$a") ;;
     *) echo "usage: velo-status [-v] [issue]" >&2; exit 1 ;;
   esac
 done
@@ -223,7 +228,83 @@ title_for() {  # $1 = issue number -> title, stripped of the [#PARENT] prefix
   sed -E 's/^\[#[0-9]+\] *//' "$f" | head -1
 }
 
-printf '%-7s %-11s %-8s %-7s %-6s %-16s %-26s %s\n' ISSUE WORKER STATE COMMITS DIRTY AGENT-LOG BRANCH TITLE
+# Native (Agent-tool) worker records, one TSV line each, read once. A read that fails
+# is said on the table: a worker that cannot be read must not look like a free slot.
+NATIVE_ROWS=$("$NATIVE_BIN" rows); NATIVE_RC=$?
+DISPATCH_RUNNING=0; NATIVE_RUNNING=0
+PRINTED_DISPATCH=""
+
+# UTC start of a runner log, from its name <tag>-<UTC>[-<pid>].log -> YYYYMMDDTHHMMSSZ.
+# Empty when the name carries no stamp.
+dispatch_stamp() {  # <runner log>
+  local s
+  s=$(basename "$1" .log | sed -nE 's/.*-([0-9]{8}T[0-9]{6}Z)(-[0-9]+)?$/\1/p')
+  [[ "$s" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || return 0
+  printf '%s' "$s"
+}
+
+# Does a native record take ISSUE's row from the dispatch row? Only when the dispatch
+# is NOT live (a record must never hide a running worker) and the record is NOT OLDER
+# than the dispatch. Both stamps are whole seconds, so a record in the SAME second as the
+# dispatch cannot be ordered against it, and it takes the row: hiding a native worker
+# undercounts the slots. A dispatch with no log at all is no record of anything, so the
+# native record stands alone. A dispatch whose start cannot be read is kept, never
+# overridden on a guess.
+native_takes_row() {  # <issue> <dispatch state> <dispatch log>
+  local line nstart dstamp
+  line=$(awk -F'\t' -v n="$1" '$1 == n { print; exit }' <<<"$NATIVE_ROWS")
+  [[ -n "$line" ]] || return 1
+  case "$2" in running|'live?'|'?') return 1 ;; esac
+  [[ -n "$3" ]] || return 0
+  dstamp=$(dispatch_stamp "$3")
+  [[ -n "$dstamp" ]] || return 1
+  nstart=$(awk -F'\t' '{ print $3 }' <<<"$line")
+  [[ "${nstart//[-:]/}" == "$dstamp" ]] && return 0
+  [[ "${nstart//[-:]/}" > "$dstamp" ]]
+}
+
+# The agent.log summary for one worktree -> LOGSUM, LOGC. Shared by dispatch and native
+# rows. wedge_check=1 colours a RUNNING dispatch yellow after 10m with no entry (the
+# dispatch wedge rule); native rows pass 0, since their own threshold is the STATE.
+agentlog_cells() {  # <worktree> <state word> <wedge_check 0|1>
+  local wt="$1" sw="$2" wc="$3" alog="$1/agent.log" linesn agemin age flags
+  LOGSUM="-"; LOGC="$DIM"
+  [[ -f "$alog" ]] || return 0
+  linesn=$(wc -l < "$alog" | tr -d ' ')
+  # Age comes from the last real UTC stamp IN the file, not the file mtime — an agent
+  # can touch its log without progressing. Derived by the shared lib, which also
+  # defines the stall predicate velo-watch will act on.
+  agemin=$(wt_agentlog_age_min "$wt")
+  age="?"; [[ -n "$agemin" ]] && age="${agemin}m"
+  flags=""
+  wt_stop_fired "$wt" && flags="${flags}S"
+  grep -q 'FINDING' "$alog" && flags="${flags}F"
+  grep -q 'CORRECTION' "$alog" && flags="${flags}C"
+  grep -qE 'SECURITY|DATA-LOSS' "$alog" && flags="${flags}!"
+  LOGSUM="${linesn}l ${age}${flags:+ $flags}"
+  # A log that has not moved while the worker is ALIVE means the worker is wedged, or
+  # is not writing the ~10-minute heartbeats the policy requires. Colour it either way.
+  if [[ "$wc" == 1 && "$sw" == "running" && "$age" =~ ^([0-9]+)m$ && ${BASH_REMATCH[1]} -ge 10 ]]; then
+    LOGC="$YEL"
+  elif [[ "$flags" == *"!"* ]]; then
+    LOGC="$RED"
+  fi
+}
+
+# One table row. Each caller passes its facts, so a dispatch row and a native row cannot
+# drift apart in layout. Unpushed commits are coloured: that is the state that silently
+# loses work when a worktree is reset.
+draw_row() {  # <issue> <worker> <state word> <state colour> <commits> <pushed> <dirty> <log colour> <log summary> <branch> <title>
+  local issue="$1" worker="$2" sw="$3" sc="$4" commits="$5" pushed="$6" dirty="$7"
+  local logc="$8" logsum="$9" branch="${10}" title="${11}" cflag_w cflag_c
+  cflag_w="$commits"; cflag_c=""
+  [[ "$commits" != "0" && "$pushed" != "0" ]] && { cflag_w="${commits}!"; cflag_c="$YEL"; }
+  printf '%-7s %-13s %s%-8s%s %s%-7s%s %-6s %s%-16s%s %-26s %s%s%s\n' \
+    "$issue" "${worker:0:13}" "$sc" "$sw" "$OFF" "$cflag_c" "$cflag_w" "$OFF" "$dirty" \
+    "$logc" "$logsum" "$OFF" "${branch:0:26}" "$DIM" "${title:0:60}" "$OFF"
+}
+
+printf '%-7s %-13s %-8s %-7s %-6s %-16s %-26s %s\n' ISSUE WORKER STATE COMMITS DIRTY AGENT-LOG BRANCH TITLE
 printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 FOUND=0
@@ -343,13 +424,17 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
   else
     STATE_W=idle; STATE_C="$DIM"
   fi
-  STATE=$(printf '%s%-8s%s' "$STATE_C" "$STATE_W" "$OFF")
+  # A native record can take this issue's row (native_takes_row). Then the native pass
+  # below draws it in this row's place, and this dispatch row is not printed.
+  if native_takes_row "$ISSUE" "$STATE_W" "$LOG"; then
+    continue
+  fi
+  PRINTED_DISPATCH="$PRINTED_DISPATCH $ISSUE"
+  [[ "$STATE_W" == running ]] && DISPATCH_RUNNING=$((DISPATCH_RUNNING + 1))
 
   # Colour the commit count: work present but unpushed is the state that
   # silently loses everything if the worktree is reset.
   PUSHED=$(wt_unpushed "$WT" "$BRANCH")
-  CFLAG_W="$COMMITS"; CFLAG_C=""
-  [[ "$COMMITS" != "0" && "$PUSHED" != "0" ]] && { CFLAG_W="${COMMITS}!"; CFLAG_C="$YEL"; }
   # ── agent.log summary ───────────────────────────────────────────────────
   # The STATE column reads PROCESSES, so it says "idle" for an agent that is
   # alive but wedged, and says nothing about what the agent found. The log has
@@ -363,37 +448,11 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
   # NOTE: $LOG is the RUNNER's stdout under /tmp — useful for leak detection,
   # but it is not the reasoning trail. The trail is agent.log in the WORKTREE,
   # written by the worker itself under the logging policy. Read that.
-  ALOG="$WT/agent.log"
-  LOGSUM="-"; LOGC="$DIM"
-  if [[ -f "$ALOG" ]]; then
-    LINES=$(wc -l < "$ALOG" | tr -d ' ')
-    # Age comes from the last real UTC stamp IN the file, not the file mtime —
-    # an agent can touch its log without progressing. Derived by the shared lib,
-    # which also defines the stall predicate velo-watch will act on.
-    AGEMIN=$(wt_agentlog_age_min "$WT")
-    AGE="?"; [[ -n "$AGEMIN" ]] && AGE="${AGEMIN}m"
-    FLAGS=""
-    wt_stop_fired "$WT" && FLAGS="${FLAGS}S"
-    grep -q 'FINDING' "$ALOG" && FLAGS="${FLAGS}F"
-    grep -q 'CORRECTION' "$ALOG" && FLAGS="${FLAGS}C"
-    grep -qE 'SECURITY|DATA-LOSS' "$ALOG" && FLAGS="${FLAGS}!"
-    LOGSUM="${LINES}l ${AGE}${FLAGS:+ $FLAGS}"
-    # A log that has not moved while the worker is ALIVE means one of two
-    # things, and both deserve attention: the worker is wedged, or it is not
-    # writing the ~10-minute heartbeats the policy requires — in which case
-    # this column is blind to its progress and its final report will be the
-    # only evidence. Colour it either way.
-    if [[ "$STATE_W" == "running" && "$AGE" =~ ^([0-9]+)m$ && ${BASH_REMATCH[1]} -ge 10 ]]; then
-      LOGC="$YEL"
-    elif [[ "$FLAGS" == *"!"* ]]; then
-      LOGC="$RED"
-    fi
-  fi
+  agentlog_cells "$WT" "$STATE_W" 1
 
   TITLE=$(title_for "$ISSUE")
-  printf '%-7s %-11s %s %s%-7s%s %-6s %s%-16s%s %-26s %s%s%s\n' \
-    "$ISSUE" "${WORKER:0:11}" "$STATE" "$CFLAG_C" "$CFLAG_W" "$OFF" "$DIRTY" \
-    "$LOGC" "$LOGSUM" "$OFF" "${BRANCH:0:26}" "$DIM" "${TITLE:0:60}" "$OFF"
+  draw_row "$ISSUE" "$WORKER" "$STATE_W" "$STATE_C" "$COMMITS" "$PUSHED" "$DIRTY" \
+    "$LOGC" "$LOGSUM" "$BRANCH" "$TITLE"
 
   if [[ $VERBOSE -eq 1 && -n "$LOG" ]]; then
     printf '        %s%s%s\n' "$DIM" "$(tail -1 "$LOG" | cut -c1-100)" "$OFF"
@@ -453,7 +512,43 @@ PYR
   fi
 done
 
+# ---- native (Agent-tool) workers ---------------------------------------------
+# A record that did not take a dispatch row (native_takes_row) is drawn here. It has
+# no process and no dispatch log, so the record is its only evidence.
+while IFS=$'\t' read -r NI NMODEL _ NFIN _ _ NWT _ NSAGE; do
+  [[ -n "$NI" ]] || continue
+  # A native record is keyed by its canonical issue number, so the filter compares that. Dispatch
+  # and worktree rows are named by their directory and keep the typed spelling, as they always have.
+  [[ -n "$ONLY" && "$NI" != "$ONLY_CANON" ]] && continue
+  case " $PRINTED_DISPATCH " in *" $NI "*) continue ;; esac
+  FOUND=1
+  BRANCH=$(wt_branch "$NWT")
+  COMMITS=$(wt_commits "$NWT")
+  DIRTY=$(wt_dirty "$NWT")
+  PUSHED=$(wt_unpushed "$NWT" "$BRANCH")
+  if [[ "$NFIN" != "-" ]]; then
+    STATE_W="done"; STATE_C="$DIM"
+  else
+    # Stalled is measured from the last agent.log stamp. A worktree with no stamp yet
+    # (a fresh start) is measured from when the record was started.
+    NAGE=$(wt_agentlog_age_min "$NWT")
+    NAGE=${NAGE:-$NSAGE}
+    if (( NAGE < NATIVE_STALL_MINUTES )); then
+      STATE_W=running; STATE_C="$GRN"
+    else
+      STATE_W='stalled?'; STATE_C="$YEL"
+    fi
+  fi
+  agentlog_cells "$NWT" "$STATE_W" 0
+  TITLE=$(title_for "$NI")
+  draw_row "$NI" "native-$NMODEL" "$STATE_W" "$STATE_C" "$COMMITS" "$PUSHED" "$DIRTY" \
+    "$LOGC" "$LOGSUM" "$BRANCH" "$TITLE"
+  [[ "$STATE_W" == running ]] && NATIVE_RUNNING=$((NATIVE_RUNNING + 1))
+done <<<"$NATIVE_ROWS"
+[[ $NATIVE_RC -eq 0 ]] || echo "${RED}native records UNREADABLE${OFF}: velo-native rows exited $NATIVE_RC (reason on stderr). A worker whose record cannot be read is NOT shown."
+
 [[ $FOUND -eq 1 ]] || { echo "no velostream-* worktrees found"; exit 0; }
+echo "slots: $NATIVE_RUNNING native running, $DISPATCH_RUNNING dispatched running"
 
 # Stale stashes are a trap for the next worker, and stashes are REPO-GLOBAL:
 # every worktree shares one stash stack. A worker that runs `git stash pop`
@@ -475,6 +570,7 @@ echo
 echo "${YEL}n!${OFF} = commits not yet pushed   ${RED}LEAKED${OFF} = tool calls emitted as text, never ran"
 echo "${YEL}live?${OFF} = no exit record and the log is still moving — a worker this build cannot see"
 echo "${RED}?${OFF}     = liveness UNKNOWN: the record check itself failed (reason on stderr)"
+echo "native-<model> = an Agent-tool worker recorded by velo-native   ${YEL}stalled?${OFF} = no agent.log entry for ${NATIVE_STALL_MINUTES}m, not finished"
 echo "AGENT-LOG = lines, age of last entry, flags: S=STOP  F=FINDING  C=CORRECTION  ${RED}!${OFF}=SECURITY/DATA-LOSS"
 echo "${YEL}yellow age${OFF} = running, but no log entry for 10m+ — wedged, OR not writing the"
 echo "             heartbeats the policy requires. Both mean the report will be thin."
