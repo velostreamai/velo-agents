@@ -87,6 +87,7 @@ suite test_zg_hidden.sh bash "$HERE/test_zg_hidden.sh"
 echo
 echo "── spec review loop ───────────────────────────────────"
 suite test_spec_review.sh bash "$HERE/test_spec_review.sh"
+suite test_spec_review_lint.sh bash "$HERE/test_spec_review_lint.sh"
 echo
 echo "── discovery-index exclusion ──────────────────────────"
 suite test_index_exclude.sh bash "$HERE/test_index_exclude.sh"

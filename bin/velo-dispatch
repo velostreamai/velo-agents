@@ -87,6 +87,10 @@ die()  { _audit "DIE  $1"; printf '\n\033[31mNOT READY:\033[0m %s\n\n' "$1" >&2;
 [[ -n "${VELO_LOCAL_MODEL_DEFAULT:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_MODEL_DEFAULT"
 [[ -n "${VELO_LOCAL_BASE_URL:-}" ]] || die "velo-local.conf does not set VELO_LOCAL_BASE_URL"
 LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-$VELO_LOCAL_BASE_URL}"
+# The brief lint (spec §7 and the checklist) and brief_prose, the fence masker the BRANCH/WORKTREE
+# readers below also use. Sourced before anything reads a brief, and shared with velo-spec-review,
+# which runs the same lint before it attests (see velo-brief-lint.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/velo-brief-lint.sh" || die "velo-brief-lint.sh missing next to velo-dispatch"
 warn() { _audit "WARN $1"; printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 ok()   { _audit "OK   $1"; printf '\033[32m  ok\033[0m %s\n' "$1"; }
 
@@ -871,44 +875,7 @@ fi
 [[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
 WT="$WORKTREE_BASE/velostream-$ISSUE"
 
-# A heading inside a fenced code block is not a heading. A brief that QUOTES one — a
-# template, an example of what an analysis brief says — must not be read as declaring
-# it: "## ANALYSIS ONLY" quoted in a fence dropped the cargo requirement from a code
-# brief, and a "## Validation" that existed only inside a fence satisfied the section
-# check (#2380). Every heading / section scan below reads THIS, not the raw file.
-#
-# Fenced lines are MASKED (four spaces in front), not deleted: a Validation section
-# whose content IS a fenced block of commands still has content, and the line count
-# and order are unchanged. CommonMark rules: an opener is up to three SPACES of indent
-# then 3+ backticks or tildes (a backtick opener cannot carry a backtick in its info
-# string, so an inline ```x``` is not one); only a line of the SAME character, at least
-# as long, with nothing after it but spaces, tabs (and a CR) closes it; an unclosed fence
-# runs to the end of the brief. A TAB in the leading whitespace reaches column 4 at once,
-# so such a line is indented code — never an opener or a closer — like four spaces
-# (velo-gate-run's extract_attack reads the same grammar). `LABEL:` declarations
-# (brief_field) and the command greps keep reading the raw file on purpose —
-# declarations and commands are written in fences.
-brief_prose() {
-  awk '
-    {
-      ind = 0
-      while (substr($0, ind + 1, 1) == " ") ind++
-      rest = substr($0, ind + 1)
-      ch = substr(rest, 1, 1)
-      run = 0
-      if (ind <= 3 && (ch == "`" || ch == "~"))
-        while (substr(rest, run + 1, 1) == ch) run++
-      if (fch == "") {
-        if (run >= 3 && (ch == "~" || index(substr(rest, run + 1), "`") == 0)) {
-          fch = ch; flen = run
-          print "    " $0
-        } else print $0
-        next
-      }
-      if (ch == fch && run >= flen && substr(rest, run + 1) ~ /^[ \t\r]*$/) fch = ""
-      print "    " $0
-    }' "$BRIEF"
-}
+# brief_prose (the fence masker) and the brief lint live in velo-brief-lint.sh, sourced above.
 
 # Two declaration forms exist in this repo: `BRANCH: x` and a `## Branch`
 # heading with the value on a following line. Read both (#2027 P1).
@@ -1036,60 +1003,11 @@ elif [[ "${BRIEF_WT%/}" != "${WT%/}" ]]; then
 fi
 ok "brief BRANCH/WORKTREE match what will be cut"
 
-# >>> velo-brief-lint (extracted verbatim by tests/test_brief_fields.sh)
-# spec §7, validation. WHAT it must contain depends on whether the stage changes code:
-#   - a brief that changes code names the commands that prove it: `cargo check|nextest`,
-#     or `.agents/tests/run.sh` for an .agents/-only tooling change (which has no
-#     Rust to build, so had to mention cargo only to say it was not needed);
-#   - a stage that changes NO code (analysis) runs no build, but the section must
-#     still EXIST and say something: how its findings are checked is what an
-#     analysis validates (see 2006-brief.md: "prove you changed nothing", "ground
-#     each claim").
-# "No code" is read from a HEADING — the title or a section — the way the real
-# analysis briefs declare it ("Stage-1 ANALYSIS ONLY", "THIS TASK WRITES NO CODE",
-# "READ-ONLY analysis"). In prose it would relax the lint for an implementation
-# brief that merely says "no code path" or "if no code change is needed, STOP".
-# The heading must be a validation heading — `## Validation`, `## 7. Validation
-# commands` — not any heading that contains the letters ("## Invalidation").
-#
-# Both heading scans read BRIEF_PROSE — the brief with its fenced blocks masked
-# (brief_prose, above) — so a heading QUOTED inside a fence is neither a no-code
-# declaration nor a Validation section. The command greps below stay on the raw
-# file: the commands are written inside fences.
-BRIEF_PROSE=$(brief_prose)
-brief_has_validation_section() {   # a Validation heading with something under it
-  awk '
-    tolower($0) ~ /^#+[ \t]+([0-9]+[.)]?[ \t]+)?validation/ { g = 1; next }
-    /^#/ { g = 0; next }
-    g && NF { found = 1; exit }
-    END { exit !found }' <<<"$BRIEF_PROSE"
-}
-MISSING=()
-grep -qi "worktree" "$BRIEF"                  || MISSING+=("no WORKTREE path (spec §1)")
-grep -qiE "do not.*cd|don't.*cd" "$BRIEF"     || MISSING+=("no 'do NOT cd' instruction (spec §1)")
-grep -qiE "STOP and report|STOP —|STOP if"    "$BRIEF" || MISSING+=("no STOP conditions (spec §5)")
-grep -qiE "commit incrementally|commit after each" "$BRIEF" || MISSING+=("no incremental-commit rule (spec §12) — a timeout will lose all work")
-if grep -qiE '^#+[[:space:]].*(analysis[ -]only|no[ -]code([^[:alpha:]]|$)|read-only[ -]analysis)' <<<"$BRIEF_PROSE"; then
-  brief_has_validation_section \
-    || MISSING+=("no '## Validation' section with content (spec §7) — a no-code stage runs no build, but still says how its findings are checked")
-else
-  grep -qiE "cargo (check|nextest)|\.agents/tests/run\.sh" "$BRIEF" \
-    || MISSING+=("no validation commands (spec §7) — a brief that changes code names 'cargo check|nextest' (or .agents/tests/run.sh for an .agents/-only change); a stage that changes NO code says so in a heading ('## THIS TASK WRITES NO CODE', 'ANALYSIS ONLY') and then needs a '## Validation' section instead")
-fi
-grep -qiE "do not commit|may commit|commit and push|do not push|do not open a pr|authorized to (commit|push)" "$BRIEF" \
-  || MISSING+=("no explicit commit/push authorization (spec §8) — the brief is the only thing telling a worker what it may do")
-if grep -qiE "\.sql|SELECT .* FROM" "$BRIEF"; then
-  grep -q "SQL_GRAMMAR_RULES\|PARSER_GRAMMAR" "$BRIEF" \
-    || MISSING+=("brief writes SQL but cites no grammar reference (spec §6)")
-fi
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-  printf '\n\033[31mBRIEF INCOMPLETE:\033[0m %s\n' "$BRIEF" >&2
-  printf '  - %s\n' "${MISSING[@]}" >&2
-  printf '\nSee %s\n\n' "$HOME/.agents/rules/velo-brief-spec.md" >&2
-  exit 1
-fi
+# spec §7 and the rest of the brief checklist: the rules live in velo-brief-lint.sh, which
+# velo-spec-review runs too, BEFORE it attests a brief. One definition, so the two tools cannot
+# disagree about what a brief needs. Refuses here, before any side effect.
+velo_brief_lint "$BRIEF" || exit 1
 ok "brief satisfies the spec checklist"
-# <<< velo-brief-lint
 
 # ---- 5. disk ----------------------------------------------------------------
 AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
@@ -1677,6 +1595,21 @@ case "$NAME" in
     a NAME was added or renamed without its arm here." ;;
 esac
 
+# >>> velo-dispatch-model-line (extracted verbatim by tests/test_spec_review_lint.sh)
+# The model the worker was launched with, stated where the operator reads the launch (the
+# dispatched block below) and as the first line of the worker's log. A launch used to name the
+# route and never the model, so a changed pin (VELO_LOCAL_MODEL, a re-pin in a case arm) was
+# visible only in ps. The local route also names its endpoint: VELO_LMSTUDIO_URL can point it at a
+# machine the operator did not have in mind. A route with no model says nothing.
+if [[ "$NAME" == "velo-local" ]]; then
+  MODEL_LINE="model  : $MODEL_ID   base-url: $LMSTUDIO_URL"
+elif [[ -n "${MODEL_ID:-}" ]]; then
+  MODEL_LINE="model  : $MODEL_ID"
+else
+  MODEL_LINE=""
+fi
+# <<< velo-dispatch-model-line
+
 # Supervisor: run the worker, then record the outcome (#1992 Phase 1).
 #
 # This script used to background the runner and return, printing "Detached — no
@@ -1704,20 +1637,25 @@ nohup bash -c '
   RBRIEF="$6"; RSTART="$7"; RMT="$8"; RBASE="$9"
   # $10 would parse as $1 followed by a literal 0, silently passing the log path
   # as the index state, so take it after a shift instead of using ${10}.
-  shift 9; RIDX="$1"; RSHEAD="$2"; shift 2
-  "$@" > "$LOGF" 2>&1
+  shift 9; RIDX="$1"; RSHEAD="$2"; RMLINE="$3"; shift 3
+  # The model line opens the log: truncate, write the line when there is one, then let the
+  # runner append its output after it.
+  : > "$LOGF"
+  if [[ -n "$RMLINE" ]]; then printf "%s\n" "$RMLINE" >> "$LOGF"; fi
+  "$@" >> "$LOGF" 2>&1
   rc=$?
   "$HOME/.agents/bin/velo-record" "$RI" --index "$RIDX" --worktree "$RWT" --worker "$RNAME" \
     --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
     --rc "$rc" --max-turns "$RMT" --base "$RBASE" --start-head "$RSHEAD" >> "$LOGF" 2>&1 || true
 ' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
-  "${INDEX_STATE:-unknown}" "$START_HEAD" "${CMD[@]}" > /dev/null 2>&1 &
+  "${INDEX_STATE:-unknown}" "$START_HEAD" "$MODEL_LINE" "${CMD[@]}" > /dev/null 2>&1 &
 PID=$!
 
 echo
 echo "── dispatched ─────────────────────────────────────────"
 echo "  #$ISSUE  $TITLE"
 echo "  worker : $NAME   supervisor pid $PID"
+if [[ -n "$MODEL_LINE" ]]; then echo "  $MODEL_LINE"; fi
 echo "  branch : $BRANCH  (off origin/master $BASE)"
 echo "  log    : $LOG"
 echo "  record : .agents/tasks/${ISSUE}.result.jsonl  (appended on exit)"

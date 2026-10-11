@@ -30,6 +30,7 @@ and the tests** — never from the worker's self-report.
     velo-ci-rollup.jq              ONE definition of "how green is a PR": velo-merge refuses on it, velo-status shows it. Must sit beside them (install.sh copies bin/ whole)
     velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
     velo-spec-review               attest a spec was read; --check has Codex REVIEW it
+    velo-brief-lint.sh             the brief lint, one definition: velo-dispatch refuses on it, velo-spec-review runs it before it attests (sourced, not run)
     velo-orchestrd                 always-on LLM-free checker (#2285 PR2): detect/post/merge/dispatch/escalate
     velo-attention                 list/ack unhandled events from velo-orchestrd
     velo-orch-lib.sh               helpers shared by velo-orchestrd + velo-attention
@@ -59,6 +60,7 @@ and the tests** — never from the worker's self-report.
     test_gate_sweep.sh             velo-gate-sweep: STALE flag, last-block verdict, per-leg caps, no-gate / gh-failure handling
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
+    test_spec_review_lint.sh       attest refuses what dispatch refuses (brief lint, worker label); dispatch names the model it launched
     test_status.sh                 velo-status worker naming
     test_tool_contract.py          the tool contract precedes the policy (#2075)
     test_ast_grep_tool.py          ast_grep is registered, and behaves (#2075)
@@ -893,6 +895,14 @@ nothing.
 Its first real run found four HIGH findings on a spec that had **already been
 dispatched** — including two `fail_to_pass` tests that do not exist, so the run
 that "landed" had an acceptance gate naming nothing.
+
+**Attest mode** (`velo-spec-review <issue> <brief> --by <who>`) writes the `reviewed` block
+that `velo-dispatch` checks against. Before it writes anything it refuses the two things dispatch
+refuses on that a review could otherwise certify: a brief the brief lint rejects
+(`bin/velo-brief-lint.sh`, the one definition both tools run), and an issue without exactly one
+`worker:*` label. Add the label **first**: a label edit moves the issue's `updatedAt`, so an
+attestation written before it is stale the moment it is written. A refusal leaves the spec and the
+issue untouched.
 
 ## Why each gate exists
 

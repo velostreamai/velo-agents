@@ -19,18 +19,19 @@ check() { if [[ "$2" == "$3" ]]; then printf '  PASS  %s: %s\n' "$1" "$2"
 
 # Per run, not a fixed /tmp path: several agents run this suite at once on one host.
 BH=$(mktemp); LD=$(mktemp -d); trap 'rm -f "$BH"; rm -rf "$LD"' EXIT
-python3 - "$ROOT/bin/velo-dispatch" > "$BH" <<'PYX' || exit 1
+python3 - "$ROOT/bin/velo-dispatch" "$ROOT/bin/velo-brief-lint.sh" > "$BH" <<'PYX' || exit 1
 import pathlib, sys
 # Extraction is by name and that is brittle: a helper the extracted functions
 # CALL but which is not listed here stays undefined, so they return empty — a
 # silent wrong answer, not an error. That happened with path_token (#2027
 # round-3). Fail loudly instead of testing a crippled copy.
-src = pathlib.Path(sys.argv[1]).read_text()
+# brief_prose moved to velo-brief-lint.sh (2026-10-11), so both files are read.
+src = pathlib.Path(sys.argv[1]).read_text() + pathlib.Path(sys.argv[2]).read_text()
 wanted = ["brief_prose", "brief_field", "brief_heading_line", "path_token",
           "path_token_count", "brief_heading_branch", "brief_heading_worktree"]
 missing = [f for f in wanted if f + "() {" not in src]
 if missing:
-    sys.exit("test_brief_fields: velo-dispatch no longer defines %s — update "
+    sys.exit("test_brief_fields: neither velo-dispatch nor velo-brief-lint.sh defines %s — update "
              "the extraction list; do not run without them" % missing)
 for fn in wanted:
     i = src.index(fn + "() {"); j = src.index("\n}\n", i) + 3
@@ -112,25 +113,28 @@ rm -f "$TMP"
 #
 # The lint demanded `cargo (check|nextest)` in EVERY brief, so a no-code analysis
 # stage, or an .agents/-only tooling brief, had to mention cargo only to say it
-# did not need it. These drive the block EXTRACTED from the shipped velo-dispatch
+# did not need it. These drive the block EXTRACTED from the shipped velo-brief-lint.sh
 # between its markers — not a copy of the rule, which would keep passing after the
 # real one changed.
 echo "brief lint: validation (spec §7)"
-LINT_BLOCK=$(sed -n '/^# >>> velo-brief-lint/,/^# <<< velo-brief-lint/p' "$ROOT/bin/velo-dispatch")
+LINT_BLOCK=$(sed -n '/^# >>> velo-brief-lint/,/^# <<< velo-brief-lint/p' "$ROOT/bin/velo-brief-lint.sh")
 if [[ -z "$LINT_BLOCK" ]]; then
-  echo "  FAIL  could not extract the brief lint from velo-dispatch — deleted, renamed or restructured."
+  echo "  FAIL  could not extract the brief lint from velo-brief-lint.sh — deleted, renamed or restructured."
   echo "        The spec checklist would stop running and nothing here would notice."
   exit 1
 fi
-# The lint block READS the fence-masked brief but does not define the masker: brief_prose
-# lives above it because brief_heading_line needs it before the lint runs. Take the
-# shipped function (sourced from the extraction above), never a copy of it.
+# The lint block READS the fence-masked brief and calls brief_prose, the masker, which
+# sits above it in velo-brief-lint.sh (brief_heading_line in velo-dispatch needs it too).
+# Take the shipped function (sourced from the extraction above), never a copy of it.
 PROSE_FN=$(declare -f brief_prose)
 if [[ -z "$PROSE_FN" ]]; then
   echo "  FAIL  brief_prose is not defined — the lint block cannot run without it."
   exit 1
 fi
 printf '#!/bin/bash\nok() { echo "OK: $1"; }\n%s\n%s\n' "$PROSE_FN" "$LINT_BLOCK" > "$LD/lint.sh"
+# The block DEFINES velo_brief_lint: velo-dispatch sources it and calls it as below, so the
+# harness does the same, and prints the OK line dispatch prints on a pass.
+printf '%s\n' 'velo_brief_lint "$BRIEF" || exit 1' 'ok "brief satisfies the spec checklist"' >> "$LD/lint.sh"
 
 # "<exit status>|<output on one line>": a function called inside $(...) cannot set
 # a variable in this shell, so the status travels with the output.

@@ -21,9 +21,15 @@
 # Run it AFTER reading the issue (including comments) and the brief. Running it
 # reflexively to clear a gate defeats it — the hash and timestamp are evidence,
 # and a wrong attestation is worse than none because it looks like diligence.
+#
+# Attest mode refuses what velo-dispatch would refuse, before it records anything: a brief that the
+# brief lint rejects, and an issue without exactly one `worker:*` label. A refusal writes nothing:
+# no reviewed block, no change to the spec, nothing to the issue.
 set -uo pipefail
 REPO="velostreamai/velostream"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
+# The brief lint, one definition shared with velo-dispatch (see velo-brief-lint.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/velo-brief-lint.sh" || die "velo-brief-lint.sh missing next to velo-spec-review"
 
 ISSUE="${1:-}"; BRIEF=""; BY="${USER:-unknown}"; CHECK=0; REVIEW_WT=""
 STATE="${VELO_STATE:-$HOME/.agents/state}"
@@ -343,8 +349,41 @@ if [[ $CHECK -eq 1 ]]; then
   exit $?
 fi
 
-UPD=$(gh issue view "$ISSUE" --repo "$REPO" --json updatedAt --jq .updatedAt 2>/dev/null) \
+# The brief must pass the lint velo-dispatch runs BEFORE anything is attested. A refusal here writes
+# nothing: no reviewed block, no change to the spec, nothing to the issue.
+velo_brief_lint "$BRIEF" || exit 1
+
+# One read for everything the attestation rests on, so the labels and the updatedAt it is pinned to
+# describe the same issue state. A label edit moves updatedAt: read apart, a check could pass on
+# labels that changed before the timestamp it then records.
+META=$(gh issue view "$ISSUE" --repo "$REPO" --json updatedAt,labels 2>/dev/null) \
   || die "could not read issue #$ISSUE"
+UPD=$(jq -r .updatedAt <<<"$META") || die "could not read updatedAt of #$ISSUE"
+[[ -n "$UPD" && "$UPD" != null ]] || die "issue #$ISSUE has no updatedAt to pin the attestation to"
+LABELS=$(jq -r '[.labels[].name] | join(",")' <<<"$META") || die "could not read the labels of #$ISSUE"
+
+# velo-dispatch routes by the issue's worker:* label and refuses on zero of them or on two (its
+# WORKERS and COUNT lines). The spec's `worker` field does not stand in for the label: dispatch
+# routes by the label alone and only warns when the spec disagrees with it.
+WORKERS=$(tr ',' '\n' <<<"$LABELS" | grep '^worker:' || true)
+COUNT=$(grep -c . <<<"$WORKERS" || true)
+if [[ "$COUNT" -eq 0 ]]; then
+  die "#$ISSUE has no 'worker:*' label — velo-dispatch refuses it, so this attestation would certify
+  a brief nothing can dispatch.
+  Add the label FIRST, then re-run this review. A label edit moves the issue's updatedAt, which
+  would make an attestation written before the edit stale the moment it is written.
+  Add one of:
+    worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
+    worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
+    worker:haiku     cheap, Claude leg. Scoped impl when a DeepSeek-shaped
+                     route should run on Anthropic's cheap model instead.
+    worker:glm       pricier. Multi-step reasoning / per-case judgement.
+    worker:codex     most capable, most expensive. Architecture-weight work:
+                     anything where a WRONG answer costs more than the run."
+elif [[ "$COUNT" -gt 1 ]]; then
+  die "#$ISSUE has $COUNT worker labels ($(tr '\n' ' ' <<<"$WORKERS")) — velo-dispatch allows at most one.
+  Remove all but one, then re-run this review: a label edit moves the issue's updatedAt."
+fi
 
 # Attest as of the issue's OWN updatedAt, not wall-clock now. If a comment lands
 # between reading and attesting, the next dispatch must catch it — stamping

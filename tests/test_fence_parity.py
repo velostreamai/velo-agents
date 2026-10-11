@@ -127,10 +127,11 @@ def main(tmp):
 
     gate_run = (BIN / "velo-gate-run").read_text()
     m = re.search(r"extract_attack\(\) \{[^\n]*\n  python3 - \"\$1\" <<'PY'\n(.*?)\nPY\n", gate_run, re.S)
-    dispatch = (BIN / "velo-dispatch").read_text()
-    n = re.search(r"^brief_prose\(\) \{\n.*?^\}\n", dispatch, re.S | re.M)
+    # brief_prose moved from velo-dispatch to velo-brief-lint.sh (2026-10-11); the masker is read there.
+    prose_src = (BIN / "velo-brief-lint.sh").read_text()
+    n = re.search(r"^brief_prose\(\) \{\n.*?^\}\n", prose_src, re.S | re.M)
     if not m or not n:
-        fail("could not extract extract_attack from velo-gate-run and brief_prose from velo-dispatch "
+        fail("could not extract extract_attack from velo-gate-run and brief_prose from velo-brief-lint.sh "
              f"(python found: {bool(m)}, awk found: {bool(n)}) — renamed or restructured? "
              "Nothing here would notice if they drifted apart.")
         return 1
