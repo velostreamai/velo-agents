@@ -112,3 +112,52 @@ fi
 return 0
 }
 # <<< velo-brief-lint
+
+# >>> velo-brief-ste (extracted verbatim by tests/test_brief_ste.sh)
+# spec §13, instruction style (ASD-STE100). ADVISORY: it prints warnings and always returns 0.
+# It does not refuse a brief until its false-positive rate on real briefs is known.
+#
+# A STEP is a numbered list item in prose: `1. Do X` or `1) Do X`, at most three spaces of
+# indent. Fenced lines are skipped (brief_prose masks them). A line under a step that is
+# indented and is not a new item or a heading continues that step. Bullets are not checked:
+# briefs use them for facts and lists, and STE limits only the procedural sentence.
+#
+# Each step is checked for:
+#   - more than 20 words. An inline code span counts as ONE word (it is a name);
+#   - more than one sentence (". " then a capital letter or a backtick);
+#   - a chained action: ", then", "; then", " and then".
+velo_brief_ste_warn() {   # $1 = the brief. Prints warnings to stderr. Always returns 0.
+  local BRIEF="$1" out
+  out=$(brief_prose | awk '
+    function flush(   t, n, why) {
+      if (step == "") return
+      t = step
+      gsub(/`[^`]*`/, "CODE", t)          # a code span is one word
+      n = split(t, w, /[ \t]+/)
+      why = ""
+      if (n > 20) why = why sprintf("%d words (max 20); ", n)
+      if (t ~ /[.!?][ \t]+[A-Z]/) why = why "more than one sentence; "
+      if (tolower(t) ~ /(, then |; then | and then )/) why = why "chained action (\"then\"); "
+      if (why != "") {
+        sub(/; $/, "", why)
+        printf "  - line %d: %s\n      %s\n", sline, why, substr(step, 1, 100)
+      }
+      step = ""
+    }
+    /^    / { flush(); next }                               # fenced: not prose
+    /^ {0,3}[0-9]+[.)][ \t]+/ {
+      flush(); sline = NR
+      s = $0; sub(/^ *[0-9]+[.)][ \t]+/, "", s); step = s; next
+    }
+    step != "" && /^[ \t]+[^ \t]/ && !/^[ \t]*([-*+]|[0-9]+[.)])[ \t]/ {
+      s = $0; sub(/^[ \t]+/, "", s); step = step " " s; next
+    }
+    { flush() }
+    END { flush() }')
+  [[ -z "$out" ]] && return 0
+  printf '\n\033[33mBRIEF STYLE (advisory, STE100 — spec §13):\033[0m %s\n' "$BRIEF" >&2
+  printf '%s\n' "$out" >&2
+  printf '  One action per step, imperative, max 20 words. Split the step; move the reason to a "Why" line.\n\n' >&2
+  return 0
+}
+# <<< velo-brief-ste

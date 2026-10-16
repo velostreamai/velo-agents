@@ -6,6 +6,16 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — briefs are written in ASD-STE100 style; an advisory lint flags long or chained steps
+
+Spec §13 says each numbered step in a brief holds one imperative action of 20 words or fewer,
+with the reason on its own `Why:` line. `rules/velo-glossary.md` gives each term one meaning
+(worker, gate, leg, verify, partition receiver, record vs row). `velo_brief_ste_warn` in
+`velo-brief-lint.sh` runs in `velo-dispatch` and `velo-spec-review` after the refusing lint. It
+warns and never refuses: it flagged 65 of the 140 steps in the 35 tracked briefs. **Prevents:**
+a cheap worker that carries out one of the three actions bundled into a step, or that reads two
+words for one thing as two things.
+
 ### Fixed — `error_empty_final` counts consecutive empty turns; empty turns keep their reasoning
 
 The runner failed a run on its 4th empty final turn (no text, no tool call) in
@@ -64,7 +74,6 @@ is running, or a stale dispatch row reads `running` for work already replaced. T
 WORKER column also widens 11 → 13, because `native-sonnet` and `velo-deepseek` were
 being cut short.
 
-||||||| parent of 9d0279d46 ([tooling] runner: error_empty_final counts CONSECUTIVE empty turns; empty turns keep their reasoning)
 ### Added — the haiku worker tier (#2423)
 
 `worker:haiku` routes to `velo-haiku` on `anthropic/claude-haiku-5.5` ($0.10/M

@@ -62,6 +62,7 @@ and the tests** — never from the worker's self-report.
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_spec_review_lint.sh       attest refuses what dispatch refuses (brief lint, worker label); dispatch names the model it launched
+    test_brief_ste.sh              brief style (STE100): long / multi-sentence / chained steps warn, never refuse
     test_status.sh                 velo-status worker naming
     test_native_workers.sh         velo-native records, velo-status native rows, the override rule
     test_tool_contract.py          the tool contract precedes the policy (#2075)
@@ -80,6 +81,7 @@ and the tests** — never from the worker's self-report.
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
     velo-brief-spec.md             what a task brief MUST contain, and why
+    velo-glossary.md               one term, one meaning — the vocabulary briefs and policy use (spec §13)
   skills/
     velo-deepseek/SKILL.md         orchestrator-facing routing + usage
     velo-haiku/SKILL.md

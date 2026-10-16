@@ -352,6 +352,8 @@ fi
 # The brief must pass the lint velo-dispatch runs BEFORE anything is attested. A refusal here writes
 # nothing: no reviewed block, no change to the spec, nothing to the issue.
 velo_brief_lint "$BRIEF" || exit 1
+# spec §13, instruction style (ASD-STE100). Advisory: it warns and never refuses.
+velo_brief_ste_warn "$BRIEF"
 
 # One read for everything the attestation rests on, so the labels and the updatedAt it is pinned to
 # describe the same issue state. A label edit moves updatedAt: read apart, a check could pass on

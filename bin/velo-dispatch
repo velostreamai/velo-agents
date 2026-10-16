@@ -1008,6 +1008,8 @@ ok "brief BRANCH/WORKTREE match what will be cut"
 # disagree about what a brief needs. Refuses here, before any side effect.
 velo_brief_lint "$BRIEF" || exit 1
 ok "brief satisfies the spec checklist"
+# spec §13, instruction style (ASD-STE100). Advisory: it warns and never refuses.
+velo_brief_ste_warn "$BRIEF"
 
 # ---- 5. disk ----------------------------------------------------------------
 AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')

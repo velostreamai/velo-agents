@@ -128,6 +128,43 @@ Pair this with a generous `--prompt-timeout` (4h+ for implementation) rather
 than relying on the default. Cost is unaffected — the timeout only bounds
 wall-clock, not tokens.
 
+## 13. Instruction style — ASD-STE100
+
+Write every step in the style of ASD-STE100 (Simplified Technical English), the
+aerospace standard for maintenance manuals. A weak model must find the action
+without reading a story. A step that holds three actions gets one of them done.
+
+Rules for a STEP (a numbered list item):
+
+1. Write one action per step.
+2. Start the step with the verb, in the imperative: "Run", "Edit", "Commit".
+3. Use the active voice. Write "Run the gate", not "The gate should be run".
+4. Keep the step to 20 words or fewer. An inline code span counts as one word.
+5. Put a warning or STOP condition BEFORE the step it applies to.
+6. Write the reason on its own line, under the step, as `Why: ...`.
+7. Use each term with one meaning only. Use the terms in
+   [`velo-glossary.md`](velo-glossary.md).
+
+Descriptive text (context, prior failures, the design) can use sentences of up
+to 25 words. It does not go in a step.
+
+Bad:
+
+    3. Run --fast, which formats in place, then check git status and commit any
+       fmt changes since CI runs its own fmt --check.
+
+Good:
+
+    3. Run `(cd <worktree> && ./run-commit.sh --fast)`.
+    4. Run `git -C <worktree> status`.
+    5. Commit every file the gate reformatted.
+       Why: the gate formats files but does not commit them. CI runs `cargo fmt --check`.
+
+`velo-dispatch` and `velo-spec-review` run `velo_brief_ste_warn` on each brief.
+It flags steps with more than 20 words, more than one sentence, or a chained
+"then". It is ADVISORY: it warns and does not refuse. On its first run it
+flagged 65 of the 140 steps in the 35 tracked briefs.
+
 ## Orchestrator's own obligations
 
 - Verify results from `git log` / `git status` / the tests, never from the
