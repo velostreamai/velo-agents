@@ -6,6 +6,20 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Fixed — `error_empty_final` counts consecutive empty turns; empty turns keep their reasoning
+
+The runner failed a run on its 4th empty final turn (no text, no tool call) in
+the WHOLE run while reporting "4 consecutive turns": the counter never reset.
+It now restarts whenever a nudge gets the model calling tools again. And the
+transcript read a reasoning item's `content` only, where openai-agents files a
+chat-completions `reasoning_content` under `summary`, so every reasoning turn was
+recorded as empty. An empty turn now logs its reasoning tail, and flags a tool
+call written inside the thinking block (`TOOL CALL INSIDE REASONING`).
+**Prevents:** four velo-local runs on Sushi (#2435 twice, #2429, #2440) failing
+`error_empty_final` with nothing to show why. #2440 had recovered from its 3rd
+empty turn and done 28 more tool calls of real work when the 4th, 21 minutes
+later, ended it.
+
 ### Fixed — `start` refuses an issue number over 9 digits, with the reason
 
 Python's `int()` raises on a digit string of about 4300 digits, so `velo-native start` with a
@@ -50,6 +64,7 @@ is running, or a stale dispatch row reads `running` for work already replaced. T
 WORKER column also widens 11 → 13, because `native-sonnet` and `velo-deepseek` were
 being cut short.
 
+||||||| parent of 9d0279d46 ([tooling] runner: error_empty_final counts CONSECUTIVE empty turns; empty turns keep their reasoning)
 ### Added — the haiku worker tier (#2423)
 
 `worker:haiku` routes to `velo-haiku` on `anthropic/claude-haiku-5.5` ($0.10/M

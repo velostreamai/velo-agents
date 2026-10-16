@@ -303,6 +303,9 @@ class Hooks(RunHooks):
         self.max_budget_usd = max_budget_usd
         self.inp = self.out = self.cached = self.turns = 0
         self.leaked = 0
+        # Tool calls requested so far: the retry loop reads it to tell an empty
+        # turn that follows real work from one that follows another empty turn.
+        self.tool_calls = 0
         self.cost = 0.0
         # Accumulated here because `Runner.run` RAISES on max_turns and on a
         # model error, and the conversation goes with it — there is no result
@@ -326,10 +329,11 @@ class Hooks(RunHooks):
                 "type": getattr(item, "type", "?"),
                 "name": getattr(item, "name", None),
                 "arguments": getattr(item, "arguments", None),
-                "text": getattr(item, "content", None) and str(item.content)[:4000],
+                "text": item_text(item)[:4000],
             })
         calls = [o for o in (getattr(response, "output", None) or [])
                  if getattr(o, "type", "") == "function_call"]
+        self.tool_calls += len(calls)
         if calls:
             names = ",".join(getattr(c, "name", "?") for c in calls)
             detail = "  ".join(
@@ -342,7 +346,23 @@ class Hooks(RunHooks):
                         getattr(c, "name", "?"),
                         summarise_tool_input(getattr(c, "arguments", None)))
         else:
-            self.log.emit(f"[{self.label}] sdk assistant text_len=0")
+            # A reply with no tool call. When it is also empty the run is about to
+            # be nudged or failed, and what the model DID write — its reasoning —
+            # is the only evidence of why: a tool call inside the thinking block,
+            # a stop mid-thought, or nothing at all.
+            texts = [(getattr(o, "type", "?"), item_text(o)) for o in
+                     (getattr(response, "output", None) or [])]
+            reasoning = "\n".join(t for kind, t in texts if kind == "reasoning")
+            visible = "".join(t for kind, t in texts if kind != "reasoning")
+            self.log.emit(f"[{self.label}] sdk assistant text_len={len(visible)} "
+                          f"reasoning_len={len(reasoning)}")
+            if not visible.strip():
+                tail = " ".join(reasoning.split())[-600:]
+                self.log.emit(f"[{self.label}] empty turn reasoning tail: {tail!r}")
+                for kind in scan_for_leaked_tool_calls(reasoning):
+                    self.log.emit(f"[{self.label}] TOOL CALL INSIDE REASONING kind={kind} "
+                                  f"turn={self.turns} — the server filed it as thinking, "
+                                  f"so it never ran")
 
         # The model's own text is the WHY the policy asks for, captured where it
         # is actually produced rather than requested of the worker afterwards.
@@ -504,6 +524,27 @@ def scan_for_leaked_tool_calls(text: str) -> list:
         return []
     scannable = INLINE_CODE_RE.sub("", CODE_FENCE_RE.sub("", text))
     return [name for name, pat in LEAKED_TOOL_CALL_PATTERNS if pat.search(scannable)]
+
+
+def item_text(item) -> str:
+    """Every text an output item carries: `text`, `content` parts, `summary` parts.
+
+    openai-agents puts a chat-completions `reasoning_content` (llama-server,
+    Sushi) in a reasoning item's SUMMARY, not its content. Reading `content`
+    alone recorded every reasoning turn as empty, so the empty final turns that
+    killed four Sushi runs left nothing to say what the model had written.
+    """
+    parts = []
+    direct = getattr(item, "text", None)
+    if isinstance(direct, str):
+        parts.append(direct)
+    for field in ("content", "summary"):
+        value = getattr(item, field, None)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, (list, tuple)):
+            parts.extend(t for t in (getattr(v, "text", None) for v in value) if isinstance(t, str))
+    return "\n".join(p for p in parts if p)
 
 
 def tool_contract(tools) -> str:
@@ -827,8 +868,16 @@ async def main() -> int:
                 remaining = a.max_turns - hooks.turns
                 if remaining <= 0:
                     raise MaxTurnsExceeded("max turns exhausted during final-turn retries")
+                calls_before = hooks.tool_calls
                 r = await Runner.run(agent, inp, max_turns=remaining,
                                      run_config=cfg, hooks=hooks)
+                # CONSECUTIVE empty turns, as the failure message says. A nudge
+                # that got the model calling tools again was a recovery, so the
+                # count restarts. Never resetting it failed #2440 on its 4th
+                # empty turn of the run, 21 minutes and 28 tool calls after the
+                # 3rd.
+                if hooks.tool_calls > calls_before:
+                    empty = 0
                 final = str(r.final_output or "").strip()
                 if not final:
                     if empty == EMPTY_FINAL_RETRIES:
