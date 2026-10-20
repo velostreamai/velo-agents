@@ -175,15 +175,80 @@ def summarise_tool_input(raw) -> str:
     return line[:400] + "…" if len(line) > 400 else line
 
 
+# Diagnostic dumps from path-less runs are bounded so they cannot fill the disk:
+# nothing older than DUMP_MAX_AGE_DAYS, and the directory stays under DUMP_MAX_BYTES
+# (oldest files go first).
+DUMP_MAX_AGE_DAYS = 7
+DUMP_MAX_BYTES = 500 * 1024 * 1024
+# One empty turn's saved thinking is cut here; the run log keeps its own tail.
+DUMP_MAX_REASONING_CHARS = 100_000
+
+
+def prune_dumps(log: "Logger", d: str) -> None:
+    now = time.time()
+    try:
+        files = sorted(((os.path.getmtime(f), os.path.getsize(f), f)
+                        for f in (os.path.join(d, n) for n in os.listdir(d))
+                        if os.path.isfile(f)))
+        removed = 0
+        for mt, _size, f in list(files):
+            if now - mt > DUMP_MAX_AGE_DAYS * 86400:
+                os.remove(f); files.remove((mt, _size, f)); removed += 1
+        total = sum(size for _, size, _ in files)
+        while files and total > DUMP_MAX_BYTES:
+            _mt, size, f = files.pop(0)
+            os.remove(f); total -= size; removed += 1
+        if removed:
+            log.emit(f"runner-dumps pruned {removed} old file(s); {total} bytes kept in {d}")
+    except OSError as exc:  # a prune failure must be visible; it must not stop the run
+        log.emit(f"runner-dumps prune FAILED: {type(exc).__name__}: {exc}")
+
+
 class Logger:
     def __init__(self, path: str | None):
+        self.path = path
         self.fh = open(path, "a", encoding="utf-8") if path else None
+        self.started = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        self.pruned = False
+
+    def sidecar(self, suffix: str) -> str:
+        """Where a diagnostic file for this run goes.
+
+        Next to the run log when the runner was given --log-file. Dispatch does
+        not pass one (it redirects stdout), so a path-less run writes to
+        runner-dumps/ instead; each use logs the path it chose.
+        """
+        if self.path:
+            return self.path + suffix
+        d = os.path.expanduser("~/.agents/state/runner-dumps")
+        os.makedirs(d, exist_ok=True)
+        if not self.pruned:
+            self.pruned = True
+            prune_dumps(self, d)
+        return f"{d}/run-{self.started}-{os.getpid()}{suffix}"
 
     def emit(self, msg: str) -> None:
         line = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.000Z {msg}"
         print(line, flush=True)
         if self.fh:
             self.fh.write(line + "\n"); self.fh.flush()
+
+
+def dump_final_input(log: "Logger", result) -> None:
+    """Write the whole conversation of a run that failed on empty turns.
+
+    error_empty_final fails after ~100 turns of context, and the log keeps only a
+    600-char tail of the last thinking, so the failure could not be replayed. The
+    file lands next to the run log as `<log>.final-input.json`.
+    """
+    try:
+        out = log.sidecar(".final-input.json")
+        items = result.to_input_list()
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(items, fh, default=str)
+        log.emit(f"final-input dump: {len(items)} items, {os.path.getsize(out)} bytes -> {out}")
+    except Exception as exc:  # a failed diagnostic must be visible, not abort the verdict
+        log.emit(f"final-input dump FAILED: {type(exc).__name__}: {exc}")
 
 
 class AgentLog:
@@ -359,6 +424,18 @@ class Hooks(RunHooks):
             if not visible.strip():
                 tail = " ".join(reasoning.split())[-600:]
                 self.log.emit(f"[{self.label}] empty turn reasoning tail: {tail!r}")
+                self.log.emit(f"[{self.label}] empty turn context: turn={self.turns} "
+                              f"tool_calls_so_far={self.tool_calls} tokens_in={self.inp} "
+                              f"tokens_out={self.out} cached={self.cached} "
+                              f"output_item_types={[k for k, _ in texts]}")
+                # The tail above is 600 chars; the whole thinking is what a later
+                # replay needs. One JSON line per empty turn.
+                sidecar = self.log.sidecar(".empty-turns.jsonl")
+                with open(sidecar, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"turn": self.turns, "tool_calls": self.tool_calls,
+                                         "reasoning": reasoning[-DUMP_MAX_REASONING_CHARS:],
+                                         "types": [k for k, _ in texts]}) + "\n")
+                self.log.emit(f"[{self.label}] empty turn thinking saved: {sidecar}")
                 for kind in scan_for_leaked_tool_calls(reasoning):
                     self.log.emit(f"[{self.label}] TOOL CALL INSIDE REASONING kind={kind} "
                                   f"turn={self.turns} — the server filed it as thinking, "
@@ -881,10 +958,13 @@ async def main() -> int:
                 final = str(r.final_output or "").strip()
                 if not final:
                     if empty == EMPTY_FINAL_RETRIES:
+                        dump_final_input(log, r)
                         return r, "error_empty_final"
                     empty += 1
                     log.emit(f"[prompt 1] empty final turn (no text, no tool call) — "
-                             f"continuing, retry {empty}/{EMPTY_FINAL_RETRIES}")
+                             f"continuing, retry {empty}/{EMPTY_FINAL_RETRIES} "
+                             f"input_items={len(r.to_input_list())} turns={hooks.turns} "
+                             f"tool_calls={hooks.tool_calls}")
                     nudge = EMPTY_FINAL_NUDGE
                 elif (stalled < NO_PROGRESS_RETRIES and ended_without_progress(
                         read_only, final, start_state, worktree_state(a.cwd))):

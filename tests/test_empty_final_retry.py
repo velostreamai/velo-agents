@@ -31,6 +31,8 @@ RUNNER = pathlib.Path(__file__).resolve().parent.parent / "bin" / "velo-openai-a
 SRC = RUNNER.read_text()
 TREE = ast.parse(SRC)
 failures: list[str] = []
+# Conversations the retry loop handed to dump_final_input, one entry per dump.
+DUMPS: list = []
 
 
 def check(label: str, got, want) -> None:
@@ -67,6 +69,7 @@ def drive(script: list[tuple[int, str]]):
     steps = iter(script)
     hooks = NS(turns=0, tool_calls=0)
     logged: list[str] = []
+    DUMPS.clear()
 
     class Runner:
         @staticmethod
@@ -78,7 +81,8 @@ def drive(script: list[tuple[int, str]]):
 
     ns = dict(consts, Runner=Runner, MaxTurnsExceeded=MaxTurnsExceeded, hooks=hooks,
               a=NS(max_turns=10_000, cwd="."), agent=None, cfg=None, task="t", budget="",
-              log=NS(emit=logged.append), read_only=True, start_state=None,
+              log=NS(emit=logged.append), dump_final_input=lambda log, r: DUMPS.append(r),
+              read_only=True, start_state=None,
               worktree_state=lambda cwd: None, ended_without_progress=lambda *a: False)
     exec(LOOP_SRC, ns)
     _, status = asyncio.run(ns["_run_with_empty_final_retry"]())
@@ -93,6 +97,10 @@ check("a recovery between empty turns restarts the count (the #2440 shape)",
       drive([(18, ""), (0, ""), (1, ""), (28, ""), (3, "done")]), ("success", 4))
 check("recovered after N, then N+1 more in a row still fails",
       drive([(5, "")] + [(0, "")] * (N - 1) + [(4, "")] + [(0, "")] * N)[0], "error_empty_final")
+drive([(5, "")] + [(0, "")] * N)
+check("a run that fails on empty turns dumps its conversation once", len(DUMPS), 1)
+drive([(18, ""), (0, ""), (1, ""), (28, ""), (3, "done")])
+check("a run that recovers dumps nothing", len(DUMPS), 0)
 check("a real final answer is accepted at once", drive([(7, "report")]), ("success", 0))
 
 # --- the evidence ---------------------------------------------------------------
