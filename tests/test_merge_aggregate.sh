@@ -294,11 +294,66 @@ sc_ci_unrecognised_wait_is_definitive() {
 }
 sc_ci_pending_wait_keeps_polling() {
   SC_FAILS=""; reset; set_pr "" "$DOCS_FILES" "[$CI_OK,{\"name\":\"Slow\",\"status\":\"IN_PROGRESS\",\"conclusion\":\"\"}]"
-  VELO_MERGE_WAIT_INTERVAL=0 VELO_MERGE_WAIT_MAX=1 merge --wait
+  # The budget is 5s, not 1s: with a 1s budget a SINGLE attempt that happens to outlast it ends
+  # the wait at the timeout before a second poll, and the last assertion below reads as a defect
+  # in --wait rather than as host load — it did, three runs in a row, next to test_native_workers.
+  # 5s is what test_merge_once.sh already uses for its --wait scenarios (VELO_MERGE_WAIT_MAX=5),
+  # per test-timeouts.sh: headroom, not a minimum. Every assertion here is unchanged.
+  VELO_MERGE_WAIT_INTERVAL=0 VELO_MERGE_WAIT_MAX=5 merge --wait
   [[ $RC -ne 0 ]];                                         sc_check wait-gives-up-at-the-timeout $?
   has "$TMPD/merge.out" "TIMEOUT";                         sc_check says-it-timed-out $?
   ! has "$TMPD/merge.out" "definitive failure";            sc_check pending-is-not-definitive $?
   [[ "$(grep -c -- '--json headRefOid' "$STUB_CALLS")" -gt 1 ]]; sc_check wait-polled-more-than-once $?
+}
+# A SUPERSEDED run must not hold the merge open (#2677). A re-run leaves its old row on the sha
+# beside the new one, and a close/reopen republishes every check, so the same check arrives as
+# several rows. Reading all of them said "the worst state ever produced for that check" — a PR
+# whose failed run has since passed was FAILING forever and --wait polled a failure it could never
+# clear. The merge gate reads the LATEST run of each check.
+# (The rows here carry no workflowName, so they key as one check; the timestamps decide which one
+# is the latest. test_ci_rollup_latest.sh pins the key itself, workflow by workflow.)
+sc_ci_superseded_failure_does_not_block() {
+  SC_FAILS=""; ci_merge '{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-09-08T03:00:00Z","completedAt":"2026-09-08T03:30:00Z"},{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-09-08T04:00:00Z","completedAt":"2026-09-08T04:30:00Z"}'
+  [[ $RC -eq 0 ]];                                         sc_check merges-exit-0 $?
+  has "$TMPD/merge.out" "CI green on current head";        sc_check says-ci-is-green $?
+  ! has "$TMPD/merge.out" "CI FAILING";                    sc_check does-not-call-it-failing $?
+  [[ "$(merges)" == 1 ]];                                  sc_check gh-pr-merge-called-once $?
+}
+# The newer run failing is a failure — dedupe reads the latest run, it does not forgive one.
+sc_ci_superseded_success_does_not_hide_a_failure() {
+  SC_FAILS=""; ci_merge '{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-09-08T03:00:00Z","completedAt":"2026-09-08T03:30:00Z"},{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-09-08T04:00:00Z","completedAt":"2026-09-08T04:30:00Z"}'
+  [[ $RC -ne 0 ]];                                         sc_check refuses $?
+  has "$TMPD/merge.out" "CI FAILING";                      sc_check says-ci-is-failing $?
+  has "$TMPD/merge.out" "Lint";                            sc_check names-the-failed-check $?
+  [[ "$(merges)" == 0 ]];                                  sc_check no-merge-was-attempted $?
+}
+# A re-run that is still going REPLACES the failure it re-ran, so --wait retries it: pending, and
+# the stale FAILING that --wait could never clear is gone.
+sc_ci_pending_rerun_supersedes_the_failure() {
+  SC_FAILS=""; ci_merge '{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-09-08T03:00:00Z","completedAt":"2026-09-08T03:30:00Z"},{"__typename":"CheckRun","name":"Lint","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-09-08T05:00:00Z","completedAt":null}'
+  [[ $RC -ne 0 ]];                                         sc_check refuses $?
+  has "$TMPD/merge.out" "CI still pending";                sc_check says-ci-is-pending $?
+  ! has "$TMPD/merge.out" "CI FAILING";                    sc_check the-superseded-failure-is-gone $?
+}
+# Two CHECKS, one failed: the newer run of the green one must not be confused with the failed one,
+# so the key is the check and not the state.
+sc_ci_failure_in_another_check_is_not_superseded() {
+  SC_FAILS=""; ci_merge '{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-09-08T03:00:00Z","completedAt":"2026-09-08T03:30:00Z"},{"__typename":"CheckRun","name":"Format","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-09-08T04:00:00Z","completedAt":"2026-09-08T04:30:00Z"}'
+  [[ $RC -ne 0 ]];                                         sc_check refuses $?
+  has "$TMPD/merge.out" "CI FAILING";                      sc_check says-ci-is-failing $?
+  has "$TMPD/merge.out" "Lint";                            sc_check names-the-failed-check $?
+}
+# --wait on a pending re-run of a check that failed before: the stale failure used to make this
+# a DEFINITIVE refusal (a FAILING row), which stopped the wait at once and on a green PR. It is
+# pending now, so the wait does not call it definitive. (The number of polls is timing-sensitive;
+# what #2677 changed is which of the two exits the wait takes, so that is what is asserted.)
+sc_ci_pending_rerun_wait_is_not_definitive() {
+  SC_FAILS=""; reset; set_pr "" "$DOCS_FILES" '[{"__typename":"CheckRun","name":"Lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-09-08T03:00:00Z","completedAt":"2026-09-08T03:30:00Z"},{"__typename":"CheckRun","name":"Lint","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-09-08T05:00:00Z","completedAt":null}]'
+  VELO_MERGE_WAIT_INTERVAL=0 VELO_MERGE_WAIT_MAX=0 merge --wait
+  [[ $RC -ne 0 ]];                                         sc_check wait-refuses $?
+  has "$TMPD/merge.out" "TIMEOUT";                         sc_check says-it-timed-out $?
+  ! has "$TMPD/merge.out" "definitive failure";            sc_check pending-is-not-definitive $?
+  ! has "$TMPD/merge.out" "CI FAILING";                    sc_check the-superseded-failure-is-gone $?
 }
 # A rollup definition that cannot be read, or cannot be run, is a refusal that names it — never
 # "no checks failed". The script is copied to a directory of its own so that the sibling file
@@ -507,6 +562,11 @@ run_scenarios \
   "sc_ci_failing_outranks_everything::failing outranks pending and unrecognised" \
   "sc_ci_unrecognised_outranks_pending::unrecognised outranks pending" \
   "sc_ci_only_skipped_is_not_green::only skipped lanes is no CI at all, not green" \
+  "sc_ci_superseded_failure_does_not_block::a superseded FAILURE beside a newer SUCCESS of the same check merges" \
+  "sc_ci_superseded_success_does_not_hide_a_failure::a newer FAILURE beside an older SUCCESS is FAILING" \
+  "sc_ci_pending_rerun_supersedes_the_failure::a pending re-run replaces the failure it re-ran" \
+  "sc_ci_failure_in_another_check_is_not_superseded::the newer run of a DIFFERENT check does not supersede a failure" \
+  "sc_ci_pending_rerun_wait_is_not_definitive::--wait does not call a pending re-run a definitive failure" \
   "sc_ci_unrecognised_wait_is_definitive::--wait stops on an unrecognised row" \
   "sc_ci_pending_wait_keeps_polling::--wait keeps polling a check that is still running" \
   "sc_ci_missing_rollup_definition_refuses::a missing rollup definition is refused, naming the file" \
@@ -687,6 +747,10 @@ prove_jq "the refusal names the unfinished check" sc_ci_running_empty_conclusion
   'pending: names("pending"), ' 'pending: "", '
 prove_jq "the refusal says what it did not recognise" sc_ci_unrecognised_conclusion says-what-it-did-not-recognise \
   '"\(.l) (\(.d))"' '"\(.l)"'
+# The #2677 fix, through the real merge gate: without the dedupe step the superseded FAILURE is
+# read again and the green PR refuses to merge.
+prove_jq "one row per check, the latest run, before the state reduce" sc_ci_superseded_failure_does_not_block merges-exit-0 \
+  '| only_latest_runs[] |' '| .[] |'
 
 echo
 if [[ $FAILED -eq 0 ]]; then echo "all merge-aggregation checks passed"; else echo "FAILED"; fi

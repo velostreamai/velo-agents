@@ -167,6 +167,9 @@ suite test_merge_gates.sh bash "$HERE/test_merge_gates.sh"
 suite test_merge_once.sh bash "$HERE/test_merge_once.sh"
 suite test_merge_aggregate.sh bash "$HERE/test_merge_aggregate.sh"
 echo
+echo "── ci rollup: the latest run of each check ────────────"
+suite test_ci_rollup_latest.sh bash "$HERE/test_ci_rollup_latest.sh"
+echo
 echo "── routing: label vs spec ─────────────────────────────"
 suite test_routing.sh bash "$HERE/test_routing.sh"
 echo
