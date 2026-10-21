@@ -782,6 +782,13 @@ if [[ $NEEDS_REVIEW -eq 1 ]]; then
   # rather than handing the reviewer a range that quietly means something else.
   # (A non-zero status is "not an ancestor" or "no such commit here": either way no delta can be
   # built from it, and the whole branch is the answer.)
+  # VELO_GATE_FULL=1: review the WHOLE branch against its base, ignoring earlier gate shas. A
+  # delta review asks "is this patch right"; a full review asks "is the PR right" and is the
+  # one to run after several fix rounds, when each delta has found one more neighbouring hole.
+  if [[ "${VELO_GATE_FULL:-0}" == "1" ]]; then
+    GSHA=""
+    SCOPE_NOTE="VELO_GATE_FULL=1: the whole branch is in range. Nothing below it is cleared — review the entire PR, not the last commit."
+  fi
   if [[ "$GSHA" != "null" && -n "$GSHA" ]]; then
     if git -C "$WTPATH" merge-base --is-ancestor "$GSHA" HEAD 2>/dev/null; then
       RANGE="$GSHA..$HEAD"
