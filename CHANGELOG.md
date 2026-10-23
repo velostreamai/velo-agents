@@ -6,6 +6,25 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — the review preamble and the worker pre-gate sweep are supplied by the tooling (#2231)
+
+Two review-quality rules used to live in whoever wrote the scope or the brief, and went missing when
+nobody pasted them. `velo-gate-run` now opens every review brief's `## ATTACK` with
+`rules/gate-attack-preamble.md` (the one-round exhaustive-review rules: finish every item, build the
+matrix first, diff each new parser against the route's own, sweep the sibling sites). It goes on
+after the scope's own ATTACK has been judged non-empty, so it cannot mask an empty one; a body
+already opening with its heading gets none added; a preamble that is missing, empty or unrecognised
+refuses the round before anything is touched; and a kept (already filled) brief must open its ATTACK
+with it too. Every worker brief must carry `rules/worker-pre-gate-sweep.md` under `## PRE-GATE
+SWEEP` (spec §14): `velo-brief-lint.sh` refuses a brief without the heading, `velo-dispatch`
+appends the file to a copy under its state dir and hands the worker the copy (the caller's file, the
+spec pin and `velo-record` keep the original), and `velo-spec-review` attest stays strict because
+it pins the file as written. The style advisory skips the tooling-owned section. **Prevents:** a gate
+round that finds one more defect of a kind the first round could have found, because the reviewer
+was told what to attack and not how thoroughly; and a worker that pushes the second parser, the
+per-row recompute or the unlisted route its brief never asked it to sweep for. Past gate rounds on
+one stream found these shapes one per round.
+
 ### Added — briefs are written in ASD-STE100 style; an advisory lint flags long or chained steps
 
 Spec §13 says each numbered step in a brief holds one imperative action of 20 words or fewer,

@@ -83,6 +83,17 @@ brief_has_validation_section() {   # a Validation heading with something under i
     g && NF { found = 1; exit }
     END { exit !found }' <<<"$BRIEF_PROSE"
 }
+# spec §14, the pre-gate sweep: rules/worker-pre-gate-sweep.md is in every brief, because past gate
+# rounds found the same few defect shapes one per round and a worker sweeps for them only if its
+# brief says so. "In the brief" means a `PRE-GATE SWEEP` HEADING outside any fence, read from the
+# fence-masked text like every other heading: a brief that merely mentions the words, or quotes the
+# heading in a fenced example, does not have it. velo-dispatch asks THIS function before it appends
+# the section, so dispatch and the lint cannot disagree about what "has it" means.
+velo_brief_has_sweep() {   # $1 = the brief. 0 when it carries the heading
+  local BRIEF="$1" prose
+  prose=$(brief_prose)
+  grep -qE '^#+[[:space:]]+PRE-GATE SWEEP' <<<"$prose"
+}
 velo_brief_lint() {   # $1 = the brief. 0 when complete; 1 with the BRIEF INCOMPLETE block on stderr
   local BRIEF="$1" BRIEF_PROSE MISSING=()
   BRIEF_PROSE=$(brief_prose)
@@ -103,6 +114,8 @@ if grep -qiE "\.sql|SELECT .* FROM" "$BRIEF"; then
   grep -q "SQL_GRAMMAR_RULES\|PARSER_GRAMMAR" "$BRIEF" \
     || MISSING+=("brief writes SQL but cites no grammar reference (spec §6)")
 fi
+velo_brief_has_sweep "$BRIEF" \
+  || MISSING+=("no '## PRE-GATE SWEEP' section (spec §14) — paste .agents/rules/worker-pre-gate-sweep.md into the brief. velo-dispatch appends it for you; velo-spec-review attests the file as written, so there it must already be in the file")
 if [[ ${#MISSING[@]} -gt 0 ]]; then
   printf '\n\033[31mBRIEF INCOMPLETE:\033[0m %s\n' "$BRIEF" >&2
   printf '  - %s\n' "${MISSING[@]}" >&2
@@ -116,6 +129,10 @@ return 0
 # >>> velo-brief-ste (extracted verbatim by tests/test_brief_ste.sh)
 # spec §13, instruction style (ASD-STE100). ADVISORY: it prints warnings and always returns 0.
 # It does not refuse a brief until its false-positive rate on real briefs is known.
+#
+# The `PRE-GATE SWEEP` section (spec §14) is skipped, up to the next heading: the tooling owns that
+# text, its steps are long on purpose, and an author cannot restyle it — checking it would print the
+# same warnings on every brief.
 #
 # A STEP is a numbered list item in prose: `1. Do X` or `1) Do X`, at most three spaces of
 # indent. Fenced lines are skipped (brief_prose masks them). A line under a step that is
@@ -145,6 +162,9 @@ velo_brief_ste_warn() {   # $1 = the brief. Prints warnings to stderr. Always re
       step = ""
     }
     /^    / { flush(); next }                               # fenced: not prose
+    /^#+[ \t]+PRE-GATE SWEEP/ { flush(); sweep = 1; next }  # tooling-owned section: not checked
+    sweep && /^#/ { sweep = 0 }
+    sweep { next }
     /^ {0,3}[0-9]+[.)][ \t]+/ {
       flush(); sline = NR
       s = $0; sub(/^ *[0-9]+[.)][ \t]+/, "", s); step = s; next

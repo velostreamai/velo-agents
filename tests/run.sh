@@ -130,6 +130,7 @@ echo
 echo "── brief fields ───────────────────────────────────────"
 suite test_brief_fields.sh bash "$HERE/test_brief_fields.sh"
 suite test_brief_ste.sh bash "$HERE/test_brief_ste.sh"
+suite test_brief_sweep.sh bash "$HERE/test_brief_sweep.sh"
 echo
 echo "── fence grammar parity (brief_prose awk vs extract_attack python) ──"
 suite test_fence_parity.py python3 "$HERE/test_fence_parity.py"

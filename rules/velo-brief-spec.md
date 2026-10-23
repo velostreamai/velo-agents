@@ -165,6 +165,19 @@ It flags steps with more than 20 words, more than one sentence, or a chained
 "then". It is ADVISORY: it warns and does not refuse. On its first run it
 flagged 65 of the 140 steps in the 35 tracked briefs.
 
+## 14. Pre-gate sweep — the tooling supplies it
+
+Every brief carries [`worker-pre-gate-sweep.md`](worker-pre-gate-sweep.md) under a
+`## PRE-GATE SWEEP` heading. It names the defect shapes that past gate rounds found one per round
+(a second parser that diverges from the route's own, batch-constant work in a row loop, a route
+nobody listed, ...) and the PR size cap. The worker sweeps for them before its first push and logs
+one `CLASS-SWEEP` line per item.
+
+Do not retype it. The lint refuses a brief without the heading. `velo-dispatch` appends the file to
+a COPY of the brief when it is missing, under `~/.agents/state/dispatch/<issue>/`, and leaves your
+file as it was. `velo-spec-review` attests the file as written, so there the section must already
+be in the file: `cat ~/.agents/rules/worker-pre-gate-sweep.md >> <brief>`.
+
 ## Orchestrator's own obligations
 
 - Verify results from `git log` / `git status` / the tests, never from the

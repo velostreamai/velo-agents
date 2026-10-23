@@ -25,12 +25,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"
 RUN_REAL="$BIN/velo-gate-run"
 PRGATE_REAL="$BIN/velo-pr-gate"
+# The one-round exhaustive-review preamble velo-gate-run puts at the top of every brief's ATTACK (#2231),
+# and the words its opening heading starts with: that heading is how the script (and a kept brief)
+# recognises it.
+PREAMBLE_REAL="$(cd "$HERE/.." && pwd)/rules/gate-attack-preamble.md"
+PREAMBLE_MARKER='ATTACK 0 — ONE-ROUND EXHAUSTIVE REVIEW'
 FAILED=0
 ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }
 
 [[ -x "$RUN_REAL" ]] || { fail "velo-gate-run not found or not executable at $RUN_REAL"; exit 1; }
 [[ -f "$PRGATE_REAL" ]] || { fail "velo-pr-gate not found at $PRGATE_REAL"; exit 1; }
+[[ -s "$PREAMBLE_REAL" ]] || { fail "the shipped preamble is missing or empty: $PREAMBLE_REAL"; exit 1; }
 
 TPR=$(( 900000 + ($$ % 90000) ))
 TMPD=$(mktemp -d)
@@ -57,6 +63,12 @@ cleanup() {
   rm -rf "$TMPD"
 }
 trap cleanup EXIT
+# The preamble as the script reads it. A mutant copy of the script lives in $TMPD/mut and looks for
+# the file at ../rules, so the real one is laid out there too; what the scenarios EXPECT to see in a
+# brief is built from this copy.
+PREAMBLE_COPY="$TMPD/rules/gate-attack-preamble.md"
+mkdir -p "$TMPD/rules"
+cp "$PREAMBLE_REAL" "$PREAMBLE_COPY"
 
 SC_FAILS=""
 sc_check() { [[ "$2" -eq 0 ]] || SC_FAILS="$SC_FAILS $1"; }   # <name> <status>
@@ -233,7 +245,14 @@ chmod +x "$TMPD/stub-bin/velo-openrouter-agent"
 
 SCOPE="$TMPD/scope.md"
 EXPECTED_ATTACK="$TMPD/expected-attack.md"
+EXPECTED_FILLED="$TMPD/expected-filled.md"
 FINAL_EXPECTED="$TMPD/final.expected"
+
+# What the brief's ATTACK holds for a scope whose own ATTACK body is <body file>: the preamble, one
+# blank line, then that body — and nothing else.
+with_preamble() {   # <body file> -> stdout
+  printf '%s\n\n%s\n' "$(cat "$PREAMBLE_COPY")" "$(cat "$1")"
+}
 
 write_default_scope() {   # <path>
   cat > "$1" <<'EOF'
@@ -268,6 +287,7 @@ Work A1 and A2. A1 is where the risk lives.
 
 It belongs to ATTACK, because it is deeper than the ATTACK heading.
 EOF
+  with_preamble "$EXPECTED_ATTACK" > "$EXPECTED_FILLED"
 }
 
 # What `codex review -` actually leaves in review.log: a transcript with `user`,
@@ -411,7 +431,7 @@ sc_attack_fill() {
   [[ $RC -eq 0 ]];                                 sc_check exits-0 $?
   ! has "$B" "<<< FILL THIS IN";                   sc_check placeholder-gone $?
   own_attack "$B" > "$TMPD/own.txt"
-  diff -q "$TMPD/own.txt" "$EXPECTED_ATTACK" >/dev/null; sc_check section-is-the-scopes-attack-body $?
+  diff -q "$TMPD/own.txt" "$EXPECTED_FILLED" >/dev/null; sc_check section-is-the-preamble-then-the-scopes-attack-body $?
   has "$B" "## Also confirm";                      sc_check rest-of-the-brief-intact $?
   has "$B" "<!-- velo-gate-brief scope=stub range=stub -->"; sc_check trailer-intact $?
   # The scope text embedded ABOVE the section carries an ATTACK heading of its own;
@@ -441,17 +461,22 @@ sc_attack_refused_empty() {
   [[ $RC -ne 0 ]];                                 sc_check refused $?
   has "$TMPD/wrapper.out" "is EMPTY";              sc_check clear-error $?
   [[ ! -e "$STUB_DIR/calls.log" ]];                sc_check nothing-was-run $?
+  # The preamble is on hand and non-empty, and must not stand in for the scope's own empty body: the
+  # round stops before it is even read, and writes no attack body for a brief to be filled from.
+  [[ ! -e "$GATE_DIR/attack-body.md" ]];           sc_check no-attack-body-of-just-the-preamble $?
+  ! has "$TMPD/wrapper.out" "exhaustive-review preamble"; sc_check never-got-as-far-as-the-preamble $?
 }
 
 # One scope shape per call: the section the wrapper writes into the brief must be
-# exactly <expected>.
+# exactly the preamble, a blank line, and <expected> (the scope's own ATTACK body).
 attack_shape() {   # <name> <scope-file> <expected-file>
   local name="$1" scope="$2" expected="$3"
   reset
   run_wrapper "$TPR" "$scope"
   if [[ $RC -ne 0 ]]; then SC_FAILS="$SC_FAILS $name(rc=$RC)"; return; fi
   own_attack "$GATE_DIR/review-brief.md" > "$TMPD/own.txt"
-  diff -q "$TMPD/own.txt" "$expected" >/dev/null || SC_FAILS="$SC_FAILS $name"
+  with_preamble "$expected" > "$TMPD/own.expected"
+  diff -q "$TMPD/own.txt" "$TMPD/own.expected" >/dev/null || SC_FAILS="$SC_FAILS $name"
 }
 
 sc_attack_shapes() {
@@ -659,13 +684,170 @@ sc_kept_brief() {
   SC_FAILS=""
   reset
   mkdir -p "$GATE_DIR"
-  printf 'READ-ONLY review.\n\n## ATTACK\n\nHAND FILLED by the author\n\n## Also confirm\n\n<!-- velo-gate-brief scope=stub range=stub -->\n' \
-    > "$GATE_DIR/review-brief.md"
+  # A filled brief from an earlier round of this script: its ATTACK opens with the preamble.
+  printf 'READ-ONLY review.\n\n## ATTACK\n\n## %s\n\nHAND FILLED by the author\n\n## Also confirm\n\n<!-- velo-gate-brief scope=stub range=stub -->\n' \
+    "$PREAMBLE_MARKER" > "$GATE_DIR/review-brief.md"
   run_wrapper "$TPR" "$SCOPE"
   [[ $RC -eq 0 ]];                                          sc_check exits-0 $?
   has "$GATE_DIR/review-brief.md" "HAND FILLED by the author"; sc_check hand-filled-attack-survives $?
   ! has "$GATE_DIR/review-brief.md" "Work A1 and A2";      sc_check scope-attack-not-forced-over-it $?
   has "$TMPD/wrapper.out" "already filled";                sc_check says-so $?
+}
+
+# ── the one-round exhaustive-review preamble (#2231) ─────────────────────────
+# Gate rounds kept finding one more defect each, because the reviewer was told what to attack and not
+# how thoroughly. The rules are rules/gate-attack-preamble.md, and velo-gate-run puts them at the top of
+# every brief's ATTACK so that nobody has to remember to paste them into a scope.
+#
+# A layout is <dir>/bin/velo-gate-run — a copy of the script under test, so a mutant is exercised — with
+# <dir>/rules beside it as the scenario sets it up and HOME pointing at a directory the scenario owns:
+# the preamble can then come only from the places the scenario chose.
+run_in_layout() {   # <layout dir> <home dir> [args...] -> $OUT $RC
+  local lay="$1" home="$2" saved="$RUN_UNDER_TEST"; shift 2
+  mkdir -p "$lay/bin" "$home"
+  cp "$RUN_UNDER_TEST" "$lay/bin/velo-gate-run"
+  RUN_UNDER_TEST="$lay/bin/velo-gate-run"
+  HOME="$home" run_wrapper "$@"
+  RUN_UNDER_TEST="$saved"
+}
+first_line_is_preamble() {   # <file>: its first line is the preamble's own heading
+  [[ "$(head -n 1 "$1")" == "## $PREAMBLE_MARKER"* ]]
+}
+
+sc_preamble_prepended() {
+  SC_FAILS=""
+  reset
+  run_wrapper "$TPR" "$SCOPE"
+  local AB="$GATE_DIR/attack-body.md" B="$GATE_DIR/review-brief.md"
+  [[ $RC -eq 0 ]];                                          sc_check exits-0 $?
+  first_line_is_preamble "$AB";                             sc_check attack-body-opens-with-the-preamble-heading $?
+  has "$AB" "**A1** — is the detector exhaustive?";         sc_check and-carries-the-scopes-items $?
+  diff -q "$AB" "$EXPECTED_FILLED" >/dev/null;              sc_check attack-body-is-the-preamble-a-blank-line-then-the-scopes-body $?
+  own_attack "$B" > "$TMPD/own.txt"
+  first_line_is_preamble "$TMPD/own.txt";                   sc_check the-briefs-attack-opens-with-it $?
+  has "$B" "**A1** — is the detector exhaustive?";          sc_check and-the-brief-carries-the-scopes-items $?
+  [[ "$(grep -c "^## $PREAMBLE_MARKER" "$B")" == "1" ]];    sc_check once-and-not-twice $?
+  grep -qE 'ATTACK filled from .* lines\), under the one-round exhaustive-review preamble \(.*/rules/gate-attack-preamble\.md\)' "$TMPD/wrapper.out"
+  sc_check the-fill-line-says-so-and-names-the-file $?
+}
+
+# A scope whose ATTACK already OPENS with the preamble's heading gets nothing added. "Opens with" is the
+# first non-blank line: the same words quoted in prose, further down, or inside a fence do not count,
+# and the shipped preamble still goes on.
+sc_preamble_not_duplicated() {
+  SC_FAILS=""
+  local AB="$GATE_DIR/attack-body.md" B="$GATE_DIR/review-brief.md" d
+  reset
+  printf '# Scope\n\n## ATTACK\n\n### %s (pasted by the author)\n\nThe author wrote this preamble line.\n\n**A1** — a scope item\n\n## Next\n\nexcluded\n' \
+    "$PREAMBLE_MARKER" > "$SCOPE"
+  printf '### %s (pasted by the author)\n\nThe author wrote this preamble line.\n\n**A1** — a scope item\n' "$PREAMBLE_MARKER" > "$TMPD/dup.expected"
+  run_wrapper "$TPR" "$SCOPE"
+  [[ $RC -eq 0 ]];                                          sc_check exits-0 $?
+  [[ "$(grep -c "$PREAMBLE_MARKER" "$AB")" == "1" ]];       sc_check the-heading-is-in-the-body-once $?
+  ! has "$AB" "This is the ONLY review round";              sc_check the-shipped-text-was-not-added-on-top $?
+  own_attack "$B" > "$TMPD/own.txt"
+  diff -q "$TMPD/own.txt" "$TMPD/dup.expected" >/dev/null;  sc_check the-brief-carries-the-scopes-body-and-nothing-before-it $?
+  has "$TMPD/wrapper.out" "already opens with the exhaustive-review preamble, so none was added"; sc_check says-so $?
+  for d in prose later fenced; do
+    reset
+    case "$d" in
+      prose)  printf '## ATTACK\n\nStart from "%s" if you like; this line only mentions it.\n\n**A1** — a scope item\n' "$PREAMBLE_MARKER" > "$SCOPE" ;;
+      later)  printf '## ATTACK\n\n**A1** — a scope item\n\n### %s\n\nquoted further down\n' "$PREAMBLE_MARKER" > "$SCOPE" ;;
+      fenced) printf '## ATTACK\n\n```text\n## %s\n```\n\n**A1** — a scope item\n' "$PREAMBLE_MARKER" > "$SCOPE" ;;
+    esac
+    run_wrapper "$TPR" "$SCOPE"
+    [[ $RC -eq 0 ]];                                        sc_check "exits-0[$d]" $?
+    first_line_is_preamble "$AB";                           sc_check "the-shipped-preamble-still-goes-on-top[$d]" $?
+    has "$AB" "This is the ONLY review round";              sc_check "and-it-is-the-shipped-text[$d]" $?
+    has "$AB" "**A1** — a scope item";                      sc_check "and-the-scopes-body-follows[$d]" $?
+  done
+}
+
+# The preamble is found, read and recognised BEFORE anything is touched, so a refused round leaves nothing
+# behind (no gate dir, no scope copy, no step run) and says what was wrong and where it looked. It must
+# also OPEN with its heading, or the check for "already there" and the kept-brief check, which both read
+# the first non-blank line, would not recognise a preamble this script itself wrote.
+expect_preamble_refusal() {   # <name> <message fragment>: the round just run was refused for that reason, touching nothing
+  [[ $RC -ne 0 ]];                                          sc_check "refused[$1]" $?
+  has "$TMPD/wrapper.out" "$2";                             sc_check "says-why[$1]" $?
+  [[ ! -e "$STUB_DIR/calls.log" ]];                         sc_check "velo-pr-gate-not-called[$1]" $?
+  [[ ! -e "$GATE_DIR" ]];                                   sc_check "nothing-created-or-saved[$1]" $?
+}
+sc_preamble_missing() {
+  SC_FAILS=""
+  local lay="$TMPD/lay" home="$TMPD/emptyhome" P="$TMPD/lay/rules/gate-attack-preamble.md" v
+  reset; rm -rf "$lay" "$home"
+  run_in_layout "$lay" "$home" "$TPR" "$SCOPE"
+  expect_preamble_refusal absent "was not found. Looked in:"
+  has "$TMPD/wrapper.out" "$lay/bin/../rules/gate-attack-preamble.md";   sc_check absent-names-the-path-beside-the-script $?
+  has "$TMPD/wrapper.out" "$home/.agents/rules/gate-attack-preamble.md"; sc_check absent-names-the-installed-path $?
+  for v in empty blank no-heading heading-not-first directory; do
+    reset; rm -rf "$lay" "$home"; mkdir -p "$lay/rules"
+    case "$v" in
+      empty)           : > "$P" ;;
+      blank)           printf ' \n\n\t\n' > "$P" ;;
+      no-heading)      printf 'rules with no heading at all\n' > "$P" ;;
+      heading-not-first) printf 'an intro line first\n\n## %s\n\nbody\n' "$PREAMBLE_MARKER" > "$P" ;;
+      directory)       mkdir -p "$P" ;;
+    esac
+    run_in_layout "$lay" "$home" "$TPR" "$SCOPE"
+    case "$v" in
+      empty|blank)                expect_preamble_refusal "$v" "the exhaustive-review preamble is EMPTY" ;;
+      no-heading|heading-not-first) expect_preamble_refusal "$v" "does not open with its '## $PREAMBLE_MARKER' heading" ;;
+      directory)                  expect_preamble_refusal "$v" "could not read the exhaustive-review preamble" ;;
+    esac
+  done
+}
+
+# Beside the script first (the repo checkout and ~/.agents lay rules/ out the same way), then the
+# installed copy; when both exist the one beside the script wins.
+sc_preamble_lookup() {
+  SC_FAILS=""
+  local lay="$TMPD/lay" home="$TMPD/home2"
+  reset; rm -rf "$lay" "$home"; mkdir -p "$home/.agents/rules"
+  printf '## %s (installed copy)\nINSTALLED-COPY-TOKEN\n' "$PREAMBLE_MARKER" > "$home/.agents/rules/gate-attack-preamble.md"
+  run_in_layout "$lay" "$home" "$TPR" "$SCOPE"
+  [[ $RC -eq 0 ]];                                          sc_check installed-copy-is-used-when-nothing-sits-beside-the-script $?
+  has "$GATE_DIR/attack-body.md" "INSTALLED-COPY-TOKEN";    sc_check and-it-is-what-the-brief-carries $?
+  has "$TMPD/wrapper.out" "preamble ($home/.agents/rules/gate-attack-preamble.md)"; sc_check and-the-fill-line-names-it $?
+  reset; mkdir -p "$lay/rules"
+  printf '## %s (beside the script)\nSIBLING-TOKEN\n' "$PREAMBLE_MARKER" > "$lay/rules/gate-attack-preamble.md"
+  run_in_layout "$lay" "$home" "$TPR" "$SCOPE"
+  [[ $RC -eq 0 ]];                                          sc_check exits-0-with-both $?
+  has "$GATE_DIR/attack-body.md" "SIBLING-TOKEN";           sc_check the-copy-beside-the-script-wins $?
+  ! has "$GATE_DIR/attack-body.md" "INSTALLED-COPY-TOKEN";  sc_check and-the-installed-one-is-not-added $?
+}
+
+# A filled brief is kept as it is — but it must still open its ATTACK with the preamble, or a brief
+# filled before this script added the preamble (or by hand) reaches the reviewer without it.
+sc_kept_brief_needs_preamble() {
+  SC_FAILS=""
+  local B="$GATE_DIR/review-brief.md"
+  reset
+  mkdir -p "$GATE_DIR"
+  printf 'READ-ONLY review.\n\n## ATTACK\n\nHAND FILLED by the author\n\n## Also confirm\n\n<!-- velo-gate-brief scope=stub range=stub -->\n' > "$B"
+  cp "$B" "$TMPD/kept.before"
+  run_wrapper "$TPR" "$SCOPE"
+  [[ $RC -ne 0 ]];                                          sc_check refused $?
+  has "$TMPD/wrapper.out" "does not open with the exhaustive-review preamble"; sc_check says-why $?
+  has "$TMPD/wrapper.out" "rm $B";                          sc_check names-the-remedy $?
+  cmp -s "$B" "$TMPD/kept.before";                          sc_check and-leaves-the-brief-as-it-was $?
+  [[ "$(ncalls '--exec --wait')" == "0" ]];                 sc_check and-launches-no-gate $?
+  # The remedy works: with the brief removed the round fills it again, under the preamble.
+  rm -f "$B"
+  run_wrapper "$TPR" "$SCOPE"
+  [[ $RC -eq 0 ]];                                          sc_check the-round-after-the-remedy-runs $?
+  own_attack "$B" > "$TMPD/own.txt"
+  first_line_is_preamble "$TMPD/own.txt";                   sc_check and-fills-it-under-the-preamble $?
+  # The scope text embedded above the brief's own section may carry an ATTACK, with a preamble, of its
+  # own: only the brief's OWN section (the last) counts.
+  reset
+  mkdir -p "$GATE_DIR"
+  printf 'READ-ONLY review.\n\n## ATTACK\n\n## %s\n\nembedded in the scope text above\n\n## ATTACK\n\nHAND FILLED by the author\n\n## Also confirm\n\n<!-- velo-gate-brief scope=stub range=stub -->\n' \
+    "$PREAMBLE_MARKER" > "$B"
+  run_wrapper "$TPR" "$SCOPE"
+  [[ $RC -ne 0 ]];                                          sc_check a-preamble-in-the-text-above-does-not-count-refused $?
+  has "$TMPD/wrapper.out" "does not open with the exhaustive-review preamble"; sc_check a-preamble-in-the-text-above-does-not-count-says-why $?
 }
 
 # ── the verdict ──────────────────────────────────────────────────────────────
@@ -1495,6 +1677,11 @@ run_scenarios \
   "sc_attack_refused_empty::a scope with an empty ## ATTACK is refused with nothing touched" \
   "sc_attack_shapes::section boundaries: next heading, fences, depth, decoration, CRLF, end of file" \
   "sc_kept_brief::an already-filled brief is kept, not overwritten from the scope" \
+  "sc_preamble_prepended::the scope's ATTACK reaches the brief under the one-round exhaustive-review preamble, which comes first" \
+  "sc_preamble_not_duplicated::a body that already opens with the preamble's heading gets none added; a quoted, later or fenced mention does not count" \
+  "sc_preamble_missing::a preamble that is absent, empty, unrecognisable or unreadable refuses the round before anything is touched" \
+  "sc_preamble_lookup::the preamble is found beside the script, then in the installed copy, and the one beside the script wins" \
+  "sc_kept_brief_needs_preamble::a kept brief whose ATTACK does not open with the preamble stops the round" \
   "sc_extract_last::the verdict is the text after the LAST bare codex line" \
   "sc_extract_fallback::no codex marker: the whole log is written, with a warning" \
   "sc_extract_empty::a marker with nothing after it is refused, not written as an empty report" \
@@ -1819,6 +2006,21 @@ if has "$GATE_DIR/check-code-agent-prompt.md" "E2E-ATTACK-TOKEN"; then
 else
   fail "the ATTACK did not reach the check-code prompt: $(ls "$GATE_DIR")"
 fi
+# The preamble opens the brief's ATTACK: its heading comes once, ahead of the scope's own items (the
+# scope text embedded higher up the brief carries the token too, so the LAST token line is the item).
+E2E_MARK=$(grep -n "^## $PREAMBLE_MARKER" "$GATE_DIR/review-brief.md" | head -1 | cut -d: -f1)
+E2E_TOK=$(grep -n "E2E-ATTACK-TOKEN" "$GATE_DIR/review-brief.md" | tail -1 | cut -d: -f1)
+if [[ -n "$E2E_MARK" && -n "$E2E_TOK" && "$E2E_MARK" -lt "$E2E_TOK" \
+      && "$(grep -c "^## $PREAMBLE_MARKER" "$GATE_DIR/review-brief.md")" == "1" ]]; then
+  ok "the brief Codex reviewed opens its ATTACK with the exhaustive-review preamble, ahead of the scope's items"
+else
+  fail "the preamble is not ahead of the scope's items in the real brief (marker line '$E2E_MARK', token line '$E2E_TOK')"
+fi
+if has "$GATE_DIR/check-code-agent-prompt.md" "$PREAMBLE_MARKER"; then
+  ok "...and the Sonnet check-code prompt carries it too"
+else
+  fail "the preamble did not reach the check-code prompt"
+fi
 if [[ "$(grep -c 'LAUNCH a read-only Sonnet agent' "$TMPD/e2e.out")" == "1" ]]; then
   ok "the one check-code launch line is in the wrapper's output"
 else
@@ -1929,6 +2131,49 @@ prove_run "an existing filled brief is kept" sc_kept_brief \
   'if has_text "$BRIEF" "<<< FILL THIS IN"; then
     printf' 'if true; then
     printf'
+
+# The one-round exhaustive-review preamble (#2231): each line of the loader and of the prepend, removed.
+PREPEND='ATTACK_BODY="$PREAMBLE_BODY"'
+ALREADY_THERE='if grep -qE "$PREAMBLE_HEADING_RE" <<<"$(first_nonblank_line "$ATTACK_BODY")"; then'
+CANDIDATES='for cand in "$HERE/../rules/$PREAMBLE_NAME" "$HOME/.agents/rules/$PREAMBLE_NAME"; do'
+prove_run "the preamble goes in front of the scope's ATTACK" sc_preamble_prepended \
+  "$PREPEND" 'ATTACK_BODY=""'
+prove_run "...so the brief's ATTACK is the preamble then the scope's body, literally" sc_attack_fill \
+  "$PREPEND" 'ATTACK_BODY=""'
+prove_run "...whatever shape the scope's section has" sc_attack_shapes \
+  "$PREPEND" 'ATTACK_BODY=""'
+prove_run "the fill line says the preamble was added, and from which file" sc_preamble_prepended \
+  'PREAMBLE_NOTE="under the one-round exhaustive-review preamble ($PREAMBLE_FILE)"' 'PREAMBLE_NOTE=""'
+prove_run "a body that already opens with the preamble gets none added" sc_preamble_not_duplicated \
+  "$ALREADY_THERE" 'if false; then'
+prove_run "only an OPENING heading counts as the preamble being there already" sc_preamble_not_duplicated \
+  "$ALREADY_THERE" 'if grep -qE "$PREAMBLE_HEADING_RE" <<<"$ATTACK_BODY"; then'
+prove_run "an empty ATTACK is still refused with the preamble on hand" sc_attack_refused_empty \
+  '  4) die "the scope file' '  4) : "the scope file'
+prove_run "a missing preamble refuses the round" sc_preamble_missing \
+  '|| die "the exhaustive-review preamble $PREAMBLE_NAME was not found' '|| : "the exhaustive-review preamble $PREAMBLE_NAME was not found'
+prove_run "an empty preamble refuses the round" sc_preamble_missing \
+  '|| die "the exhaustive-review preamble is EMPTY' '|| : "the exhaustive-review preamble is EMPTY'
+prove_run "a preamble that does not open with its heading refuses the round" sc_preamble_missing \
+  '|| die "the exhaustive-review preamble does not open with its' '|| : "the exhaustive-review preamble does not open with its'
+prove_run "an unreadable preamble refuses the round" sc_preamble_missing \
+  '|| die "could not read the exhaustive-review preamble: $PREAMBLE_FILE"' '|| :'
+prove_run "the preamble is loaded before anything is touched" sc_preamble_missing \
+  'load_preamble
+
+# It goes on AFTER' ':
+
+# It goes on AFTER' \
+  'echo "scope file saved: $SCOPE_COPY"' 'echo "scope file saved: $SCOPE_COPY"
+load_preamble'
+prove_run "the installed copy is the fallback" sc_preamble_lookup \
+  "$CANDIDATES" 'for cand in "$HERE/../rules/$PREAMBLE_NAME"; do'
+prove_run "the copy beside the script wins over the installed one" sc_preamble_lookup \
+  "$CANDIDATES" 'for cand in "$HOME/.agents/rules/$PREAMBLE_NAME" "$HERE/../rules/$PREAMBLE_NAME"; do'
+prove_run "a kept brief must open its ATTACK with the preamble" sc_kept_brief_needs_preamble \
+  '<<<"$KEPT_FIRST" || die' '<<<"$KEPT_FIRST" || :'
+prove_run "...and it is the brief's OWN (last) ATTACK section that is read" sc_kept_brief_needs_preamble \
+  '/^## ATTACK$/ { first = ""; want = 1; next }' '/^## ATTACK$/ && !seen { seen = 1; first = ""; want = 1; next }'
 prove_run "verdict = after the LAST marker" sc_extract_last \
   "LAST_MARKER=\$(grep -n '^codex\$' \"\$LOG\" | tail -1 | cut -d: -f1)" "LAST_MARKER=\$(grep -n '^codex\$' \"\$LOG\" | head -1 | cut -d: -f1)"
 prove_run "no-marker fallback" sc_extract_fallback \

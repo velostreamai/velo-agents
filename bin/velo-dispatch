@@ -1003,6 +1003,40 @@ elif [[ "${BRIEF_WT%/}" != "${WT%/}" ]]; then
 fi
 ok "brief BRANCH/WORKTREE match what will be cut"
 
+# spec §14, the pre-gate sweep (#2231). Every worker brief carries rules/worker-pre-gate-sweep.md and
+# the lint below refuses one without it. The caller should not have to remember to paste it, so a
+# brief that lacks it gets it APPENDED — to a COPY under the dispatch state dir, never to the caller's
+# file — and everything from here on (the lint, the style check, the worker's task) reads the copy.
+#
+# BRIEF_AS_WRITTEN stays the caller's file. It is what the spec attestation pinned (hashed above) and
+# what velo-record is handed: record classifies a brief as read-only by grepping its prose, and the
+# sweep text says "mandatory", which that grep reads as a brief that mandates commits.
+#
+# Whether a brief "has" the section is the lint's own test (velo_brief_has_sweep), so this and the
+# lint cannot disagree. The file is looked up beside this script, then in the installed copy; one
+# that cannot be found, read, or recognised stops the dispatch — appending nothing would just be the
+# lint refusing a brief this script was meant to complete.
+BRIEF_AS_WRITTEN="$BRIEF"
+if ! velo_brief_has_sweep "$BRIEF"; then
+  SWEEP_NAME="worker-pre-gate-sweep.md"
+  SWEEP_FILE=""
+  for cand in "$(dirname "${BASH_SOURCE[0]}")/../rules/$SWEEP_NAME" "$HOME/.agents/rules/$SWEEP_NAME"; do
+    if [[ -e "$cand" ]]; then SWEEP_FILE="$cand"; break; fi
+  done
+  [[ -n "$SWEEP_FILE" ]] || die "the brief has no '## PRE-GATE SWEEP' section, and $SWEEP_NAME was not found to append. Looked in:
+    $(dirname "${BASH_SOURCE[0]}")/../rules/$SWEEP_NAME
+    $HOME/.agents/rules/$SWEEP_NAME
+  It ships with the tooling (.agents/rules/): run .agents/install.sh, or restore the file."
+  SWEEP_TEXT=$(cat "$SWEEP_FILE") || die "could not read $SWEEP_FILE"
+  [[ -n "${SWEEP_TEXT//[[:space:]]/}" ]] || die "$SWEEP_FILE is EMPTY — there is nothing to append to the brief. Restore the file."
+  velo_brief_has_sweep "$SWEEP_FILE" \
+    || die "$SWEEP_FILE has no '## PRE-GATE SWEEP' heading, so appending it would not satisfy the lint. Restore the file."
+  BRIEF="$VELO_STATE/dispatch/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"
+  { cat "$BRIEF_AS_WRITTEN"; printf '\n\n%s\n' "$SWEEP_TEXT"; } > "$BRIEF" \
+    || die "could not write the brief with the sweep appended: $BRIEF"
+  ok "brief had no PRE-GATE SWEEP: appended $SWEEP_FILE — the worker gets $BRIEF ($BRIEF_AS_WRITTEN is untouched)"
+fi
+
 # spec §7 and the rest of the brief checklist: the rules live in velo-brief-lint.sh, which
 # velo-spec-review runs too, BEFORE it attests a brief. One definition, so the two tools cannot
 # disagree about what a brief needs. Refuses here, before any side effect.
@@ -1091,7 +1125,10 @@ if [[ $DRY -eq 1 ]]; then
   fi
   echo "  assign   : #$ISSUE -> $ASSIGNEE"
   echo "  worker   : $NAME"
-  echo "  brief    : $BRIEF"
+  echo "  brief    : $BRIEF_AS_WRITTEN"
+  if [[ "$BRIEF" != "$BRIEF_AS_WRITTEN" ]]; then
+    echo "             + PRE-GATE SWEEP appended: the worker gets $BRIEF"
+  fi
   # The real run TIMESTAMPS this (see LOG= below) so a re-dispatch cannot
   # overwrite the log velo-record reads for the previous run's cost (#2012 M3).
   # This line printed the untimestamped name — a path that never exists. A dry
@@ -1649,7 +1686,7 @@ nohup bash -c '
   "$HOME/.agents/bin/velo-record" "$RI" --index "$RIDX" --worktree "$RWT" --worker "$RNAME" \
     --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
     --rc "$rc" --max-turns "$RMT" --base "$RBASE" --start-head "$RSHEAD" >> "$LOGF" 2>&1 || true
-' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
+' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF_AS_WRITTEN" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
   "${INDEX_STATE:-unknown}" "$START_HEAD" "$MODEL_LINE" "${CMD[@]}" > /dev/null 2>&1 &
 PID=$!
 

@@ -24,7 +24,9 @@
 #
 # Attest mode refuses what velo-dispatch would refuse, before it records anything: a brief that the
 # brief lint rejects, and an issue without exactly one `worker:*` label. A refusal writes nothing:
-# no reviewed block, no change to the spec, nothing to the issue.
+# no reviewed block, no change to the spec, nothing to the issue. One refusal is stricter than
+# dispatch's: a brief without the `## PRE-GATE SWEEP` section. velo-dispatch appends it to a copy at
+# dispatch time, but the attestation pins the file AS WRITTEN, so here it must already be in the file.
 set -uo pipefail
 REPO="velostreamai/velostream"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }

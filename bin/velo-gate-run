@@ -30,6 +30,14 @@
 # heading, or an empty one, is refused before anything is touched — velo-pr-gate
 # would refuse the stub anyway, later and more obscurely.
 #
+# The brief's ATTACK always OPENS with .agents/rules/gate-attack-preamble.md: the one-round
+# exhaustive-review rules (finish every item, build the matrix first, diff every new parser against
+# the route's own, sweep the sibling sites). It is added here so that nobody has to remember to paste
+# it into a scope. It goes on after the scope's own ATTACK has been judged non-empty, so it can never
+# mask an empty one; a body that already opens with the preamble's heading gets nothing added; a
+# preamble that cannot be found, read or recognised refuses the round before anything is touched. A
+# filled brief kept for a re-run must open its ATTACK with it too, or the round stops.
+#
 # The WHOLE scope file is also copied to $VELO_STATE/gate/<pr>/scope.<UTC>.md, one
 # per round, before any step runs: a round that dies early can be re-run from it
 # (the file passed in may live somewhere a reboot clears), and a re-review can see
@@ -173,6 +181,51 @@ case $? in
   An empty ATTACK is the stub the gate exists to refuse. Say what to attack." ;;
   *) die "could not read the ATTACK section of $SCOPE (is python3 on PATH?)" ;;
 esac
+
+# ---- the one-round exhaustive-review preamble ------------------------------------
+#
+# Gate rounds kept finding one more defect each, because the reviewer was told what to attack and
+# not how thoroughly: the ONLY round is the one that must report everything (#2231). The rules are
+# a file, so the brief says them every time instead of whoever writes the scope remembering to.
+#
+# Looked for beside this script first (../rules: the repo checkout and ~/.agents both lay it out
+# that way, and install.sh copies rules/), then in the installed copy. Loaded and checked BEFORE
+# anything is touched: a gate round that silently runs without it is the failure this removes.
+PREAMBLE_NAME="gate-attack-preamble.md"
+PREAMBLE_MARKER="ATTACK 0 — ONE-ROUND EXHAUSTIVE REVIEW"
+PREAMBLE_HEADING_RE="^#{1,6}[[:space:]]+$PREAMBLE_MARKER"
+PREAMBLE_FILE=""; PREAMBLE_BODY=""
+first_nonblank_line() { grep -m1 '[^[:space:]]' <<<"$1"; }   # <text>
+load_preamble() {
+  local cand
+  for cand in "$HERE/../rules/$PREAMBLE_NAME" "$HOME/.agents/rules/$PREAMBLE_NAME"; do
+    if [[ -e "$cand" ]]; then PREAMBLE_FILE="$cand"; break; fi
+  done
+  [[ -n "$PREAMBLE_FILE" ]] || die "the exhaustive-review preamble $PREAMBLE_NAME was not found. Looked in:
+    $HERE/../rules/$PREAMBLE_NAME
+    $HOME/.agents/rules/$PREAMBLE_NAME
+  It ships with the tooling (.agents/rules/): run .agents/install.sh, or restore the file.
+  No review round runs without it."
+  PREAMBLE_BODY=$(cat "$PREAMBLE_FILE") || die "could not read the exhaustive-review preamble: $PREAMBLE_FILE"
+  [[ -n "${PREAMBLE_BODY//[[:space:]]/}" ]] || die "the exhaustive-review preamble is EMPTY: $PREAMBLE_FILE
+  An empty preamble is a review round told nothing. Restore the file."
+  grep -qE "$PREAMBLE_HEADING_RE" <<<"$(first_nonblank_line "$PREAMBLE_BODY")" \
+    || die "the exhaustive-review preamble does not open with its '## $PREAMBLE_MARKER' heading: $PREAMBLE_FILE
+  That heading is how this script, and a kept brief, recognise the preamble. Restore the file."
+}
+load_preamble
+
+# It goes on AFTER the emptiness check above: the preamble is a header, not content, and a scope
+# with nothing to attack stays refused instead of being masked by the one thing this script writes
+# for it. "Already there" means the body OPENS with the heading — the first non-blank line — so a
+# marker quoted further down, or inside a fenced block, cannot suppress the preamble.
+SCOPE_ATTACK_LINES=$(printf '%s\n' "$ATTACK_BODY" | wc -l | tr -d ' ')
+if grep -qE "$PREAMBLE_HEADING_RE" <<<"$(first_nonblank_line "$ATTACK_BODY")"; then
+  PREAMBLE_NOTE="and it already opens with the exhaustive-review preamble, so none was added"
+else
+  ATTACK_BODY="$PREAMBLE_BODY"$'\n\n'"$ATTACK_BODY"
+  PREAMBLE_NOTE="under the one-round exhaustive-review preamble ($PREAMBLE_FILE)"
+fi
 
 # ---- one gate per PR at a time --------------------------------------------------
 #
@@ -429,8 +482,16 @@ PY
     if has_text "$BRIEF" "<<< FILL THIS IN"; then
       die "the brief still has an unfilled ATTACK placeholder after the fill: $BRIEF"
     fi
-    ok "ATTACK filled from $SCOPE ($(printf '%s\n' "$ATTACK_BODY" | wc -l | tr -d ' ') lines)"
+    ok "ATTACK filled from $SCOPE ($SCOPE_ATTACK_LINES lines), $PREAMBLE_NOTE"
   else
+    # Kept as is — but it must still open its ATTACK with the preamble, or this is a second way for a
+    # review to run without it: a brief filled before velo-gate-run added the preamble, or by hand.
+    # The brief's OWN section is the LAST `## ATTACK` line (the scope text above it may carry one).
+    KEPT_FIRST=$(awk '/^## ATTACK$/ { first = ""; want = 1; next } want && first == "" && NF { first = $0; want = 0 } END { print first }' "$BRIEF")
+    grep -qE "$PREAMBLE_HEADING_RE" <<<"$KEPT_FIRST" || die "the kept brief's ## ATTACK does not open with the exhaustive-review preamble: $BRIEF
+  It was filled before velo-gate-run added the preamble, or by hand, and would reach the reviewer without it.
+  Remove it so this round fills it again from the scope:   rm $BRIEF
+  Or paste $PREAMBLE_FILE at the top of its ## ATTACK."
     ok "the brief is already filled and matches this scope and range — kept as is"
   fi
 fi

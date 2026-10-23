@@ -56,13 +56,14 @@ and the tests** — never from the worker's self-report.
     test_gate_routing.sh            the routing table: one definition, three readers
     test_gate_check_code_mode.sh   the check-code route: sonnet default, opus opt-in, stale state cleared
     test_gate_substitution.sh      a substituted check-code reviewer is declared on the comment and the label
-    test_gate_run.sh               velo-gate-run: ATTACK fill, last-marker verdict, retry, --brief-only, one e2e round
+    test_gate_run.sh               velo-gate-run: ATTACK fill under the exhaustive-review preamble, last-marker verdict, retry, --brief-only, one e2e round
     test_gate_finish.sh            velo-gate-finish: post order, gated sha, idempotence, retry, no label over a missing report
     test_gate_sweep.sh             velo-gate-sweep: STALE flag, last-block verdict, per-leg caps, no-gate / gh-failure handling
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_spec_review_lint.sh       attest refuses what dispatch refuses (brief lint, worker label); dispatch names the model it launched
     test_brief_ste.sh              brief style (STE100): long / multi-sentence / chained steps warn, never refuse
+    test_brief_sweep.sh            the pre-gate sweep (spec §14): the lint requires it, velo-dispatch appends it to a copy, attest pins the file as written
     test_status.sh                 velo-status worker naming
     test_native_workers.sh         velo-native records, velo-status native rows, the override rule
     test_tool_contract.py          the tool contract precedes the policy (#2075)
@@ -82,6 +83,8 @@ and the tests** — never from the worker's self-report.
     velo-impl.md                   MANDATORY implementation policy for every worker
     velo-brief-spec.md             what a task brief MUST contain, and why
     velo-glossary.md               one term, one meaning — the vocabulary briefs and policy use (spec §13)
+    gate-attack-preamble.md        the one-round exhaustive-review rules velo-gate-run puts at the top of every review brief's ATTACK
+    worker-pre-gate-sweep.md       the pre-gate sweep and PR size cap every worker brief carries (spec §14); velo-dispatch appends it when missing
   skills/
     velo-deepseek/SKILL.md         orchestrator-facing routing + usage
     velo-haiku/SKILL.md
@@ -102,6 +105,7 @@ Runtime state lives **outside the repo**, under `$VELO_STATE` (default
 ~/.agents/state/
   dispatch/<issue>/
     dispatch-<UTC>.log     every ok/warn/die the preflight emitted — why it ran, or refused
+    brief-<UTC>-<pid>.md   the brief with rules/worker-pre-gate-sweep.md appended — the copy the worker gets, only when the caller's brief had no sweep section
     <worker>-<UTC>.log     the worker's own transcript
     zg-index.log           output of the discovery-index build
   gate/<pr>/
@@ -610,6 +614,17 @@ blast-radius checks and injects acceptance criteria into the brief.
 Must satisfy `rules/velo-brief-spec.md`. `velo-dispatch` checks for the required
 sections and names any that are missing.
 
+Every brief carries `rules/worker-pre-gate-sweep.md` under a `## PRE-GATE SWEEP` heading (spec §14):
+the defect shapes past gate rounds found one per round, and the PR size cap. You do not have to
+paste it. The lint refuses a brief without the heading, and `velo-dispatch` appends the file to a
+**copy** of such a brief (`~/.agents/state/dispatch/<issue>/brief-<UTC>-<pid>.md`) and hands the
+worker the copy. Your file is never touched, and it is still your file that the spec attestation
+pins and that `velo-record` reads; a dry run prints both paths. The file is looked for beside the
+script, then in `~/.agents/rules/`, and one that is missing, empty or without the heading stops the
+dispatch. `velo-spec-review` (attest) is the one tool that does not append: it pins the file as
+written, so there the section must already be in it —
+`cat ~/.agents/rules/worker-pre-gate-sweep.md >> <brief>`.
+
 ### 4. Check the brief FIRST, then dispatch
 
 ```bash
@@ -907,7 +922,8 @@ refuses on that a review could otherwise certify: a brief the brief lint rejects
 (`bin/velo-brief-lint.sh`, the one definition both tools run), and an issue without exactly one
 `worker:*` label. Add the label **first**: a label edit moves the issue's `updatedAt`, so an
 attestation written before it is stale the moment it is written. A refusal leaves the spec and the
-issue untouched.
+issue untouched. One refusal is stricter than dispatch's: a brief with no `## PRE-GATE SWEEP`
+section. Dispatch appends it to a copy, but the attestation pins the file as written.
 
 ## Why each gate exists
 
@@ -1216,6 +1232,19 @@ It replaces the hand-run sequence, each step of which went wrong in some round:
    writing into the log that round truncates). A pid file naming anything other
    than an agent runner kills nothing. `VELO_SECOND_OPINION_TIMEOUT` (default
    3600s) is the runner's own bound when nothing else ends it.
+
+In step 3 the ATTACK always opens with `rules/gate-attack-preamble.md`, the one-round
+exhaustive-review rules: finish every item, build the matrix before judging, diff every new parser
+against the route's own, sweep the sibling sites, report everything in one pass. The script adds
+it, so nobody has to remember to paste it into a scope. It goes on **after** the scope's own ATTACK
+has been judged non-empty, so it can never stand in for an empty one. A body that already opens
+with its `## ATTACK 0 — ONE-ROUND EXHAUSTIVE REVIEW` heading (the first non-blank line; a quoted,
+later or fenced mention does not count) gets nothing added, and the fill line says which file was
+used. The file is looked for beside the script (`../rules/`), then in `~/.agents/rules/`; one that
+is missing, empty or without that opening heading refuses the round before anything is touched (no
+scope copy, no gate dir). A brief that is already filled, and so kept, must open its ATTACK with
+the preamble too, or the round stops and names the fix: remove the brief so it is filled again, or
+paste the file at the top of its `## ATTACK`.
 
 Before step 1 it copies the **whole** scope file to `gate/<pr>/scope.<UTC>.md` —
 one file per round, never overwritten (a second round in the same second becomes

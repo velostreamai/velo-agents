@@ -155,9 +155,9 @@ verdict() {   # <label> <want rc> <want substring> <brief text>
   fi
 }
 # Every brief below starts from this body, which satisfies every OTHER rule of the
-# lint (worktree, no-cd, STOP, incremental commits, commit authorization); only the
-# validation shape varies.
-BODY=$'WORKTREE: /w\nDo NOT cd into it.\nSTOP and report if blocked.\nCommit after each step.\nYou may commit. Do NOT push.\n'
+# lint (worktree, no-cd, STOP, incremental commits, commit authorization, the
+# PRE-GATE SWEEP heading of spec §14); only the validation shape varies.
+BODY=$'WORKTREE: /w\nDo NOT cd into it.\nSTOP and report if blocked.\nCommit after each step.\nYou may commit. Do NOT push.\n## PRE-GATE SWEEP\n'
 PASS_MSG="satisfies the spec checklist"
 NEED_CMDS="no validation commands (spec §7)"
 NEED_SECTION="no '## Validation' section with content (spec §7)"

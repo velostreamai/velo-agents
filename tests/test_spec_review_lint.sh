@@ -60,10 +60,10 @@ fi
 echo "the lint, driven as velo-dispatch drives it (the shipped function, sourced)"
 NOAUTH="$TMPD/noauth.md"
 printf '%s\n' 'WORKTREE: /w' 'Do NOT cd into it.' 'STOP and report if blocked.' \
-  'Commit after each step.' 'cargo check --no-default-features' > "$NOAUTH"
+  'Commit after each step.' 'cargo check --no-default-features' '## PRE-GATE SWEEP' > "$NOAUTH"
 COMPLETE="$TMPD/complete.md"
 printf '%s\n' 'WORKTREE: /w' 'Do NOT cd into it.' 'STOP and report if blocked.' \
-  'Commit after each step.' 'You may commit. Do NOT push.' 'cargo check --no-default-features' > "$COMPLETE"
+  'Commit after each step.' 'You may commit. Do NOT push.' 'cargo check --no-default-features' '## PRE-GATE SWEEP' > "$COMPLETE"
 if [[ -f "$LIB" ]]; then
   . "$LIB"
   OUT=$(velo_brief_lint "$NOAUTH" 2>&1); RC=$?
