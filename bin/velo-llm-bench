@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""velo-llm-bench — same-prompt prefill/decode bench for a worker:local server.
+
+    velo-llm-bench <base_url> <model> <label> [--runs N] [--prompt-commit SHA]
+                   [--extra JSON] [--note TEXT] [--prompt-only]
+
+Talks to any OpenAI-compatible server (llama-server, Sushi, oMLX, LM Studio).
+Each run sends a short prompt, then the long prompt. Run 0 is cold; later runs
+differ only in the last line, so they measure a WARM turn — what an agent pays on
+every turn of one conversation. One JSON line per case
+on stdout; append them to .agents/bench/local-models/results/ and summarise in
+that directory's README.
+
+The long prompt is built from src/velostream/sql/execution AT A PINNED COMMIT,
+read through git, never from a working tree. The first version read the live
+checkout: master moved between two benches, the "same" prompt went from 53,135 to
+39,273 tokens, and a 6-bit model looked comparable to a 4-bit one until the token
+counts were read. Change the pin only together with fresh baselines for every
+model being compared — numbers from different pins are not comparable.
+
+Every line records the machine, the date and the pin, so a result can always be
+told apart from one taken on another machine or prompt.
+"""
+import argparse, datetime, json, os, platform, subprocess, sys, time, urllib.request
+
+# 59938664e: the prompt behind every result in .agents/bench/local-models from
+# 2026-10-11 on — 39,273 tokens in the Qwen3.8 tokenizer, 161,890 chars.
+DEFAULT_PROMPT_COMMIT = "59938664e"
+REPO = os.environ.get("VELO_BENCH_REPO", os.path.expanduser("~/RustroverProjects/velostream"))
+SUBDIR = "src/velostream/sql/execution"
+CHAR_BUDGET = 160_000
+QUESTION = ("\n\nQuestion: list the five most important types defined above and explain "
+            "in one paragraph how a record flows through them.")
+SHORT_PROMPT = ("Write a Rust function that merges two sorted Vec<i64> into one sorted "
+                "Vec<i64>, with a short explanation.")
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", REPO, *args], check=True, capture_output=True).stdout
+
+
+def long_prompt(commit):
+    """Every .rs file under SUBDIR at `commit`, in path order, until CHAR_BUDGET."""
+    names = sorted(n for n in git("ls-tree", "-r", "--name-only", commit, SUBDIR).decode().split()
+                   if n.endswith(".rs"))
+    if not names:
+        sys.exit(f"velo-llm-bench: no .rs files under {SUBDIR} at {commit} in {REPO}")
+    ctx, n = [], 0
+    for name in names:
+        text = git("show", f"{commit}:{name}").decode(errors="ignore")
+        ctx.append(f"// FILE: {name[len(SUBDIR) + 1:]}\n{text}")
+        n += len(text)
+        if n > CHAR_BUDGET:
+            break
+    return "\n\n".join(ctx) + QUESTION
+
+
+def machine():
+    try:
+        chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                              capture_output=True, text=True).stdout.strip()
+        mem = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                 capture_output=True, text=True).stdout.strip()) // 2**30
+        return f"{chip} {mem}GB"
+    except (OSError, ValueError):
+        return platform.machine()
+
+
+def one(args, meta, prompt, case, max_tokens=1024):
+    body = {"model": args.model, "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95, "seed": args.seed,
+            "stream": True,
+            "stream_options": {"include_usage": True}, **json.loads(args.extra)}
+    req = urllib.request.Request(args.base_url.rstrip("/") + "/chat/completions",
+                                 json.dumps(body).encode(), {"Content-Type": "application/json"})
+    t0 = time.time(); ttft = None; usage = None; chunks = 0; timings = None
+    with urllib.request.urlopen(req, timeout=1800) as r:
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data:") or line == "data: [DONE]":
+                continue
+            d = json.loads(line[5:])
+            if d.get("usage"): usage = d["usage"]
+            if d.get("timings"): timings = d["timings"]
+            delta = (d.get("choices") or [{}])[0].get("delta", {})
+            if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
+                chunks += 1
+                if ttft is None: ttft = time.time() - t0
+    tot = time.time() - t0
+    pt = usage.get("prompt_tokens") if usage else None
+    ct = usage.get("completion_tokens") if usage else chunks
+    res = {"label": args.label, "case": case, "prompt_tokens": pt, "completion_tokens": ct,
+           "ttft_s": round(ttft or 0, 2),
+           "prefill_tok_s": round(pt / ttft, 1) if pt and ttft else None,
+           "decode_tok_s": round(ct / (tot - ttft), 1) if ttft and tot > ttft else 0,
+           "total_s": round(tot, 1), **meta}
+    if timings:
+        res["server_timings"] = {k: round(v, 1) for k, v in timings.items() if isinstance(v, (int, float))}
+    print(json.dumps(res), flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("base_url"); ap.add_argument("model"); ap.add_argument("label")
+    # 3 runs, report the median: one run is an anecdote. Run 0 is the cold one.
+    ap.add_argument("--runs", type=int, default=3)
+    # Fixed seed: with speculative decoding (MTP) the decode rate depends on WHAT is
+    # generated, so unseeded runs differ in speed as well as text. Recorded per line;
+    # a server that ignores it shows up as run-to-run spread, not as a silent pass.
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--prompt-commit", default=DEFAULT_PROMPT_COMMIT)
+    ap.add_argument("--extra", default=os.environ.get("BENCH_EXTRA", "{}"),
+                    help='extra request fields as JSON, e.g. \'{"top_k":20}\'')
+    ap.add_argument("--note", default=None, help="free text recorded on every line")
+    ap.add_argument("--prompt-only", action="store_true",
+                    help="print the long prompt and exit (no server needed)")
+    args = ap.parse_args()
+    prompt = long_prompt(args.prompt_commit)
+    if args.prompt_only:
+        sys.stdout.write(prompt); return
+    meta = {"date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "machine": machine(), "prompt_commit": args.prompt_commit, "seed": args.seed}
+    if args.note: meta["note"] = args.note
+    for i in range(args.runs):
+        one(args, meta, SHORT_PROMPT, f"short#{i}")
+        one(args, meta, prompt + f"\n(run {i})", f"long#{i}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,88 @@
+{
+  "machine": "Apple M3 Ultra 256GB",
+  "omlx": "0.6.4",
+  "thinking": false,
+  "temperature": 0.0,
+  "mtp_enabled": true,
+  "mtp_num_draft_tokens": 3,
+  "script": "scripts/bench_qwen_decode.py --skip-32k",
+  "date": "2026-08-31",
+  "coding_task": {
+    "prompt": "Write a Python function that returns the nth Fibonacci number. No comments.",
+    "finish_reason": "stop",
+    "time_to_completion_s": {
+      "oq4e": 1.739,
+      "oq6e": 2.074,
+      "oq8e": 2.571
+    },
+    "time_to_first_token_s": {
+      "oq4e": 0.51,
+      "oq6e": 0.64,
+      "oq8e": 0.67
+    },
+    "generation_s": {
+      "oq4e": 1.23,
+      "oq6e": 1.43,
+      "oq8e": 1.9
+    },
+    "completion_tokens": {
+      "oq4e": 79,
+      "oq6e": 80,
+      "oq8e": 80
+    },
+    "decode_tok_s": {
+      "oq4e": 64.41,
+      "oq6e": 56.07,
+      "oq8e": 42.11
+    }
+  },
+  "decode_tok_s": {
+    "code-256": {
+      "oq4e": 64.41,
+      "oq6e": 56.07,
+      "oq8e": 42.11
+    },
+    "decode-4k": {
+      "oq4e": 56.48,
+      "oq6e": 44.94,
+      "oq8e": 41.94
+    },
+    "decode-8k": {
+      "oq4e": 56.25,
+      "oq6e": 44.75,
+      "oq8e": 43.7
+    },
+    "decode-16k": {
+      "oq4e": 52.88,
+      "oq6e": 48.34,
+      "oq8e": 47.45
+    }
+  },
+  "prefill_tok_s": {
+    "code-256": {
+      "oq4e": 51.18,
+      "oq6e": 40.31,
+      "oq8e": 38.89
+    },
+    "decode-4k": {
+      "oq4e": 731.71,
+      "oq6e": 597.44,
+      "oq8e": 581.06
+    },
+    "decode-8k": {
+      "oq4e": 772.25,
+      "oq6e": 728.17,
+      "oq8e": 715.98
+    },
+    "decode-16k": {
+      "oq4e": 729.32,
+      "oq6e": 785.33,
+      "oq8e": 762.86
+    }
+  },
+  "packs": {
+    "oq4e": "Jundot/Qwen3.8-Flash-Next-oQ4e-mtp",
+    "oq6e": "PorkkChop/Qwen3.8-Flash-Next-oQ6e-mtp",
+    "oq8e": "PorkkChop/Qwen3.8-Flash-Next-oQ8e-mtp"
+  }
+}

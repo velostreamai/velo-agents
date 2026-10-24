@@ -45,6 +45,7 @@ and the tests** — never from the worker's self-report.
     velo-openai-agents-runner.py   worker runner on openai-agents   (SUPPORTED)
     velo_oai_tools.py              local tools openai-agents does not ship
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
+    velo-llm-bench                 same-prompt speed bench for a worker:local server; prompt pinned to a commit
   tests/
     run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants
@@ -77,6 +78,10 @@ and the tests** — never from the worker's self-report.
     test_gate_comments.sh          velo-gate: a failed gate-comment or issue read is not "nothing recorded"; --pass judges every gate
     test_verdict_of.sh             verdict_of: one verdict from every **Verdict:** line, not the first
     test_fence_parity.py           the three code-fence readers (brief lint, ATTACK fill, acceptance-bar counter) read ONE grammar
+    test_llm_bench.sh              velo-llm-bench: the prompt is the pinned commit's, byte for byte; every result line says what produced it
+  bench/local-models/
+    README.md                      worker:local model results, method and verdicts — read before switching models
+    results/*.jsonl                raw bench lines, one file per model per day
   launchd/
     ai.velostream.orchestrd.plist  source template for the velo-orchestrd launchd agent
   rules/

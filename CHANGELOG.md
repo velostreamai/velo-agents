@@ -93,6 +93,18 @@ is running, or a stale dispatch row reads `running` for work already replaced. T
 WORKER column also widens 11 → 13, because `native-sonnet` and `velo-deepseek` were
 being cut short.
 
+### Added — `velo-llm-bench` and stored worker:local benchmarks
+
+`velo-llm-bench` (from a scratch script) builds its long prompt from a **pinned
+commit** through `git show`, sends a fixed seed, runs three times, and stamps every
+result line with machine, date, prompt commit and seed. Results and verdicts for
+llama-server, Sushi and oMLX live in `.agents/bench/local-models/`.
+**Prevents:** a benchmark that cannot be repeated. The scratch version read the
+live checkout; master moved between two runs, the prompt went from 53,135 to
+39,273 tokens, and a 6-bit model was compared against 4-bit baselines taken on a
+different prompt. The results themselves lived only in a scratch directory.
+
+||||||| 5087dd1f8
 ### Added — the haiku worker tier (#2423)
 
 `worker:haiku` routes to `velo-haiku` on `anthropic/claude-haiku-5.5` ($0.10/M
