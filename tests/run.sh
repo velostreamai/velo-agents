@@ -151,6 +151,7 @@ echo
 echo
 echo "── runner accounting ──────────────────────────────────"
 suite test_runner_accounting.py "$PY" "$HERE/test_runner_accounting.py"
+suite test_transient_retry.py python3 "$HERE/test_transient_retry.py"
 echo
 echo "── tool-input logging ─────────────────────────────────"
 suite test_tool_input_log.py "$PY" "$HERE/test_tool_input_log.py"

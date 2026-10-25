@@ -63,7 +63,7 @@ import velo_oai_tools as T  # noqa: E402
 from velo_skills import apply_skills  # noqa: E402
 # Salvage is SDK-agnostic — pure git plus a transcript dump — so both runtimes
 # share ONE implementation rather than each growing its own half-working copy.
-from velo_runner_lib import local_conf, salvage_on_failure  # noqa: E402
+from velo_runner_lib import call_with_transient_retry, local_conf, salvage_on_failure  # noqa: E402
 
 set_tracing_disabled(True)
 
@@ -827,7 +827,7 @@ async def main() -> int:
     _inner = client.chat.completions.create
 
     async def _with_cost(*args, **kw):
-        resp = await _inner(*args, **kw)
+        resp = await call_with_transient_retry(lambda: _inner(*args, **kw), log.emit)
         u = getattr(resp, "usage", None)
         extra = getattr(u, "model_extra", None) or {}
         c = extra.get("cost", getattr(u, "cost", None))
