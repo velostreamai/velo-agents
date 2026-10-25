@@ -318,7 +318,7 @@ VELO_FREE_MODEL=poolside/laguna-s-2.1:free sc_openrouter_route free poolside/lag
 # The pins must be velo-dispatch's: a report from a model the worker records do
 # not describe is a reviewer nobody has measured.
 for r in deepseek haiku glm; do
-  want=$(awk -v arm="  velo-$r)" '$0 == arm {f=1} f && /MODEL_ID=/ {gsub(/.*MODEL_ID=.|.$/, ""); print; exit}' "$BIN/velo-dispatch")
+  want=$(awk -v arm="  velo-$r)" '$0 == arm {f=1} f && /MODEL_ID=/ {gsub(/.*MODEL_ID=.|.$/, ""); print; exit}' "$BIN/velo-dispatch" | sed -E 's/^\$\{VELO_MODEL_OVERRIDE:-(.*)\}$/\1/')
   got=$(awk -v arm="  $r)" 'index($0, arm) == 1 && /CODE_MODEL_ID=/ {gsub(/.*CODE_MODEL_ID=.|. ;;$/, ""); print; exit}' "$GATE")
   if [[ -n "$want" && "$want" == "$got" ]]; then
     ok "$r: velo-pr-gate pins the same model as velo-dispatch ($want)"

@@ -40,6 +40,10 @@ PROVIDER_ORDER: dict[str, list[str]] = {
     # 29 endpoints; Relace is both the cheapest ($0.045 vs $0.065 list) and the
     # one the cache probe confirmed.
     "deepseek/deepseek-v4-flash-0731": ["Relace", "Baidu", "OpenInference"],
+    # v4.1-flash: 96% of input tokens are cache READS across 368 recorded runs, so the cache-read
+    # price decides the bill. Modelled on that mix: Baidu $22, DeepInfra $48, median provider $107
+    # (billed $94 unpinned). Ordered with fallbacks, as above.
+    "deepseek/deepseek-v4.1-flash": ["Baidu", "DeepInfra"],
     # 23 endpoints, four tied at $0.075. Z.AI is the model's own vendor.
     "z-ai/glm-5.3-flash": ["Z.AI", "DeepInfra", "Novita"],
 }
@@ -269,6 +273,8 @@ def install_provider_pinning(model: str, logger=None) -> list[str]:
 CONTEXT_WINDOWS: dict[str, int] = {
     "deepseek/deepseek-v4-flash-0731": 1_048_576,
     "deepseek/deepseek-v4.1-flash": 1_048_576,
+    "deepseek/deepseek-v4.1-flash-1017": 1_048_576,
+    "xiaomi/mimo-v2.6-flash": 1_048_576,
     "nvidia/nemotron-3-ultra-550b-a55b:free": 1_000_000,
     "z-ai/glm-5.3-flash": 1_048_576,
 }

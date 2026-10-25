@@ -377,6 +377,8 @@ if [[ "$COUNT" -eq 0 ]]; then
   Add the label FIRST, then re-run this review. A label edit moves the issue's updatedAt, which
   would make an attestation written before the edit stale the moment it is written.
   Add one of:
+    worker:free      $0 via OpenRouter free models (rate-limited; the provider may log
+                     prompts). Scoped, low-risk impl; escalates to deepseek on failure.
     worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
     worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
     worker:haiku     cheap, Claude leg. Scoped impl when a DeepSeek-shaped

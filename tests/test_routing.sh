@@ -66,6 +66,9 @@ OUT=$(run "worker:glm" "glm");       check "label+spec agree"   "$OUT" "OK: rout
 OUT=$(run "worker:haiku" "haiku");   check "label+spec agree (haiku)" "$OUT" "OK: routed to velo-haiku"
 OUT=$(run "worker:haiku" "");        check "label only (haiku)"  "$OUT" "OK: routed to velo-haiku"
 OUT=$(run "" "haiku");               check "spec alone does NOT route (haiku)" "$OUT" "no 'worker:*' label"
+# The $0 tier routes like any other label; spec alone still does not.
+OUT=$(run "worker:free" "");         check "label only (free)"   "$OUT" "OK: routed to velo-free"
+OUT=$(run "" "free");                check "spec alone does NOT route (free)" "$OUT" "no 'worker:*' label"
 
 # The new rung must route like any other label, and — more importantly — an
 # UNROUTABLE value must still be refused. Adding a route widens the accepted set
@@ -113,7 +116,7 @@ check "two worker labels rejected" "$OUT" "at most one"
 echo
 echo "every routed NAME has a dispatch arm"
 DISP="$(dirname "$0")/../bin/velo-dispatch"
-for N in velo-local velo-deepseek velo-haiku velo-glm velo-codex; do
+for N in velo-free velo-local velo-deepseek velo-haiku velo-glm velo-codex; do
   if grep -qE "^  $N\\)" "$DISP"; then
     echo "  PASS  $N has a dispatch arm"
   else

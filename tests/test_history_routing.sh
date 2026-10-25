@@ -48,7 +48,7 @@ done
 # velo-haiku (#2423) between deepseek and glm. Ranks are derived from the worker
 # NAME on every call and never stored, so neither renumbering can invalidate a
 # historical result.jsonl row.
-for PAIR in 'velo-local:0' 'velo-deepseek:1' 'velo-haiku:2' 'velo-glm:3' 'velo-codex:4'; do
+for PAIR in 'velo-free:0' 'velo-local:1' 'velo-deepseek:2' 'velo-haiku:3' 'velo-glm:4' 'velo-codex:5'; do
   GOT=$(TIER_RANK "${PAIR%%:*}"); WANT="${PAIR##*:}"
   if [[ "$GOT" == "$WANT" ]]; then
     ok "tier rank ${PAIR%%:*} = $GOT"

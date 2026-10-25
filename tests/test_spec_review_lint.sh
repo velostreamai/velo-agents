@@ -142,9 +142,9 @@ check "...and writes no attestation (the spec is byte-identical)" "$(spec_unchan
 
 echo "the choices velo-spec-review offers are the ones velo-dispatch offers"
 offered() { grep -E '^ *worker:[a-z]+ ' "$1" | sed -E 's/^ +//; s/ +/ /g'; }
-check "the five worker choices match, line for line" \
+check "the six worker choices match, line for line" \
   "$(offered "$BIN/velo-spec-review" | diff - <(offered "$BIN/velo-dispatch") >/dev/null && echo same || echo differ)" same
-check "...and there are five of them" "$(offered "$BIN/velo-spec-review" | wc -l | tr -d ' ')" 5
+check "...and there are six of them" "$(offered "$BIN/velo-spec-review" | wc -l | tr -d ' ')" 6
 
 echo "velo-dispatch --dry-run: the same lint, reached through the real script (no launch)"
 # A scratch clone of a seed repo supplies origin/master, which dispatch fetches and pins. The

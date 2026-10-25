@@ -101,6 +101,7 @@ worker_from_cmd() {   # $1 = the process argv
     if [[ -n "$u" && "$1" == *"$u"* ]]; then echo "velo-local"; return; fi
   done
   case "$1" in
+    *":free"*)                echo "velo-free" ;;
     *deepseek/deepseek*)      echo "velo-deepseek" ;;
     # #2423: the haiku route is Anthropic, so it matches on the anthropic/ id
     # rather than a z-ai/ one. Same one-arm-per-ROUTE rule as the rest.

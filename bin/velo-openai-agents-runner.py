@@ -138,6 +138,7 @@ COMPACT_KEEP_RECENT = 6
 
 PROVIDER_ORDER = {
     "deepseek/deepseek-v4-flash-0731": ["Relace", "Baidu", "OpenInference"],
+    "deepseek/deepseek-v4.1-flash": ["Baidu", "DeepInfra"],
     "z-ai/glm-5.3-flash": ["Z.AI", "DeepInfra", "Novita"],
 }
 

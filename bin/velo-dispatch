@@ -24,6 +24,7 @@
 # caller never burns a worker run on an under-specified task.
 #
 # Worker selection comes from the issue's `worker:*` label:
+#   worker:free      -> nvidia/nemotron-3-ultra-550b-a55b:free    ($0, rate-limited; VELO_FREE_MODEL swaps it)
 #   worker:local     -> $VELO_LOCAL_MODEL_DEFAULT (velo-local.conf) via LM Studio (free)
 #   worker:deepseek  -> deepseek/deepseek-v4.1-flash               (very cheap)
 #   worker:haiku     -> anthropic/claude-haiku-5.5                (cheap, Claude leg)
@@ -222,6 +223,8 @@ fi
 ROUTE="$LABEL_WORKER"
 [[ -n "$ROUTE" ]] || die "#$ISSUE has no 'worker:*' label — routing is undefined.
     Add one of:
+      worker:free      $0 via OpenRouter free models (rate-limited; the provider may log
+                       prompts). Scoped, low-risk impl; escalates to deepseek on failure.
       worker:local     free, local Qwen3-Coder. Scoped impl + audits, slower.
       worker:deepseek  very cheap. Fast scoped impl against a PINNED design.
       worker:haiku     cheap, Claude leg. Scoped impl when a DeepSeek-shaped
@@ -249,13 +252,14 @@ case "$ROUTE" in
   # differed per column: codex was the only NAME without the prefix, and local
   # was the only LOGTAG with it. A convention with an exception is not a
   # convention, and the exception is what a reader has to memorise.
+  free)       NAME="velo-free";       LOGTAG="free" ;;
   local)      NAME="velo-local";      LOGTAG="local" ;;
   deepseek)   NAME="velo-deepseek";   LOGTAG="deepseek" ;;
   haiku)      NAME="velo-haiku";      LOGTAG="haiku" ;;
   glm)        NAME="velo-glm";        LOGTAG="glm" ;;
   codex)      NAME="velo-codex";      LOGTAG="codex" ;;
   *) die "unroutable worker '$ROUTE' (from ${LABEL_WORKER:+label}${LABEL_WORKER:-spec}).
-    Routable: local, deepseek, haiku, glm, codex. See #2062 for opus/fable." ;;
+    Routable: free, local, deepseek, haiku, glm, codex. See #2062 for opus/fable." ;;
 esac
 ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 
@@ -285,7 +289,7 @@ ok "routed to $NAME (label='${LABEL_WORKER:-none}' spec='${SPEC_WORKER:-none}')"
 # carry worker "codex", and an unrecognised name ranks -1, which history_verdict
 # reports as `unknown` — so without the alias the guard would quietly stop
 # comparing tiers on every past codex run.
-TIER_RANK() { case "$1" in velo-local) echo 0 ;; velo-deepseek) echo 1 ;; velo-haiku) echo 2 ;; velo-glm) echo 3 ;; velo-codex|codex) echo 4 ;; *) echo -1 ;; esac; }
+TIER_RANK() { case "$1" in velo-free) echo 0 ;; velo-local) echo 1 ;; velo-deepseek) echo 2 ;; velo-haiku) echo 3 ;; velo-glm) echo 4 ;; velo-codex|codex) echo 5 ;; *) echo -1 ;; esac; }
 
 # The decision is a FUNCTION so the test can execute this code rather than a
 # copy of it. An earlier draft of the test re-implemented the comparison and
@@ -488,6 +492,7 @@ for r in rows:
       # permanently disagreeing — the exact drift #2085 was filed about.
       NEXT_TIER=""
       case "$L_WORKER" in
+        velo-free)     NEXT_TIER="worker:deepseek" ;;
         velo-local)    NEXT_TIER="worker:deepseek" ;;
         velo-deepseek) NEXT_TIER="worker:haiku" ;;
         velo-haiku)    NEXT_TIER="worker:glm" ;;
@@ -1502,6 +1507,13 @@ STARTED=$(date -u +%FT%TZ)
 # cost (#2012 L2).
 RECORD_MAX_TURNS="$MAX_TURNS"
 
+# A/B trials: VELO_MODEL_OVERRIDE runs an OpenRouter route (free/deepseek/haiku/glm) on another
+# model for ONE dispatch, so the same brief can be replayed across models. result.jsonl records
+# the model per row, so the runs stay comparable. Never set it in a normal dispatch.
+if [[ -n "${VELO_MODEL_OVERRIDE:-}" && "$NAME" != "velo-local" && "$NAME" != "velo-codex" ]]; then
+  warn "VELO_MODEL_OVERRIDE=$VELO_MODEL_OVERRIDE — $NAME will run THIS model, not its pinned one (A/B trial)"
+fi
+
 # The runner command is BUILT, not launched, because the supervisor wrapper
 # below must be identical for every worker. Four inline launches would be four
 # places for the outcome recording to be silently missing from one of them.
@@ -1578,6 +1590,16 @@ case "$NAME" in
           --max-budget-usd "$MAX_BUDGET_USD"
           --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
     ;;
+  velo-free)
+    # The $0 tier: OpenRouter ':free' models. Rate-limited, and the provider may log prompts —
+    # so scoped, low-risk work only. VELO_FREE_MODEL swaps the model for an A/B (result.jsonl
+    # records the model per row, so runs stay comparable).
+    MODEL_ID="${VELO_MODEL_OVERRIDE:-${VELO_FREE_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}}"
+    CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
+          --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
+          --max-budget-usd "$MAX_BUDGET_USD"
+          --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
+    ;;
   velo-deepseek)
     # Pinned at V4.1-Flash. The route is unversioned and the model is pinned
     # here, which is the convention every other route follows.
@@ -1596,7 +1618,7 @@ case "$NAME" in
     # "builds plausible-looking scaffolding quickly, but the underlying logic
     # frequently breaks under scrutiny", with state-tracking failures across
     # multi-step logic. Worth watching on long detached runs.
-    MODEL_ID='deepseek/deepseek-v4.1-flash'
+    MODEL_ID="${VELO_MODEL_OVERRIDE:-deepseek/deepseek-v4.1-flash}"
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"
@@ -1607,14 +1629,14 @@ case "$NAME" in
     # $0.10/M in, $0.50/M out — DeepSeek-class cost on a Claude model, so a task
     # that a DeepSeek-shaped brief describes but wants the Claude leg for can
     # take it without paying glm rates.
-    MODEL_ID='anthropic/claude-haiku-5.5'
+    MODEL_ID="${VELO_MODEL_OVERRIDE:-anthropic/claude-haiku-5.5}"
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"
           --cwd "$WT" --task "$TASK" --skill "$CHECK_CODE_SKILL" )
     ;;
   velo-glm)
-    MODEL_ID='z-ai/glm-5.3-flash'
+    MODEL_ID="${VELO_MODEL_OVERRIDE:-z-ai/glm-5.3-flash}"
     CMD=( "$HOME/.agents/bin/velo-openrouter-agent" --model "$MODEL_ID"
           --policy "$POLICY" --max-turns "$MAX_TURNS" --prompt-timeout "$PROMPT_TIMEOUT"
           --max-budget-usd "$MAX_BUDGET_USD"
