@@ -25,7 +25,7 @@
 #
 # Worker selection comes from the issue's `worker:*` label:
 #   worker:local     -> $VELO_LOCAL_MODEL_DEFAULT (velo-local.conf) via LM Studio (free)
-#   worker:deepseek  -> deepseek/deepseek-v4-flash-0731           (very cheap)
+#   worker:deepseek  -> deepseek/deepseek-v4.1-flash               (very cheap)
 #   worker:haiku     -> anthropic/claude-haiku-5.5                (cheap, Claude leg)
 #   worker:glm       -> z-ai/glm-5.3-flash                        (pricier)
 

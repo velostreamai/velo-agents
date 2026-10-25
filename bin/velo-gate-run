@@ -1,7 +1,7 @@
 #!/bin/bash
 # velo-gate-run — run one PR gate round end to end and leave Codex's verdict on disk.
 #
-#   velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm]
+#   velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm|free]
 #
 # The hand-run sequence, as one command:
 #
@@ -48,7 +48,7 @@
 # so it launched check-spec before reaching the unfilled-ATTACK refusal, and the
 # real run then launched it again over the same log.
 #
-# check-code --check-code-by deepseek|haiku|glm runs the same prompt on that
+# check-code --check-code-by deepseek|haiku|glm|free runs the same prompt on that
 # OpenRouter model, dispatched by velo-pr-gate; its report is ADVISORY (the
 # posted comment and velo-gate say so) — Codex's code-review stays the gating leg.
 #
@@ -78,7 +78,7 @@ ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
 usage() {
-  die "usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm]
+  die "usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm|free]
   The scope file must carry a '## ATTACK' section: its body becomes the review
   brief's ATTACK. Launch with run_in_background: true — it blocks for the review."
 }
@@ -91,12 +91,12 @@ PASS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check-code-by)
-      [[ $# -ge 2 ]] || die "--check-code-by needs a value: sonnet | opus | deepseek | haiku | glm"
+      [[ $# -ge 2 ]] || die "--check-code-by needs a value: sonnet | opus | deepseek | haiku | glm | free"
       PASS+=(--check-code-by "$2"); shift 2 ;;
     --check-code-by=*)
       PASS+=("$1"); shift ;;
     *) die "unknown argument: $1
-  usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm]" ;;
+  usage: velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm|free]" ;;
   esac
 done
 # velo-pr-gate validates the route too, but a bad one should fail before the first
@@ -104,8 +104,8 @@ done
 if [[ ${#PASS[@]} -gt 0 ]]; then
   BY="${PASS[${#PASS[@]}-1]#--check-code-by=}"
   case "$BY" in
-    sonnet|opus|deepseek|haiku|glm) ;;
-    *) die "check-code route must be 'sonnet', 'opus', 'deepseek', 'haiku' or 'glm', got '$BY'" ;;
+    sonnet|opus|deepseek|haiku|glm|free) ;;
+    *) die "check-code route must be 'sonnet', 'opus', 'deepseek', 'haiku', 'glm' or 'free', got '$BY'" ;;
   esac
 fi
 
@@ -540,7 +540,7 @@ next_steps() {
     local by
     by=$(tr -d '[:space:]' < "$GATE_DIR/check-code.by" 2>/dev/null || true)
     case "$by" in
-      deepseek|haiku|glm)
+      deepseek|haiku|glm|free)
         echo "  check-code  the $by leg's report (ADVISORY — not a gating verdict) is the tail of $GATE_DIR/code.log — curate it as post-cc-$PR.md" ;;
       *)
         echo "  check-code  the opus leg's report is $GATE_DIR/code.log — curate it as post-cc-$PR.md" ;;

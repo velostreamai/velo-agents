@@ -69,7 +69,7 @@ echo "all four resolve the SAME variable — one path, not four literals"
 SAME=$(python3 - "$DISPATCH" <<'PYEOF'
 import re, sys, pathlib
 src = pathlib.Path(sys.argv[1]).read_text()
-arms = dict(re.findall(r'(velo-(?:local|deepseek|haiku|glm))\)(.*?);;\n', src, re.DOTALL))
+arms = dict(re.findall(r'(velo-(?:local|deepseek|haiku|glm|free))\)(.*?);;\n', src, re.DOTALL))
 vals = {k: sorted(set(re.findall(r'--skill\s+"([^"]+)"', v))) for k, v in arms.items()}
 print("MISSING-ARM" if len(vals) != 4 else
       (list(vals.values())[0][0] if len({tuple(v) for v in vals.values()}) == 1

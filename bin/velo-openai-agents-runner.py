@@ -98,6 +98,7 @@ set_tracing_disabled(True)
 MAX_TOKENS_BY_MODEL = {
     "z-ai/glm-5.3-flash": 131072,
     "deepseek/deepseek-v4-flash-0731": 65536,
+    "deepseek/deepseek-v4.1-flash": 65536,
 }
 # Applies to any model not named above. Deliberately generous for the same reason.
 DEFAULT_MAX_TOKENS = 65536

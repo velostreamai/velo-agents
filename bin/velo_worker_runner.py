@@ -38,7 +38,7 @@ from velo_sdk_patches import (  # noqa: E402
 PROVIDERS: dict[str, dict[str, Any]] = {
     "openrouter": {
         "label": "velo-openrouter-agent",
-        "default_model": "deepseek/deepseek-v4-flash-0731",
+        "default_model": "deepseek/deepseek-v4.1-flash",
         "default_base_url": "https://openrouter.ai/api/v1",
         "base_url_env": "CODEANY_BASE_URL",
         "api_key_envs": ("OPENROUTER_API_KEY", "CODEANY_API_KEY"),

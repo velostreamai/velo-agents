@@ -329,11 +329,11 @@ prove "gate: label line" gate sc_gate_declares \
 prove "gate: --show line" gate sc_gate_declares \
   '[[ -n "$SUBST_SHOW" ]] && echo "  check-code :' '[[ -n "$SUBST_SHOW" ]] && : "  check-code :'
 prove "post: advisory routes declared" post sc_post_advisory \
-  '      deepseek|haiku|glm)
+  '      deepseek|haiku|glm|free)
         #' '      never)
         #'
 prove "gate: advisory routes declared" gate sc_gate_advisory \
-  '  deepseek|haiku|glm)
+  '  deepseek|haiku|glm|free)
     # #2350' '  never)
     # #2350'
 

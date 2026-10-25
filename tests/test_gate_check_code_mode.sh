@@ -93,7 +93,7 @@ cat > "$TMPD/bin/codex" <<EOF
 cat >/dev/null
 exec -a $MARKER sleep 400
 EOF
-# The OpenRouter runner velo-pr-gate launches for --check-code-by deepseek|haiku|glm
+# The OpenRouter runner velo-pr-gate launches for --check-code-by deepseek|haiku|glm|free
 # (it resolves it under $HOME, which run_gate points here). Records its argv.
 cat > "$TMPD/home/.agents/bin/velo-openrouter-agent" <<EOF
 #!/bin/bash
@@ -246,7 +246,7 @@ sc_refused_run_writes_nothing() {
   [[ ! -e "$GATE_DIR/check-code.by" ]];              sc_check no-stale-route-after-a-refusal $?
 }
 
-# ── scenario: --check-code-by deepseek|haiku|glm runs the prompt on OpenRouter (#2350) ──
+# ── scenario: --check-code-by deepseek|haiku|glm|free runs the prompt on OpenRouter (#2350) ──
 # The route is dispatched by velo-pr-gate itself, read-only, with the sonnet
 # route's prompt and output shape, and recorded so it is declared ADVISORY.
 # Runs on FAST_PATH (no codex), so the leg under test is the only dispatch.
@@ -307,6 +307,14 @@ sc_openrouter_route glm z-ai/glm-5.3-flash
 sc_openrouter_route haiku anthropic/claude-haiku-5.5
 [[ -z "$SC_FAILS" ]] && ok "--check-code-by haiku: read-only OpenRouter leg, pinned model, same prompt, route recorded" \
                      || fail "haiku route:$SC_FAILS"
+# free: the $0 tier. No velo-dispatch arm (free models are review-only, never implementation
+# workers), so it is outside the parity loop below; VELO_FREE_MODEL swaps the model.
+sc_openrouter_route free nvidia/nemotron-3-ultra-550b-a55b:free
+[[ -z "$SC_FAILS" ]] && ok "--check-code-by free: read-only OpenRouter leg, default free model, route recorded" \
+                     || fail "free route:$SC_FAILS"
+VELO_FREE_MODEL=poolside/laguna-s-2.1:free sc_openrouter_route free poolside/laguna-s-2.1:free
+[[ -z "$SC_FAILS" ]] && ok "--check-code-by free honours VELO_FREE_MODEL" \
+                     || fail "free model override:$SC_FAILS"
 # The pins must be velo-dispatch's: a report from a model the worker records do
 # not describe is a reviewer nobody has measured.
 for r in deepseek haiku glm; do
@@ -420,7 +428,7 @@ fi
 # allowed set named.
 rm -rf "$GATE_DIR"
 run_gate "$FAST_PATH" --check-code-by gemini
-if [[ $RC -ne 0 ]] && grep -q "must be 'sonnet', 'opus', 'deepseek', 'haiku' or 'glm', got 'gemini'" "$TMPD/out.txt"; then
+if [[ $RC -ne 0 ]] && grep -q "must be 'sonnet', 'opus', 'deepseek', 'haiku', 'glm' or 'free', got 'gemini'" "$TMPD/out.txt"; then
   ok "an unknown route is refused and the allowed values are named"
 else
   fail "unknown route accepted or unexplained (rc=$RC): $(tail -2 "$TMPD/out.txt")"
@@ -447,7 +455,7 @@ fi
 # #2423: the route the probes vacated is accepted, not merely parsed — asserted
 # statically here so this section still leaves no gate state behind (the gate's
 # own end-to-end haiku run is sc_openrouter_route above).
-if grep -qF "  sonnet|opus|deepseek|haiku|glm) ;;" "$GATE"; then
+if grep -qF "  sonnet|opus|deepseek|haiku|glm|free) ;;" "$GATE"; then
   ok "--check-code-by haiku is inside the accepted set"
 else
   fail "haiku is not in the accepted route set — haiku would be refused"

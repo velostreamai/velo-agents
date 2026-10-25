@@ -1024,7 +1024,7 @@ Choosing the model per PR by judgement is how the routing drifted: a review once
 went to velo-local and came back `MERGE-READY` while missing a HIGH and asserting
 a fact that was demonstrably false. The routing is now in the script.
 
-**The `check-code` route** is chosen by `--check-code-by sonnet|opus|deepseek|haiku|glm`
+**The `check-code` route** is chosen by `--check-code-by sonnet|opus|deepseek|haiku|glm|free`
 or `VELO_CHECK_CODE=…` (the flag wins; the default is `sonnet`):
 
 - `sonnet` — the script launches **nothing** for this gate. It writes
@@ -1207,7 +1207,7 @@ record against an older one.
 ### `velo-gate-run` — one gate round in one command
 
 ```bash
-velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm]     # launch with run_in_background: true
+velo-gate-run <pr> <scope-file> [--check-code-by sonnet|opus|deepseek|haiku|glm|free]     # launch with run_in_background: true
 ```
 
 It replaces the hand-run sequence, each step of which went wrong in some round:

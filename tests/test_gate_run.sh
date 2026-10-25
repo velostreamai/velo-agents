@@ -415,7 +415,7 @@ sc_usage() {
   # could no longer prove the rejection path. The assertions are unchanged in kind:
   # an unrouted token is refused AND the message lists the whole accepted set.
   run_wrapper "$TPR" "$SCOPE" --check-code-by gemini
-  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "must be 'sonnet', 'opus', 'deepseek', 'haiku' or 'glm', got 'gemini'"; sc_check bad-route $?
+  [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "must be 'sonnet', 'opus', 'deepseek', 'haiku', 'glm' or 'free', got 'gemini'"; sc_check bad-route $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by=gemini
   [[ $RC -ne 0 ]] && has "$TMPD/wrapper.out" "got 'gemini'"; sc_check bad-route-equals-form $?
   run_wrapper "$TPR" "$SCOPE" --check-code-by
@@ -1703,7 +1703,7 @@ run_scenarios \
   "sc_empty_range::an empty diff range ends the round without a verdict" \
   "sc_check_code_hint::the Sonnet prompt and the post files are named at the end" \
   "sc_finish_line::the velo-gate-finish line names the reports the plan has: both, either one, or none" \
-  "sc_advisory_hint::--check-code-by deepseek|haiku|glm is accepted and its report named ADVISORY" \
+  "sc_advisory_hint::--check-code-by deepseek|haiku|glm|free is accepted and its report named ADVISORY" \
   "sc_reap_after_codex::a second opinion still running past the grace is killed, children too, once Codex is done" \
   "sc_reap_grace::a second opinion that finishes within the grace is left to finish" \
   "sc_reap_on_failure::a failed round does not leave the second opinion running" \
@@ -2233,9 +2233,9 @@ prove_run "finish line: check-code only" sc_finish_line \
 prove_run "finish line: no report at all" sc_finish_line \
   'no check-code or code-review report to post for this plan' 'a finish line for this plan'
 prove_run "advisory routes accepted" sc_advisory_hint \
-  '    sonnet|opus|deepseek|haiku|glm) ;;' '    sonnet|opus) ;;'
+  '    sonnet|opus|deepseek|haiku|glm|free) ;;' '    sonnet|opus) ;;'
 prove_run "advisory report named" sc_advisory_hint \
-  '      deepseek|haiku|glm)
+  '      deepseek|haiku|glm|free)
         echo "  check-code  the $by' '      never)
         echo "  check-code  the $by'
 prove_run "reaped once Codex is done" sc_reap_after_codex \

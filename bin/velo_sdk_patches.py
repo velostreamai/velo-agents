@@ -268,6 +268,8 @@ def install_provider_pinning(model: str, logger=None) -> list[str]:
 # small, tripping the 187k auto-compact threshold with enormous headroom left.
 CONTEXT_WINDOWS: dict[str, int] = {
     "deepseek/deepseek-v4-flash-0731": 1_048_576,
+    "deepseek/deepseek-v4.1-flash": 1_048_576,
+    "nvidia/nemotron-3-ultra-550b-a55b:free": 1_000_000,
     "z-ai/glm-5.3-flash": 1_048_576,
 }
 
