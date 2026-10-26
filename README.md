@@ -28,6 +28,7 @@ and the tests** — never from the worker's self-report.
     velo-gate-finish               post a round's reports at the gated sha, then record the verdict
     velo-gate-sweep                one compact view of every gating PR — sweep it instead of reading each gate's files
     velo-merge                     merge only if gated against the CURRENT head
+    velo-waiver.jq                 ONE definition of "what is a waiver" (comment opens `gate-waived: <name> @ <9+ hex>`, next line `Approved by: <name>`, by an OWNER/MEMBER/COLLABORATOR): velo-gate --pass, velo-merge and velo-gate-finish read it. Must sit beside them
     velo-ci-rollup.jq              ONE definition of "how green is a PR": velo-merge refuses on it, velo-status shows it. Must sit beside them (install.sh copies bin/ whole)
     velo-record                    write a dispatch's OUTCOME (appended, never overwritten)
     velo-spec-review               attest a spec was read; --check has Codex REVIEW it
@@ -55,7 +56,7 @@ and the tests** — never from the worker's self-report.
     test_gate_post_sha.sh          the gate stamp: never claim a sha the gate did not see
     test_spec_review_worker.sh     reviewer substitution is allowed, never silent
     test_gate_routing.sh            the routing table: one definition, three readers
-    test_gate_check_code_mode.sh   the check-code route: sonnet default, opus opt-in, stale state cleared
+    test_gate_check_code_mode.sh   the check-code route: free default, sonnet/opus opt-in, stale state cleared
     test_gate_substitution.sh      a substituted check-code reviewer is declared on the comment and the label
     test_gate_run.sh               velo-gate-run: ATTACK fill under the exhaustive-review preamble, last-marker verdict, retry, --brief-only, one e2e round
     test_gate_finish.sh            velo-gate-finish: post order, gated sha, idempotence, retry, no label over a missing report
@@ -117,8 +118,8 @@ Runtime state lives **outside the repo**, under `$VELO_STATE` (default
     review-brief.md        the brief; stable, so a hand-filled ATTACK survives a re-run
     code-brief.md
     review.log  code.log   the reviewers' output
-    check-code-agent-prompt.md   the read-only Sonnet agent's prompt (default check-code route)
-    check-code.by          which route check-code used this run (`sonnet`); velo-gate-post and velo-gate read it
+    check-code-agent-prompt.md   the read-only Sonnet agent's prompt (the opt-in `sonnet` check-code route)
+    check-code.by          which route check-code used this run (`free` by default); velo-gate-post and velo-gate read it
     codex-verdict.md       Codex's final message, cut out of review.log by velo-gate-run
     attack-body.md         the ATTACK text velo-gate-run took from the scope file
     scope.<UTC>.md         the WHOLE scope file, one copy per velo-gate-run round; never read back (velo-gate-sweep and velo-status open named files only)
@@ -300,8 +301,8 @@ removed:
 diff: `src/` touched adds `check-code`; a linked issue with 3+ acceptance bars
 adds `check-spec`; anything under `.agents/` requires `code-review`, because
 tooling governs every other run. **Which model runs each gate is fixed** —
-`code-review` to Codex, `check-code` to a read-only Sonnet agent (opus at
-`--effort high` only on request), `check-spec` to the local worker. Hand-
+`code-review` to Codex, `check-code` to the free OpenRouter tier (a read-only
+Sonnet agent, or opus at `--effort high`, only on request), `check-spec` to the local worker. Hand-
 picking drifted twice in one session, once sending a review to a worker that
 returned MERGE-READY while missing a HIGH.
 
@@ -491,7 +492,7 @@ arbitrary spend. GLM is set to 131,072; the default is 65,536.
 |---|---|---|
 | **orchestrator** | a Claude Code session (usually), or Codex | runs `velo-dispatch` / `velo-status` / `velo-pr-gate`; writes briefs and specs; never writes the feature code itself |
 | **delegated worker** | `velo-local`, `velo-deepseek`, `velo-haiku`, `velo-glm` via the worker runner (`VELO_AGENT_BACKEND`); `worker:codex` via `codex exec` | implements one scoped task in its own worktree, unattended |
-| **review gate** | `codex review` for `code-review`; a read-only Sonnet agent for `check-code` (the orchestrator launches it); `velo-local` for `check-spec` | reads a diff read-only and returns findings |
+| **review gate** | `codex review` for `code-review`; the free OpenRouter tier for `check-code` (the script dispatches it; a Sonnet agent is opt-in); `velo-local` for `check-spec` | reads a diff read-only and returns findings |
 
 Codex appears in **two** of those roles and they are not interchangeable:
 `worker:codex` implements (via `codex exec`, dispatched by `velo-dispatch`),
@@ -1017,7 +1018,7 @@ velo-merge    1902                  # refuses unless gate:passed AND gate sha ==
 | gate | model | why this one |
 |---|---|---|
 | `code-review` | **Codex** | found a real defect in every round it ran, including against designs already pinned and code the orchestrator wrote |
-| `check-code` | **read-only Sonnet agent** (default) · opus at `--effort high` (`--check-code-by opus`) · DeepSeek / Haiku / GLM on OpenRouter, **advisory** (`--check-code-by deepseek\|haiku\|glm`) | the opus leg has never produced a report — it times out; a bounded Sonnet agent does, at a fraction of the cost; the OpenRouter route costs no Claude tokens but has not earned a gating verdict |
+| `check-code` | **free OpenRouter tier, advisory** (default, dispatched by the script) · read-only Sonnet agent (`--check-code-by sonnet`, opt-in) · opus at `--effort high` (`--check-code-by opus`) · DeepSeek / Haiku / GLM on OpenRouter, **advisory** (`--check-code-by deepseek\|haiku\|glm`) | the opus leg has never produced a report — it times out; a bounded Sonnet agent does, at a fraction of the cost; the OpenRouter route costs no Claude tokens but has not earned a gating verdict |
 | `check-spec` | velo-local | free; fine at bar-by-bar verification |
 
 Choosing the model per PR by judgement is how the routing drifted: a review once
@@ -1025,9 +1026,9 @@ went to velo-local and came back `MERGE-READY` while missing a HIGH and assertin
 a fact that was demonstrably false. The routing is now in the script.
 
 **The `check-code` route** is chosen by `--check-code-by sonnet|opus|deepseek|haiku|glm|free`
-or `VELO_CHECK_CODE=…` (the flag wins; the default is `sonnet`):
+or `VELO_CHECK_CODE=…` (the flag wins; the default is `free`, dispatched by the script itself):
 
-- `sonnet` — the script launches **nothing** for this gate. It writes
+- `sonnet` (opt-in) — the script launches **nothing** for this gate. It writes
   `~/.agents/state/gate/<pr>/check-code-agent-prompt.md` (the check-code
   instructions, the brief's worktree/range/scope/ATTACK, read-only, a 40-tool-call
   cap, one output shape) and prints one line telling the orchestrator to launch a
@@ -1268,7 +1269,7 @@ still handed the original path.
 
 It ends by printing the `velo-gate-finish` line for this plan. The wrapper holds a
 session for the length of a review, so launch it with `run_in_background: true`; with
-the default check-code route the one launch line for the Sonnet agent appears in its
+the opt-in sonnet check-code route the one launch line for the Sonnet agent appears in its
 output as soon as the gates are dispatched.
 
 A transient gh failure inside `velo-pr-gate` (`PR #N not found`, `could not read

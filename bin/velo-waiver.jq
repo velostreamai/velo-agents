@@ -1,0 +1,1 @@
+[.comments[] | select(.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")) | .body | capture("^[ \\t]*gate-waived: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{9,40})[^\\n]*\\r?\\nApproved by:[ \\t\\p{Zs}]*[^\\s\\p{Z}\\p{C}]")]

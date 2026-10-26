@@ -110,7 +110,9 @@ gate() {   # <mode> -> $OUT $RC ; the scenario's STUB_* variables are in the env
   OUT=$(bash "$GATE_UNDER_TEST" "$PR" "$1" 2>&1); RC=$?
   printf '%s\n' "$OUT" > "$TMPD/gate.out"
 }
-reset() { set_labels '[]'; set_comments; rm -f "$STUB_EDITS" "$STUB_CALLS" "$TMPDIR"/velo-gate-err.*; }
+# A --pass needs every planned leg reported at head; the stub PR is tooling-only (code-review), so a
+# scenario that is not ABOUT the comments starts with that one comment at head.
+reset() { set_labels '[]'; set_comments "$(gate_comment code-review "$H9")"; rm -f "$STUB_EDITS" "$STUB_CALLS" "$TMPDIR"/velo-gate-err.*; }
 
 # ── --pass: the guard ─────────────────────────────────────────────────────────
 sc_pass_current() {
@@ -193,14 +195,17 @@ sc_show_digit_named_and_sha_less_gates_are_stale() {
   ! has "$TMPD/gate.out" "every gate comment matches the current head"; sc_check does-not-say-current $?
 }
 
-# No gate comment at all is a successful read of nothing: there is nothing to compare, and
-# velo-merge is what insists a code PR carries a gate comment. This is the case a FAILED read
-# used to be mistaken for.
+# No gate comment at all is a successful read of nothing — and a PR with a planned leg and no report
+# for it is not passed (a leg that never ran must never read as a pass). The refusal is for the
+# MISSING LEG; it must not be mistaken for the unreadable-comments refusal this file also pins.
 sc_pass_nothing_recorded() {
-  SC_FAILS=""; reset
+  SC_FAILS=""; reset; set_comments
   gate --pass
-  [[ $RC -eq 0 ]];                                         sc_check nothing-recorded-still-passes $?
-  has "$STUB_EDITS" "--add-label gate:passed";             sc_check sets-the-label $?
+  [[ $RC -ne 0 ]];                                         sc_check refuses-a-planned-leg-with-no-report $?
+  has "$TMPD/gate.out" "has no report at head";            sc_check says-the-leg-has-no-report $?
+  has "$TMPD/gate.out" "code-review";                      sc_check names-the-missing-leg $?
+  ! has "$TMPD/gate.out" "could not read the gate comments"; sc_check does-not-call-it-an-unreadable-read $?
+  [[ ! -e "$STUB_EDITS" ]];                                sc_check no-label-was-touched $?
 }
 
 # ── --pass: a read that cannot be trusted ─────────────────────────────────────
@@ -459,11 +464,17 @@ sc_label_modes_do_not_read_the_issue() {
   SC_FAILS=""; code_pr; reset
   export STUB_ISSUE_FAIL="gh: HTTP 502: Bad Gateway"
   local m
-  for m in --pass --block --running; do
+  for m in --block --running; do
     gate "$m"
     [[ $RC -eq 0 ]];                                       sc_check "$m-needs-no-issue" $?
     ! has "$STUB_CALLS" "issue view";                      sc_check "$m-does-not-read-the-issue" $?
   done
+  # --pass must know whether check-spec is planned, so it reads the issue — and fails CLOSED when it
+  # cannot: an unknown plan is not an empty plan.
+  gate --pass
+  [[ $RC -ne 0 ]];                                         sc_check pass-refuses-an-unknown-plan $?
+  has "$TMPD/gate.out" "Refusing to mark passed";          sc_check pass-says-why $?
+  [[ ! -e "$STUB_EDITS" ]];                                sc_check pass-touched-no-label $?
   unset STUB_ISSUE_FAIL
   plain_pr
 }
@@ -563,7 +574,7 @@ run_scenarios \
   "sc_plan_closing_keywords::every GitHub closing keyword links its issue, as a whole word, in any case" \
   "sc_plan_reads_each_issue_once::an issue the body names three times is read once" \
   "sc_plan_unreadable_body_refuses::a body that cannot be read is refused, not taken as closing nothing" \
-  "sc_label_modes_do_not_read_the_issue::--pass / --block / --running never read the issue" \
+  "sc_label_modes_do_not_read_the_issue::--block / --running never read the issue; --pass fails closed on an unreadable plan" \
   "sc_label_show_ambiguous::--show names two gate labels as ambiguous (exit 1), in either order, not as whichever is first" \
   "sc_label_pass_replaces_the_old_label::--pass removes the old verdict label — only if it is there — and adds the new one" \
   "sc_label_running_clears_every_other_gate_label::--running over two verdict labels leaves one" \
@@ -571,6 +582,7 @@ run_scenarios \
 
 # ── MUTATION-PROOF ────────────────────────────────────────────────────────────
 MUT="$TMPD/mut"; mkdir -p "$MUT"
+cp "$(dirname "$GATE_REAL")/velo-waiver.jq" "$MUT/velo-waiver.jq"   # the waiver definition sits beside the script, as in bin/
 mutate() {   # <anchor> <replacement> [<anchor> <replacement>]... -> $MUT/velo-gate ; each anchor occurs exactly once
   python3 - "$GATE_REAL" "$MUT/velo-gate" "$@" <<'PY'
 import sys
@@ -605,22 +617,22 @@ prove() {   # <label> <scenario fn> <the check that must go red> <anchor> <repla
 
 echo
 echo "mutation proofs"
-prove "a failed read refuses --pass" sc_pass_unreadable unreadable-read-refuses-the-label \
+prove "a failed read refuses --pass" sc_pass_unreadable says-what-it-could-not-do \
   '  if [[ $rc -ne 0 ]]; then' '  if false; then'
-prove "a failed read refuses --pass without a scratch file too" sc_pass_unreadable_no_scratch unreadable-read-without-a-scratch-file-refuses \
+prove "a failed read refuses --pass without a scratch file too" sc_pass_unreadable_no_scratch says-why-there-is-no-message \
   'GH_OUT=$(gh "$@" 2>/dev/null); rc=$?' 'GH_OUT=$(gh "$@" 2>/dev/null); rc=0'
 prove "the refusal shows gh's own error" sc_pass_unreadable shows-ghs-own-error \
   'die "could not read the gate comments for #$PR: $GATES_ERR' 'die "could not read the gate comments for #$PR'
 prove "the scratch file is removed" sc_pass_unreadable no-scratch-file-left \
   'rm -f "$errf"' ':'
-prove "a garbled answer refuses --pass" sc_pass_garbled a-null-answer-refuses-the-label \
+prove "a garbled answer refuses --pass" sc_pass_garbled says-what-it-got \
   '    if [[ ! "$line" =~ $GATE_LINE_RE ]]; then' '    if false; then'
 prove "the newest comment alone is not the state" sc_pass_stale_older_leg older-leg-stale-refuses \
   '| reduce .[] as $g ({}; .[$g.n] = ($g.s // "-")) | to_entries[] | "\(.key) \(.value)"' '| (last // empty) | "\(.n) \(.s)"'
 prove "a re-run gate's old comment does not condemn it" sc_pass_rerun_clears_old a-rerun-clears-the-old-comment \
   '| reduce .[] as $g ({}; .[$g.n] = ($g.s // "-")) | to_entries[] | "\(.key) \(.value)"' '| .[] | "\(.n) \(.s)"'
 prove "a gate name may carry a digit" sc_pass_digit_named_stale_gate_refuses names-the-digit-named-gate \
-  'capture("gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]' 'capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})?")]'
+  '*gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]' '*gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})?")]'
 prove "the gate-list shape check accepts a digit in a name" sc_pass_digit_named_stale_gate_refuses names-the-digit-named-gate \
   "GATE_LINE_RE='^[a-z0-9-]+ ([0-9a-f]{7,40}|-)\$'" "GATE_LINE_RE='^[a-z-]+ ([0-9a-f]{7,40}|-)\$'"
 prove "a header with no readable sha is still a gate comment" sc_pass_freshest_gate_without_a_sha_refuses refuses \
@@ -630,16 +642,13 @@ prove "the gate-list shape check accepts a gate that names no commit" sc_pass_fr
 prove "a gate that names no commit is named as such" sc_pass_freshest_gate_without_a_sha_refuses names-the-gate-that-names-no-commit \
   '    if [[ "$gsha" == "-" ]]; then' '    if false; then'
 prove "--show reports a digit-named stale gate" sc_show_digit_named_and_sha_less_gates_are_stale names-the-digit-named-gate \
-  'capture("gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]' 'capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})?")]'
+  '*gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]' '*gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})?")]'
 prove "--show reports a gate that names no commit" sc_show_digit_named_and_sha_less_gates_are_stale names-the-gate-that-names-no-commit \
   '    if [[ "$gsha" == "-" ]]; then' '    if false; then'
-prove "a stale gate refuses --pass" sc_pass_stale_newer_leg newer-leg-stale-refuses \
+prove "a stale gate refuses --pass" sc_pass_stale_newer_leg names-the-stale-gate \
   '      [[ -z "$STALE_GATES" ]] \' '      : \'
-prove "nothing recorded is not a refusal" sc_pass_nothing_recorded nothing-recorded-still-passes \
-  '      stale_gates
-      [[ -z "$STALE_GATES" ]] \' '      stale_gates
-      [[ -n "$GATES" ]] || die "no gate comment"
-      [[ -z "$STALE_GATES" ]] \'
+prove "a planned leg with no report refuses --pass" sc_pass_nothing_recorded refuses-a-planned-leg-with-no-report \
+  '      [[ -z "$MISSING" ]] \' '      : \'
 prove "--show says it could not read the comments" sc_show_unreadable says-it-cannot-tell \
   '    if ! read_gate_comments; then' '    if false; then'
 prove "--show exits 1 on an unreadable read" sc_show_unreadable unreadable-exits-1 \
@@ -672,7 +681,7 @@ prove "--show flags an incomplete plan" sc_show_unreadable_issue says-the-plan-i
 prove "the issue is read only for a plan that needs it" sc_plan_issue_read_only_where_needed docs-only-does-not-read-the-issue \
   '    NEED+=("none — docs only, no buildable code and no orchestration")' '    NEED+=("none — docs only, no buildable code and no orchestration")
     count_acceptance_bars || return 1'
-prove "the issue is read only where a plan is printed" sc_label_modes_do_not_read_the_issue --pass-does-not-read-the-issue \
+prove "the issue is read only where a plan is printed" sc_label_modes_do_not_read_the_issue --block-does-not-read-the-issue \
   'SHOW_RC=0
 case "$MODE" in' 'SHOW_RC=0
 build_need || die "eager read"

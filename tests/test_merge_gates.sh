@@ -17,6 +17,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MERGE="$HERE/../bin/velo-merge"
+MERGE_DIR="$HERE/../bin"
 RC=0
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
@@ -50,7 +51,7 @@ if [[ -n "$JQF" ]]; then
   python3 -c '
 import json, os, sys
 bodies = [b for b in os.environ.get("COMMENTS", "").split("\n") if b]
-print(json.dumps({"comments": [{"body": b} for b in bodies]}))' | jq -r "$JQF"
+print(json.dumps({"comments": [{"body": b.replace("<NONE>", "").replace("<NL>", "\n"), "authorAssociation": ("NONE" if b.startswith("<NONE>") else "OWNER")} for b in bodies]}))' | jq -r "$JQF"
   exit 0
 fi
 echo ""; exit 0
@@ -79,12 +80,13 @@ pathlib.Path(sys.argv[2]).write_text(
     'ok()  { echo "OK: $*"; }\n'
     'PR=1; REPO=x/y; FORCE=${FORCE:-0}\n'
     'HEAD="$HEADSHA"; SHORT="${HEADSHA:0:7}"\n'
+    'WAIVER_EXPR=$(cat -- "$WAIVER_JQ_PATH")\n'
     + block)
 print("  extracted the real gate block from velo-merge")
 PYEOF
 
 run() {  # COMMENTS via env
-  COMMENTS="$1" FORCE="${2:-0}" HEADSHA="$HEADSHA" \
+  COMMENTS="$1" FORCE="${2:-0}" HEADSHA="$HEADSHA" WAIVER_JQ_PATH="$MERGE_DIR/velo-waiver.jq" \
     PATH="$TMPD/bin:$PATH" bash "$TMPD/block.sh" 2>&1
 }
 
@@ -132,6 +134,51 @@ echo
 echo "--force still overrides, and says so"
 OUT=$(run "gate: check-code @ $OLDSHA" 1)
 check_not "force does not die" "$OUT" "DIE:"
+
+echo
+echo "a planned leg must be recorded or WAIVED by a named approver, at head"
+python3 - "$MERGE" "$TMPD/block.sh" "$TMPD/recorded.sh" <<'PYEOF'
+import sys, pathlib
+src = pathlib.Path(sys.argv[1]).read_text()
+first = pathlib.Path(sys.argv[2]).read_text()        # the single read + stale-gate check, as extracted above
+start = src.index("  if [[ $GATE_PASSED -eq 1 ]]; then\n    RECORDED=")
+end = src.index("\n  fi\nfi\n", start) + len("\n  fi\n")
+pathlib.Path(sys.argv[3]).write_text(
+    first.replace('die() {', 'warn() { echo "WARN: $*"; }\ndie() {', 1)
+    + 'GATE_PASSED=1; NEEDED="$NEEDED_IN"\n' + src[start:end])
+PYEOF
+run_rec() {  # <recorded gates "name sha" lines> <NEEDED names> <extra COMMENTS: waivers etc.>
+  # The recorded gates are given as `gate:` comments, so the real single read produces GATES and WAIVED_RAW.
+  local c="" l
+  while read -r n sh; do [[ -n "$n" ]] && c="$c
+gate: $n @ $sh"; done <<<"$1"
+  COMMENTS="${c#
+}
+$3" NEEDED_IN="$2" HEADSHA="$HEADSHA" WAIVER_JQ_PATH="$MERGE_DIR/velo-waiver.jq" PATH="$TMPD/bin:$PATH" bash "$TMPD/recorded.sh" 2>&1
+}
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "")
+check     "a planned leg with no report and no waiver blocks the merge"  "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "gate-waived: check-code @ $HEADSHA<NL>Approved by: neil<NL>Reason: docs-only")
+check_not "a waiver by a named approver, at head, covers the leg"        "$OUT" "DIE:"
+check     "and the merge says the leg was waived"                         "$OUT" "check-code was WAIVED"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "gate: code-review @ $HEADSHA<NL>quoting an old thread:<NL>gate-waived: check-code @ $HEADSHA<NL>Approved by: Alice")
+check     "a gate report that merely quotes waiver text is not a waiver"  "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "I did not run check-code.<NL><NL>gate: check-code @ $HEADSHA")
+check     "a comment that merely quotes a gate header is not a report"   "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA
+check-code $OLDSHA" "code-review check-code" "gate-waived: check-code @ $HEADSHA<NL>Approved by: neil<NL>Reason: later")
+check_not "a current waiver covers a leg reported only at an older head" "$OUT" "STALE"
+check_not "and the merge does not die on it"                              "$OUT" "DIE:"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "gate-waived: check-code @ $OLDSHA<NL>Approved by: neil")
+check     "a waiver for an older head does not cover the current head"   "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "<NONE>gate-waived: check-code @ $HEADSHA<NL>Approved by: Alice<NL>Reason: cheap")
+check     "a waiver by a non-collaborator does not count"                "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "gate-waived: check-code @ $HEADSHA<NL>Approved by: $(printf '\xe2\x80\x83')<NL>Reason: cheap")
+check     "a Unicode-whitespace approver does not count"                 "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "gate-waived: check-code @ $HEADSHA<NL>Approved by: 	 <NL>Reason: cheap")
+check     "a whitespace-only approver does not count"                    "$OUT" "NO recorded report for: check-code"
+OUT=$(run_rec "code-review $HEADSHA" "code-review check-code" "gate-waived: check-code @ $HEADSHA<NL>Reason: cheap")
+check     "a waiver with no named approver does not count"               "$OUT" "NO recorded report for: check-code"
 
 echo
 [[ $RC -eq 0 ]] && echo "all merge-gate checks passed" || echo "FAILED"

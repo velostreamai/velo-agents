@@ -6,6 +6,22 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Fixed — a gate leg that did not run can no longer read as a pass (#2231)
+
+Four PRs (#2756, #2758, #2761, #2762) went `gate:passed` with check-code posted as "NOT RUN (declared)",
+the poster adding "run by a Sonnet agent" to it, and check-spec never planned. Three holes, three
+closes. `velo-gate-post` refuses a report whose opening says the leg was NOT RUN / skipped.
+`velo-gate --pass` refuses until every planned leg has a report at head, or a waiver at head — a
+separate `gate-waived: <name> @ <sha>` comment carrying `Approved by:`, posted with
+`velo-gate-finish --waive <gate>='<reason>' --approved-by '<who>'`, and never a `gate:` stamp. `velo-merge` reads the same waivers (at head, a non-whitespace approver name incl. Unicode whitespace, posted by an OWNER/MEMBER/COLLABORATOR — a drive-by commenter's waiver does not count). The approver name is an audit trail, not an authentication (the orchestrator posts under the owner's token); the control that the user really approved is procedural, in CLAUDE.md so a waived leg does not block the merge, and `velo-gate --pass` accepts the same reviewer-named code-review aliases `velo-merge` does. The plan
+adds check-spec for every `[#N]`-titled PR that touches `src/` (a "Part B of #N" / "Parent: #N" body is
+not a closing keyword, so the issue scan found nothing). check-code now defaults to the free
+OpenRouter tier, which the script dispatches itself, instead of the Sonnet route that needed a manual
+launch; Sonnet is `--check-code-by sonnet`. `tests/test_gate_no_silent_skip.sh`; the comments,
+routing, check-code-mode and substitution suites moved to the new contract (a `--pass` over no
+reports now refuses; the planned-leg refusal is pinned, and the old guards' proofs pin their own
+messages because the new check also refuses those cases).
+
 ### Added — the review preamble and the worker pre-gate sweep are supplied by the tooling (#2231)
 
 Two review-quality rules used to live in whoever wrote the scope or the brief, and went missing when

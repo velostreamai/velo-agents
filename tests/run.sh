@@ -109,6 +109,7 @@ suite test_gate_substitution.sh bash "$HERE/test_gate_substitution.sh"
 suite test_gate_comments.sh bash "$HERE/test_gate_comments.sh"
 suite test_gate_run.sh bash "$HERE/test_gate_run.sh"
 suite test_gate_finish.sh bash "$HERE/test_gate_finish.sh"
+suite test_gate_no_silent_skip.sh bash "$HERE/test_gate_no_silent_skip.sh"
 suite test_gate_sweep.sh bash "$HERE/test_gate_sweep.sh"
 echo
 echo "── dispatch preflight (end-to-end) ────────────────────"

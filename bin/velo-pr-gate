@@ -10,7 +10,7 @@
 #                                       gates are launched, exactly as before.
 #   velo-pr-gate <pr> --plan           show what would run, dispatch nothing
 #   velo-pr-gate <pr> <scope-file> --check-code-by sonnet|opus|deepseek|haiku|glm|free
-#                                      choose check-code's route (default sonnet;
+#                                      choose check-code's route (default free;
 #                                      env VELO_CHECK_CODE; the flag wins).
 #                                      deepseek|haiku|glm|free are ADVISORY (see below)
 #   velo-pr-gate <pr> <scope-file> --brief-only
@@ -31,7 +31,7 @@
 #   code-review  -> Codex      adversarial; found a real defect in EVERY round it
 #                              ran, including against designs the orchestrator had
 #                              pinned and code the orchestrator wrote
-#   check-code   -> sonnet     DEFAULT (--check-code-by sonnet | VELO_CHECK_CODE=sonnet).
+#   check-code   -> sonnet     OPT-IN (--check-code-by sonnet | VELO_CHECK_CODE=sonnet); the default is free (below).
 #                              Prepared by this script, LAUNCHED by the orchestrator.
 #                              The opus leg below has never produced a report — it
 #                              times out — so every round ended in a hand-written
@@ -65,7 +65,7 @@
 #                              "do not write" is a guarantee rather than a
 #                              request. velo-glm committed on 2 of its 3
 #                              read-only dispatches (#1987, #1994).
-#   check-code   -> deepseek|haiku|glm|free  OPT-IN, ADVISORY (--check-code-by deepseek|haiku|glm|free):
+#   check-code   -> free       DEFAULT. deepseek|haiku|glm|free are ADVISORY (--check-code-by deepseek|haiku|glm|free):
 #                              the cheap route. The sonnet leg costs ~90-115k
 #                              Claude tokens a PR; this runs the SAME prompt on an
 #                              OpenRouter model through velo-openrouter-agent, read-
@@ -95,7 +95,7 @@
 #                              must not move Codex's next range. Skip with
 #                              VELO_SECOND_OPINION=0.
 #
-# Every gate is dispatched by this script except check-code's default route,
+# Every gate is dispatched by this script except check-code's opt-in sonnet route,
 # which is prepared here and launched by the orchestrator (see above).
 # `codex review` runs non-interactively and takes its prompt on stdin.
 #
@@ -160,9 +160,12 @@ warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
 PR="${1:-}"; SCOPE=""; EXEC=0; WAIT=0; BRIEF_ONLY=0
 # check-code's route. The flag wins over the environment, the environment over the
-# default. sonnet: this script writes the prompt and the orchestrator launches a
-# read-only Sonnet agent. opus: the original dispatched `claude` leg.
-CHECK_CODE_BY="${VELO_CHECK_CODE:-sonnet}"
+# default. DEFAULT free: dispatched by this script on the $0 OpenRouter tier, advisory, so
+# the leg RUNS without anyone remembering to launch it — the sonnet route is a manual step,
+# and four PRs went through with it silently not run. sonnet: this script writes the prompt
+# and the orchestrator launches a read-only Sonnet agent (opt-in, for non-trivial PRs).
+# opus: the original dispatched `claude` leg.
+CHECK_CODE_BY="${VELO_CHECK_CODE:-free}"
 ARGS=("${@:2}")
 i=0
 while [[ $i -lt ${#ARGS[@]} ]]; do
@@ -738,8 +741,8 @@ print('\n'.join(names))
 fi
 # <<< velo-fail-to-pass-merge
 
-# check-code is routed alongside code-review below (a read-only Sonnet agent the
-# orchestrator launches by default, the opus leg on request) — see the routing
+# check-code is routed alongside code-review below (the free OpenRouter tier by default; a
+# read-only Sonnet agent the orchestrator launches, or the opus leg, on request) — see the routing
 # table in this file's header for the measurement behind each route.
 # --brief-only dispatches NOTHING. Priming the brief with a plain run launched
 # check-spec here, ahead of the ATTACK refusal below, and the real run then
@@ -970,7 +973,7 @@ EOF
   CODE_LOG="$GATE_DIR/code.log"
   CODE_BRIEF="$GATE_DIR/code-brief.md"
   if [[ $NEEDS_CODE -eq 1 && "$CHECK_CODE_BY" == "sonnet" ]]; then
-    # The default route: nothing is launched here. The opus leg below has never
+    # The sonnet route (opt-in): nothing is launched here. The opus leg below has never
     # produced a report (it times out), so what the orchestrator actually did on
     # every round was run a read-only Sonnet agent by hand and write the
     # substitution note by hand. This makes that the route: the prompt is

@@ -252,7 +252,7 @@ step_gates() {
       [[ -n "$gated_sha" ]] || { all_approve=0; continue; }
 
       local header; header="gate: $name @ ${gated_sha:0:9}"
-      if ! grep -qiF "$header" <<<"$comments"; then
+      if ! orch_comments_open_with "$header" <<<"$comments"; then
         local post_out post_rc
         post_out=$("$VELO_GATE_POST" "$pr" "$name" "$log_file" --sha "$gated_sha" 2>&1); post_rc=$?
         if [[ $post_rc -ne 0 ]]; then
@@ -263,7 +263,7 @@ step_gates() {
           all_approve=0
           continue
         fi
-        comments="$comments"$'\n'"$header"   # so a later gate in this same loop sees it too
+        comments="$comments"$'\n---\n'"$header"   # so a later gate in this same loop sees it too (as its own comment)
         log "POST #$pr $name @ ${gated_sha:0:9}"
       fi
 

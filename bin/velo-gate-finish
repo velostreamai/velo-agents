@@ -47,9 +47,10 @@ ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
 USAGE="usage: velo-gate-finish <pr> <sha> --pass|--block <check-code-report> <code-review-report>
-       velo-gate-finish <pr> <sha> --pass|--block [--check-code <file>] [--code-review <file>]"
+       velo-gate-finish <pr> <sha> --pass|--block [--check-code <file>] [--code-review <file>] [--check-spec <file>]
+                        [--waive <gate>='<reason>' ... --approved-by '<who>']"
 
-VERDICT=""; CC=""; CR=""; POS=()
+VERDICT=""; CC=""; CR=""; CS=""; APPROVER=""; POS=(); WAIVE_NAMES=(); WAIVE_REASONS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pass|--block)
@@ -64,6 +65,18 @@ $USAGE"
       [[ $# -ge 2 ]] || die "--code-review needs a report file
 $USAGE"
       CR="$2"; shift 2 ;;
+    --check-spec)
+      [[ $# -ge 2 ]] || die "--check-spec needs a report file
+$USAGE"
+      CS="$2"; shift 2 ;;
+    --waive)
+      [[ $# -ge 2 && "$2" == *=* ]] || die "--waive needs <gate>='<reason>', e.g. --waive check-code='docs-only follow-up'
+$USAGE"
+      WAIVE_NAMES+=("${2%%=*}"); WAIVE_REASONS+=("${2#*=}"); shift 2 ;;
+    --approved-by)
+      [[ $# -ge 2 && -n "$2" ]] || die "--approved-by needs who approved the waiver
+$USAGE"
+      APPROVER="$2"; shift 2 ;;
     -*) die "unknown flag: $1
 $USAGE" ;;
     *)  POS+=("$1"); shift ;;
@@ -85,12 +98,23 @@ PR="${POS[0]}"; SHA="${POS[1]}"
 $USAGE"
 [[ "$SHA" =~ ^[0-9a-f]{7,40}$ ]] || die "the sha must be 7-40 hex characters, got '$SHA' — it is the commit the gates ran against
 $USAGE"
-[[ -n "$CC" || -n "$CR" ]] || die "no report to post: give --check-code and/or --code-review (or both positionally)
+if [[ ${#WAIVE_NAMES[@]} -gt 0 ]]; then
+  # The same rule velo-gate/velo-merge apply to the posted comment (a name has a character that is not
+  # ASCII or Unicode whitespace); jq, because bash's [[:space:]] is locale-dependent.
+  jq -en --arg a "$APPROVER" '$a | test("[^\\s\\p{Z}\\p{C}]")' >/dev/null 2>&1 || die "--waive needs --approved-by <who>: a gate is waived by a named person, never by the orchestrator alone
+$USAGE"
+  [[ ${#SHA} -ge 9 ]] || die "--waive needs a sha of 9+ hex characters (the waiver names the head by it), got '$SHA'
+$USAGE"
+  for _w in "${WAIVE_NAMES[@]}"; do
+    [[ "$_w" =~ ^[a-z0-9-]+$ ]] || die "--waive gate name must be like check-code / check-spec / code-review, got '$_w'"
+  done
+fi
+[[ -n "$CC" || -n "$CR" || -n "$CS" || ${#WAIVE_NAMES[@]} -gt 0 ]] || die "no report to post: give --check-code and/or --code-review (or both positionally)
 $USAGE"
 
 # Everything is checked before anything is posted: a half-finished round caused by a
 # typo in the second filename is exactly what this refuses to produce.
-for f in "$CC" "$CR"; do
+for f in "$CC" "$CR" "$CS"; do
   [[ -z "$f" ]] && continue
   [[ -f "$f" ]] || die "report file not found: $f"
   [[ -s "$f" ]] || die "report file is empty: $f"
@@ -116,9 +140,11 @@ is_transient() {   # <output file>
 # directory and a second invocation alike. Spacing is as tolerant as velo-gate's own
 # capture of the header, so what counts as a gate comment here is what counts there.
 header_on_pr() {   # <name>
-  local comments
-  comments=$(gh pr view "$PR" --repo "$REPO" --json comments --jq '[.comments[].body] | join("\n---\n")' 2>/dev/null) || return 1
-  grep -qiE "gate: *$1 *@ *${SHA:0:9}" <<<"$comments"
+  # Anchored like velo-gate's own reading of the header: a comment that merely QUOTES it below its
+  # first line is not a report, and counting it here would skip a post velo-gate --pass then needs.
+  local n
+  n=$(gh pr view "$PR" --repo "$REPO" --json comments --jq "[.comments[].body | select(test(\"^[ \\\\t]*gate: *$1 *@ *${SHA:0:9}\"; \"i\"))] | length" 2>/dev/null) || return 1
+  [[ "${n:-0}" -gt 0 ]]
 }
 
 # After velo-gate-post says OK, the PR must say so too. The poster exits 0 without
@@ -192,7 +218,35 @@ record_verdict() {
   done
 }
 
+# A waiver is a comment of its own kind (`gate-waived: <name> @ <sha>` + `Approved by:`), never a
+# `gate: <name> @ <sha>` stamp: that header says the gate RAN, and velo-gate --pass accepts a waiver
+# only in its own form.
+WAIVER_EXPR=$(cat -- "$HERE/velo-waiver.jq" 2>&1) \
+  || die "cannot read the waiver definition $HERE/velo-waiver.jq — it decides what counts as a waiver: $WAIVER_EXPR"
+waive_gate() {   # <name> <reason>
+  local name="$1" reason="$2" body
+  if header_waived "$name"; then
+    ok "waiver for $name @ ${SHA:0:9} is already on #$PR — not posted again"
+    return 0
+  fi
+  body="gate-waived: $name @ ${SHA:0:9}
+Approved by: $APPROVER
+Reason: $reason
+
+This gate leg did NOT run. It was waived, not passed."
+  gh pr comment "$PR" --repo "$REPO" --body "$body" > "$GATE_DIR/gate-finish.waive-$name.out" 2>&1 \
+    || { cat "$GATE_DIR/gate-finish.waive-$name.out" >&2; die "could not post the waiver for $name to #$PR. No verdict was recorded."; }
+  ok "waived $name @ ${SHA:0:9} (approved by $APPROVER): $reason"
+}
+header_waived() {   # <name> — judged by the SAME definition velo-gate --pass enforces (velo-waiver.jq)
+  local waived
+  waived=$(gh pr view "$PR" --repo "$REPO" --json comments --jq "$WAIVER_EXPR | .[] | \"\\(.n) \\(.s)\"" 2>/dev/null) || return 1
+  grep -qiE "^$1 ${SHA:0:9}" <<<"$waived"
+}
+for _i in "${!WAIVE_NAMES[@]}"; do waive_gate "${WAIVE_NAMES[$_i]}" "${WAIVE_REASONS[$_i]}"; done
+
 # check-code first, as the hand-run sequence had it.
 [[ -n "$CC" ]] && post_gate check-code "$CC"
 [[ -n "$CR" ]] && post_gate code-review "$CR"
+[[ -n "$CS" ]] && post_gate check-spec "$CS"
 record_verdict

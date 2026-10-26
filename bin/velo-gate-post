@@ -162,6 +162,26 @@ else
   [[ "$HEAD" == "$SHA"* ]] || printf '\033[33mwarn:\033[0m recording against %s, but head is now %s — this will read as STALE, which is correct if the review predates the newer commits.\n' "$SHA" "${HEAD:0:9}" >&2
 fi
 
+# ---- a declaration that the leg did not run is not a report ------------------------
+#
+# Round after round on #2756/#2758/#2761/#2762 a check-code "report" was posted whose
+# whole body was "check-code leg NOT RUN (declared)". The gate stamp then read as a
+# check-code that ran, and this script added "run by a Sonnet agent" to it. A leg that
+# did not run has no report: launch it, or waive it (velo-gate-finish --waive, which
+# needs a named approver and is recorded as a waiver, never as `gate: <name> @`).
+# Only the opening lines are read, so a real report that mentions an unrun test later
+# is not refused.
+if head -n 8 <<<"$BODY" | grep -qiE "(^|[^a-z-])$NAME[ ]+(leg|gate|review)[ :(,-]*(NOT[ -]RUN|not run)\\b|(^|[^a-z-])$NAME[ ]+(leg|gate|review)[ :(,-]*(was |is |has been |were |has not been )(NOT[ -]RUN|not run|skipped)\\b|(^|[^a-z-])$NAME[ ]*:[ ]*(NOT[ -]RUN|SKIPPED)\\b|^[[:space:]>*_-]*(NOT[ -]RUN|SKIPPED|WAIVED)\\b[:,. -]*(the |this )?$NAME([ ]+(leg|gate|review))?([ ]*[.,:;(!]|[ ]*$| was\\b| is\\b| has\\b)|^[[:space:]>*_-]*NOT[ -]RUN[[:space:].:!*_]*$"; then
+  die "refusing to post — this report says the leg did not run.
+
+  A gate comment records that the gate RAN. '$NAME ... NOT RUN' is not a result:
+  posting it stamps 'gate: $NAME @ ${SHA:0:9}' on a PR the leg never reviewed.
+
+  Run the leg (check-code defaults to the free tier; check-spec runs on velo-local),
+  or waive it with a named approver:
+    velo-gate-finish <pr> <sha> --pass --waive $NAME='<reason>' --approved-by '<who>'"
+fi
+
 HDR="gate: $NAME @ ${SHA:0:9}"
 
 # ---- a declared reviewer substitution ----------------------------------------

@@ -127,6 +127,16 @@ verdict_of() {   # <report text> -> approve|approve-with-findings|blocked|"" (em
 
 # ---- gate-plan / gate-dir helpers --------------------------------------------
 
+# Does any comment OPEN with <header>? $comments is the bodies joined by a `---` line (the shape
+# velo-orchestrd reads), so a comment starts at line 1 or right after a `---` line. A comment that
+# merely quotes a header below its first line is not a report; velo-gate reads it the same way.
+orch_comments_open_with() {   # <header>, comments on stdin
+  awk -v h="$1" 'BEGIN { h = tolower(h) }
+    NR == 1 || prev == "---" { l = $0; sub(/^[ \t]+/, "", l); if (index(tolower(l), h) == 1) found = 1 }
+    { prev = $0 }
+    END { exit found ? 0 : 1 }'
+}
+
 gate_needed_names() {   # <pr> <velo-gate-bin> -> "code-review\ncheck-code\ncheck-spec" subset
   local pr="$1" velo_gate="$2" plan
   plan=$("$velo_gate" "$pr" --plan 2>/dev/null) || return 1

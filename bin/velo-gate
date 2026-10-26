@@ -222,6 +222,14 @@ build_need() {   # -> NEED; returns 1 (BARS_UNREADABLE / BARS_ERR set) when a li
       [[ -n "$SPEC_BULLET" ]] && NEED+=("check-spec   ($SPEC_BULLET)")
     fi
   fi
+  # A child PR of a tracked parent ("[#2231] ...") ships a pinned brief, and its bars live in
+  # the scope the gate is given — not in a closing-keyword issue. "Part B of #N" and
+  # "Parent: #N" are not closing keywords, so the issue scan above found nothing and
+  # check-spec was silently never planned on #2756/#2758/#2761/#2762. It runs on velo-local
+  # ($0), so there is no saving in leaving it out.
+  if [[ "$TOUCHES_SRC" -gt 0 && "$TITLE" =~ ^\[#[0-9]+\] && "${NEED[*]}" != *check-spec* ]]; then
+    NEED+=("check-spec   (parent-tracked PR: the pinned brief's bars are verified; velo-local, free)")
+  fi
   return 0
 }
 
@@ -250,8 +258,23 @@ GATES=""; GATES_ERR=""; STALE_GATES=""
 # velo-merge counts the gate as recorded.
 GATE_LINE_RE='^[a-z0-9-]+ ([0-9a-f]{7,40}|-)$'
 # Comments arrive oldest-first, so a later comment for the same name replaces the earlier.
-GATE_JQ='[.comments[].body | capture("gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]
+GATE_JQ='[.comments[].body | capture("^[ \\t]*gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]
          | reduce .[] as $g ({}; .[$g.n] = ($g.s // "-")) | to_entries[] | "\(.key) \(.value)"'
+# Waiver authority, stated honestly: the orchestrator posts as the repo owner's own gh token, so the
+# `Approved by:` name is an AUDIT TRAIL the user can read on the PR, not an authentication. What is
+# enforced is that the comment is by an OWNER/MEMBER/COLLABORATOR (a drive-by commenter cannot forge
+# one), that it names someone, that it names this head, and that it is its own kind of comment, never a
+# `gate:` stamp. That the user really approved is the standing rule in CLAUDE.md (waive only on the
+# user's say-so, per PR), not something this script can prove.
+# A waiver is its own comment kind — `gate-waived: <name> @ <sha>` with an `Approved by:` line —
+# so it can never be mistaken for `gate: <name> @ <sha>`, which says the gate RAN.
+# ONE definition of "what is a waiver", shared with velo-merge and velo-gate-finish (the comment must OPEN
+# with `gate-waived: <name> @ <9+ hex>`, the next line is `Approved by: <a name>`, by an
+# OWNER/MEMBER/COLLABORATOR): velo-waiver.jq sits beside this script, as velo-ci-rollup.jq does for velo-merge.
+WAIVER_EXPR=$(cat -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/velo-waiver.jq" 2>&1) \
+  || die "cannot read the waiver definition velo-waiver.jq beside this script — it decides what counts as a waiver: $WAIVER_EXPR"
+WAIVE_JQ="$WAIVER_EXPR | .[] | \"\(.n) \(.s)\""
+WAIVERS=""; WAIVED_NAMES=""
 read_gate_comments() {
   local line
   GATES=""; GATES_ERR=""
@@ -271,10 +294,13 @@ read_gate_comments() {
 # One "<name> ran at <sha>" line per gate whose freshest comment is not the head, and one
 # "<name> names no commit" line per gate whose freshest comment carries no readable sha.
 stale_gates() {
-  local gname gsha
+  local gname gsha wname
   STALE_GATES=""
   while read -r gname gsha; do
     [[ -z "$gname" ]] && continue
+    # A leg waived at THIS head is covered whatever its older report said.
+    case "$gname" in codex-review|opus-review|sonnet-review) wname=code-review ;; *) wname="$gname" ;; esac
+    [[ " $WAIVED_NAMES " == *" $wname "* ]] && continue
     if [[ "$gsha" == "-" ]]; then
       STALE_GATES="$STALE_GATES
     $gname names no commit (its 'gate: $gname @' header carries no readable sha, so it cannot be compared to head)"
@@ -303,10 +329,47 @@ case "$MODE" in
         || die "could not read the gate comments for #$PR: $GATES_ERR
   Refusing to mark passed: without them there is no telling whether a gate ran against a
   commit other than head ($SHORT), and a stale gate would pass. Nothing was changed."
+      if ! gh_read pr view "$PR" --repo "$REPO" --json comments --jq "$WAIVE_JQ"; then
+        die "could not read the gate waivers for #$PR: $GH_ERR
+  Refusing to mark passed. Nothing was changed."
+      fi
+      WAIVERS="$GH_OUT"
+      WAIVED_NAMES=""
+      while read -r rn rs; do
+        [[ -n "$rn" && -n "$rs" && "$HEAD" == "$rs"* ]] && WAIVED_NAMES="$WAIVED_NAMES $rn "
+      done <<<"$WAIVERS"
       stale_gates
       [[ -z "$STALE_GATES" ]] \
         || die "refusing to mark passed: head is $SHORT, but:$STALE_GATES
   Re-run the gate against the current head."
+      # Every PLANNED leg must have a report at head (or a named-approver waiver at head). The
+      # check above only compares the gates that were recorded, so a leg that was never run or
+      # posted was invisible to it: four PRs went gate:passed with check-code declared "NOT RUN"
+      # and check-spec never planned.
+      build_need \
+        || die "could not read $BARS_UNREADABLE, which #$PR closes, to count its acceptance bars: $BARS_ERR
+  Refusing to mark passed: whether check-spec is required is unknown. Nothing was changed."
+      MISSING=""
+      for need in "${NEED[@]}"; do
+        gname="${need%% *}"
+        [[ "$gname" == "none" ]] && continue
+        have=0
+        # velo-merge accepts these reviewer-named aliases for code-review (and only these); the same
+        # allowlist here, so a PR velo-merge would accept is not refused as "no code-review".
+        case "$gname" in code-review) names="code-review codex-review opus-review sonnet-review" ;; *) names="$gname" ;; esac
+        while read -r rn rs; do
+          [[ " $names " == *" $rn "* && -n "$rs" && "$rs" != "-" && "$HEAD" == "$rs"* ]] && have=1
+        done <<<"$GATES"
+        while read -r rn rs; do
+          [[ "$rn" == "$gname" && -n "$rs" && "$HEAD" == "$rs"* ]] && have=1
+        done <<<"$WAIVERS"
+        [[ $have -eq 1 ]] || MISSING="$MISSING
+    $gname  (planned: ${need#* })"
+      done
+      [[ -z "$MISSING" ]] \
+        || die "refusing to mark passed: head is $SHORT, and a planned gate has no report at head:$MISSING
+  Run the leg and post its report. A leg may be waived only with a named approver:
+    velo-gate-finish $PR $SHORT --pass --waive <gate>='<reason>' --approved-by '<who>'"
     fi
     # The old verdict label is removed BEFORE the new one is added, and a removal that fails stops
     # the run: adding beside a label that could not be removed would leave two gate labels, a PR

@@ -52,7 +52,7 @@
 # OpenRouter model, dispatched by velo-pr-gate; its report is ADVISORY (the
 # posted comment and velo-gate say so) — Codex's code-review stays the gating leg.
 #
-# check-code: with the default route (sonnet) velo-pr-gate launches nothing for it;
+# check-code: with the sonnet route (opt-in; the default is free, dispatched by the script) velo-pr-gate launches nothing for it;
 # it writes check-code-agent-prompt.md and prints ONE line saying to launch a
 # read-only Sonnet agent. That line appears in this command's output as soon as the
 # gates are dispatched — read the background output, do not wait for the end.
@@ -529,7 +529,7 @@ CODE_PROMPT="$GATE_DIR/check-code-agent-prompt.md"
 VERDICT="$GATE_DIR/codex-verdict.md"
 
 next_steps() {
-  local have_cc=0 have_cr=0 finish
+  local have_cc=0 have_cr=0 have_cs=0 finish
   echo
   echo "Next:"
   if [[ -f "$CODE_PROMPT" ]]; then
@@ -550,10 +550,19 @@ next_steps() {
     have_cr=1
     echo "  code-review read $VERDICT, curate it as post-cr-$PR.md"
   fi
+  if [[ -f "$GATE_DIR/spec.log" ]]; then
+    have_cs=1
+    echo "  check-spec  the velo-local leg's report is the tail of $GATE_DIR/spec.log (a pass is \"found nothing\", not \"nothing is there\") — curate it as post-cs-$PR.md"
+  fi
   # The finish command names the reports THIS plan has — both positionally, one by
   # flag. A line that names a report the plan never produces is a command that dies.
   finish="velo-gate-finish $PR ${GATED_SHA:-<sha>} --pass|--block"
-  if [[ $have_cc -eq 1 && $have_cr -eq 1 ]]; then
+  if [[ $have_cs -eq 1 ]]; then
+    local named=""
+    [[ $have_cc -eq 1 ]] && named="$named --check-code post-cc-$PR.md"
+    [[ $have_cr -eq 1 ]] && named="$named --code-review post-cr-$PR.md"
+    echo "  then        $finish$named --check-spec post-cs-$PR.md"
+  elif [[ $have_cc -eq 1 && $have_cr -eq 1 ]]; then
     echo "  then        $finish post-cc-$PR.md post-cr-$PR.md"
   elif [[ $have_cc -eq 1 ]]; then
     echo "  then        $finish --check-code post-cc-$PR.md"

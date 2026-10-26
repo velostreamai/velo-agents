@@ -1,10 +1,10 @@
 #!/bin/bash
-# velo-pr-gate's check-code route: sonnet by default, opus on request.
+# velo-pr-gate's check-code route: free by default, sonnet/opus on request.
 #
 # The opus leg — and the velo-local shim that later stood in for it — never
 # produced a report: it timed out. So every round ended the same way, with the
 # orchestrator running a read-only Sonnet agent by hand and writing the
-# substitution note by hand. The default route now PREPARES that agent's prompt
+# substitution note by hand. The sonnet route PREPARES that agent's prompt
 # instead of launching a leg that cannot finish, and records the route so the
 # substitution is declared rather than remembered. `--check-code-by opus` keeps
 # the original dispatched leg.
@@ -125,7 +125,9 @@ GATE_UNDER_TEST="$GATE"
 run_gate() {   # <PATH value> [args after <pr> <scope>...]  ->  $TMPD/out.txt, $RC
   local p="$1"; shift
   rm -f "$TMPD/running.flag"
-  (cd "$REPO" && HOME="$TMPD/home" PATH="$p" bash "$GATE_UNDER_TEST" "$TPR" "$SCOPE" "$@" > "$TMPD/out.txt" 2>&1)
+  # RUN_ROUTE=<route> run_gate ... pins the route explicitly; unset, the script's own DEFAULT (free) runs.
+  local route_args=(); [[ -n "${RUN_ROUTE:-}" ]] && route_args=(--check-code-by "$RUN_ROUTE")
+  (cd "$REPO" && HOME="$TMPD/home" PATH="$p" bash "$GATE_UNDER_TEST" "$TPR" "$SCOPE" ${route_args[@]+"${route_args[@]}"} "$@" > "$TMPD/out.txt" 2>&1)
   RC=$?
   pkill -f "$MARKER" 2>/dev/null
   return 0
@@ -162,7 +164,7 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }   # <file> <fixed string>
 sc_default_sonnet() {
   SC_FAILS=""
   plan_with_code; prime_and_fill; rm -f "$TMPD/claude.called"
-  run_gate "$FAST_PATH"
+  RUN_ROUTE=sonnet run_gate "$FAST_PATH"
   local P="$GATE_DIR/check-code-agent-prompt.md"
   has "$TMPD/out.txt" "NOTHING was dispatched"; sc_check reached-the-dispatch-section $?
   [[ -s "$P" ]];                                sc_check prompt-written $?
@@ -178,7 +180,7 @@ sc_default_sonnet() {
 sc_prompt_content() {
   SC_FAILS=""
   plan_with_code; prime_and_fill
-  run_gate "$FAST_PATH"
+  RUN_ROUTE=sonnet run_gate "$FAST_PATH"
   local P="$GATE_DIR/check-code-agent-prompt.md"
   has "$P" "READ-ONLY";                          sc_check read-only $?
   has "$P" "at most 40 tool calls";              sc_check tool-cap-40 $?
@@ -214,7 +216,7 @@ sc_stale_removed() {
   plan_with_code; prime_and_fill
   printf 'an old opus report\n**Verdict:** approve\n' > "$GATE_DIR/code.log"
   printf '999999999\n' > "$GATE_DIR/code.log.pid"
-  run_gate "$FAST_PATH"
+  RUN_ROUTE=sonnet run_gate "$FAST_PATH"
   [[ ! -e "$GATE_DIR/code.log" ]];     sc_check stale-code-log-removed $?
   [[ ! -e "$GATE_DIR/code.log.pid" ]]; sc_check stale-pid-removed $?
 }
@@ -255,7 +257,7 @@ sc_openrouter_route() {   # <route> <model id>
   local by="$1" model="$2" A="$TMPD/oragent.args"
   plan_with_code; prime_and_fill; rm -f "$TMPD/claude.called" "$A"
   printf 'old prompt\n' > "$GATE_DIR/check-code-agent-prompt.md"
-  run_gate "$FAST_PATH" --check-code-by "$by"
+  if [[ "${3:-}" == default ]]; then run_gate "$FAST_PATH"; else run_gate "$FAST_PATH" --check-code-by "$by"; fi
   # The runner is detached: velo-pr-gate returning does not mean it has started.
   local i; for i in $(seq 50); do [[ -s "$A" ]] && break; sleep 0.1; done
   [[ -s "$A" ]];                                         sc_check runner-launched $?
@@ -276,10 +278,10 @@ sc_openrouter_route() {   # <route> <model id>
 
 echo "check-code route (end to end, real velo-pr-gate)"
 
-# ── 1. the default is sonnet ─────────────────────────────────────────────────
+# ── 1. the sonnet route (opt-in) ─────────────────────────────────────────────────
 sc_default_sonnet
-[[ -z "$SC_FAILS" ]] && ok "default route: prompt written, route recorded, ONE launch line, nothing launched" \
-                     || fail "default route is not sonnet:$SC_FAILS"
+[[ -z "$SC_FAILS" ]] && ok "sonnet route (opt-in): prompt written, route recorded, ONE launch line, nothing launched" \
+                     || fail "sonnet route:$SC_FAILS"
 sc_prompt_content
 [[ -z "$SC_FAILS" ]] && ok "the prompt is complete: read-only, tool cap 40, the filled brief, one output shape, no Codex framing" \
                      || fail "prompt incomplete:$SC_FAILS"
@@ -309,6 +311,12 @@ sc_openrouter_route haiku anthropic/claude-haiku-5.5
                      || fail "haiku route:$SC_FAILS"
 # free: the $0 tier. No velo-dispatch arm (free models are review-only, never implementation
 # workers), so it is outside the parity loop below; VELO_FREE_MODEL swaps the model.
+# The DEFAULT route is free: no flag, no env — the leg is dispatched by the script itself, so it RUNS
+# without anyone remembering to launch it (the sonnet route is a manual step; four PRs skipped it).
+sc_default_free() { sc_openrouter_route free nvidia/nemotron-3-ultra-550b-a55b:free default; }
+sc_default_free
+[[ -z "$SC_FAILS" ]] && ok "DEFAULT route is free: dispatched by the script, advisory, route recorded" \
+                     || fail "default route is not free:$SC_FAILS"
 sc_openrouter_route free nvidia/nemotron-3-ultra-550b-a55b:free
 [[ -z "$SC_FAILS" ]] && ok "--check-code-by free: read-only OpenRouter leg, default free model, route recorded" \
                      || fail "free route:$SC_FAILS"
@@ -331,7 +339,7 @@ done
 # This is the one that proves the whole point: no opus leg, and still a gate that
 # is running. Costs the 10s liveness window, so it runs once per route.
 plan_with_code; prime_and_fill; rm -f "$TMPD/claude.called"
-run_gate "$HEALTHY_PATH"
+RUN_ROUTE=sonnet run_gate "$HEALTHY_PATH"
 if [[ -f "$TMPD/running.flag" ]]; then
   ok "healthy sonnet run: codex dispatched and gate:running set with no opus leg"
 else
@@ -392,14 +400,20 @@ fi
 # ── 5. --plan states the route and writes nothing ────────────────────────────
 plan_with_code; rm -rf "$GATE_DIR"
 plan_out() { (cd "$REPO" && HOME="$TMPD/home" PATH="$FAST_PATH" "$@" 2>&1); }
-D=$(plan_out bash "$GATE" "$TPR" --plan)
+D=$(plan_out bash "$GATE" "$TPR" --plan --check-code-by sonnet)
+DD=$(plan_out bash "$GATE" "$TPR" --plan)
 O=$(plan_out bash "$GATE" "$TPR" --plan --check-code-by opus)
 E=$(plan_out env VELO_CHECK_CODE=opus bash "$GATE" "$TPR" --plan)
 F=$(plan_out env VELO_CHECK_CODE=opus bash "$GATE" "$TPR" --plan --check-code-by sonnet)
 if grep -q 'check-code   -> sonnet' <<<"$D" && ! grep -q 'opus:high via claude CLI' <<<"$D"; then
-  ok "--plan advertises sonnet by default"
+  ok "--plan advertises the sonnet route when asked for"
 else
-  fail "--plan does not state the default route: $(grep 'check-code' <<<"$D")"
+  fail "--plan does not state the sonnet route: $(grep 'check-code' <<<"$D")"
+fi
+if grep -q 'check-code   -> free via OpenRouter, ADVISORY' <<<"$DD" && ! grep -q 'check-code   -> sonnet' <<<"$DD"; then
+  ok "--plan advertises the free route by default"
+else
+  fail "--plan does not state the default (free) route: $(grep 'check-code' <<<"$DD")"
 fi
 if grep -q 'check-code   -> opus:high via claude CLI' <<<"$O" && ! grep -q 'check-code   -> sonnet' <<<"$O"; then
   ok "--plan --check-code-by opus advertises the opus leg"
@@ -496,8 +510,8 @@ prove() {   # <label> <scenario fn> <anchor> <replacement>
   fi
 }
 
-prove "default route sonnet" sc_default_sonnet \
-  'CHECK_CODE_BY="${VELO_CHECK_CODE:-sonnet}"' 'CHECK_CODE_BY="${VELO_CHECK_CODE:-opus}"'
+prove "default route free" sc_default_free \
+  'CHECK_CODE_BY="${VELO_CHECK_CODE:-free}"' 'CHECK_CODE_BY="${VELO_CHECK_CODE:-sonnet}"'
 prove "the flag is parsed" sc_flag_beats_env \
   'CHECK_CODE_BY="${ARGS[$i]}" ;;' ': ;;'
 prove "route recorded in check-code.by" sc_default_sonnet \

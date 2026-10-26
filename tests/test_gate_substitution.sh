@@ -1,7 +1,7 @@
 #!/bin/bash
 # A substituted check-code reviewer is DECLARED, on the comment and on the label.
 #
-# velo-pr-gate's default check-code route hands the leg to a read-only Sonnet
+# velo-pr-gate's sonnet check-code route (opt-in) hands the leg to a read-only Sonnet
 # agent instead of opus --effort high, and records that in gate/<pr>/check-code.by.
 # The failure this guards is the silent one: a `gate:passed` label and a
 # `gate: check-code @ <sha>` comment that read as an opus:high result which never
@@ -42,7 +42,9 @@ SHORT="${HEADSHA:0:9}"
 export STUB_HEAD="$HEADSHA"
 export STUB_POSTED="$TMPD/posted.md"
 export STUB_EDITS="$TMPD/edits.txt"
-export STUB_GSHA="null"
+# The stub PR touches src/, so --pass plans code-review + check-code and needs both reported at head.
+export STUB_GSHA="code-review $SHORT
+check-code $SHORT"
 export STUB_META="$TMPD/meta.json"
 printf '{"headRefOid":"%s","labels":[],"files":[{"path":"src/x.rs"}],"state":"OPEN","title":"stub pr","body":""}\n' \
   "$HEADSHA" > "$STUB_META"

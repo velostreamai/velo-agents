@@ -360,7 +360,7 @@ sc_ci_pending_rerun_wait_is_not_definitive() {
 # is the thing that is wrong.
 with_rollup_file() {   # <content of velo-ci-rollup.jq, or the word MISSING> -> runs velo-merge from a private copy
   local d="$TMPD/nojq.$$.$RANDOM"; mkdir -p "$d"
-  cp "$MERGE_UNDER_TEST" "$d/velo-merge"
+  cp "$MERGE_UNDER_TEST" "$d/velo-merge"; cp "$BIN/velo-waiver.jq" "$d/velo-waiver.jq"
   [[ "$1" == MISSING ]] || printf '%s\n' "$1" > "$d/velo-ci-rollup.jq"
   MERGE_UNDER_TEST_SAVED="$MERGE_UNDER_TEST"; MERGE_UNDER_TEST="$d/velo-merge"
   reset; set_pr "" "$DOCS_FILES"
@@ -609,8 +609,8 @@ PY
 }
 # A mutant is a PAIR of files in $MUT — velo-merge reads its CI rollup definition from beside itself
 # — and each mutation starts from copies of both real files and changes exactly one of them.
-mutate()    { cp "$JQ_REAL" "$MUT/velo-ci-rollup.jq" && _mutate "$MERGE_REAL" "$MUT/velo-merge" "$@"; }
-mutate_jq() { cp "$MERGE_REAL" "$MUT/velo-merge" && _mutate "$JQ_REAL" "$MUT/velo-ci-rollup.jq" "$@"; }
+mutate()    { cp "$JQ_REAL" "$MUT/velo-ci-rollup.jq" && cp "$BIN/velo-waiver.jq" "$MUT/velo-waiver.jq" && _mutate "$MERGE_REAL" "$MUT/velo-merge" "$@"; }
+mutate_jq() { cp "$MERGE_REAL" "$MUT/velo-merge" && cp "$BIN/velo-waiver.jq" "$MUT/velo-waiver.jq" && _mutate "$JQ_REAL" "$MUT/velo-ci-rollup.jq" "$@"; }
 # The mutant's red must NAME the check that pins the behaviour: an unrelated red (a broken stub,
 # a typo in the mutation) is not a proof.
 _prove() {   # <mutator> <label> <scenario fn> <the check that must go red> <anchor> <replacement> [<anchor> <replacement>]...
@@ -667,7 +667,7 @@ prove "a rollup definition that cannot run says what jq said" sc_ci_broken_rollu
 
 # The gate comments: one read, one grammar.
 prove "a gate name may carry a digit" sc_gates_digit_named_stale_gate_refuses refuses \
-  'capture("gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]' 'capture("gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})?")]'
+  '*gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]' '*gate: *(?<n>[a-z-]+) *@ *(?<s>[0-9a-f]{7,40})?")]'
 prove "a header with no readable sha is still a gate comment" sc_gates_freshest_comment_without_a_sha_refuses refuses \
   '(?<s>[0-9a-f]{7,40})?")]' '(?<s>[0-9a-f]{7,40})")]'
 prove "a header with no readable sha is named as naming no commit" sc_gates_needed_gate_without_a_sha_refuses names-the-gate-that-names-no-commit \

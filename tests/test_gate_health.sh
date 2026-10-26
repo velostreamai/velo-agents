@@ -54,8 +54,8 @@ TMPD=$(mktemp -d)
 export VELO_STATE="$TMPD/state"
 # This file pins the DISPATCHED check-code leg: its health check, the quota-death
 # refusal and the claude stub below. That is the opus route, which is opt-in now
-# that the default hands check-code to a read-only Sonnet agent the orchestrator
-# launches (nothing for a health check to watch). Select the route explicitly so
+# that the default hands check-code to the free OpenRouter leg the script dispatches
+# (its own health path), and the sonnet route to an agent the orchestrator launches. Select the route explicitly so
 # every assertion here keeps testing the code it names; the default route has its
 # own end-to-end coverage in test_gate_check_code_mode.sh.
 export VELO_CHECK_CODE=opus

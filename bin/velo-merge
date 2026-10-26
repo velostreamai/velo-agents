@@ -238,6 +238,10 @@ MERGEABLE=$(jq -r .mergeable <<<"$M")
 # status has no conclusion at all. The classification is velo-ci-rollup.jq — one definition,
 # which velo-status uses too. A definition that cannot be read or run is a refusal: with no
 # classification there is no "nothing failed".
+# What a waiver is: ONE definition, shared with velo-gate and velo-gate-finish.
+WAIVER_JQ_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/velo-waiver.jq"
+WAIVER_EXPR=$(cat -- "$WAIVER_JQ_FILE" 2>&1) \
+  || die "cannot read the waiver definition $WAIVER_JQ_FILE — it decides what counts as a waiver: $WAIVER_EXPR"
 CI_ROLLUP_JQ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/velo-ci-rollup.jq"
 CI_ROLLUP_DEFS=$(cat -- "$CI_ROLLUP_JQ" 2>&1) \
   || die "cannot read the CI rollup definition $CI_ROLLUP_JQ — it is what decides whether CI is green:
@@ -404,8 +408,15 @@ $PLAN_OUT"
   #
   # A read that FAILS is not "no gate comment": it is reported as a failed read, in the kinds the
   # PR read above uses, so that --wait retries a blip and stops on a dead token.
-  GATE_JQ='[.comments[].body | capture("gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]
-           | reduce .[] as $g ({}; .[$g.n] = ($g.s // "-")) | to_entries[] | "\(.key) \(.value)"'
+  # ONE read of the comments answers three questions: the freshest `gate: <name> @ <sha>` per gate,
+  # and the waivers (`waived:<name> <sha>` lines). A waiver is a comment that OPENS with
+  # `gate-waived: <name> @ <sha>` and whose next line is `Approved by: <a name>`, by an
+  # OWNER/MEMBER/COLLABORATOR (a name has a character that is not ASCII or Unicode whitespace); it
+  # is its own kind of comment and never a `gate:` stamp, which says the gate RAN. The approver name
+  # is an audit trail, not an authentication: the orchestrator posts under the owner's token.
+  GATE_JQ='([.comments[].body | capture("^[ \\t]*gate: *(?<n>[a-z0-9-]+) *@ *(?<s>[0-9a-f]{7,40})?")]
+           | reduce .[] as $g ({}; .[$g.n] = ($g.s // "-")) | to_entries[] | "\(.key) \(.value)"),
+           ('"$WAIVER_EXPR"' | .[] | "waived:\(.n) \(.s)")'
   GATE_LINE_RE='^[a-z0-9-]+ ([0-9a-f]{7,40}|-)$'
   GATES_ERRF=$(mktemp "${TMPDIR:-/tmp}/velo-merge-gates.XXXXXX") || GATES_ERRF=""
   if [[ -n "$GATES_ERRF" ]]; then
@@ -420,6 +431,14 @@ $PLAN_OUT"
     GATES=$(gh pr view "$PR" --repo "$REPO" --json comments --jq "$GATE_JQ" 2>/dev/null); GATES_RC=$?
     GATES_ERR="(stderr unavailable: could not create a scratch file in ${TMPDIR:-/tmp})"
   fi
+  # Waiver lines ride the same read; split them off before the gate list is checked.
+  WAIVED_RAW=$(grep '^waived:' <<<"$GATES" | sed 's/^waived://' || true)
+  GATES=$(grep -v '^waived:' <<<"$GATES" || true)
+  # Legs waived at THIS head (named approver, see GATE_JQ): covered whatever their older report said.
+  WAIVED=""
+  while read -r WN WS; do
+    [[ -n "$WN" && -n "$WS" && "$HEAD" == "$WS"* ]] && WAIVED="$WAIVED $WN "
+  done <<< "$WAIVED_RAW"
   # Why the read is not usable: a kind from gh_failure_kind when gh failed, `payload` when gh
   # exited 0 but what it printed is not a gate list (a proxy's error page). Empty when it is usable.
   GATES_KIND=""
@@ -465,6 +484,8 @@ $PLAN_OUT"
     while read -r GNAME GS; do
       [[ -z "$GNAME" ]] && continue
       NGATES=$((NGATES + 1))
+      case "$GNAME" in codex-review|opus-review|sonnet-review) WNAME=code-review ;; *) WNAME="$GNAME" ;; esac
+      [[ " $WAIVED " == *" $WNAME "* ]] && continue
       if [[ "$GS" == "-" ]]; then
         STALE="$STALE
     $GNAME names no commit (its 'gate: $GNAME @' header carries no readable sha, so it cannot be compared to head)"
@@ -489,8 +510,12 @@ $PLAN_OUT"
   # counts through its freshest comment, the one just compared to head.
   if [[ $GATE_PASSED -eq 1 ]]; then
     RECORDED=$(awk '{print $1}' <<<"$GATES" | sort | tr '\n' ' ' | sed 's/ $//')
+    # A leg waived by a named approver (velo-gate-finish --waive ... --approved-by ...) at THIS head
+    # counts as covered; WAIVED_RAW came from the single read of the comments above. A read that
+    # FAILED never gets here: it died (or --force cleared both lists) before.
     MISSING=""
     for g in $NEEDED; do
+      [[ " $WAIVED " == *" $g "* ]] && { warn "$g was WAIVED (see the gate-waived comment on #$PR for who approved it and why)"; continue; }
       # Match the gate FAMILY, not the exact string. A review is legitimately
       # recorded as `codex-review` (the README's own worked example) or under
       # any `<who>-review` name when a reviewer is substituted. velo-pr-gate's

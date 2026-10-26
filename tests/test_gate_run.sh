@@ -43,7 +43,9 @@ TMPD=$(mktemp -d)
 export VELO_STATE="$TMPD/state"
 # A test must never start the real local-model worker.
 export VELO_SECOND_OPINION=0
-unset VELO_CHECK_CODE
+# These suites exercise the SONNET route's prompt flow (a prompt written, ONE launch line); the script's own
+# default is the free tier, so the route is pinned here rather than inherited from the environment.
+export VELO_CHECK_CODE=sonnet
 GATE_DIR="$VELO_STATE/gate/$TPR"
 STUB_DIR="$TMPD/stub"; export STUB_DIR
 STUB="$TMPD/stub-bin/velo-pr-gate"
@@ -2225,7 +2227,7 @@ prove_run "empty range stops the round" sc_empty_range \
 prove_run "the check-code launch hint" sc_check_code_hint \
   '  if [[ -f "$CODE_PROMPT" ]]; then' '  if false; then'
 prove_run "finish line: both reports positional" sc_finish_line \
-  '  if [[ $have_cc -eq 1 && $have_cr -eq 1 ]]; then' '  if false; then'
+  '  elif [[ $have_cc -eq 1 && $have_cr -eq 1 ]]; then' '  elif false; then'
 prove_run "finish line: code-review only" sc_finish_line \
   '  elif [[ $have_cr -eq 1 ]]; then' '  elif false; then'
 prove_run "finish line: check-code only" sc_finish_line \

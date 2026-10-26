@@ -142,33 +142,34 @@ else
   fail "no --sha is composed from the resolved head"
 fi
 
-# ── the DEFAULT check-code route is a read-only Sonnet agent ───────────────
+# ── the DEFAULT check-code route is the $0 free tier (sonnet is opt-in) ─────
 # Everything above describes the dispatched opus leg, which is the OPT-IN route
 # (--check-code-by opus). That leg has never produced a report — it times out —
-# so the default writes the prompt for a Sonnet agent the orchestrator launches.
+# so the default is the free OpenRouter leg the script dispatches itself, and the Sonnet
+# prompt (check-code-agent-prompt.md) belongs to the opt-in sonnet route.
 # Each reader has to say so, or the routing drifts apart again.
-if grep -qF 'CHECK_CODE_BY="${VELO_CHECK_CODE:-sonnet}"' "$GATE"; then
-  ok "the default route is sonnet, overridable by VELO_CHECK_CODE"
+if grep -qF 'CHECK_CODE_BY="${VELO_CHECK_CODE:-free}"' "$GATE"; then
+  ok "the default route is free, overridable by VELO_CHECK_CODE"
 else
-  fail "the default check-code route is not sonnet"
+  fail "the default check-code route is not free"
 fi
 if grep -qF -- '--check-code-by)' "$GATE"; then
   ok "--check-code-by is parsed"
 else
   fail "no --check-code-by flag — the route cannot be chosen per run"
 fi
-if sed -n '/^#   check-code/,/^#   check-spec/p' "$GATE" | grep -qE 'sonnet.*DEFAULT|DEFAULT.*sonnet'; then
-  ok "velo-pr-gate's header table names the sonnet default"
+if sed -n '/^#   check-code/,/^#   check-spec/p' "$GATE" | grep -qE 'free +DEFAULT|DEFAULT.*free'; then
+  ok "velo-pr-gate's header table names the free default"
 else
-  fail "the header table does not say sonnet is the default"
+  fail "the header table does not say free is the default"
 fi
-if grep -q 'check-code   -> sonnet' "$GATE"; then
-  ok "--plan output names the sonnet default"
+if grep -q 'check-code   -> sonnet' "$GATE" && grep -q 'ADVISORY — Codex' "$GATE"; then
+  ok "--plan output names both the sonnet (opt-in) and the OpenRouter/free routes"
 else
-  fail "--plan does not say what the default check-code route does"
+  fail "--plan does not say what the check-code routes do"
 fi
 if grep -q 'check-code-agent-prompt.md' "$GATE"; then
-  ok "the default route writes check-code-agent-prompt.md"
+  ok "the opt-in sonnet route writes check-code-agent-prompt.md"
 else
   fail "the sonnet route has no prompt file"
 fi

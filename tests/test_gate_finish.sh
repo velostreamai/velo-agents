@@ -105,7 +105,12 @@ case "$*" in
       if [[ "$n" -gt 1 ]]; then echo "$((n - 1))" > "$STUB_DIR/hide"; else rm -f "$STUB_DIR/hide"; fi
       exit 0
     fi
-    cat "$STUB_DIR/comments.txt" 2>/dev/null; exit 0 ;;
+    # Run the CALLER'S own jq over the posted comments (one per line of comments.txt), so the anchored
+    # header check is evaluated, never canned.
+    expr=""; prev=""; for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
+    [[ -n "$expr" ]] || exit 0
+    { printf '{"comments":['; sep=""; while IFS= read -r l; do [[ -n "$l" ]] && { printf '%s' "$sep"; jq -Rn --arg b "$l" '{body:$b}'; sep=","; }; done < "$STUB_DIR/comments.txt" 2>/dev/null; printf ']}'; } | jq -r "$expr" 2>/dev/null
+    exit 0 ;;
 esac
 exit 0
 EOF
@@ -197,6 +202,12 @@ sc_named() {
   reset
   run_finish "$PR" "$SHA" --pass --code-review "$CR" --check-code "$CC"
   head -1 "$STUB_DIR/calls.log" | grep -qF "check-code"; sc_check check-code-first-whatever-the-flag-order $?
+  # check-spec is a planned leg for a [#N] PR touching src/: it has its own report and post.
+  reset
+  run_finish "$PR" "$SHA" --pass --check-code "$CC" --code-review "$CR" --check-spec "$CR"
+  [[ $RC -eq 0 ]];                                 sc_check three-reports-exit-0 $?
+  [[ "$(ncalls 'post '"$PR"' check-spec')" == "1" ]]; sc_check check-spec-posted-once $?
+  tail -2 "$STUB_DIR/calls.log" | head -1 | grep -qF "check-spec"; sc_check check-spec-posted-before-the-verdict $?
 }
 
 sc_block() {
@@ -593,7 +604,7 @@ prove "the confirmation waits out a slow read" sc_poster_noop \
 prove "a skipped report says its file was not compared" sc_idempotent \
   ' — not posted again (what that comment holds is not compared with $file)"' ' — not posted again"'
 prove "the header check tolerates velo-gates own spacing" sc_idempotent \
-  '  grep -qiE "gate: *$1 *@ *${SHA:0:9}" <<<"$comments"' '  grep -qiF "gate: $1 @ ${SHA:0:9}" <<<"$comments"'
+  'gate: *$1 *@ *${SHA:0:9}' 'gate: $1 @ ${SHA:0:9}'
 prove "a stale marker cannot get a label (real velo-gate-post)" sc_real_stale_marker \
   '      if ! confirm_on_pr "$name"; then' '      if false; then'
 prove "every post carries the gated sha (real velo-gate-post)" sc_real_stale_head \
