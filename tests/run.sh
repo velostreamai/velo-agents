@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the .agents tooling tests (#1992).
 #
-#   ./.agents/tests/run.sh
+#   ./tests/run.sh
 #
 # These exist because `velo-gate` classifies an .agents/-only diff as
 # "tooling-only, no gate required", so this code gets no review and no CI by

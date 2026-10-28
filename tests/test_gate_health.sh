@@ -75,7 +75,8 @@ trap cleanup EXIT
 rm -f "$BRIEF" "$BRIEF".superseded.*
 
 mkdir -p "$TMPD/bin" "$TMPD/home/.agents/bin"
-WTPATH="$(cd "$HERE/../.." && pwd)"
+# A Velostream checkout: velo-pr-gate reviews Velostream PRs against origin/master.
+WTPATH="${VELO_BENCH_REPO:-$HOME/RustroverProjects/velostream}"
 BRANCH="$(git -C "$WTPATH" branch --show-current 2>/dev/null)"
 [[ -n "$BRANCH" ]] || { echo "  SKIP  not on a branch"; exit 0; }
 

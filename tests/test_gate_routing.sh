@@ -15,7 +15,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"
-ROOT="$(cd "$HERE/../.." && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+# CLAUDE.md is the Velostream repo's, which tells orchestrator sessions how to gate.
+VELOREPO="${VELO_BENCH_REPO:-$HOME/RustroverProjects/velostream}"
 GATE="$BIN/velo-pr-gate"
 FAILED=0
 ok()   { printf '  ok   %s\n' "$1"; }
@@ -71,7 +73,7 @@ else
 fi
 
 # CLAUDE.md, which is what every orchestrator session reads.
-if grep -q '`check-code` → opus' "$ROOT/CLAUDE.md"; then
+if grep -q '`check-code` → opus' "$VELOREPO/CLAUDE.md"; then
   ok "CLAUDE.md says check-code -> opus"
 else
   fail "CLAUDE.md disagrees with the script — the drift this suite exists to catch"
@@ -173,7 +175,7 @@ if grep -q 'check-code-agent-prompt.md' "$GATE"; then
 else
   fail "the sonnet route has no prompt file"
 fi
-for DOC in "$ROOT/CLAUDE.md" "$ROOT/.agents/README.md"; do
+for DOC in "$VELOREPO/CLAUDE.md" "$ROOT/README.md"; do
   if grep -q 'check-code-by' "$DOC"; then
     ok "$(basename "$DOC") documents --check-code-by"
   else

@@ -18,7 +18,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/.." && pwd)/bin"
-ROOT="$(cd "$HERE/../.." && pwd)"
+# Task specs live in the Velostream checkout.
+ROOT="${VELO_BENCH_REPO:-$HOME/RustroverProjects/velostream}"
 SR="$BIN/velo-spec-review"
 FAILED=0
 ok()   { printf '  ok   %s\n' "$1"; }

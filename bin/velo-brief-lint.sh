@@ -105,7 +105,7 @@ if grep -qiE '^#+[[:space:]].*(analysis[ -]only|no[ -]code([^[:alpha:]]|$)|read-
   brief_has_validation_section \
     || MISSING+=("no '## Validation' section with content (spec §7) — a no-code stage runs no build, but still says how its findings are checked")
 else
-  grep -qiE "cargo (check|nextest)|\.agents/tests/run\.sh" "$BRIEF" \
+  grep -qiE "cargo (check|nextest)|(\.agents/)?tests/run\.sh" "$BRIEF" \
     || MISSING+=("no validation commands (spec §7) — a brief that changes code names 'cargo check|nextest' (or .agents/tests/run.sh for an .agents/-only change); a stage that changes NO code says so in a heading ('## THIS TASK WRITES NO CODE', 'ANALYSIS ONLY') and then needs a '## Validation' section instead")
 fi
 grep -qiE "do not commit|may commit|commit and push|do not push|do not open a pr|authorized to (commit|push)" "$BRIEF" \

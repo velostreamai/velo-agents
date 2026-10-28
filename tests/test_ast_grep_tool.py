@@ -46,7 +46,9 @@ sys.modules.setdefault("agents", _stub)
 
 m = types.ModuleType("plain")
 exec(compile(src.replace("@function_tool", ""), "velo_oai_tools", "exec"), m.__dict__)
-repo = pathlib.Path(__file__).resolve().parents[2]
+import os
+# The fixture path is a Velostream source directory: use the Velostream checkout.
+repo = pathlib.Path(os.environ.get("VELO_BENCH_REPO") or os.path.expanduser("~/RustroverProjects/velostream"))
 m.set_cwd(str(repo))
 P = "src/velostream/sql/execution/processors"
 

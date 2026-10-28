@@ -18,8 +18,10 @@
 # is the failure mode test_fail_to_pass.sh documents.
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-DISPATCH="$ROOT/.agents/bin/velo-dispatch"
+TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Task specs and SCHEMA.md live in the Velostream checkout.
+ROOT="${VELO_BENCH_REPO:-$HOME/RustroverProjects/velostream}"
+DISPATCH="$TOOLS/bin/velo-dispatch"
 FAILED=0
 ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }
