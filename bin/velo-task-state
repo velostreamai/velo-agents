@@ -4,21 +4,31 @@
 Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper for them.
 
   lock [--timeout S] <path> -- cmd...      run cmd holding an exclusive flock on <path>
-  publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dir
+  lock-held <path>                         exit 0 when some process holds the flock on <path>, else 1
+  publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dest's dir, unlink srcfile, fsync its dir
+  retire <path>                            durably rename path to <path>.retired.<epoch> (never replaces)
   append-index <file> <job_id>             append one line (O_APPEND), fsync file, fsync dir if created
   fp <status> <exit_code> <stop_actor> <stop_reason> <end>   first 16 hex of SHA-256 of the row
   sha256 [file]                            hex SHA-256 of a file, or of stdin
+  json-get <file|-> <key>                  top-level JSON value as text (string raw, true/false, number); empty when absent
+  modes-check <home> [file...]             exit 8 and print the first path that group or other can access
   redact                                   stdin -> stdout with secrets replaced by ***
   jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
   failpoint <name>                         test-only crash/barrier point (see below)
+  test-capability                          exit 0 when the test capability holds (see below), else 2
 
-Exit codes: 0 ok, 1 error, 2 usage or refused failpoint, 3 publish: dest exists, 4 jobs-ro: database
-locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 75 lock or failpoint wait timed out,
-137 failpoint exit. Any other code from `lock` is the command's own.
+Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists, 4 jobs-ro: database
+locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 8 modes-check: loose mode found, 75 lock or
+failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held. Any other code from `lock`
+is the command's own.
 
-Failpoints (spec R21): VELO_TASK_FAILPOINT=<name>[:exit|:wait=<barrier-file>] is honoured only when
-VELO_TASK_TEST=1 and VELO_TASK_HOME is under the temp root; otherwise any set value is refused
-(exit 2) on every invocation. `wait` creates <barrier-file>.reached, then polls for <barrier-file>.
+Test seams (spec R21): VELO_TASK_FAILPOINT=<name>[@<dest-name>][:exit|:wait=<barrier-file>], VELO_TASK_FSYNC_TRACE=<file>
+and, for velo-task itself, VELO_TASK_UV are honoured only when VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is
+set and the nearest .velo-task-test-root above VELO_TASK_HOME holds that nonce; otherwise any set value is
+refused (exit 2) on every invocation. `wait` creates <barrier-file>.reached, then polls for <barrier-file>.
+publish.linked@<dest-name> fires only for the publish whose destination file is named <dest-name>.
+The trace file gets one line per durable step: fsync file|dir <path>, link <src> <dest>, unlink <path>,
+rename <src> <dest>.
 """
 import errno
 import fcntl
@@ -28,14 +38,19 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 from urllib.parse import quote
 
 # A failpoint name is registered when its call site exists; a typo must not pass silently.
-FAILPOINTS = {"daemon.lock.held", "publish.linked"}
+FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.intent", "launch.ready",
+              "restart.validated", "install.lock.held"}
+TEST_MARKER = ".velo-task-test-root"
+# sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API;
+# the module only exports them as names from Python 3.11, and this helper must run on the system 3.9 as well.
+SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION = 20, 21, 31
 # Columns the spec reads from Vanth's database (R1, R8); install-vanth and every read check them.
 SCHEMA = {
     "jobs": ("job_id", "name", "status", "exit_code", "stop_actor", "stop_reason",
@@ -59,34 +74,82 @@ def usage(msg):
     die(2, msg + "\n" + __doc__.split("\n\n")[2])
 
 
-def _under(path, root):
-    path, root = os.path.realpath(path), os.path.realpath(root)
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+def test_capability_problem():
+    """None when the test capability (R21) holds, else why not. The capability is a directory that contains
+    VELO_TASK_HOME and holds TEST_MARKER with VELO_TASK_TEST_ROOT_NONCE as its content: a test creates both, so
+    nothing the environment alone controls (TMPDIR, the working directory, a broad temp root) can grant it."""
+    if os.environ.get("VELO_TASK_TEST") != "1":
+        return "VELO_TASK_TEST is not 1"
+    nonce = os.environ.get("VELO_TASK_TEST_ROOT_NONCE", "")
+    if not nonce:
+        return "VELO_TASK_TEST_ROOT_NONCE is not set"
+    home = os.environ.get("VELO_TASK_HOME", "")
+    if not home:
+        return "VELO_TASK_HOME is not set"
+    here = os.path.realpath(home)
+    while True:
+        marker = os.path.join(here, TEST_MARKER)
+        if os.path.isfile(marker):
+            with open(marker, encoding="utf-8") as fh:
+                held = fh.read().strip()
+            return None if held == nonce else "%s does not hold VELO_TASK_TEST_ROOT_NONCE" % marker
+        parent = os.path.dirname(here)
+        if parent == here:
+            return "no %s above VELO_TASK_HOME (%s)" % (TEST_MARKER, home)
+        here = parent
+
+
+def require_test_capability(name):
+    problem = test_capability_problem()
+    if problem:
+        die(2, "%s is set but refused: it is honoured only for tests (%s)" % (name, problem))
+
+
+_TRACE_PATH = None
+
+
+def load_trace():
+    global _TRACE_PATH
+    path = os.environ.get("VELO_TASK_FSYNC_TRACE", "")
+    if path:
+        require_test_capability("VELO_TASK_FSYNC_TRACE")
+        _TRACE_PATH = os.path.abspath(path)
+
+
+def trace(*fields):
+    """Append one line per durable step to VELO_TASK_FSYNC_TRACE (test capability only), so a test can assert the order."""
+    if _TRACE_PATH is None:
+        return
+    fd = os.open(_TRACE_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (" ".join(fields) + "\n").encode())
+    finally:
+        os.close(fd)
 
 
 def failpoint_spec():
+    """(name, action, barrier, dest-name) of the armed failpoint, or None. Only publish.linked takes a dest-name
+    (publish.linked@daemon.provenance fires for that publish alone, not for the intent's that precedes it)."""
     raw = os.environ.get("VELO_TASK_FAILPOINT", "")
     if not raw:
         return None
-    home = os.environ.get("VELO_TASK_HOME", "")
-    if os.environ.get("VELO_TASK_TEST") != "1" or not home or not _under(home, tempfile.gettempdir()):
-        die(2, "VELO_TASK_FAILPOINT is set but refused: honoured only with VELO_TASK_TEST=1 and VELO_TASK_HOME "
-               "under the test temp root (VELO_TASK_TEST=%r, VELO_TASK_HOME=%r, temp root=%r; python's tempfile "
-               "follows TMPDIR, which macOS mktemp does not unless given a template)"
-               % (os.environ.get("VELO_TASK_TEST", ""), home, tempfile.gettempdir()))
-    name, _, action = raw.partition(":")
+    require_test_capability("VELO_TASK_FAILPOINT")
+    point, _, action = raw.partition(":")
+    name, _, target = point.partition("@")
     if name not in FAILPOINTS:
         die(2, "unknown failpoint %r" % name)
+    if "@" in point and (name != "publish.linked" or not target):
+        die(2, "failpoint %r: only publish.linked takes a non-empty @<dest-name>" % point)
     if action in ("", "exit"):
-        return name, "exit", None
+        return name, "exit", None, target
     if action.startswith("wait=") and len(action) > 5:
-        return name, "wait", action[5:]
+        return name, "wait", action[5:], target
     die(2, "unknown failpoint action %r" % action)
 
 
-def failpoint(name):
+def failpoint(name, dest=None):
     spec = failpoint_spec()
-    if not spec or spec[0] != name:
+    if not spec or spec[0] != name or (spec[3] and spec[3] != os.path.basename(dest or "")):
         return
     if spec[1] == "exit":
         sys.stderr.write("velo-task-state: failpoint %s: exit\n" % name)
@@ -100,7 +163,10 @@ def failpoint(name):
         time.sleep(0.02)
 
 
-def _sync(fd):
+def _sync_fd(fd, kind, path):
+    """fsync an open descriptor (kind is "file" or "dir", path names it) and record it in the trace. The trace line and the
+    sync are one call, so a change that drops the sync drops the line, and a test on the trace sees it."""
+    trace("fsync", kind, path)
     # macOS fsync does not flush the drive cache; F_FULLFSYNC does.
     if hasattr(fcntl, "F_FULLFSYNC"):
         fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
@@ -108,10 +174,10 @@ def _sync(fd):
         os.fsync(fd)
 
 
-def _sync_path(path, flags=os.O_RDONLY):
-    fd = os.open(path, flags)
+def _sync_path(path, kind):
+    fd = os.open(path, os.O_RDONLY)
     try:
-        _sync(fd)
+        _sync_fd(fd, kind, path)
     finally:
         os.close(fd)
 
@@ -146,21 +212,73 @@ def cmd_lock(args):
     return rc if rc >= 0 else 128 - rc
 
 
+def cmd_lock_held(args):
+    if len(args) != 1:
+        usage("lock-held: expected <path>")
+    try:
+        fd = os.open(args[0], os.O_RDWR)  # never creates the lock file
+    except FileNotFoundError:
+        return 1
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return 0
+            raise
+        return 1  # nobody held it; closing fd releases the probe
+    finally:
+        os.close(fd)
+
+
+def publish_file(src, dest):
+    """The one durable no-clobber publish (R17), used by `publish` and so by every provenance and intent writer.
+    Order: fsync the temp, link it to dest (never replacing), fsync dest's directory so the new name is durable,
+    unlink the temp, fsync the temp's directory. A crash between link and unlink leaves both names, never neither.
+    Returns False, with the temp removed, when dest already exists."""
+    src, dest = os.path.abspath(src), os.path.abspath(dest)
+    _sync_path(src, "file")
+    trace("link", src, dest)
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        trace("unlink", src)
+        os.unlink(src)
+        _sync_path(os.path.dirname(src), "dir")
+        return False
+    failpoint("publish.linked", dest)
+    _sync_path(os.path.dirname(dest), "dir")
+    trace("unlink", src)
+    os.unlink(src)
+    _sync_path(os.path.dirname(src), "dir")
+    return True
+
+
 def cmd_publish(args):
     if len(args) != 2:
         usage("publish: expected <dest> <srcfile>")
     dest, src = args
-    _sync_path(src)
-    try:
-        os.link(src, dest)  # fails if dest exists: never replaces a published name
-    except FileExistsError:
-        os.unlink(src)
-        _sync_path(os.path.dirname(os.path.abspath(src)))
+    if not publish_file(src, dest):
         die(3, "publish: %s already exists (temp removed)" % dest)
-    failpoint("publish.linked")
-    os.unlink(src)
-    for d in {os.path.dirname(os.path.abspath(dest)), os.path.dirname(os.path.abspath(src))}:
-        _sync_path(d)
+    return 0
+
+
+def cmd_retire(args):
+    """Move a record out of the way for good: rename to <path>.retired.<epoch> (a numeric suffix if that name is taken),
+    then fsync the directory so the retirement survives a crash."""
+    if len(args) != 1:
+        usage("retire: expected <path>")
+    path = os.path.abspath(args[0])
+    if not os.path.lexists(path):
+        die(1, "retire: %s does not exist" % path)
+    base = "%s.retired.%d" % (path, int(time.time()))
+    target, n = base, 0
+    while os.path.lexists(target):
+        n += 1
+        target = "%s.%d" % (base, n)
+    trace("rename", path, target)
+    os.rename(path, target)
+    _sync_path(os.path.dirname(path), "dir")
     return 0
 
 
@@ -168,6 +286,7 @@ def cmd_append_index(args):
     if len(args) != 2:
         usage("append-index: expected <file> <job_id>")
     path, job_id = args
+    path = os.path.abspath(path)
     if not JOB_ID.fullmatch(job_id):
         die(2, "append-index: job_id must match ^[A-Za-z0-9_-]+$")
     created = False
@@ -180,11 +299,11 @@ def cmd_append_index(args):
         line = (job_id + "\n").encode()
         if os.write(fd, line) != len(line):  # one write(2) under O_APPEND: concurrent lines never tear
             die(1, "append-index: short write to %s" % path)
-        _sync(fd)
+        _sync_fd(fd, "file", path)
     finally:
         os.close(fd)
     if created:
-        _sync_path(os.path.dirname(os.path.abspath(path)))
+        _sync_path(os.path.dirname(path), "dir")
     return 0
 
 
@@ -201,6 +320,87 @@ def cmd_sha256(args):
         usage("sha256: expected [file]")
     data = open(args[0], "rb").read() if args else sys.stdin.buffer.read()
     print(hashlib.sha256(data).hexdigest())
+    return 0
+
+
+def cmd_json_get(args):
+    """Print one top-level value of a JSON object, the way `jq -r` would: strings raw, booleans as true/false, numbers as
+    written, nested values as compact JSON, nothing for a missing or null key. A missing file has no value (the caller
+    decides whether that matters); a file or stdin that is not a JSON object is an error."""
+    if len(args) != 2:
+        usage("json-get: expected <file|-> <key>")
+    src, key = args
+    if src == "-":
+        raw = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        try:
+            with open(src, encoding="utf-8") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            return 0
+    doc = json.loads(raw)
+    if not isinstance(doc, dict):
+        die(1, "json-get: %s does not hold a JSON object" % ("stdin" if src == "-" else src))
+    value = doc.get(key)
+    if value is None:
+        return 0
+    sys.stdout.reconfigure(encoding="utf-8")  # the text is the same whatever locale the caller runs under
+    if isinstance(value, bool):
+        print("true" if value else "false")
+    elif isinstance(value, str):
+        print(value)
+    elif isinstance(value, (int, float)):
+        print(json.dumps(value))
+    else:
+        print(json.dumps(value, separators=(",", ":")))
+    return 0
+
+
+def _mode_problem(path):
+    """Why path is not private (no group or other access), or None. Symlinks are refused: their own mode says nothing."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return "%s is a symlink; its mode cannot be checked" % path
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        return "%s has mode %o, must be %s" % (path, mode, "700" if stat.S_ISDIR(info.st_mode) else "600")
+    return None
+
+
+def _walk_modes(root):
+    """Every directory and file below root, not following symlinks; an unreadable directory is an error, not a pass."""
+    def fail(exc):
+        raise exc
+    for dirpath, dirnames, filenames in os.walk(root, onerror=fail):
+        yield dirpath
+        for name in dirnames + filenames:
+            yield os.path.join(dirpath, name)
+
+
+def cmd_modes_check(args):
+    """Vanth's state must be private (R11(c)): the home 0700; jobs.sqlite*, token, daemon.json and the launch log 0600;
+    logs/ and events/ with everything below them. Prints the first offender and exits 8; exits 0 when all is private."""
+    if not args:
+        usage("modes-check: expected <home> [file...]")
+    home, extras = os.path.abspath(args[0]), args[1:]
+    paths = [home]
+    if os.path.isdir(home):
+        paths += [os.path.join(home, n) for n in sorted(os.listdir(home))
+                  if n.startswith("jobs.sqlite") or n in ("token", "daemon.json")]
+        for sub in ("logs", "events"):
+            if os.path.isdir(os.path.join(home, sub)) and not os.path.islink(os.path.join(home, sub)):
+                paths += list(_walk_modes(os.path.join(home, sub)))
+            else:
+                paths.append(os.path.join(home, sub))
+    paths += [os.path.abspath(p) for p in extras]
+    for path in paths:
+        problem = _mode_problem(path)
+        if problem:
+            print(problem)
+            return 8
     return 0
 
 
@@ -235,22 +435,38 @@ def cmd_redact(args):
     return 0
 
 
+def read_only_authorizer(action, arg1, arg2, db_name, source):
+    """Allow only what a plain SELECT needs and deny the rest: ATTACH and DETACH (which can create a file), DDL, DML,
+    PRAGMA (so none can be written), transactions, and load_extension."""
+    if action == SQLITE_FUNCTION and str(arg2).lower() == "load_extension":
+        return sqlite3.SQLITE_DENY
+    if action in (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION):
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 def cmd_jobs_ro(args):
     if len(args) != 2:
         usage("jobs-ro: expected <db> <sql>")
     db, sql = args
     try:
-        # mode=ro is the read-only guarantee; timeout=2.0 is the 2000 ms busy timeout (R8).
+        # Three layers keep this read-only (R8): mode=ro opens the file read-only, query_only refuses writes on the
+        # connection (attached databases included), and the authorizer, installed after the pragmas this function itself
+        # needs, denies everything but SELECT. timeout=2.0 is the 2000 ms busy timeout.
         con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db)), uri=True, timeout=2.0)
+        con.execute("PRAGMA query_only=ON")
         missing = ["%s.%s" % (t, c) for t, cols in SCHEMA.items()
                    for c in cols if c not in {r[1] for r in con.execute("PRAGMA table_info(%s)" % t)}]
         if missing:
             die(5, "jobs-ro: schema mismatch, missing: %s" % ", ".join(missing))
         con.row_factory = sqlite3.Row
+        con.set_authorizer(read_only_authorizer)
         rows = [dict(r) for r in con.execute(sql)]
     except sqlite3.OperationalError as exc:
         if "locked" in str(exc):
             die(4, "jobs-ro: %s (waited 2000 ms)" % exc)
+        die(1, "jobs-ro: %s" % exc)
+    except sqlite3.DatabaseError as exc:  # not authorized, malformed database
         die(1, "jobs-ro: %s" % exc)
     sys.stdout.write(json.dumps(rows, separators=(",", ":"), default=str) + "\n")
     return 0
@@ -265,12 +481,24 @@ def cmd_failpoint(args):
     return 0
 
 
-COMMANDS = {"lock": cmd_lock, "publish": cmd_publish, "append-index": cmd_append_index, "fp": cmd_fp,
-            "sha256": cmd_sha256, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro, "failpoint": cmd_failpoint}
+def cmd_test_capability(args):
+    if args:
+        usage("test-capability: takes no arguments")
+    problem = test_capability_problem()
+    if problem:
+        die(2, "the test capability is not granted: %s" % problem)
+    return 0
+
+
+COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish, "retire": cmd_retire,
+            "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
+            "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
+            "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 
 def main(argv):
-    failpoint_spec()  # a stray VELO_TASK_FAILPOINT is refused by every subcommand, not just the ones that use it
+    failpoint_spec()  # a stray VELO_TASK_FAILPOINT or VELO_TASK_FSYNC_TRACE is refused by every subcommand, not just the ones that use it
+    load_trace()
     if not argv or argv[0] in ("-h", "--help", "help"):
         sys.stdout.write(__doc__)
         return 0

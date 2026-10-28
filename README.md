@@ -48,7 +48,8 @@ and the tests** — never from the worker's self-report.
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
     velo-llm-bench                 same-prompt speed bench for a worker:local server; prompt pinned to a commit
     velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); M1: install-vanth, ensure-daemon, restart-daemon, doctor
-    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock, publish, append-index, fp, redact, jobs-ro, failpoints
+    velo-task-lib.sh               the functions behind velo-task, sourced and never a subcommand: the locked bodies (ensure, restart, install), launch, records, doctor
+    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock, lock-held, publish, retire, append-index, fp, sha256, json-get, modes-check, redact, jobs-ro, failpoint, test-capability
   tests/
     run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants
@@ -83,6 +84,8 @@ and the tests** — never from the worker's self-report.
     test_fence_parity.py           the three code-fence readers (brief lint, ATTACK fill, acceptance-bar counter) read ONE grammar
     test_llm_bench.sh              velo-llm-bench: the prompt is the pinned commit's, byte for byte; every result line says what produced it
     test_velo_task_foundation.sh   velo-task M1: install-vanth, state helper, daemon lifecycle; each check is proved red on a mutated copy; VELO_TASK_NETWORK_TESTS=1 adds the real install
+    fixtures/velo-task/            fake uv, vanth and vanthd, and a port holder, for the velo-task tests (the suite renders them into a temp tree)
+    fixtures/vanth-closure.txt     the distributions a real Vanth install has, checked in: the fake install reports this set and the lock must pin exactly it
   bench/local-models/
     README.md                      worker:local model results, method and verdicts — read before switching models
     results/*.jsonl                raw bench lines, one file per model per day
