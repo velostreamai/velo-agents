@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""velo-task-state: the durable-state helper behind velo-task (stdlib only, Python >= 3.9).
+
+Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper for them.
+
+  lock [--timeout S] <path> -- cmd...      run cmd holding an exclusive flock on <path>
+  publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dir
+  append-index <file> <job_id>             append one line (O_APPEND), fsync file, fsync dir if created
+  fp <status> <exit_code> <stop_actor> <stop_reason> <end>   first 16 hex of SHA-256 of the row
+  sha256 [file]                            hex SHA-256 of a file, or of stdin
+  redact                                   stdin -> stdout with secrets replaced by ***
+  jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
+  failpoint <name>                         test-only crash/barrier point (see below)
+
+Exit codes: 0 ok, 1 error, 2 usage or refused failpoint, 3 publish: dest exists, 4 jobs-ro: database
+locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 75 lock or failpoint wait timed out,
+137 failpoint exit. Any other code from `lock` is the command's own.
+
+Failpoints (spec R21): VELO_TASK_FAILPOINT=<name>[:exit|:wait=<barrier-file>] is honoured only when
+VELO_TASK_TEST=1 and VELO_TASK_HOME is under the temp root; otherwise any set value is refused
+(exit 2) on every invocation. `wait` creates <barrier-file>.reached, then polls for <barrier-file>.
+"""
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote
+
+# A failpoint name is registered when its call site exists; a typo must not pass silently.
+FAILPOINTS = {"daemon.lock.held", "publish.linked"}
+# Columns the spec reads from Vanth's database (R1, R8); install-vanth and every read check them.
+SCHEMA = {
+    "jobs": ("job_id", "name", "status", "exit_code", "stop_actor", "stop_reason",
+             "trigger_json", "created_at", "ended_at", "policy_state_json"),
+    "local_start_requests": ("idempotency_key", "job_id"),
+}
+SECRET_NAME = re.compile(r"token|secret|key|password|credential|auth", re.I)
+AUTH_HEADER = re.compile(r"(authorization[\"']?\s*:)[^\r\n]*", re.I)
+SECRET_SHAPES = [re.compile(p) for p in (
+    r"ghp_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}",
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{6,}", r"AKIA[0-9A-Z]{8,}")]
+JOB_ID = re.compile(r"[A-Za-z0-9_-]+")  # used with fullmatch: `$` would also accept a trailing newline
+
+
+def die(code, msg):
+    sys.stderr.write("velo-task-state: %s\n" % msg)
+    sys.exit(code)
+
+
+def usage(msg):
+    die(2, msg + "\n" + __doc__.split("\n\n")[2])
+
+
+def _under(path, root):
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def failpoint_spec():
+    raw = os.environ.get("VELO_TASK_FAILPOINT", "")
+    if not raw:
+        return None
+    home = os.environ.get("VELO_TASK_HOME", "")
+    if os.environ.get("VELO_TASK_TEST") != "1" or not home or not _under(home, tempfile.gettempdir()):
+        die(2, "VELO_TASK_FAILPOINT is set but refused: honoured only with VELO_TASK_TEST=1 and VELO_TASK_HOME "
+               "under the test temp root (VELO_TASK_TEST=%r, VELO_TASK_HOME=%r, temp root=%r; python's tempfile "
+               "follows TMPDIR, which macOS mktemp does not unless given a template)"
+               % (os.environ.get("VELO_TASK_TEST", ""), home, tempfile.gettempdir()))
+    name, _, action = raw.partition(":")
+    if name not in FAILPOINTS:
+        die(2, "unknown failpoint %r" % name)
+    if action in ("", "exit"):
+        return name, "exit", None
+    if action.startswith("wait=") and len(action) > 5:
+        return name, "wait", action[5:]
+    die(2, "unknown failpoint action %r" % action)
+
+
+def failpoint(name):
+    spec = failpoint_spec()
+    if not spec or spec[0] != name:
+        return
+    if spec[1] == "exit":
+        sys.stderr.write("velo-task-state: failpoint %s: exit\n" % name)
+        sys.stderr.flush()
+        os._exit(137)
+    open(spec[2] + ".reached", "w").close()
+    deadline = time.monotonic() + float(os.environ.get("VELO_TASK_FAILPOINT_WAIT_MAX", "60"))
+    while not os.path.exists(spec[2]):
+        if time.monotonic() > deadline:
+            die(75, "failpoint %s: barrier %s never appeared" % (name, spec[2]))
+        time.sleep(0.02)
+
+
+def _sync(fd):
+    # macOS fsync does not flush the drive cache; F_FULLFSYNC does.
+    if hasattr(fcntl, "F_FULLFSYNC"):
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    else:
+        os.fsync(fd)
+
+
+def _sync_path(path, flags=os.O_RDONLY):
+    fd = os.open(path, flags)
+    try:
+        _sync(fd)
+    finally:
+        os.close(fd)
+
+
+def cmd_lock(args):
+    timeout = None
+    if args[:1] == ["--timeout"]:
+        timeout, args = float(args[1]), args[2:]
+    if len(args) < 3 or args[1] != "--":
+        usage("lock: expected <path> -- cmd...")
+    path, cmd = args[0], args[2:]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)  # non-inheritable: the command never holds the lock
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise
+            if deadline is not None and time.monotonic() >= deadline:
+                die(75, "lock %s: not acquired within %ss" % (path, timeout))
+            time.sleep(0.02)
+    try:
+        proc = subprocess.Popen(cmd)
+    except OSError as exc:
+        die(127, "lock: cannot run %s: %s" % (cmd[0], exc.strerror))
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda s, _frame: proc.send_signal(s))
+    rc = proc.wait()
+    return rc if rc >= 0 else 128 - rc
+
+
+def cmd_publish(args):
+    if len(args) != 2:
+        usage("publish: expected <dest> <srcfile>")
+    dest, src = args
+    _sync_path(src)
+    try:
+        os.link(src, dest)  # fails if dest exists: never replaces a published name
+    except FileExistsError:
+        os.unlink(src)
+        _sync_path(os.path.dirname(os.path.abspath(src)))
+        die(3, "publish: %s already exists (temp removed)" % dest)
+    failpoint("publish.linked")
+    os.unlink(src)
+    for d in {os.path.dirname(os.path.abspath(dest)), os.path.dirname(os.path.abspath(src))}:
+        _sync_path(d)
+    return 0
+
+
+def cmd_append_index(args):
+    if len(args) != 2:
+        usage("append-index: expected <file> <job_id>")
+    path, job_id = args
+    if not JOB_ID.fullmatch(job_id):
+        die(2, "append-index: job_id must match ^[A-Za-z0-9_-]+$")
+    created = False
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        line = (job_id + "\n").encode()
+        if os.write(fd, line) != len(line):  # one write(2) under O_APPEND: concurrent lines never tear
+            die(1, "append-index: short write to %s" % path)
+        _sync(fd)
+    finally:
+        os.close(fd)
+    if created:
+        _sync_path(os.path.dirname(os.path.abspath(path)))
+    return 0
+
+
+def cmd_fp(args):
+    if len(args) != 5:
+        usage("fp: expected <status> <exit_code> <stop_actor> <stop_reason> <end>")
+    row = "|".join(args).encode("utf-8", "surrogateescape")
+    print(hashlib.sha256(row).hexdigest()[:16])
+    return 0
+
+
+def cmd_sha256(args):
+    if len(args) > 1:
+        usage("sha256: expected [file]")
+    data = open(args[0], "rb").read() if args else sys.stdin.buffer.read()
+    print(hashlib.sha256(data).hexdigest())
+    return 0
+
+
+def _allowlist_names():
+    if not os.environ.get("VELO_TASK_HOME"):
+        die(1, "redact: VELO_TASK_HOME is not set, so the allowlist cannot be located")
+    path = os.path.join(os.environ["VELO_TASK_HOME"], "vanth.env.allow")
+    if not os.path.lexists(path):
+        return set()
+    names = set()
+    for line in open(path, encoding="utf-8").read().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.add(line)
+    return names
+
+
+def cmd_redact(args):
+    if args:
+        usage("redact: takes no arguments")
+    text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+    allowed = _allowlist_names()
+    values = {v for k, v in os.environ.items() if v and (k in allowed or SECRET_NAME.search(k))}
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, "***")
+    text = AUTH_HEADER.sub(r"\1 ***", text)
+    for shape in SECRET_SHAPES:
+        text = shape.sub("***", text)
+    out = text.encode("utf-8", "surrogateescape")  # nothing is written before every step has succeeded
+    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def cmd_jobs_ro(args):
+    if len(args) != 2:
+        usage("jobs-ro: expected <db> <sql>")
+    db, sql = args
+    try:
+        # mode=ro is the read-only guarantee; timeout=2.0 is the 2000 ms busy timeout (R8).
+        con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db)), uri=True, timeout=2.0)
+        missing = ["%s.%s" % (t, c) for t, cols in SCHEMA.items()
+                   for c in cols if c not in {r[1] for r in con.execute("PRAGMA table_info(%s)" % t)}]
+        if missing:
+            die(5, "jobs-ro: schema mismatch, missing: %s" % ", ".join(missing))
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute(sql)]
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc):
+            die(4, "jobs-ro: %s (waited 2000 ms)" % exc)
+        die(1, "jobs-ro: %s" % exc)
+    sys.stdout.write(json.dumps(rows, separators=(",", ":"), default=str) + "\n")
+    return 0
+
+
+def cmd_failpoint(args):
+    if len(args) != 1:
+        usage("failpoint: expected <name>")
+    if args[0] not in FAILPOINTS:
+        die(2, "unknown failpoint %r" % args[0])
+    failpoint(args[0])
+    return 0
+
+
+COMMANDS = {"lock": cmd_lock, "publish": cmd_publish, "append-index": cmd_append_index, "fp": cmd_fp,
+            "sha256": cmd_sha256, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro, "failpoint": cmd_failpoint}
+
+
+def main(argv):
+    failpoint_spec()  # a stray VELO_TASK_FAILPOINT is refused by every subcommand, not just the ones that use it
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__)
+        return 0
+    if argv[0] not in COMMANDS:
+        usage("unknown subcommand %r" % argv[0])
+    try:
+        return COMMANDS[argv[0]](argv[1:])
+    except Exception as exc:  # surfaced, never swallowed; the message never carries stdin
+        die(1, "%s: %s: %s" % (argv[0], type(exc).__name__, exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

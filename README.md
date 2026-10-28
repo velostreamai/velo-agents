@@ -47,6 +47,8 @@ and the tests** — never from the worker's self-report.
     velo_oai_tools.py              local tools openai-agents does not ship
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
     velo-llm-bench                 same-prompt speed bench for a worker:local server; prompt pinned to a commit
+    velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); M1: install-vanth, ensure-daemon, restart-daemon, doctor
+    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock, publish, append-index, fp, redact, jobs-ro, failpoints
   tests/
     run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants
@@ -80,11 +82,15 @@ and the tests** — never from the worker's self-report.
     test_verdict_of.sh             verdict_of: one verdict from every **Verdict:** line, not the first
     test_fence_parity.py           the three code-fence readers (brief lint, ATTACK fill, acceptance-bar counter) read ONE grammar
     test_llm_bench.sh              velo-llm-bench: the prompt is the pinned commit's, byte for byte; every result line says what produced it
+    test_velo_task_foundation.sh   velo-task M1: install-vanth, state helper, daemon lifecycle; each check is proved red on a mutated copy; VELO_TASK_NETWORK_TESTS=1 adds the real install
   bench/local-models/
     README.md                      worker:local model results, method and verdicts — read before switching models
     results/*.jsonl                raw bench lines, one file per model per day
   launchd/
     ai.velostream.orchestrd.plist  source template for the velo-orchestrd launchd agent
+  requirements/
+    vanth.in                       the one pin velo-task installs (vanth==1.14.0)
+    vanth.lock                     its uv-compiled lock: a hash for every distribution, wheels only, CPython 3.12 macOS arm64; an upgrade is a reviewed change here
   rules/
     velo-impl.md                   MANDATORY implementation policy for every worker
     velo-brief-spec.md             what a task brief MUST contain, and why

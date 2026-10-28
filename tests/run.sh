@@ -163,6 +163,9 @@ echo
 echo "── install --check drift (pyc artifacts) ──────────────"
 suite test_install_check.sh bash "$HERE/test_install_check.sh"
 echo
+echo "── velo-task foundation (install-vanth, state helper, daemon lifecycle) ──"
+suite test_velo_task_foundation.sh bash "$HERE/test_velo_task_foundation.sh"
+echo
 echo "── zg discovery tool ──────────────────────────────────"
 suite test_zg_tool.py "$PY" "$HERE/test_zg_tool.py"
 echo
