@@ -1,10 +1,13 @@
-#!@PY3@
+#!@PY3@ -I
 """Fake vanthd for the velo-task tests (rendered by the test harness: @E@ and @PY3@ are filled in).
+Run isolated (-I): a user site in the HOME it is given must not load into it, or the hostile-environment test could not tell
+velo-task's own python from this fixture's.
 
 Only what velo-task relies on, but with real behaviour where velo-task now checks it: it LISTENS (127.0.0.1, or
 0.0.0.0 when @E@/bind-all exists), so the loopback check sees a real socket; it exits when it cannot bind. It records its
-launch (pid, umask, home, port, retention), the NAMES of its environment and a hash of OPENROUTER_API_KEY (never a value)
-to @E@/calls, secures its home like Vanth, writes daemon.json once it is listening, and exits on SIGTERM.
+launch (pid, umask, home, port, retention), the NAMES of its environment, a hash of OPENROUTER_API_KEY (never a value) and whether
+descriptor 9 (the one velo-task's locked body holds on its lock) reached it, to @E@/calls, secures its home like Vanth, writes
+daemon.json once it is listening, and exits on SIGTERM.
 
 Switches (files under @E@): fail-launch (exit 1 at once), ignore-term (ignore SIGTERM), bind-all (listen on 0.0.0.0),
 seed.sqlite (copied to jobs.sqlite), bind-fail-delay (seconds to linger after a failed bind, default 1), start-delay (seconds
@@ -23,6 +26,11 @@ import sys
 import time
 
 E = "@E@"
+try:  # the lock descriptor velo-task hands its locked body (9) must not reach the daemon: asked first, before this process opens anything
+    os.fstat(9)
+    FD9 = "open"
+except OSError:
+    FD9 = "closed"
 HOME_DIR = os.environ.get("VANTH_HOME", "")
 if not HOME_DIR:
     sys.stderr.write("fake vanthd: no VANTH_HOME\n")
@@ -56,6 +64,7 @@ with open(E + "/calls", "a") as calls:
                 % (os.getpid(), umask, HOME_DIR, env.get("VANTH_DAEMON_PORT", ""), env.get("VANTH_RETENTION_SECONDS", "unset")))
     calls.write("names=%s \n" % " ".join(sorted(k for k in env if k not in hidden)))
     calls.write("keyhash=%s\n" % (hashlib.sha256(key.encode()).hexdigest() if key is not None else "unset"))
+    calls.write("fd9=%s\n" % FD9)
 
 slow = E + "/start-delay"
 if os.path.exists(slow):

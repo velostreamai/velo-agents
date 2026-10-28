@@ -1,5 +1,7 @@
-#!@PY3@
+#!@PY3@ -I
 """Fake uv for the velo-task install tests (rendered by the test harness: @E@ @PY3@ @FIX@ @CLOSURE@ @VARIANT@ @MUTANT@ are filled in).
+Run isolated (-I), like the real uv, which is not a Python program: a user site in the HOME it is given must not load into it, or a
+test of what velo-task itself starts could not tell velo-task's python from this fixture's.
 
 It writes only below the fixture root @E@, and it refuses, before it creates, removes or writes anything, a target that is
 outside that root, has a symlink in any component below it, or is itself a symlink. A defective velo-task, or a mutant, that
@@ -10,7 +12,7 @@ venv symlink and clobbered the Homebrew python3.
   uv pip install ...            logged only
   uv pip freeze ...             the checked-in closure fixture (tests/fixtures/vanth-closure.txt), NOT derived from the lock;
                                 the variant extra adds a distribution, missing drops starlette
-Every call is logged to @E@/uv.log with the PATH it was given.
+Every call is logged to @E@/uv.log with the PATH it was given and the names of its environment.
 """
 import os
 import sys
@@ -64,6 +66,7 @@ def render(template, dest, mode):
 
 log("uv " + " ".join(sys.argv[1:]))
 log("path=" + os.environ.get("PATH", ""))
+log("env=" + " ".join(sorted(os.environ)))  # the NAMES of its environment, never a value
 args = sys.argv[1:]
 if args[:1] == ["venv"]:
     d = args[-1]
@@ -76,7 +79,16 @@ if args[:1] == ["venv"]:
         os.unlink(py)
     fd = os.open(py, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
     with os.fdopen(fd, "w") as fh:
-        fh.write('#!/bin/sh\nPYTHONPATH=%s/site exec %s "$@"\n' % (E, PY3))
+        # The fake package sits beside the fixtures, not in a site-packages, and `-I` (which velo-task passes) ignores PYTHONPATH:
+        # this stand-in for the venv's python puts the package on sys.path itself for a `-c` run, then runs the real interpreter.
+        # It is itself run isolated (the -I in the shebang), so it does not load the caller's user site on the way.
+        fh.write("#!" + PY3 + " -I\n"
+                 "import os, sys\n"
+                 "args = sys.argv[1:]\n"
+                 "if '-c' in args:\n"
+                 "    i = args.index('-c') + 1\n"
+                 "    args[i] = 'import sys; sys.path.insert(0, ' + repr(" + repr(E + "/site") + ") + ')\\n' + args[i]\n"
+                 "os.execv(" + repr(PY3) + ", [" + repr(PY3) + "] + args)\n")
     render("fake-vanth.sh", os.path.join(d, "bin", "vanth"), 0o755)
     render("fake-vanthd.py", os.path.join(d, "bin", "vanthd"), 0o755)
 elif args[:2] == ["pip", "install"]:

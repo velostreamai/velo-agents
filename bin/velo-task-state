@@ -3,11 +3,15 @@
 
 Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper for them.
 
-  lock [--timeout S] <path> -- cmd...      run cmd holding an exclusive flock on <path>
-  lock-held <path>                         exit 0 when some process holds the flock on <path>, else 1
+  lock [--timeout S] [--child-fd N] <path> -- cmd...   run cmd holding an exclusive flock on <path>; the directory and the file are opened without following symlinks and must be yours; --child-fd hands cmd descriptor N on the same file (it holds no lock)
+  lock-held --fd N <path>                  exit 0 when descriptor N is the file <path> still names and some process holds the flock on it, else 1 saying why
   publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dest's dir, unlink srcfile, fsync its dir
+  write-record <dest> <pid> <lstart> <digest> <incarnation>   a daemon.intent / daemon.provenance record: O_EXCL temp, then publish
+  rec-read <path>                          print a record, not following symlinks: exit 1 when absent, 9 (problem on stdout) when unsafe
+  check-state <home>                       exit 9 and print the first state path that is a symlink, the wrong type or not yours
+  launch-exec <intent> <digest> <incarnation> <program> [name...]   publish the intent for THIS process, then exec <program> with only the named variables
   retire <path>                            durably rename path to <path>.retired.<epoch> (never replaces)
-  append-index <file> <job_id>             append one line (O_APPEND), fsync file, fsync dir if created
+  append-index <file> <job_id>             append one line (O_APPEND) to a regular file of yours, never through a symlink; fsync file, fsync dir if created
   fp <status> <exit_code> <stop_actor> <stop_reason> <end>   first 16 hex of SHA-256 of the row
   sha256 [file]                            hex SHA-256 of a file, or of stdin
   json-get <file|-> <key>                  top-level JSON value as text (string raw, true/false, number); empty when absent
@@ -18,9 +22,10 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   test-capability                          exit 0 when the test capability holds (see below), else 2
 
 Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists, 4 jobs-ro: database
-locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 8 modes-check: loose mode found, 75 lock or
-failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held. Any other code from `lock`
-is the command's own.
+locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 8 modes-check: loose mode found, 9 unsafe state
+(a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire, append-index), 75 lock or
+failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from
+`lock` is the command's own.
 
 Test seams (spec R21): VELO_TASK_FAILPOINT=<name>[@<dest-name>][:exit|:wait=<barrier-file>], VELO_TASK_FSYNC_TRACE=<file>
 and, for velo-task itself, VELO_TASK_UV are honoured only when VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is
@@ -45,9 +50,16 @@ import time
 from urllib.parse import quote
 
 # A failpoint name is registered when its call site exists; a typo must not pass silently.
-FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.intent", "launch.ready",
+FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready",
               "restart.validated", "install.lock.held"}
 TEST_MARKER = ".velo-task-test-root"
+# Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
+# exists as a symlink, as the wrong kind of node, or owned by another user; a path that does not exist yet is fine.
+STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "dir"), ("venv/.velo-task-installed", "file"),
+               ("vanth", "dir"), ("vanth/daemon.json", "file"), ("daemon.intent", "file"), ("daemon.provenance", "file"),
+               ("daemon.launch.log", "file"))
+LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
+RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 # sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API;
 # the module only exports them as names from Python 3.11, and this helper must run on the system 3.9 as well.
 SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION = 20, 21, 31
@@ -72,6 +84,42 @@ def die(code, msg):
 
 def usage(msg):
     die(2, msg + "\n" + __doc__.split("\n\n")[2])
+
+
+def node_problem(path, info, kind):
+    """Why a state node (info is its lstat or fstat) is not safe to use, or None. A symlink is never accepted, the node must
+    be the kind the caller expects ("dir" or "file", a regular file), and it must belong to the current user."""
+    if stat.S_ISLNK(info.st_mode):
+        return "%s is a symlink" % path
+    if kind == "dir" and not stat.S_ISDIR(info.st_mode):
+        return "%s is not a directory" % path
+    if kind == "file" and not stat.S_ISREG(info.st_mode):
+        return "%s is not a regular file" % path
+    if info.st_uid != os.getuid():
+        return "%s is owned by uid %d, not by you (uid %d)" % (path, info.st_uid, os.getuid())
+    return None
+
+
+def open_dir_nofollow(path):
+    """A descriptor for the directory at path, opened without following a symlink at its last component, after checking it
+    is a directory of the current user. Everything below it is then opened relative to this descriptor."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        die(9, "%s cannot be opened as a real directory: %s" % (path, "it is a symlink" if os.path.islink(path) else exc.strerror))
+    problem = node_problem(path, os.fstat(fd), "dir")
+    if problem:
+        die(9, problem)
+    return fd
+
+
+def process_lstart(pid):
+    """ps's start time for pid, rendered LC_ALL=C TZ=UTC with whitespace squeezed: what the records store and the lib compares."""
+    out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], env=LSTART_ENV, capture_output=True, text=True, check=False)
+    text = " ".join(out.stdout.split())
+    if not text:
+        die(1, "cannot read the start time of pid %d (ps exit %d)" % (pid, out.returncode))
+    return text
 
 
 def test_capability_problem():
@@ -175,7 +223,7 @@ def _sync_fd(fd, kind, path):
 
 
 def _sync_path(path, kind):
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         _sync_fd(fd, kind, path)
     finally:
@@ -183,14 +231,29 @@ def _sync_path(path, kind):
 
 
 def cmd_lock(args):
-    timeout = None
-    if args[:1] == ["--timeout"]:
-        timeout, args = float(args[1]), args[2:]
+    timeout, child_fd = None, None
+    while args[:1] in (["--timeout"], ["--child-fd"]):
+        if len(args) < 2:
+            usage("lock: %s needs a value" % args[0])
+        if args[0] == "--timeout":
+            timeout = float(args[1])
+        else:
+            child_fd = int(args[1])
+        args = args[2:]
     if len(args) < 3 or args[1] != "--":
         usage("lock: expected <path> -- cmd...")
-    path, cmd = args[0], args[2:]
-    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)  # non-inheritable: the command never holds the lock
+    path, cmd = os.path.abspath(args[0]), args[2:]
+    parent, name = os.path.split(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    # The directory and the file are opened through descriptors and never by a path that could have been swapped for a symlink.
+    dirfd = open_dir_nofollow(parent)
+    try:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)  # non-inheritable: the command never holds the lock
+    except OSError as exc:
+        die(9, "lock file %s cannot be opened: %s" % (path, "it is a symlink" if os.path.islink(path) else exc.strerror))
+    problem = node_problem(path, os.fstat(fd), "file")
+    if problem:
+        die(9, problem)
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         try:
@@ -202,8 +265,27 @@ def cmd_lock(args):
             if deadline is not None and time.monotonic() >= deadline:
                 die(75, "lock %s: not acquired within %ss" % (path, timeout))
             time.sleep(0.02)
+    locked = os.fstat(fd)
+    named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino):
+        die(9, "%s was replaced while the lock was being taken; the lock is not on the file the name now has" % path)
+    pass_fds = ()
+    if child_fd is not None:
+        # The command's view of the lock: another open file description of the very file locked, holding no flock of its own, so
+        # it can ask lock-held whether the lock is still held and still on this name, and can never keep the lock alive.
+        view = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+        seen = os.fstat(view)
+        if (seen.st_dev, seen.st_ino) != (locked.st_dev, locked.st_ino):
+            die(9, "%s was replaced while the lock was being taken" % path)
+        if fd == child_fd:  # the lock itself must never sit on the number the command is given
+            fd = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, child_fd + 1)
+            os.close(child_fd)
+        if view != child_fd:
+            os.dup2(view, child_fd, inheritable=True)
+            os.close(view)
+        pass_fds = (child_fd,)
     try:
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, pass_fds=pass_fds)
     except OSError as exc:
         die(127, "lock: cannot run %s: %s" % (cmd[0], exc.strerror))
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -213,34 +295,54 @@ def cmd_lock(args):
 
 
 def cmd_lock_held(args):
-    if len(args) != 1:
-        usage("lock-held: expected <path>")
-    try:
-        fd = os.open(args[0], os.O_RDWR)  # never creates the lock file
-    except FileNotFoundError:
+    """The question a locked body asks (lock --child-fd handed it descriptor N): is that descriptor still the file <path> names,
+    and does some other open file description hold the flock on it? The path is only looked at (lstat), never opened."""
+    if len(args) != 3 or args[0] != "--fd":
+        usage("lock-held: expected --fd N <path>")
+    fd, path = int(args[1]), os.path.abspath(args[2])
+
+    def not_held(why):
+        sys.stderr.write("velo-task-state: lock-held: %s\n" % why)
         return 1
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return 0
-            raise
-        return 1  # nobody held it; closing fd releases the probe
-    finally:
-        os.close(fd)
+        mine = os.fstat(fd)
+    except OSError:
+        return not_held("descriptor %d is not open: this process was not started by `lock --child-fd %d`" % (fd, fd))
+    problem = node_problem("descriptor %d" % fd, mine, "file")
+    if problem:
+        return not_held(problem)
+    try:
+        named = os.lstat(path)  # never creates the lock file
+    except FileNotFoundError:
+        return not_held("%s does not exist" % path)
+    if stat.S_ISLNK(named.st_mode):
+        return not_held("%s is a symlink: it is no longer the file the lock was taken on" % path)
+    if (named.st_dev, named.st_ino) != (mine.st_dev, mine.st_ino):
+        return not_held("%s is no longer the file the lock was taken on" % path)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return 0
+        raise
+    fcntl.flock(fd, fcntl.LOCK_UN)  # the probe took it, so nobody held it: give it back
+    return not_held("nobody holds the lock on %s" % path)
 
 
 def publish_file(src, dest):
     """The one durable no-clobber publish (R17), used by `publish` and so by every provenance and intent writer.
     Order: fsync the temp, link it to dest (never replacing), fsync dest's directory so the new name is durable,
     unlink the temp, fsync the temp's directory. A crash between link and unlink leaves both names, never neither.
-    Returns False, with the temp removed, when dest already exists."""
+    Returns False, with the temp removed, when dest already exists. The temp must be a regular file of the current user and
+    is linked as itself: a symlink is never followed, on the way in or onto an existing dest."""
     src, dest = os.path.abspath(src), os.path.abspath(dest)
+    problem = node_problem(src, os.lstat(src), "file")
+    if problem:
+        die(9, "publish: %s" % problem)
     _sync_path(src, "file")
     trace("link", src, dest)
     try:
-        os.link(src, dest)
+        os.link(src, dest, follow_symlinks=False)
     except FileExistsError:
         trace("unlink", src)
         os.unlink(src)
@@ -269,8 +371,12 @@ def cmd_retire(args):
     if len(args) != 1:
         usage("retire: expected <path>")
     path = os.path.abspath(args[0])
-    if not os.path.lexists(path):
+    try:
+        problem = node_problem(path, os.lstat(path), "file")
+    except FileNotFoundError:
         die(1, "retire: %s does not exist" % path)
+    if problem:
+        die(9, "retire: %s" % problem)
     base = "%s.retired.%d" % (path, int(time.time()))
     target, n = base, 0
     while os.path.lexists(target):
@@ -280,6 +386,101 @@ def cmd_retire(args):
     os.rename(path, target)
     _sync_path(os.path.dirname(path), "dir")
     return 0
+
+
+def write_record(dest, pid, lstart, digest, incarnation):
+    """The one writer of daemon.intent and daemon.provenance. The temp is created O_EXCL and O_NOFOLLOW, so nothing already
+    there (or planted there) is ever written through; it is then published like every record (publish_file). Exit 3 when
+    dest exists: a record is retired before it is replaced, never overwritten."""
+    fields = {"pid": (pid, r"[0-9]+"), "lstart": (lstart, r"[^\n]+"), "digest": (digest, r"[0-9a-f]{64}"),
+              "incarnation": (incarnation, RECORD_UUID.pattern)}
+    for name, (value, pattern) in fields.items():
+        if not re.fullmatch(pattern, str(value)):
+            usage("write-record: %s %r is not a valid value" % (name, value))
+    dest = os.path.abspath(dest)
+    tmp = "%s.tmp.%d.%s" % (dest, os.getpid(), os.urandom(4).hex())
+    data = ("pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\n" % (pid, lstart, digest, incarnation)).encode()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.write(fd, data) != len(data):
+            die(1, "write-record: short write to %s" % tmp)
+    finally:
+        os.close(fd)
+    if not publish_file(tmp, dest):
+        die(3, "write-record: %s already exists (temp removed)" % dest)
+
+
+def cmd_write_record(args):
+    if len(args) != 5:
+        usage("write-record: expected <dest> <pid> <lstart> <digest> <incarnation>")
+    write_record(*args)
+    return 0
+
+
+def cmd_rec_read(args):
+    """Print a record. Exit 1 when it does not exist. Exit 9, with the reason on STDOUT, when it is a symlink, not a regular
+    file or not the current user's: the caller reads one stream and never mistakes an unsafe record for an absent one."""
+    if len(args) != 1:
+        usage("rec-read: expected <path>")
+    path = os.path.abspath(args[0])
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
+    except FileNotFoundError:
+        return 1
+    except OSError as exc:
+        print("%s is a symlink" % path if exc.errno == errno.ELOOP else "%s cannot be opened: %s" % (path, exc.strerror))
+        return 9
+    problem = node_problem(path, os.fstat(fd), "file")  # before fdopen, which would refuse a directory with an exception of its own
+    if problem:
+        os.close(fd)
+        print(problem)
+        return 9
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read()
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def cmd_check_state(args):
+    """Exit 9 and print the first path under <home> (STATE_PATHS) that exists as a symlink, as the wrong kind of node, or owned
+    by someone else. Nothing is opened, followed, created or changed: a lstat per path."""
+    if len(args) != 1:
+        usage("check-state: expected <home>")
+    home = os.path.abspath(args[0])
+    for rel, kind in STATE_PATHS:
+        path = os.path.join(home, rel) if rel else home
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        problem = node_problem(path, info, kind)
+        if problem:
+            print(problem)
+            return 9
+    return 0
+
+
+def cmd_launch_exec(args):
+    """The process that becomes vanthd. velo-task starts `launch-exec <intent> <digest> <incarnation> <vanthd> <names>`; it
+    publishes daemon.intent for its OWN pid and start time, durably and in the order of every record, and only then execs
+    vanthd, which keeps the pid and the start time. A hard kill before the exec leaves no daemon at all; a hard kill after it
+    leaves a daemon whose intent is already in place. vanthd gets exactly the named variables and nothing else this process
+    holds, the test seams among them."""
+    if len(args) < 4:
+        usage("launch-exec: expected <intent> <digest> <incarnation> <program> [name...]")
+    intent, digest, incarnation, program, names = args[0], args[1], args[2], args[3], args[4:]
+    missing = [n for n in names if n not in os.environ]
+    if missing:
+        die(1, "launch-exec: not set in the environment: %s" % " ".join(missing))
+    env = {n: os.environ[n] for n in names}
+    failpoint("launch.wrapper")
+    pid = os.getpid()
+    write_record(intent, pid, process_lstart(pid), digest, incarnation)
+    failpoint("launch.intent")
+    for sig in (signal.SIGPIPE, signal.SIGXFSZ):  # Python ignores these; vanthd gets the dispositions a plain exec would have given it
+        signal.signal(sig, signal.SIG_DFL)
+    os.execve(program, [program], env)
 
 
 def cmd_append_index(args):
@@ -293,8 +494,15 @@ def cmd_append_index(args):
     try:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
         created = True
-    except FileExistsError:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except FileExistsError:  # the index is a control file: opened without following a symlink, and only a regular file of yours is appended to
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
+        except OSError as exc:
+            die(9, "append-index: %s cannot be opened: %s" % (path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
+        problem = node_problem(path, os.fstat(fd), "file")
+        if problem:
+            os.close(fd)
+            die(9, "append-index: %s" % problem)
     try:
         line = (job_id + "\n").encode()
         if os.write(fd, line) != len(line):  # one write(2) under O_APPEND: concurrent lines never tear
@@ -491,7 +699,8 @@ def cmd_test_capability(args):
 
 
 COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish, "retire": cmd_retire,
-            "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
+            "write-record": cmd_write_record, "rec-read": cmd_rec_read, "check-state": cmd_check_state,
+            "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
             "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
             "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 

@@ -9,6 +9,19 @@
 # pinned venv (st) except for the lock, the failpoints and the capability check (stl): install-vanth replaces the venv while it
 # holds the lock, so the lock holder must not live in it.
 #
+# Environment: nothing velo-task starts inherits the caller's. The helper (st, stl) runs `env -i` with PATH=system dirs, HOME,
+# VELO_TASK_HOME, TMPDIR and LANG when set, under `python -I` (no PYTHONPATH, no sitecustomize, no user site, and no current
+# directory on sys.path, which a `-c` run would otherwise import from; the venv python that checks the install is run so too). The locked body
+# is a `bash -c` under `env -i` with those plus the VELO_TASK_* tunables and the allowlisted secret names it launches the daemon
+# with, so BASH_ENV, ENV, SHELLOPTS and the rest never reach it. uv runs under `env -i` with its own fixed PATH. The test seams
+# (VELO_TASK_TEST, the nonce, VELO_TASK_FAILPOINT, VELO_TASK_FSYNC_TRACE, VELO_TASK_UV) are forwarded only when the test
+# capability holds (R21), and a seam that is set without it is refused (exit 2), never ignored.
+#
+# State safety: the state root, lock/, lock/daemon, venv/, vanth/, both records and the launch log are checked before use
+# (check-state: not a symlink, the right kind of node, yours) and a locked body checks again once it holds the lock. Records are
+# read through rec-read and written through write-record (O_NOFOLLOW, O_EXCL). The lock is a descriptor (LOCK_FD) the body was
+# handed, checked against the path before every action that cannot be undone.
+#
 # Layout (VELO_TASK_HOME defaults to ${VELO_STATE:-~/.agents/state}/velo-task; tests override it):
 #   venv/               pinned Vanth install      vanth/              VANTH_HOME = AGENT_BG_HOME
 #   vanth.env.allow     secret NAMES the daemon may inherit (one per line)
@@ -42,9 +55,13 @@ LAUNCH_LOG="$VELO_TASK_HOME/daemon.launch.log"
 LOCK_FILE="$VELO_TASK_HOME/lock/daemon"
 UV_PINNED=/opt/homebrew/bin/uv
 INSTALL_PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+SYS_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+LOCK_FD=9  # the descriptor the lock helper hands the locked body (lock --child-fd); launch_daemon closes it in the daemon's subshell
 LOCK_PY_CANDIDATES="/opt/homebrew/bin/python3 /usr/bin/python3"
 LOCK_PY=""
 UV=""
+HELPER_ENV=()  # NAME=value for `env -i` in front of every helper run (set by prep_env)
+SEAM_ENV=()    # the test seams among them, when the test capability holds
 # Jobs inherit the daemon's environment: a fixed PATH, HOME, Vanth's own variables, allowlisted names.
 JOB_PATH="$HOME/.agents/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 NAME_RE='^[A-Z][A-Z0-9_]*$'
@@ -56,8 +73,7 @@ MODES_WHY=""
 LOOPBACK_WHY=""
 
 die() { local code="$1"; shift; printf 'velo-task: %s\n' "$*" >&2; exit "$code"; }
-st() { "$PY" "$STATE_SCRIPT" "$@"; }
-stl() {
+need_lock_py() {
   if [ -z "$LOCK_PY" ]; then
     local p
     for p in $LOCK_PY_CANDIDATES; do
@@ -65,11 +81,49 @@ stl() {
     done
     [ -n "$LOCK_PY" ] || die 6 "no Python 3 for the state helper's lock (looked for: $LOCK_PY_CANDIDATES)"
   fi
-  "$LOCK_PY" "$STATE_SCRIPT" "$@"
 }
+test_capability() {  # R21: succeeds when the test capability holds; says why not otherwise. Run with nothing of the caller's but the capability's own variables
+  need_lock_py
+  /usr/bin/env -i PATH="$SYS_PATH" HOME="$HOME" VELO_TASK_HOME="$VELO_TASK_HOME" VELO_TASK_TEST="${VELO_TASK_TEST:-}" \
+    VELO_TASK_TEST_ROOT_NONCE="${VELO_TASK_TEST_ROOT_NONCE:-}" "$LOCK_PY" -I "$STATE_SCRIPT" test-capability 2>&1
+}
+prep_env() {  # once per entry point, in the main shell: what the helper and the locked body inherit (see the header)
+  local v why seam=0
+  HELPER_ENV=(PATH="$SYS_PATH" HOME="$HOME" VELO_TASK_HOME="$VELO_TASK_HOME")
+  SEAM_ENV=()
+  if [ -n "${TMPDIR:-}" ]; then HELPER_ENV[${#HELPER_ENV[@]}]="TMPDIR=$TMPDIR"; fi
+  if [ -n "${LANG:-}" ]; then HELPER_ENV[${#HELPER_ENV[@]}]="LANG=$LANG"; fi
+  for v in VELO_TASK_TEST VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV; do
+    if [ -n "${!v:-}" ]; then seam=1; fi
+  done
+  [ "$seam" = 1 ] || return 0
+  if why=$(test_capability); then
+    for v in VELO_TASK_TEST VELO_TASK_TEST_ROOT_NONCE VELO_TASK_FAILPOINT VELO_TASK_FAILPOINT_WAIT_MAX VELO_TASK_FSYNC_TRACE VELO_TASK_UV; do
+      if [ -n "${!v:-}" ]; then SEAM_ENV[${#SEAM_ENV[@]}]="$v=${!v}"; fi
+    done
+    HELPER_ENV=("${HELPER_ENV[@]}" ${SEAM_ENV[@]+"${SEAM_ENV[@]}"})
+  else
+    for v in VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV; do
+      if [ -n "${!v:-}" ]; then die 2 "$v is set but refused: it is honoured only for tests ($why)"; fi
+    done
+  fi
+}
+py_run() {  # <python> <helper args...>: the state helper, isolated (-I) and under the minimal environment, never the caller's
+  if [ "${#HELPER_ENV[@]}" -eq 0 ]; then prep_env; fi
+  local py="$1"; shift
+  /usr/bin/env -i "${HELPER_ENV[@]}" "$py" -I "$STATE_SCRIPT" "$@"
+}
+st() { py_run "$PY" "$@"; }
+stl() { need_lock_py; py_run "$LOCK_PY" "$@"; }
 
 case "$VELO_TASK_HOME" in /*) ;; *) die 2 "VELO_TASK_HOME must be an absolute path: $VELO_TASK_HOME" ;; esac
 case "$PORT" in ''|*[!0-9]*) die 2 "VELO_TASK_PORT must be a number: $PORT" ;; esac
+# The waits are evaluated by bash arithmetic, which runs command substitutions inside a subscript: a value is a number or it is refused.
+for v in VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT; do
+  case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac
+done
+case "${VELO_TASK_POLL:-0}" in *[!0-9.]*) die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL" ;; esac
+unset v
 
 # ---- process identity (R11(d), R18): the start time is always rendered LC_ALL=C TZ=UTC ----------
 ps_lstart() {  # <pid> -> start time, empty when no such process
@@ -89,10 +143,19 @@ signal_validated() {  # <signal> <pid> <expected lstart>: re-checks pid AND star
 }
 
 # ---- records: daemon.intent and daemon.provenance share one format ---------------------------------
-rec_get() { /usr/bin/sed -n "s/^$2=//p" "$1" 2>/dev/null | /usr/bin/head -n 1 || true; }  # <file> <key>
+rec_present() { [ -e "$1" ] || [ -L "$1" ]; }  # a record exists under this name, a dangling symlink included: rec_load refuses that, it never counts as absent
+rec_get() { printf '%s\n' "$1" | /usr/bin/sed -n "s/^$2=//p" | /usr/bin/head -n 1 || true; }  # <record text> <key>
 rec_load() {  # <file>: sets REC_PID REC_LSTART REC_DIGEST REC_INC; fails, saying why in REC_WHY, unless the record is complete
+  local text rc=0
   REC_WHY=""
-  REC_PID=$(rec_get "$1" pid); REC_LSTART=$(rec_get "$1" lstart); REC_DIGEST=$(rec_get "$1" digest); REC_INC=$(rec_get "$1" incarnation)
+  text=$(st rec-read "$1") || rc=$?  # O_NOFOLLOW and an owner check in the helper: a record that is a symlink or someone else's is refused, never read
+  case "$rc" in
+    0) ;;
+    1) REC_WHY="$1 does not exist"; return 1 ;;
+    9) die 6 "unsafe state: $text; refusing. Remove or fix it by hand, then re-run" ;;
+    *) die 6 "reading $1 failed (helper exit $rc)" ;;
+  esac
+  REC_PID=$(rec_get "$text" pid); REC_LSTART=$(rec_get "$text" lstart); REC_DIGEST=$(rec_get "$text" digest); REC_INC=$(rec_get "$text" incarnation)
   case "$REC_PID" in ''|*[!0-9]*) REC_WHY="$1 has no valid pid"; return 1 ;; esac
   [ -n "$REC_LSTART" ] || { REC_WHY="$1 has no start time"; return 1; }
   printf '%s\n' "$REC_DIGEST" | /usr/bin/grep -Eq '^[0-9a-f]{64}$' || { REC_WHY="$1 has no valid launch digest"; return 1; }
@@ -106,12 +169,8 @@ rec_live() {  # <file>: the record is complete and its pid runs with the recorde
   [ -n "$live" ] || { REC_WHY="${1##*/}: pid $REC_PID is not running"; return 1; }
   [ "$live" = "$REC_LSTART" ] || { REC_WHY="${1##*/}: pid $REC_PID started '$live', the record says '$REC_LSTART' (reused pid)"; return 1; }
 }
-write_record() {  # <dest> <pid> <lstart> <digest> <incarnation>: the dest must be free (launch retires the old record first)
-  local tmp="$1.tmp.$$"
-  ( umask 077; printf 'pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\n' "$2" "$3" "$4" "$5" > "$tmp" )
-  st publish "$1" "$tmp"  # R17: fsync, no-clobber link, fsync the directory, unlink the temp, fsync its directory
-}
-retire_record() { if [ -e "$1" ]; then st retire "$1"; fi; }  # durable rename to <file>.retired.<epoch>
+write_record() { st write-record "$@"; }  # <dest> <pid> <lstart> <digest> <incarnation>: the dest must be free (launch retires the old record first). The helper writes the temp O_EXCL|O_NOFOLLOW and publishes it (R17): fsync, no-clobber link, fsync the directory, unlink the temp, fsync its directory
+retire_record() { if rec_present "$1"; then st retire "$1" || die 6 "refusing to retire $1 (see above)"; fi; }  # durable rename to <file>.retired.<epoch>; a symlink or someone else's file is refused
 
 # A live process is ours only when a record names it: pid, start time, launch digest and incarnation. The start time is
 # re-rendered now and must equal the recorded one, so a reused pid never qualifies. The digest is compared by ensure-daemon
@@ -122,7 +181,7 @@ find_ours_live() {  # [any]: sets OURS_PID OURS_LSTART OURS_SRC; OURS_WHY says w
   local f dj
   OURS_PID=""; OURS_LSTART=""; OURS_SRC=""; OURS_WHY=""
   for f in "$PROV" "$INTENT"; do
-    [ -e "$f" ] || continue
+    rec_present "$f" || continue
     if rec_live "$f"; then
       dj=$(djson pid)
       if [ "${1:-}" != any ] && [ -n "$dj" ] && [ "$dj" != "$REC_PID" ]; then
@@ -183,7 +242,7 @@ launch_digest() { launch_spec | st sha256; }
 prov_valid() {  # adoption: sets PROV_WHY when the running daemon is not provably the one we launched with this configuration
   local dj live
   PROV_WHY=""
-  [ -f "$PROV" ] || { PROV_WHY="no $PROV: this daemon was not launched by velo-task"; return 1; }
+  rec_present "$PROV" || { PROV_WHY="no $PROV: this daemon was not launched by velo-task"; return 1; }
   rec_load "$PROV" || { PROV_WHY="$REC_WHY; the record is incomplete"; return 1; }
   dj=$(djson pid)
   [ "$dj" = "$REC_PID" ] || { PROV_WHY="daemon.json pid '$dj' differs from provenance pid '$REC_PID'"; return 1; }
@@ -237,27 +296,31 @@ abandon_launch() {  # <pid> <started> <why>: a launch that cannot be proven good
   die 6 "$why"
 }
 launch_daemon() {
-  local args k pid started digest inc deadline
+  local args names k pid started digest inc deadline
+  still_locked
   /bin/mkdir -p -m 700 "$VH"
   args=(PATH="$JOB_PATH" HOME="$HOME" VANTH_HOME="$VH" AGENT_BG_HOME="$VH" VANTH_DAEMON_PORT="$PORT" VANTH_RETENTION_SECONDS=0)
+  names="PATH HOME VANTH_HOME AGENT_BG_HOME VANTH_DAEMON_PORT VANTH_RETENTION_SECONDS"
   for k in $ALLOW_NAMES; do
-    if [ "${!k+set}" = set ]; then args[${#args[@]}]="$k=${!k}"; fi
+    if [ "${!k+set}" = set ]; then args[${#args[@]}]="$k=${!k}"; names="$names $k"; fi
   done
   retire_record "$PROV"; retire_record "$INTENT"
   digest=$(launch_digest); inc=$(/usr/bin/uuidgen)
-  # env -i: jobs see exactly the lines above and nothing else from the caller (R11(b)). The values sit in env's argv only until
-  # it execs vanthd. umask 077 makes jobs.sqlite, logs/, events/ and daemon.json private (R11(c)). Own process group, stdio
-  # detached from the caller.
+  need_lock_py
+  # The process started here IS the daemon, pid for pid: env -i hands the helper's launch-exec the lines above (R11(b): jobs see
+  # exactly those and nothing else from the caller; the values sit in env's argv only until it execs the helper), launch-exec
+  # publishes daemon.intent for its OWN pid and start time and only then execs vanthd, which keeps both. No kill of this shell,
+  # at any point, can leave a running daemon without its intent; a kill before the exec leaves no daemon. launch-exec passes on
+  # the NAMES listed and nothing else it holds, so the test seams that reach it never reach vanthd. umask 077 makes
+  # jobs.sqlite, logs/, events/ and daemon.json private (R11(c)). Own process group, stdio detached from the caller, and the lock
+  # descriptor (9 = LOCK_FD) closed: the daemon outlives this body.
   set -m
-  ( umask 077; exec /usr/bin/env -i "${args[@]}" "$VANTHD" </dev/null >"$LAUNCH_LOG" 2>&1 ) &
+  ( umask 077; exec 9>&-; exec /usr/bin/env -i "${args[@]}" VELO_TASK_HOME="$VELO_TASK_HOME" ${SEAM_ENV[@]+"${SEAM_ENV[@]}"} \
+      "$LOCK_PY" -I "$STATE_SCRIPT" launch-exec "$INTENT" "$digest" "$inc" "$VANTHD" $names </dev/null >"$LAUNCH_LOG" 2>&1 ) &
   pid=$!
   set +m
   started=$(ps_lstart "$pid")
   stl failpoint launch.started
-  if [ -n "$started" ]; then  # the intent is what lets restart-daemon prove a daemon that crashed before it was known good is ours
-    write_record "$INTENT" "$pid" "$started" "$digest" "$inc"
-    stl failpoint launch.intent
-  fi
   deadline=$((SECONDS + ${VELO_TASK_START_WAIT:-20}))
   while [ "$SECONDS" -lt "$deadline" ]; do
     kill -0 "$pid" 2>/dev/null || break
@@ -278,19 +341,35 @@ launch_daemon() {
 
 # ---- the per-home lock (R17, R18): install, ensure and restart all run under it ----------------------
 run_locked() {  # <function in this file>: run it in a child shell that holds the lock; the child is told the lock path
-  local rc=0
-  stl lock --timeout "${VELO_TASK_LOCK_WAIT:-60}" "$LOCK_FILE" -- \
+  local rc=0 v body
+  if [ "${#HELPER_ENV[@]}" -eq 0 ]; then prep_env; fi
+  body=("${HELPER_ENV[@]}")  # the body is the helper's child, so it inherits exactly this: the minimal environment, the tunables, the allowlisted names
+  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL $ALLOW_NAMES; do
+    if [ "${!v+set}" = set ]; then body[${#body[@]}]="$v=${!v}"; fi
+  done
+  need_lock_py
+  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" lock --timeout "${VELO_TASK_LOCK_WAIT:-60}" --child-fd "$LOCK_FD" "$LOCK_FILE" -- \
     /bin/bash -c 'set -euo pipefail; . "$1"; shift; "$@"' velo-task "$LIB_FILE" "$1" "$LOCK_FILE" || rc=$?
-  case "$rc" in 0) ;; 75) die 6 "timed out waiting for the lock $LOCK_FILE" ;; *) exit "$rc" ;; esac
+  case "$rc" in 0) ;; 75) die 6 "timed out waiting for the lock $LOCK_FILE" ;; 9) die 6 "the lock state is unsafe (see above); nothing was done" ;; *) exit "$rc" ;; esac
 }
-assert_lock_held() {  # <lock path>: a locked body runs only inside run_locked
-  [ "${1:-}" = "$LOCK_FILE" ] && stl lock-held "$LOCK_FILE" \
+assert_lock_held() {  # <lock path>: a locked body runs only inside run_locked, holding the descriptor it was handed (LOCK_FD) on the file LOCK_FILE still names
+  [ "${1:-}" = "$LOCK_FILE" ] && stl lock-held --fd "$LOCK_FD" "$LOCK_FILE" \
     || die 2 "refusing to run without the lock on $LOCK_FILE: this body is not a subcommand"
 }
+still_locked() { assert_lock_held "$LOCK_FILE"; }  # right before an action that cannot be undone (a launch, a signal, replacing the venv)
+need_state() {  # nothing under the state root is a symlink, the wrong kind of node or someone else's (check-state lists them); nothing is followed
+  local why rc=0
+  why=$(stl check-state "$VELO_TASK_HOME") || rc=$?
+  case "$rc" in
+    0) ;;
+    9) die 6 "unsafe state: $why; refusing. Remove or fix it by hand, then re-run" ;;
+    *) die 6 "the state check failed (helper exit $rc): $why" ;;
+  esac
+}
 
-cmd_ensure_daemon() { need_install; need_allowlist; run_locked locked_ensure; }
+cmd_ensure_daemon() { prep_env; need_state; need_install; need_allowlist; run_locked locked_ensure; }
 locked_ensure() {  # R18: probe only once the lock is held; another caller may have started the daemon
-  assert_lock_held "${1:-}"
+  prep_env; assert_lock_held "${1:-}"; need_state
   need_install; need_allowlist; need_modes
   local pid
   if probe_up; then
@@ -302,7 +381,7 @@ locked_ensure() {  # R18: probe only once the lock is held; another caller may h
     fi
     pid="$REC_PID"
     check_loopback "$pid" || die 6 "$LOOPBACK_WHY; refusing to adopt it. Run: velo-task restart-daemon"
-    if [ -e "$INTENT" ] && { ! rec_live "$INTENT" || [ "$REC_PID" = "$pid" ]; }; then retire_record "$INTENT"; fi  # the launch it recorded is done
+    if rec_present "$INTENT" && { ! rec_live "$INTENT" || [ "$REC_PID" = "$pid" ]; }; then retire_record "$INTENT"; fi  # the launch it recorded is done
     printf 'daemon up pid=%s port=%s (adopted)\n' "$pid" "$PORT"
   else
     # Nothing answers. A live process a record names is a daemon velo-task launched (starting, hung, or a launch that was
@@ -316,14 +395,15 @@ locked_ensure() {  # R18: probe only once the lock is held; another caller may h
   fi
 }
 
-cmd_restart_daemon() { need_install; need_allowlist; run_locked locked_restart; }
+cmd_restart_daemon() { prep_env; need_state; need_install; need_allowlist; run_locked locked_restart; }
 locked_restart() {  # R7, R18: signal only a process a record proves is ours, re-validated right before the signal
-  assert_lock_held "${1:-}"
+  prep_env; assert_lock_held "${1:-}"; need_state
   need_install; need_allowlist; need_modes
   stl failpoint daemon.lock.held
   local deadline
   if find_ours_live; then
     stl failpoint restart.validated  # nothing after this point re-reads the records: the pid and start time validated above are what is signalled
+    still_locked
     signal_validated TERM "$OURS_PID" "$OURS_LSTART"
     deadline=$((SECONDS + ${VELO_TASK_STOP_WAIT:-20}))
     while kill -0 "$OURS_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do /bin/sleep "${VELO_TASK_POLL:-0.2}"; done
@@ -337,15 +417,17 @@ locked_restart() {  # R7, R18: signal only a process a record proves is ours, re
 }
 
 # ---- install-vanth (R11, R12, B23): lock + --require-hashes + wheels only, then assert ---------------
-resolve_uv() {  # the pinned Homebrew uv; VELO_TASK_UV replaces it only under the test capability
-  UV="$UV_PINNED"
-  if [ -n "${VELO_TASK_UV:-}" ]; then
-    stl test-capability || die 2 "VELO_TASK_UV is set but refused: it is honoured only under the test capability (VELO_TASK_TEST=1 and a test root)"
-    UV="$VELO_TASK_UV"
-  fi
+resolve_uv() {  # the pinned Homebrew uv; VELO_TASK_UV (in this body's environment only when the test capability held: prep_env) replaces it
+  UV="${VELO_TASK_UV:-$UV_PINNED}"
   [ -x "$UV" ] || die 6 "uv not found at $UV; velo-task installs through the Homebrew uv (brew install uv)"
 }
-run_uv() { PATH="$INSTALL_PATH" "$UV" "$@"; }  # uv sees fixed system dirs, never the caller's PATH, when it looks for an interpreter
+run_uv() {  # uv sees nothing of the caller's: fixed system dirs for PATH (where it looks for an interpreter), HOME for its cache, TMPDIR and LANG when set
+  local uvenv
+  uvenv=(PATH="$INSTALL_PATH" HOME="$HOME")
+  if [ -n "${TMPDIR:-}" ]; then uvenv[${#uvenv[@]}]="TMPDIR=$TMPDIR"; fi
+  if [ -n "${LANG:-}" ]; then uvenv[${#uvenv[@]}]="LANG=$LANG"; fi
+  /usr/bin/env -i "${uvenv[@]}" "$UV" "$@"
+}
 norm_names() { /usr/bin/awk -F'==' '{ n = tolower($1); gsub(/[-_.]+/, "-", n); print n "==" $2 }'; }
 venv_in_use() {  # a daemon runs from this venv: a record names a live process, or daemon.json's pid runs a command from the venv
   local pid cmd
@@ -368,22 +450,23 @@ verify_install() {
   installed=$(run_uv pip freeze --no-config --python "$PY" | norm_names | LC_ALL=C /usr/bin/sort -u) || fail_install "uv pip freeze"
   [ "$locked" = "$installed" ] \
     || fail_install "installed distributions differ from the lock: $(/usr/bin/diff <(echo "$locked") <(echo "$installed") | /usr/bin/tr '\n' ' ')"
-  site=$("$PY" -c 'import os, vanth; print(os.path.dirname(vanth.__file__))') || fail_install "vanth is not importable"
+  site=$("$PY" -I -c 'import os, vanth; print(os.path.dirname(vanth.__file__))') || fail_install "vanth is not importable"
   /usr/bin/grep -rqF --include='*.py' 'trigger parent reached an incompatible terminal status' "$site" \
     || fail_install "the pinned trigger-parent stop reason is absent from the installed Vanth (R1)"
   tmp=$(/usr/bin/mktemp -d "$VENV/schema.XXXXXX")  # inside the venv: fail_install removes it with the venv
-  "$PY" -c 'import sqlite3, sys; from vanth.migrations import migrate; db = sqlite3.connect(sys.argv[1] + "/jobs.sqlite"); migrate(db, sys.argv[1]); db.close()' "$tmp" \
+  "$PY" -I -c 'import sqlite3, sys; from vanth.migrations import migrate; db = sqlite3.connect(sys.argv[1] + "/jobs.sqlite"); migrate(db, sys.argv[1]); db.close()' "$tmp" \
     || fail_install "the installed Vanth could not create its schema"
   st jobs-ro "$tmp/jobs.sqlite" 'SELECT 1 AS ok' >/dev/null || fail_install "the installed Vanth schema lacks columns the spec reads (R8)"
   /bin/rm -rf "$tmp"
 }
 cmd_install_vanth() {
   [ -f "$LOCKFILE" ] || die 1 "lock file not found: $LOCKFILE"
+  prep_env; need_state
   /bin/mkdir -p -m 700 "$VELO_TASK_HOME"
   run_locked locked_install
 }
 locked_install() {  # the same lock as ensure and restart: nothing can launch or signal while the venv is rebuilt
-  assert_lock_held "${1:-}"
+  prep_env; assert_lock_held "${1:-}"; need_state
   stl failpoint install.lock.held
   local want
   resolve_uv
@@ -398,6 +481,7 @@ locked_install() {  # the same lock as ensure and restart: nothing can launch or
   if venv_in_use; then
     die 6 "a daemon is running from $VENV; stop it before replacing the venv (SIGTERM the pid in $VH/daemon.json)"
   fi
+  still_locked
   /bin/rm -f "$MARKER"
   run_uv venv --no-config --python 3.12 --clear "$VENV" || fail_install "uv venv"
   run_uv pip install --no-config --python "$PY" --default-index https://pypi.org/simple \
@@ -409,9 +493,11 @@ locked_install() {  # the same lock as ensure and restart: nothing can launch or
 
 # ---- doctor: read-only; never starts, signals, locks or modifies anything ---------------------------
 cmd_doctor() {
-  local rc=0 pid
+  local rc=0 pid why
   ok() { printf 'ok   %s\n' "$*"; }
   bad() { printf 'FAIL %s\n' "$*"; rc=1; }
+  prep_env
+  if ! why=$(stl check-state "$VELO_TASK_HOME"); then bad "state: ${why:-the state check failed}; nothing else was read"; return "$rc"; fi
   if [ -f "$MARKER" ] && [ -x "$PY" ] && [ -x "$VANTHD" ] && [ -x "$VANTH" ]; then
     if [ "$(/bin/cat "$MARKER")" = "$(st sha256 "$LOCKFILE")" ]; then ok "install: $VENV matches the lock"
     else bad "install: $VENV was built from a different lock; run velo-task install-vanth, then restart-daemon"; fi
@@ -432,7 +518,7 @@ cmd_doctor() {
   if [ -d "$VH" ]; then
     if modes_problem; then bad "modes: $MODES_WHY"; else ok "modes: private"; fi
   fi
-  if [ -e "$INTENT" ]; then
+  if rec_present "$INTENT"; then
     if rec_live "$INTENT"; then bad "intent: a launch of vanthd pid $REC_PID was interrupted before it was recorded as good (run: velo-task restart-daemon)"
     else ok "intent: stale ($REC_WHY); ensure-daemon retires it"; fi
   fi
