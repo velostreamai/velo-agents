@@ -59,12 +59,17 @@ realpath_of() {  # <path>: its canonical absolute path, every symlink followed
   done
   echo "realpath_of: none of the resolver pythons is an executable file (looked for: $RESOLVER_PYTHONS)" >&2; return 1
 }
+# The guard compares a resolved candidate with resolved roots: TMPDIR may be spelled through a symlink (on macOS /var/folders/... is
+# /private/var/folders/...), and a resolved path never starts with the unresolved spelling of its own root. TEMP_ROOT_CANON names
+# the function that resolves the roots; the proof of the guard (t_suite_python) sets it to echo, which compares them as spelled.
+TEMP_ROOT_CANON=realpath_of
 pick_python() {  # prints the first candidate that is executable and resolves outside the temp root
-  local p real
+  local p real root_t root_tmp
+  root_t=$("$TEMP_ROOT_CANON" "$T") && root_tmp=$("$TEMP_ROOT_CANON" "$TMP_ROOT") || return 1   # a root that cannot be resolved is a failure, never a pass
   for p in $PYTHON_CANDIDATES; do
     real=$(command -v "$p") && real=$(realpath_of "$real") || continue   # command -v fails for a candidate that is not an executable file
     if [ -z "${PYTHON_UNCHECKED:-}" ]; then
-      case "$real/" in "$T"/*|"$TMP_ROOT"/*) echo "pick_python: $p resolves to $real, inside the temp root $TMP_ROOT" >&2; continue ;; esac
+      case "$real/" in "$root_t"/*|"$root_tmp"/*) echo "pick_python: $p resolves to $real, inside the temp root $root_tmp" >&2; continue ;; esac
     fi
     printf '%s\n' "$p"; return 0
   done
@@ -1645,12 +1650,13 @@ t_child_env() {  # R11: each process velo-task starts inherits exactly what the 
     [ "$(sed -n 's/^env=//p' "$E/pyenv.log" | while read -r l; do printf '%s\n' "$l" | tr ' ' '\n' | hidden_names | LC_ALL=C sort | tr '\n' ' '; echo; done | sort -u)" = "$exp_pyenv" ]
 }
 t_suite_python() {  # the suite's interpreter is an absolute path chosen once, never found through PATH: a python3 on the caller's PATH, or one a test puts there, is never executed
-  local sh n picked; sh="$T/pyshims"; mkdir -p "$sh"
+  local sh n picked tree real; sh="$T/pyshims"; mkdir -p "$sh"
   printf '#!/bin/sh\necho "$0 $*" >> "%s/sentinel"\nexit 97\n' "$sh" > "$sh/shim"; chmod +x "$sh/shim"
   for n in python3 python python3.12 python3.13 python3.14; do ln "$sh/shim" "$sh/$n"; done
   case "$PYBIN" in /*) ;; *) echo "FAILED: the suite's python is not an absolute path: $PYBIN"; exit 1 ;; esac
   need "the suite's python is executable" [ -x "$PYBIN" ]
-  need "...and does not resolve into the temp tree the suite fills" not grep -q "^$TMP_ROOT/" <<<"$(realpath_of "$PYBIN")"
+  tree=$(realpath_of "$TMP_ROOT"); real=$(realpath_of "$PYBIN")   # both sides resolved: TMPDIR may be spelled through a symlink
+  need "...and does not resolve into the temp tree the suite fills" [ "${real#"$tree"/}" = "$real" ]
   picked=$(PATH="$sh:$PATH" pick_python); need "with python shims first on PATH the choice is still the same interpreter" [ "$picked" = "$PYBIN" ]
   shimmed() { PATH="$sh:$PATH" "$@"; }
   need "the helper runs with the shims first on PATH" [ "$(printf abc | shimmed ST sha256)" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ]
@@ -1675,6 +1681,15 @@ t_suite_python() {  # the suite's interpreter is an absolute path chosen once, n
   PYTHONPATH="$hostile" realpath_of "$sh/link" >/dev/null; need "realpath_of is isolated: a hostile PYTHONPATH never fires" [ ! -e "$sh/hostile-fired" ]
   RESOLVER_PYTHONS="$sh/not-there $sh/not-executable" run realpath_of "$sh/link"; need "with no executable resolver realpath_of fails loudly (exit 1)" [ "$RC" = 1 ]
   need "...saying so" grep -q 'none of the resolver pythons' <<<"$OUT"
+  # the temp root as TMPDIR spells it may go through a symlink (on macOS /var/folders/... is /private/var/folders/...): the guard resolves both sides
+  local spell root; spell="$sh/spell"; mkdir -p "$spell/real"; ln -s real "$spell/alias"; ln "$sh/shim" "$spell/real/python3"
+  for root in real alias; do   # the same directory spelled as itself, then through a symlink
+    T="$spell/$root" TMP_ROOT="$spell/$root" PYTHON_CANDIDATES="$spell/real/python3" run pick_python
+    need "[temp root spelled via $root] a candidate that resolves into it is refused (exit 1)" [ "$RC" = 1 ]
+    need "[temp root spelled via $root] ...saying so" grep -q 'inside the temp root' <<<"$OUT"
+    T="$spell/$root" TMP_ROOT="$spell/$root" PYTHON_CANDIDATES="$PYBIN" run pick_python
+    need "[temp root spelled via $root] control: a python outside it is picked" [ "$OUT" = "$PYBIN" ]
+  done
   need "no shim ran, whatever was asked" [ ! -e "$sh/sentinel" ]
 }
 # ---- lifecycle interleavings (findings 3, 19): the barrier holds one caller inside the lock, the other must wait ----
@@ -2344,6 +2359,7 @@ prove "the locked body is not given the allowlisted names" t_child_env $L \
   '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL $ALLOW_NAMES; do' '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL; do'
 PYTHON_CANDIDATES=python3 prove_env "the suite finds its python through the caller's PATH" t_suite_python
 PYTHON_UNCHECKED=1 prove_env "the suite accepts a python that resolves into its own temp tree" t_suite_python
+TEMP_ROOT_CANON=echo prove_env "the temp root is compared as it is spelled, not resolved" t_suite_python
 RESOLVER_PYTHONS=python3 prove_env "realpath_of finds its python through the caller's PATH" t_suite_python
 RESOLVER_CODE='import os, sys; print(os.path.abspath(sys.argv[1]))' prove_env "realpath_of follows no symlink (abspath in place of realpath)" t_suite_python
 RESOLVER_FLAGS= prove_env "realpath_of runs its python without -I" t_suite_python
