@@ -31,7 +31,7 @@ die()  { printf '\033[31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 # file newer here is a pending install. Both matter, and only one is fixed by
 # re-running install.
 drift=0
-for d in bin rules skills hooks launchd; do
+for d in bin rules skills hooks launchd requirements; do
   [[ -d "$SRC/$d" ]] || continue
   # __pycache__/*.pyc are python runtime artifacts, not tooling: python drops
   # them next to any module it imports, including .agents/bin. A .pyc embeds the
@@ -79,7 +79,7 @@ fi
 
 # ── install ───────────────────────────────────────────────────────────────────
 mkdir -p "$DEST" "$SKILLS"
-for d in bin rules skills hooks launchd; do
+for d in bin rules skills hooks launchd requirements; do
   [[ -d "$SRC/$d" ]] || continue
   mkdir -p "$DEST/$d"
   # Same exclusion as the drift check above: python artifacts are never shipped.

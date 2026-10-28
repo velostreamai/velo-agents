@@ -1,0 +1,37 @@
+#!/bin/bash
+# velo-task - detached-work coordination on a pinned, hash-locked Vanth (docs/velo-task-spec.md).
+#
+# M1 (foundation) implements only the install and daemon lifecycle:
+#   velo-task install-vanth    build the pinned venv from requirements/vanth.lock (R11, R12)
+#   velo-task ensure-daemon    adopt the daemon velo-task launched, or launch one (R6, R11, R18)
+#   velo-task restart-daemon   SIGTERM the validated daemon pid, then a clean launch (R7, R18)
+#   velo-task doctor           read-only report on install, allowlist, modes, provenance, schema
+# Every other subcommand exits 2 ("not implemented in M1").
+#
+# Layout (VELO_TASK_HOME defaults to ${VELO_STATE:-~/.agents/state}/velo-task; tests override it):
+#   venv/               pinned Vanth install      vanth/              VANTH_HOME = AGENT_BG_HOME
+#   vanth.env.allow     secret NAMES the daemon may inherit (one per line)
+#   daemon.provenance   pid, start time, launch digest, incarnation of the daemon WE launched
+#   daemon.intent       the same, written the moment a launch has a pid, retired once the daemon is proved ready
+#   lock/daemon         per-home lock (install, ensure, restart)   daemon.launch.log   vanthd stdout/stderr
+# VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT,
+# VELO_TASK_STOP_WAIT, VELO_TASK_LOCK_WAIT (seconds), VELO_TASK_POLL (poll interval). Exit codes: 0 ok,
+# 1 error, 2 usage, 6 daemon refused/down/misconfigured. The functions live in velo-task-lib.sh, which
+# this file sources; nothing in the library is a subcommand.
+set -euo pipefail
+
+SELF_SRC="${BASH_SOURCE[0]}"
+SELF_DIR="${SELF_SRC%/*}"; [ "$SELF_DIR" != "$SELF_SRC" ] || SELF_DIR=.
+SELF="$(cd "$SELF_DIR" && pwd)/${SELF_SRC##*/}"
+. "${SELF%/*}/velo-task-lib.sh"
+
+usage() { /usr/bin/sed -n '2,/^set -euo/p' "$SELF" | /usr/bin/sed '$d; s/^# \{0,1\}//'; }
+sub="${1:-}"; [ "$#" -eq 0 ] || shift
+case "$sub" in
+  install-vanth|ensure-daemon|restart-daemon|doctor)
+    [ "$#" -eq 0 ] || die 2 "$sub takes no arguments"
+    "cmd_${sub//-/_}" ;;
+  -h|--help|help|'') usage ;;
+  _*) die 2 "unknown subcommand '$sub'" ;;
+  *) die 2 "'$sub' is not implemented in M1 (available: install-vanth, ensure-daemon, restart-daemon, doctor)" ;;
+esac

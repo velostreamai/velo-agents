@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""velo-task-state: the durable-state helper behind velo-task (stdlib only, Python >= 3.9).
+
+Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper for them.
+
+  lock [--timeout S] [--child-fd N] <path> -- cmd...   run cmd holding an exclusive flock on <path>; the directory and the file are opened without following symlinks and must be yours; --child-fd hands cmd descriptor N on the same file (it holds no lock)
+  lock-held --fd N <path>                  exit 0 when descriptor N is the file <path> still names and some process holds the flock on it, else 1 saying why
+  publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dest's dir, unlink srcfile, fsync its dir
+  write-record <dest> <pid> <lstart> <digest> <incarnation>   a daemon.intent / daemon.provenance record: O_EXCL temp, then publish
+  rec-read <path>                          print a record, not following symlinks: exit 1 when absent, 9 (problem on stdout) when unsafe
+  check-state [--owner-only] <home>        exit 9 and print the first state path that is a symlink, the wrong type or not yours, or the home itself unless its mode is exactly 0700 (--owner-only, which doctor passes because it only reads: unless group and other have no access)
+  launch-exec <intent> <digest> <incarnation> <program> [name...]   publish the intent for THIS process, then exec <program> with only the named variables
+  retire <path>                            durably rename path to <path>.retired.<epoch> (never replaces)
+  append-index <file> <job_id>             append one line (O_APPEND) to a regular file of yours, never through a symlink; fsync file, fsync dir if created
+  fp <status> <exit_code> <stop_actor> <stop_reason> <end>   first 16 hex of SHA-256 of the row
+  sha256 [file]                            hex SHA-256 of a file, or of stdin
+  json-get <file|-> <key>                  top-level JSON value as text (string raw, true/false, number); empty when absent
+  modes-check <home> [file...]             exit 8 and print the first path that group or other can access
+  redact                                   stdin -> stdout with secrets replaced by ***
+  jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
+  failpoint <name>                         test-only crash/barrier point (see below)
+  test-capability                          exit 0 when the test capability holds (see below), else 2
+
+Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists, 4 jobs-ro: database
+locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 8 modes-check: loose mode found, 9 unsafe state
+(a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire, append-index; for check-state
+also a home whose mode is not 0700), 75 lock or failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not
+held or unsafe. Any other code from `lock` is the command's own.
+
+Test seams (spec R21): VELO_TASK_FAILPOINT=<name>[@<dest-name>][:exit|:wait=<barrier-file>], VELO_TASK_FSYNC_TRACE=<file>
+and, for velo-task itself, VELO_TASK_UV are honoured only when VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is
+set and the nearest .velo-task-test-root above VELO_TASK_HOME holds that nonce; otherwise any set value is
+refused (exit 2) on every invocation. `wait` creates <barrier-file>.reached, then polls for <barrier-file>.
+publish.linked@<dest-name> fires only for the publish whose destination file is named <dest-name>.
+The trace file gets one line per durable step: fsync file|dir <path>, link <src> <dest>, unlink <path>,
+rename <src> <dest>.
+"""
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+from urllib.parse import quote
+
+# A failpoint name is registered when its call site exists; a typo must not pass silently.
+FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready",
+              "restart.validated", "install.lock.held"}
+TEST_MARKER = ".velo-task-test-root"
+# Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
+# exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly
+# STATE_ROOT_MODE: in a home that others can reach, anything could be planted between a check and an open. A path that does not
+# exist yet is fine.
+STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "dir"), ("venv/.velo-task-installed", "file"),
+               ("vanth", "dir"), ("vanth/daemon.json", "file"), ("vanth.env.allow", "file"), ("daemon.intent", "file"),
+               ("daemon.provenance", "file"), ("daemon.launch.log", "file"))
+STATE_ROOT_MODE = 0o700
+LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
+RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
+# sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API;
+# the module only exports them as names from Python 3.11, and this helper must run on the system 3.9 as well.
+SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION = 20, 21, 31
+# Columns the spec reads from Vanth's database (R1, R8); install-vanth and every read check them.
+SCHEMA = {
+    "jobs": ("job_id", "name", "status", "exit_code", "stop_actor", "stop_reason",
+             "trigger_json", "created_at", "ended_at", "policy_state_json"),
+    "local_start_requests": ("idempotency_key", "job_id"),
+}
+SECRET_NAME = re.compile(r"token|secret|key|password|credential|auth", re.I)
+AUTH_HEADER = re.compile(r"(authorization[\"']?\s*:)[^\r\n]*", re.I)
+SECRET_SHAPES = [re.compile(p) for p in (
+    r"ghp_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}",
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{6,}", r"AKIA[0-9A-Z]{8,}")]
+JOB_ID = re.compile(r"[A-Za-z0-9_-]+")  # used with fullmatch: `$` would also accept a trailing newline
+
+
+def die(code, msg):
+    sys.stderr.write("velo-task-state: %s\n" % msg)
+    sys.exit(code)
+
+
+def usage(msg):
+    die(2, msg + "\n" + __doc__.split("\n\n")[2])
+
+
+def node_problem(path, info, kind):
+    """Why a state node (info is its lstat or fstat) is not safe to use, or None. A symlink is never accepted, the node must
+    be the kind the caller expects ("dir" or "file", a regular file), and it must belong to the current user."""
+    if stat.S_ISLNK(info.st_mode):
+        return "%s is a symlink" % path
+    if kind == "dir" and not stat.S_ISDIR(info.st_mode):
+        return "%s is not a directory" % path
+    if kind == "file" and not stat.S_ISREG(info.st_mode):
+        return "%s is not a regular file" % path
+    if info.st_uid != os.getuid():
+        return "%s is owned by uid %d, not by you (uid %d)" % (path, info.st_uid, os.getuid())
+    return None
+
+
+def open_dir_nofollow(path):
+    """A descriptor for the directory at path, opened without following a symlink at its last component, after checking it
+    is a directory of the current user. Everything below it is then opened relative to this descriptor."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        die(9, "%s cannot be opened as a real directory: %s" % (path, "it is a symlink" if os.path.islink(path) else exc.strerror))
+    problem = node_problem(path, os.fstat(fd), "dir")
+    if problem:
+        die(9, problem)
+    return fd
+
+
+def process_lstart(pid):
+    """ps's start time for pid, rendered LC_ALL=C TZ=UTC with whitespace squeezed: what the records store and the lib compares."""
+    out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], env=LSTART_ENV, capture_output=True, text=True, check=False)
+    text = " ".join(out.stdout.split())
+    if not text:
+        die(1, "cannot read the start time of pid %d (ps exit %d)" % (pid, out.returncode))
+    return text
+
+
+def test_capability_problem():
+    """None when the test capability (R21) holds, else why not. The capability is a directory that contains
+    VELO_TASK_HOME and holds TEST_MARKER with VELO_TASK_TEST_ROOT_NONCE as its content: a test creates both, so
+    nothing the environment alone controls (TMPDIR, the working directory, a broad temp root) can grant it."""
+    if os.environ.get("VELO_TASK_TEST") != "1":
+        return "VELO_TASK_TEST is not 1"
+    nonce = os.environ.get("VELO_TASK_TEST_ROOT_NONCE", "")
+    if not nonce:
+        return "VELO_TASK_TEST_ROOT_NONCE is not set"
+    home = os.environ.get("VELO_TASK_HOME", "")
+    if not home:
+        return "VELO_TASK_HOME is not set"
+    here = os.path.realpath(home)
+    while True:
+        marker = os.path.join(here, TEST_MARKER)
+        if os.path.isfile(marker):
+            with open(marker, encoding="utf-8") as fh:
+                held = fh.read().strip()
+            return None if held == nonce else "%s does not hold VELO_TASK_TEST_ROOT_NONCE" % marker
+        parent = os.path.dirname(here)
+        if parent == here:
+            return "no %s above VELO_TASK_HOME (%s)" % (TEST_MARKER, home)
+        here = parent
+
+
+def require_test_capability(name):
+    problem = test_capability_problem()
+    if problem:
+        die(2, "%s is set but refused: it is honoured only for tests (%s)" % (name, problem))
+
+
+_TRACE_PATH = None
+
+
+def load_trace():
+    global _TRACE_PATH
+    path = os.environ.get("VELO_TASK_FSYNC_TRACE", "")
+    if path:
+        require_test_capability("VELO_TASK_FSYNC_TRACE")
+        _TRACE_PATH = os.path.abspath(path)
+
+
+def trace(*fields):
+    """Append one line per durable step to VELO_TASK_FSYNC_TRACE (test capability only), so a test can assert the order."""
+    if _TRACE_PATH is None:
+        return
+    fd = os.open(_TRACE_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (" ".join(fields) + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def failpoint_spec():
+    """(name, action, barrier, dest-name) of the armed failpoint, or None. Only publish.linked takes a dest-name
+    (publish.linked@daemon.provenance fires for that publish alone, not for the intent's that precedes it)."""
+    raw = os.environ.get("VELO_TASK_FAILPOINT", "")
+    if not raw:
+        return None
+    require_test_capability("VELO_TASK_FAILPOINT")
+    point, _, action = raw.partition(":")
+    name, _, target = point.partition("@")
+    if name not in FAILPOINTS:
+        die(2, "unknown failpoint %r" % name)
+    if "@" in point and (name != "publish.linked" or not target):
+        die(2, "failpoint %r: only publish.linked takes a non-empty @<dest-name>" % point)
+    if action in ("", "exit"):
+        return name, "exit", None, target
+    if action.startswith("wait=") and len(action) > 5:
+        return name, "wait", action[5:], target
+    die(2, "unknown failpoint action %r" % action)
+
+
+def failpoint(name, dest=None):
+    spec = failpoint_spec()
+    if not spec or spec[0] != name or (spec[3] and spec[3] != os.path.basename(dest or "")):
+        return
+    if spec[1] == "exit":
+        sys.stderr.write("velo-task-state: failpoint %s: exit\n" % name)
+        sys.stderr.flush()
+        os._exit(137)
+    open(spec[2] + ".reached", "w").close()
+    deadline = time.monotonic() + float(os.environ.get("VELO_TASK_FAILPOINT_WAIT_MAX", "60"))
+    while not os.path.exists(spec[2]):
+        if time.monotonic() > deadline:
+            die(75, "failpoint %s: barrier %s never appeared" % (name, spec[2]))
+        time.sleep(0.02)
+
+
+def _sync_fd(fd, kind, path):
+    """fsync an open descriptor (kind is "file" or "dir", path names it) and record it in the trace. The trace line and the
+    sync are one call, so a change that drops the sync drops the line, and a test on the trace sees it."""
+    trace("fsync", kind, path)
+    # macOS fsync does not flush the drive cache; F_FULLFSYNC does.
+    if hasattr(fcntl, "F_FULLFSYNC"):
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    else:
+        os.fsync(fd)
+
+
+def _sync_path(path, kind):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        _sync_fd(fd, kind, path)
+    finally:
+        os.close(fd)
+
+
+def cmd_lock(args):
+    timeout, child_fd = None, None
+    while args[:1] in (["--timeout"], ["--child-fd"]):
+        if len(args) < 2:
+            usage("lock: %s needs a value" % args[0])
+        if args[0] == "--timeout":
+            timeout = float(args[1])
+        else:
+            child_fd = int(args[1])
+        args = args[2:]
+    if len(args) < 3 or args[1] != "--":
+        usage("lock: expected <path> -- cmd...")
+    path, cmd = os.path.abspath(args[0]), args[2:]
+    parent, name = os.path.split(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    # The directory and the file are opened through descriptors and never by a path that could have been swapped for a symlink.
+    dirfd = open_dir_nofollow(parent)
+    try:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)  # non-inheritable: the command never holds the lock
+    except OSError as exc:
+        die(9, "lock file %s cannot be opened: %s" % (path, "it is a symlink" if os.path.islink(path) else exc.strerror))
+    problem = node_problem(path, os.fstat(fd), "file")
+    if problem:
+        die(9, problem)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise
+            if deadline is not None and time.monotonic() >= deadline:
+                die(75, "lock %s: not acquired within %ss" % (path, timeout))
+            time.sleep(0.02)
+    locked = os.fstat(fd)
+    named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino):
+        die(9, "%s was replaced while the lock was being taken; the lock is not on the file the name now has" % path)
+    pass_fds = ()
+    if child_fd is not None:
+        # The command's view of the lock: another open file description of the very file locked, holding no flock of its own, so
+        # it can ask lock-held whether the lock is still held and still on this name, and can never keep the lock alive.
+        view = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+        seen = os.fstat(view)
+        if (seen.st_dev, seen.st_ino) != (locked.st_dev, locked.st_ino):
+            die(9, "%s was replaced while the lock was being taken" % path)
+        if fd == child_fd:  # the lock itself must never sit on the number the command is given
+            fd = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, child_fd + 1)
+            os.close(child_fd)
+        if view != child_fd:
+            os.dup2(view, child_fd, inheritable=True)
+            os.close(view)
+        pass_fds = (child_fd,)
+    try:
+        proc = subprocess.Popen(cmd, pass_fds=pass_fds)
+    except OSError as exc:
+        die(127, "lock: cannot run %s: %s" % (cmd[0], exc.strerror))
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda s, _frame: proc.send_signal(s))
+    rc = proc.wait()
+    return rc if rc >= 0 else 128 - rc
+
+
+def cmd_lock_held(args):
+    """The question a locked body asks (lock --child-fd handed it descriptor N): is that descriptor still the file <path> names,
+    and does some other open file description hold the flock on it? The path is only looked at (lstat), never opened."""
+    if len(args) != 3 or args[0] != "--fd":
+        usage("lock-held: expected --fd N <path>")
+    fd, path = int(args[1]), os.path.abspath(args[2])
+
+    def not_held(why):
+        sys.stderr.write("velo-task-state: lock-held: %s\n" % why)
+        return 1
+    try:
+        mine = os.fstat(fd)
+    except OSError:
+        return not_held("descriptor %d is not open: this process was not started by `lock --child-fd %d`" % (fd, fd))
+    problem = node_problem("descriptor %d" % fd, mine, "file")
+    if problem:
+        return not_held(problem)
+    try:
+        named = os.lstat(path)  # never creates the lock file
+    except FileNotFoundError:
+        return not_held("%s does not exist" % path)
+    if stat.S_ISLNK(named.st_mode):
+        return not_held("%s is a symlink: it is no longer the file the lock was taken on" % path)
+    if (named.st_dev, named.st_ino) != (mine.st_dev, mine.st_ino):
+        return not_held("%s is no longer the file the lock was taken on" % path)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return 0
+        raise
+    fcntl.flock(fd, fcntl.LOCK_UN)  # the probe took it, so nobody held it: give it back
+    return not_held("nobody holds the lock on %s" % path)
+
+
+def publish_file(src, dest):
+    """The one durable no-clobber publish (R17), used by `publish` and so by every provenance and intent writer.
+    Order: fsync the temp, link it to dest (never replacing), fsync dest's directory so the new name is durable,
+    unlink the temp, fsync the temp's directory. A crash between link and unlink leaves both names, never neither.
+    Returns False, with the temp removed, when dest already exists. The temp must be a regular file of the current user and
+    is linked as itself: a symlink is never followed, on the way in or onto an existing dest."""
+    src, dest = os.path.abspath(src), os.path.abspath(dest)
+    problem = node_problem(src, os.lstat(src), "file")
+    if problem:
+        die(9, "publish: %s" % problem)
+    _sync_path(src, "file")
+    trace("link", src, dest)
+    try:
+        os.link(src, dest, follow_symlinks=False)
+    except FileExistsError:
+        trace("unlink", src)
+        os.unlink(src)
+        _sync_path(os.path.dirname(src), "dir")
+        return False
+    failpoint("publish.linked", dest)
+    _sync_path(os.path.dirname(dest), "dir")
+    trace("unlink", src)
+    os.unlink(src)
+    _sync_path(os.path.dirname(src), "dir")
+    return True
+
+
+def cmd_publish(args):
+    if len(args) != 2:
+        usage("publish: expected <dest> <srcfile>")
+    dest, src = args
+    if not publish_file(src, dest):
+        die(3, "publish: %s already exists (temp removed)" % dest)
+    return 0
+
+
+def cmd_retire(args):
+    """Move a record out of the way for good: rename to <path>.retired.<epoch> (a numeric suffix if that name is taken),
+    then fsync the directory so the retirement survives a crash."""
+    if len(args) != 1:
+        usage("retire: expected <path>")
+    path = os.path.abspath(args[0])
+    try:
+        problem = node_problem(path, os.lstat(path), "file")
+    except FileNotFoundError:
+        die(1, "retire: %s does not exist" % path)
+    if problem:
+        die(9, "retire: %s" % problem)
+    base = "%s.retired.%d" % (path, int(time.time()))
+    target, n = base, 0
+    while os.path.lexists(target):
+        n += 1
+        target = "%s.%d" % (base, n)
+    trace("rename", path, target)
+    os.rename(path, target)
+    _sync_path(os.path.dirname(path), "dir")
+    return 0
+
+
+def write_record(dest, pid, lstart, digest, incarnation):
+    """The one writer of daemon.intent and daemon.provenance. The temp is created O_EXCL and O_NOFOLLOW, so nothing already
+    there (or planted there) is ever written through; it is then published like every record (publish_file). Exit 3 when
+    dest exists: a record is retired before it is replaced, never overwritten."""
+    fields = {"pid": (pid, r"[0-9]+"), "lstart": (lstart, r"[^\n]+"), "digest": (digest, r"[0-9a-f]{64}"),
+              "incarnation": (incarnation, RECORD_UUID.pattern)}
+    for name, (value, pattern) in fields.items():
+        if not re.fullmatch(pattern, str(value)):
+            usage("write-record: %s %r is not a valid value" % (name, value))
+    dest = os.path.abspath(dest)
+    tmp = "%s.tmp.%d.%s" % (dest, os.getpid(), os.urandom(4).hex())
+    data = ("pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\n" % (pid, lstart, digest, incarnation)).encode()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.write(fd, data) != len(data):
+            die(1, "write-record: short write to %s" % tmp)
+    finally:
+        os.close(fd)
+    if not publish_file(tmp, dest):
+        die(3, "write-record: %s already exists (temp removed)" % dest)
+
+
+def cmd_write_record(args):
+    if len(args) != 5:
+        usage("write-record: expected <dest> <pid> <lstart> <digest> <incarnation>")
+    write_record(*args)
+    return 0
+
+
+def cmd_rec_read(args):
+    """Print a record. Exit 1 when it does not exist. Exit 9, with the reason on STDOUT, when it is a symlink, not a regular
+    file or not the current user's: the caller reads one stream and never mistakes an unsafe record for an absent one."""
+    if len(args) != 1:
+        usage("rec-read: expected <path>")
+    path = os.path.abspath(args[0])
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
+    except FileNotFoundError:
+        return 1
+    except OSError as exc:
+        print("%s is a symlink" % path if exc.errno == errno.ELOOP else "%s cannot be opened: %s" % (path, exc.strerror))
+        return 9
+    problem = node_problem(path, os.fstat(fd), "file")  # before fdopen, which would refuse a directory with an exception of its own
+    if problem:
+        os.close(fd)
+        print(problem)
+        return 9
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read()
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def cmd_check_state(args):
+    """Exit 9 and print the first path under <home> (STATE_PATHS) that exists as a symlink, as the wrong kind of node, or owned
+    by someone else, and the home itself unless its mode is exactly 0700. With --owner-only, which doctor passes because it only
+    reads, the home must instead give group and other no access (so a home nobody can write to is fine). Nothing is opened,
+    followed, created or changed: a lstat per path."""
+    owner_only = args[:1] == ["--owner-only"]
+    if owner_only:
+        args = args[1:]
+    if len(args) != 1:
+        usage("check-state: expected [--owner-only] <home>")
+    home = os.path.abspath(args[0])
+    for rel, kind in STATE_PATHS:
+        path = os.path.join(home, rel) if rel else home
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        problem = node_problem(path, info, kind)
+        if not problem and not rel:  # the home itself
+            mode = stat.S_IMODE(info.st_mode)
+            if owner_only and mode & 0o077:
+                problem = "%s has mode %o, group and other must have no access" % (path, mode)
+            elif not owner_only and mode != STATE_ROOT_MODE:
+                problem = "%s has mode %o, must be %o" % (path, mode, STATE_ROOT_MODE)
+        if problem:
+            print(problem)
+            return 9
+    return 0
+
+
+def cmd_launch_exec(args):
+    """The process that becomes vanthd. velo-task starts `launch-exec <intent> <digest> <incarnation> <vanthd> <names>`; it
+    publishes daemon.intent for its OWN pid and start time, durably and in the order of every record, and only then execs
+    vanthd, which keeps the pid and the start time. A hard kill before the exec leaves no daemon at all; a hard kill after it
+    leaves a daemon whose intent is already in place. vanthd gets exactly the named variables and nothing else this process
+    holds, the test seams among them."""
+    if len(args) < 4:
+        usage("launch-exec: expected <intent> <digest> <incarnation> <program> [name...]")
+    intent, digest, incarnation, program, names = args[0], args[1], args[2], args[3], args[4:]
+    missing = [n for n in names if n not in os.environ]
+    if missing:
+        die(1, "launch-exec: not set in the environment: %s" % " ".join(missing))
+    env = {n: os.environ[n] for n in names}
+    failpoint("launch.wrapper")
+    pid = os.getpid()
+    write_record(intent, pid, process_lstart(pid), digest, incarnation)
+    failpoint("launch.intent")
+    for sig in (signal.SIGPIPE, signal.SIGXFSZ):  # Python ignores these; vanthd gets the dispositions a plain exec would have given it
+        signal.signal(sig, signal.SIG_DFL)
+    os.execve(program, [program], env)
+
+
+def cmd_append_index(args):
+    if len(args) != 2:
+        usage("append-index: expected <file> <job_id>")
+    path, job_id = args
+    path = os.path.abspath(path)
+    if not JOB_ID.fullmatch(job_id):
+        die(2, "append-index: job_id must match ^[A-Za-z0-9_-]+$")
+    created = False
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:  # the index is a control file: opened without following a symlink, and only a regular file of yours is appended to
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
+        except OSError as exc:
+            die(9, "append-index: %s cannot be opened: %s" % (path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
+        problem = node_problem(path, os.fstat(fd), "file")
+        if problem:
+            os.close(fd)
+            die(9, "append-index: %s" % problem)
+    try:
+        line = (job_id + "\n").encode()
+        if os.write(fd, line) != len(line):  # one write(2) under O_APPEND: concurrent lines never tear
+            die(1, "append-index: short write to %s" % path)
+        _sync_fd(fd, "file", path)
+    finally:
+        os.close(fd)
+    if created:
+        _sync_path(os.path.dirname(path), "dir")
+    return 0
+
+
+def cmd_fp(args):
+    if len(args) != 5:
+        usage("fp: expected <status> <exit_code> <stop_actor> <stop_reason> <end>")
+    row = "|".join(args).encode("utf-8", "surrogateescape")
+    print(hashlib.sha256(row).hexdigest()[:16])
+    return 0
+
+
+def cmd_sha256(args):
+    if len(args) > 1:
+        usage("sha256: expected [file]")
+    data = open(args[0], "rb").read() if args else sys.stdin.buffer.read()
+    print(hashlib.sha256(data).hexdigest())
+    return 0
+
+
+def cmd_json_get(args):
+    """Print one top-level value of a JSON object, the way `jq -r` would: strings raw, booleans as true/false, numbers as
+    written, nested values as compact JSON, nothing for a missing or null key. A missing file has no value (the caller
+    decides whether that matters); a file or stdin that is not a JSON object is an error."""
+    if len(args) != 2:
+        usage("json-get: expected <file|-> <key>")
+    src, key = args
+    if src == "-":
+        raw = sys.stdin.buffer.read().decode("utf-8")
+    else:
+        try:
+            with open(src, encoding="utf-8") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            return 0
+    doc = json.loads(raw)
+    if not isinstance(doc, dict):
+        die(1, "json-get: %s does not hold a JSON object" % ("stdin" if src == "-" else src))
+    value = doc.get(key)
+    if value is None:
+        return 0
+    sys.stdout.reconfigure(encoding="utf-8")  # the text is the same whatever locale the caller runs under
+    if isinstance(value, bool):
+        print("true" if value else "false")
+    elif isinstance(value, str):
+        print(value)
+    elif isinstance(value, (int, float)):
+        print(json.dumps(value))
+    else:
+        print(json.dumps(value, separators=(",", ":")))
+    return 0
+
+
+def _mode_problem(path):
+    """Why path is not private (no group or other access), or None. Symlinks are refused: their own mode says nothing."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return "%s is a symlink; its mode cannot be checked" % path
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        return "%s has mode %o, must be %s" % (path, mode, "700" if stat.S_ISDIR(info.st_mode) else "600")
+    return None
+
+
+def _walk_modes(root):
+    """Every directory and file below root, not following symlinks; an unreadable directory is an error, not a pass."""
+    def fail(exc):
+        raise exc
+    for dirpath, dirnames, filenames in os.walk(root, onerror=fail):
+        yield dirpath
+        for name in dirnames + filenames:
+            yield os.path.join(dirpath, name)
+
+
+def cmd_modes_check(args):
+    """Vanth's state must be private (R11(c)): the home 0700; jobs.sqlite*, token, daemon.json and the launch log 0600;
+    logs/ and events/ with everything below them. Prints the first offender and exits 8; exits 0 when all is private."""
+    if not args:
+        usage("modes-check: expected <home> [file...]")
+    home, extras = os.path.abspath(args[0]), args[1:]
+    paths = [home]
+    if os.path.isdir(home):
+        paths += [os.path.join(home, n) for n in sorted(os.listdir(home))
+                  if n.startswith("jobs.sqlite") or n in ("token", "daemon.json")]
+        for sub in ("logs", "events"):
+            if os.path.isdir(os.path.join(home, sub)) and not os.path.islink(os.path.join(home, sub)):
+                paths += list(_walk_modes(os.path.join(home, sub)))
+            else:
+                paths.append(os.path.join(home, sub))
+    paths += [os.path.abspath(p) for p in extras]
+    for path in paths:
+        problem = _mode_problem(path)
+        if problem:
+            print(problem)
+            return 8
+    return 0
+
+
+def _allowlist_names():
+    if not os.environ.get("VELO_TASK_HOME"):
+        die(1, "redact: VELO_TASK_HOME is not set, so the allowlist cannot be located")
+    path = os.path.join(os.environ["VELO_TASK_HOME"], "vanth.env.allow")
+    if not os.path.lexists(path):
+        return set()
+    names = set()
+    for line in open(path, encoding="utf-8").read().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.add(line)
+    return names
+
+
+def cmd_redact(args):
+    if args:
+        usage("redact: takes no arguments")
+    text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+    allowed = _allowlist_names()
+    values = {v for k, v in os.environ.items() if v and (k in allowed or SECRET_NAME.search(k))}
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, "***")
+    text = AUTH_HEADER.sub(r"\1 ***", text)
+    for shape in SECRET_SHAPES:
+        text = shape.sub("***", text)
+    out = text.encode("utf-8", "surrogateescape")  # nothing is written before every step has succeeded
+    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def read_only_authorizer(action, arg1, arg2, db_name, source):
+    """Allow only what a plain SELECT needs and deny the rest: ATTACH and DETACH (which can create a file), DDL, DML,
+    PRAGMA (so none can be written), transactions, and load_extension."""
+    if action == SQLITE_FUNCTION and str(arg2).lower() == "load_extension":
+        return sqlite3.SQLITE_DENY
+    if action in (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION):
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def cmd_jobs_ro(args):
+    if len(args) != 2:
+        usage("jobs-ro: expected <db> <sql>")
+    db, sql = args
+    try:
+        # Three layers keep this read-only (R8): mode=ro opens the file read-only, query_only refuses writes on the
+        # connection (attached databases included), and the authorizer, installed after the pragmas this function itself
+        # needs, denies everything but SELECT. timeout=2.0 is the 2000 ms busy timeout.
+        con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db)), uri=True, timeout=2.0)
+        con.execute("PRAGMA query_only=ON")
+        missing = ["%s.%s" % (t, c) for t, cols in SCHEMA.items()
+                   for c in cols if c not in {r[1] for r in con.execute("PRAGMA table_info(%s)" % t)}]
+        if missing:
+            die(5, "jobs-ro: schema mismatch, missing: %s" % ", ".join(missing))
+        con.row_factory = sqlite3.Row
+        con.set_authorizer(read_only_authorizer)
+        rows = [dict(r) for r in con.execute(sql)]
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc):
+            die(4, "jobs-ro: %s (waited 2000 ms)" % exc)
+        die(1, "jobs-ro: %s" % exc)
+    except sqlite3.DatabaseError as exc:  # not authorized, malformed database
+        die(1, "jobs-ro: %s" % exc)
+    sys.stdout.write(json.dumps(rows, separators=(",", ":"), default=str) + "\n")
+    return 0
+
+
+def cmd_failpoint(args):
+    if len(args) != 1:
+        usage("failpoint: expected <name>")
+    if args[0] not in FAILPOINTS:
+        die(2, "unknown failpoint %r" % args[0])
+    failpoint(args[0])
+    return 0
+
+
+def cmd_test_capability(args):
+    if args:
+        usage("test-capability: takes no arguments")
+    problem = test_capability_problem()
+    if problem:
+        die(2, "the test capability is not granted: %s" % problem)
+    return 0
+
+
+COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish, "retire": cmd_retire,
+            "write-record": cmd_write_record, "rec-read": cmd_rec_read, "check-state": cmd_check_state,
+            "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
+            "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
+            "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
+
+
+def main(argv):
+    failpoint_spec()  # a stray VELO_TASK_FAILPOINT or VELO_TASK_FSYNC_TRACE is refused by every subcommand, not just the ones that use it
+    load_trace()
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__)
+        return 0
+    if argv[0] not in COMMANDS:
+        usage("unknown subcommand %r" % argv[0])
+    try:
+        return COMMANDS[argv[0]](argv[1:])
+    except Exception as exc:  # surfaced, never swallowed; the message never carries stdin
+        die(1, "%s: %s: %s" % (argv[0], type(exc).__name__, exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

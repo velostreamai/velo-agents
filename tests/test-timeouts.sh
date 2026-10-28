@@ -13,6 +13,10 @@
 #   5s          0      velo-gate-run / velo-gate-finish: delay between gh retries
 #   0.2s        0.1s   velo-pr-gate / velo-gate-run: poll for the pid a just-made gate lock has not written yet (x10)
 #   900s        5s     velo-spec-review: Codex timeout
+#   20s         10s    velo-task: a launched vanthd must answer
+#   20s         3s     velo-task restart-daemon: a SIGTERMed vanthd must exit
+#   60s         30s    velo-task: the per-home daemon lock
+#   0.2s        0.05s  velo-task: poll interval while a launched vanthd comes up or a SIGTERMed one exits
 #
 # A scenario that tests one of these waits sets its own value inline.
 #
@@ -26,3 +30,7 @@ export VELO_SECOND_OPINION_GRACE=1
 export VELO_GATE_RETRY_DELAY=0
 export VELO_GATE_LOCK_POLL=0.1
 export VELO_SPEC_TIMEOUT=5
+export VELO_TASK_START_WAIT=10
+export VELO_TASK_STOP_WAIT=3
+export VELO_TASK_LOCK_WAIT=30
+export VELO_TASK_POLL=0.05
