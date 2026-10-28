@@ -17,8 +17,9 @@
 # (VELO_TASK_TEST, the nonce, VELO_TASK_FAILPOINT, VELO_TASK_FSYNC_TRACE, VELO_TASK_UV) are forwarded only when the test
 # capability holds (R21), and a seam that is set without it is refused (exit 2), never ignored.
 #
-# State safety: the state root, lock/, lock/daemon, venv/, vanth/, both records and the launch log are checked before use
-# (check-state: not a symlink, the right kind of node, yours) and a locked body checks again once it holds the lock. Records are
+# State safety: the state root, lock/, lock/daemon, venv/, vanth/, vanth.env.allow, both records and the launch log are checked
+# before use (check-state: not a symlink, the right kind of node, yours; and the root itself exactly mode 0700, or for doctor,
+# which only reads, free of group and other access) and a locked body checks again once it holds the lock. Records are
 # read through rec-read and written through write-record (O_NOFOLLOW, O_EXCL). The lock is a descriptor (LOCK_FD) the body was
 # handed, checked against the path before every action that cannot be undone.
 #
@@ -497,7 +498,7 @@ cmd_doctor() {
   ok() { printf 'ok   %s\n' "$*"; }
   bad() { printf 'FAIL %s\n' "$*"; rc=1; }
   prep_env
-  if ! why=$(stl check-state "$VELO_TASK_HOME"); then bad "state: ${why:-the state check failed}; nothing else was read"; return "$rc"; fi
+  if ! why=$(stl check-state --owner-only "$VELO_TASK_HOME"); then bad "state: ${why:-the state check failed}; nothing else was read"; return "$rc"; fi
   if [ -f "$MARKER" ] && [ -x "$PY" ] && [ -x "$VANTHD" ] && [ -x "$VANTH" ]; then
     if [ "$(/bin/cat "$MARKER")" = "$(st sha256 "$LOCKFILE")" ]; then ok "install: $VENV matches the lock"
     else bad "install: $VENV was built from a different lock; run velo-task install-vanth, then restart-daemon"; fi

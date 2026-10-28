@@ -8,7 +8,7 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dest's dir, unlink srcfile, fsync its dir
   write-record <dest> <pid> <lstart> <digest> <incarnation>   a daemon.intent / daemon.provenance record: O_EXCL temp, then publish
   rec-read <path>                          print a record, not following symlinks: exit 1 when absent, 9 (problem on stdout) when unsafe
-  check-state <home>                       exit 9 and print the first state path that is a symlink, the wrong type or not yours
+  check-state [--owner-only] <home>        exit 9 and print the first state path that is a symlink, the wrong type or not yours, or the home itself unless its mode is exactly 0700 (--owner-only, which doctor passes because it only reads: unless group and other have no access)
   launch-exec <intent> <digest> <incarnation> <program> [name...]   publish the intent for THIS process, then exec <program> with only the named variables
   retire <path>                            durably rename path to <path>.retired.<epoch> (never replaces)
   append-index <file> <job_id>             append one line (O_APPEND) to a regular file of yours, never through a symlink; fsync file, fsync dir if created
@@ -23,9 +23,9 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
 
 Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists, 4 jobs-ro: database
 locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 8 modes-check: loose mode found, 9 unsafe state
-(a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire, append-index), 75 lock or
-failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from
-`lock` is the command's own.
+(a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire, append-index; for check-state
+also a home whose mode is not 0700), 75 lock or failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not
+held or unsafe. Any other code from `lock` is the command's own.
 
 Test seams (spec R21): VELO_TASK_FAILPOINT=<name>[@<dest-name>][:exit|:wait=<barrier-file>], VELO_TASK_FSYNC_TRACE=<file>
 and, for velo-task itself, VELO_TASK_UV are honoured only when VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is
@@ -54,10 +54,13 @@ FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wr
               "restart.validated", "install.lock.held"}
 TEST_MARKER = ".velo-task-test-root"
 # Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
-# exists as a symlink, as the wrong kind of node, or owned by another user; a path that does not exist yet is fine.
+# exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly
+# STATE_ROOT_MODE: in a home that others can reach, anything could be planted between a check and an open. A path that does not
+# exist yet is fine.
 STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "dir"), ("venv/.velo-task-installed", "file"),
-               ("vanth", "dir"), ("vanth/daemon.json", "file"), ("daemon.intent", "file"), ("daemon.provenance", "file"),
-               ("daemon.launch.log", "file"))
+               ("vanth", "dir"), ("vanth/daemon.json", "file"), ("vanth.env.allow", "file"), ("daemon.intent", "file"),
+               ("daemon.provenance", "file"), ("daemon.launch.log", "file"))
+STATE_ROOT_MODE = 0o700
 LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
 RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 # sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API;
@@ -444,9 +447,14 @@ def cmd_rec_read(args):
 
 def cmd_check_state(args):
     """Exit 9 and print the first path under <home> (STATE_PATHS) that exists as a symlink, as the wrong kind of node, or owned
-    by someone else. Nothing is opened, followed, created or changed: a lstat per path."""
+    by someone else, and the home itself unless its mode is exactly 0700. With --owner-only, which doctor passes because it only
+    reads, the home must instead give group and other no access (so a home nobody can write to is fine). Nothing is opened,
+    followed, created or changed: a lstat per path."""
+    owner_only = args[:1] == ["--owner-only"]
+    if owner_only:
+        args = args[1:]
     if len(args) != 1:
-        usage("check-state: expected <home>")
+        usage("check-state: expected [--owner-only] <home>")
     home = os.path.abspath(args[0])
     for rel, kind in STATE_PATHS:
         path = os.path.join(home, rel) if rel else home
@@ -455,6 +463,12 @@ def cmd_check_state(args):
         except FileNotFoundError:
             continue
         problem = node_problem(path, info, kind)
+        if not problem and not rel:  # the home itself
+            mode = stat.S_IMODE(info.st_mode)
+            if owner_only and mode & 0o077:
+                problem = "%s has mode %o, group and other must have no access" % (path, mode)
+            elif not owner_only and mode != STATE_ROOT_MODE:
+                problem = "%s has mode %o, must be %o" % (path, mode, STATE_ROOT_MODE)
         if problem:
             print(problem)
             return 9

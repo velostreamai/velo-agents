@@ -45,10 +45,24 @@ printf '%s\n' "$NONCE" > "$T/.velo-task-test-root"; export VELO_TASK_TEST_ROOT_N
 # read from the caller's environment; the suite's own mutation proofs of this choice (t_suite_python) set PYTHON_CANDIDATES and
 # PYTHON_UNCHECKED for one proof at a time.
 PYTHON_CANDIDATES="/opt/homebrew/bin/python3 /usr/bin/python3"; unset PYTHON_UNCHECKED
+# realpath_of resolves a candidate. BSD readlink -f is missing on older macOS, so the resolution is os.path.realpath in a python of its
+# own. That python is not a candidate (a candidate must not run before it has been checked) but the first of a fixed pair of absolute
+# paths, never found through PATH, and it runs isolated (-I: no PYTHON* variable, no user site, nothing from the current directory).
+# Like PYTHON_CANDIDATES, the RESOLVER_ values are fixed here, not read from the caller's environment; the mutation proofs of the helper
+# (t_suite_python) set one of them for one proof at a time.
+RESOLVER_PYTHONS="/opt/homebrew/bin/python3 /usr/bin/python3"; RESOLVER_FLAGS="-I"; RESOLVER_CODE='import os, sys; print(os.path.realpath(sys.argv[1]))'
+realpath_of() {  # <path>: its canonical absolute path, every symlink followed
+  local r py
+  for r in $RESOLVER_PYTHONS; do
+    py=$(command -v "$r") || continue   # command -v fails for a resolver that is not an executable file
+    "$py" $RESOLVER_FLAGS -c "$RESOLVER_CODE" "$1"; return
+  done
+  echo "realpath_of: none of the resolver pythons is an executable file (looked for: $RESOLVER_PYTHONS)" >&2; return 1
+}
 pick_python() {  # prints the first candidate that is executable and resolves outside the temp root
   local p real
   for p in $PYTHON_CANDIDATES; do
-    real=$(command -v "$p") && real=$(/usr/bin/readlink -f "$real") || continue   # command -v fails for a candidate that is not an executable file
+    real=$(command -v "$p") && real=$(realpath_of "$real") || continue   # command -v fails for a candidate that is not an executable file
     if [ -z "${PYTHON_UNCHECKED:-}" ]; then
       case "$real/" in "$T"/*|"$TMP_ROOT"/*) echo "pick_python: $p resolves to $real, inside the temp root $TMP_ROOT" >&2; continue ;; esac
     fi
@@ -393,10 +407,10 @@ t_lock_held() {  # what a locked body asks before it acts: is descriptor 9, the 
 opened_by() {  # <pid> <name suffix>: the process has a file open whose name ends in the suffix
   /usr/sbin/lsof -nP -a -p "$1" -Fn 2>/dev/null | grep -q "^n.*$2\$"
 }
-t_check_state() {  # R17/R18: everything velo-task opens by name under the state root is lstat-ed first; a symlink, the wrong kind of node or someone else's is refused (exit 9)
-  local d h n=0 rel kind ext; d=$(mktemp -d "$T/cs.XXXXXX"); ext="$d/ext"; mkdir -m 700 "$ext"; printf 'SENTINEL\n' > "$ext/target"
+t_check_state() {  # R17/R18: everything velo-task opens by name under the state root is lstat-ed first; a symlink, the wrong kind of node or someone else's is refused (exit 9), and so is a state root whose mode is not exactly 0700 (--owner-only, which doctor passes because it only reads: group and other must have no access)
+  local d h n=0 rel kind ext mode; d=$(mktemp -d "$T/cs.XXXXXX"); ext="$d/ext"; mkdir -m 700 "$ext"; printf 'SENTINEL\n' > "$ext/target"
   run ST check-state "$d/absent"; need "a state root that does not exist yet passes (exit 0)" [ "$RC" = 0 ]; need "...printing nothing" [ -z "$OUT" ]
-  for rel in "" lock lock/daemon venv venv/.velo-task-installed vanth vanth/daemon.json daemon.intent daemon.provenance daemon.launch.log; do
+  for rel in "" lock lock/daemon venv venv/.velo-task-installed vanth vanth/daemon.json vanth.env.allow daemon.intent daemon.provenance daemon.launch.log; do
     case "$rel" in ""|lock|venv|vanth) kind=dir ;; *) kind=file ;; esac
     n=$((n + 1)); h="$d/h$n"; mkdir -m 700 "$h"; [ -z "$rel" ] || mkdir -p "$(dirname "$h/$rel")"
     if [ -z "$rel" ]; then  # the root itself is the node: a link, a dangling link, a plain file
@@ -417,9 +431,27 @@ t_check_state() {  # R17/R18: everything velo-task opens by name under the state
     rm -rf "${h:?}/$rel"; if [ "$kind" = dir ]; then mkdir -m 700 "$h/$rel"; else : > "$h/$rel"; fi
     run ST check-state "$h"; need "[$rel] control: a $kind of the right kind passes (exit 0)" [ "$RC" = 0 ]
   done
+  h="$d/modes"; mkdir -m 700 "$h"   # the root's own mode: exactly 0700, or with --owner-only no access for group and other
+  run ST check-state "$h"; need "[the state root] mode 700 passes (exit 0)" [ "$RC" = 0 ]
+  run ST check-state --owner-only "$h"; need "[the state root] ...and passes --owner-only (exit 0)" [ "$RC" = 0 ]; need "...printing nothing" [ -z "$OUT" ]
+  for mode in 755 777 750 705 770; do
+    chmod "$mode" "$h"
+    run ST check-state "$h"; need "[the state root] mode $mode is refused (exit 9)" [ "$RC" = 9 ]
+    need "[the state root] ...naming it, its mode and the mode it must have" grep -qF "$h has mode $mode, must be 700" <<<"$OUT"
+    run ST check-state --owner-only "$h"; need "[the state root] --owner-only: mode $mode, which group or other can reach, is refused (exit 9)" [ "$RC" = 9 ]
+    need "[the state root] ...naming it and its mode" grep -qF "$h has mode $mode, group and other must have no access" <<<"$OUT"
+  done
+  chmod 500 "$h"
+  run ST check-state "$h"; need "[the state root] mode 500, which nobody can write to, is refused: only exactly 700 will do (exit 9)" [ "$RC" = 9 ]
+  run ST check-state --owner-only "$h"; need "[the state root] --owner-only: mode 500 passes, nobody but you can reach it (exit 0)" [ "$RC" = 0 ]; need "...printing nothing" [ -z "$OUT" ]
+  chmod 700 "$h"
+  run ST check-state --owner-only "$d/root-link1"; need "[the state root] --owner-only still refuses a symlink (exit 9)" [ "$RC" = 9 ]
+  run ST check-state --owner-only /private/etc; need "[the state root] --owner-only still refuses a directory that another user owns (exit 9)" [ "$RC" = 9 ]; need "...naming the owner" grep -q 'owned by uid' <<<"$OUT"
+  ln -s "$ext/target" "$h/daemon.intent"; run ST check-state --owner-only "$h"; need "[daemon.intent] --owner-only still refuses a symlink under the root (exit 9)" [ "$RC" = 9 ]
   run ST check-state /private/etc; need "a state root that another user owns is refused (exit 9)" [ "$RC" = 9 ]; need "...naming the owner" grep -q 'owned by uid' <<<"$OUT"
   need "nothing was followed or created through any of the links" [ "$(cat "$ext/target")" = SENTINEL ] && [ "$(ls "$ext")" = target ]
   run ST check-state; need "no argument: usage error (exit 2)" [ "$RC" = 2 ]
+  run ST check-state --owner-only; need "--owner-only without a home: usage error (exit 2)" [ "$RC" = 2 ]
 }
 t_records() {  # write-record and rec-read: a record is created and read without following a symlink, and is refused unless it is your regular file
   local d ext bad w; d=$(mktemp -d "$T/rr.XXXXXX"); ext="$d/ext"; mkdir -m 700 "$ext"; printf 'SENTINEL\n' > "$ext/target"
@@ -1429,9 +1461,9 @@ PY
   need "a venv whose python is a symlink is refused (exit 1)" [ "$RC" = 1 ]; need "...the file it points at is untouched" [ "$(cat "$ext/bin/python")" = SENTINEL ]
 }
 
-t_unsafe_state() {  # R17/R18: a state root, lock, record, venv, Vanth home or launch log that is a symlink is refused by every lifecycle command and by doctor; nothing it points at is touched
+t_unsafe_state() {  # R17/R18: a state root, lock, record, venv, Vanth home, allowlist or launch log that is a symlink is refused by every lifecycle command and by doctor; nothing it points at is touched
   local rel cmd ext; ext=$(mktemp -d "$T/ext.XXXXXX"); mkdir -m 700 "$ext/dir"; printf 'SENTINEL\n' > "$ext/file"
-  for rel in "" lock lock/daemon venv vanth daemon.intent daemon.provenance daemon.launch.log; do
+  for rel in "" lock lock/daemon venv vanth vanth.env.allow daemon.intent daemon.provenance daemon.launch.log; do
     mkhome; mkvenv; mkuv ok
     case "$rel" in
       "") mv "$E_HOME" "$E/real-home"; ln -s "$E/real-home" "$E_HOME" ;;
@@ -1449,6 +1481,27 @@ t_unsafe_state() {  # R17/R18: a state root, lock, record, venv, Vanth home or l
     need "[${rel:-state root}] nothing was launched" [ "$(launches)" = 0 ]; need "[${rel:-state root}] ...and no uv ran" [ ! -e "$E/uv.log" ]
     need "[${rel:-state root}] what the link points at is untouched" [ "$(cat "$ext/file")" = SENTINEL ] && [ -z "$(ls "$ext/dir")" ]
   done
+}
+t_loose_root() {  # a state root that is not exactly mode 0700 is refused by every lifecycle command before anything is read, launched or built, and by doctor when group or other can reach it; doctor, which only reads, still takes a root nobody can write to
+  local mode cmd
+  for mode in 755 777 750; do
+    mkhome; mkvenv; mkuv ok; chmod "$mode" "$E_HOME"
+    for cmd in ensure-daemon restart-daemon; do
+      run VT "$cmd"; need "[$mode] $cmd refuses the state root (exit 6)" [ "$RC" = 6 ]
+      need "[$mode] ...saying the state is unsafe, with the mode it has and the one it must have" grep -qF "unsafe state: $E_HOME has mode $mode, must be 700" <<<"$OUT"
+    done
+    installv; need "[$mode] install-vanth refuses it (exit 6)" [ "$RC" = 6 ]
+    need "[$mode] ...saying the state is unsafe, with the mode it has and the one it must have" grep -qF "unsafe state: $E_HOME has mode $mode, must be 700" <<<"$OUT"
+    run VT doctor; need "[$mode] doctor fails (exit 1)" [ "$RC" = 1 ]
+    need "[$mode] ...reporting the state, and reading nothing else" grep -qF "FAIL state: $E_HOME has mode $mode, group and other must have no access; nothing else was read" <<<"$OUT"
+    need "[$mode] nothing was launched" [ "$(launches)" = 0 ]; need "[$mode] ...and no uv ran" [ ! -e "$E/uv.log" ]
+    chmod 700 "$E_HOME"; run VT ensure-daemon; need "[$mode] control: the same root at 700 starts the daemon (exit 0)" [ "$RC" = 0 ]; need "[$mode] ...as one launch" [ "$(launches)" = 1 ]
+  done
+  mkhome; mkvenv; mkuv ok; chmod 500 "$E_HOME"   # a root nobody can write to: the lifecycle commands refuse it, doctor reads on
+  for cmd in ensure-daemon restart-daemon; do run VT "$cmd"; need "[500] $cmd refuses it: only exactly 700 will do (exit 6)" [ "$RC" = 6 ]; done
+  installv; need "[500] install-vanth refuses it (exit 6)" [ "$RC" = 6 ]
+  run VT doctor; need "[500] doctor takes it and reads on (the install is reported)" grep -q '^ok   install' <<<"$OUT"; need "[500] ...without calling the state unsafe" not grep -q 'FAIL state' <<<"$OUT"
+  need "[500] nothing was launched" [ "$(launches)" = 0 ]; chmod 700 "$E_HOME"
 }
 t_lock_swapped() {  # the body holds the lock as a descriptor and asks, right before each thing it cannot undo, whether the lock path still is that file
   local ext b w p; ext=$(mktemp -d "$T/ext.XXXXXX"); printf 'SENTINEL\n' > "$ext/file"
@@ -1477,7 +1530,7 @@ t_lock_swapped() {  # the body holds the lock as a descriptor and asks, right be
   need "...the venv and its marker are as they were" [ -x "$E_VENV/bin/vanthd" ] && [ "$(cat "$E_VENV/.velo-task-installed")" = stale ]
 }
 t_state_swapped() {  # state is checked again once the lock is held, and a record is never read through a link, however late the link is put there
-  local ext b w p hw mode cmd; ext=$(mktemp -d "$T/ext.XXXXXX")
+  local ext b w p hw mode cmd rel; ext=$(mktemp -d "$T/ext.XXXXXX")
   # (1) a command waits for the lock, and the venv becomes a symlink meanwhile: its body looks again once it holds the lock
   for cmd in ensure-daemon restart-daemon install-vanth; do
     mkhome; mkvenv; mkuv ok; mkdir -m 700 "$E_HOME/lock"; hold_lock "$E_HOME/lock/daemon" "$E/held-$cmd"
@@ -1488,6 +1541,20 @@ t_state_swapped() {  # state is checked again once the lock is held, and a recor
     need "[$cmd] that waited for the lock while the venv was swapped for a symlink refuses (exit 6)" [ "$(cat "$E/rc-$cmd")" = 6 ]
     need "[$cmd] ...saying the state is unsafe" grep -q 'unsafe state' "$E/o-$cmd"
     need "[$cmd] ...and launched nothing" [ "$(launches)" = 0 ]; need "[$cmd] ...nor ran uv" [ ! -e "$E/uv.log" ]
+  done
+  # (1b) the same wait, and the allowlist or the launch log becomes a symlink meanwhile: both are opened by name, so both are looked at again
+  for rel in vanth.env.allow daemon.launch.log; do
+    for cmd in ensure-daemon restart-daemon install-vanth; do
+      mkhome; mkvenv; mkuv ok; mkdir -m 700 "$E_HOME/lock"; hold_lock "$E_HOME/lock/daemon" "$E/held-$cmd"
+      if [ "$rel" = vanth.env.allow ]; then printf 'OPENROUTER_API_KEY\n' > "$E_HOME/$rel"; else ( umask 077; : > "$E_HOME/$rel" ); fi
+      ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VT "$cmd" > "$E/o-$cmd" 2>&1; echo $? > "$E/rc-$cmd" ) & w=$!
+      waitfor 10 has_proc "--child-fd 9 $E_HOME/lock/daemon" || { echo "FAILED: [$rel $cmd] it never started waiting for the lock"; exit 1; }
+      hw=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); waitfor 10 opened_by "$hw" "/lock/daemon" || { echo "FAILED: [$rel $cmd] it never opened the lock"; exit 1; }
+      mv "$E_HOME/$rel" "$E/real-$rel"; ln -s "$E/real-$rel" "$E_HOME/$rel"; release_lock "$E/held-$cmd"; wait "$w"
+      need "[$rel $cmd] that waited for the lock while it was swapped for a symlink to what it had been refuses (exit 6)" [ "$(cat "$E/rc-$cmd")" = 6 ]
+      need "[$rel $cmd] ...saying the state is unsafe, naming it" grep -qF "unsafe state: $E_HOME/$rel is a symlink" "$E/o-$cmd"
+      need "[$rel $cmd] ...and launched nothing" [ "$(launches)" = 0 ]; need "[$rel $cmd] ...nor ran uv" [ ! -e "$E/uv.log" ]
+    done
   done
   # (2) a daemon.provenance forged as a symlink to a valid record for the running daemon, put there after the state was checked
   for mode in symlink file; do
@@ -1583,7 +1650,7 @@ t_suite_python() {  # the suite's interpreter is an absolute path chosen once, n
   for n in python3 python python3.12 python3.13 python3.14; do ln "$sh/shim" "$sh/$n"; done
   case "$PYBIN" in /*) ;; *) echo "FAILED: the suite's python is not an absolute path: $PYBIN"; exit 1 ;; esac
   need "the suite's python is executable" [ -x "$PYBIN" ]
-  need "...and does not resolve into the temp tree the suite fills" not grep -q "^$TMP_ROOT/" <<<"$(/usr/bin/readlink -f "$PYBIN")"
+  need "...and does not resolve into the temp tree the suite fills" not grep -q "^$TMP_ROOT/" <<<"$(realpath_of "$PYBIN")"
   picked=$(PATH="$sh:$PATH" pick_python); need "with python shims first on PATH the choice is still the same interpreter" [ "$picked" = "$PYBIN" ]
   shimmed() { PATH="$sh:$PATH" "$@"; }
   need "the helper runs with the shims first on PATH" [ "$(printf abc | shimmed ST sha256)" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ]
@@ -1597,6 +1664,17 @@ t_suite_python() {  # the suite's interpreter is an absolute path chosen once, n
   picked=$(PYTHON_CANDIDATES="$T/not-there/python3 $sh/python3 /usr/bin/python3" pick_python 2>/dev/null)
   need "an absent candidate and a refused one are passed over for the next that is fine" [ "$picked" = /usr/bin/python3 ]
   : > "$sh/not-executable"; PYTHON_CANDIDATES="$sh/not-executable" run pick_python; need "a candidate that is not executable is refused" [ "$RC" != 0 ]
+  # realpath_of: every symlink followed, by an isolated python found by absolute path and never through PATH
+  local cdir hostile; cdir=$(cd -P "$sh" && pwd -P); hostile="$sh/hostile"
+  mkdir "$sh/real dir" "$hostile"; : > "$sh/real dir/target"; ln -s target "$sh/real dir/hop"; ln -s "real dir" "$sh/dir-link"
+  need "realpath_of follows a directory link and a relative file link to the file itself" [ "$(realpath_of "$sh/dir-link/hop")" = "$cdir/real dir/target" ]
+  need "...an absolute link too, and makes a path with .. in it canonical" [ "$(realpath_of "$sh/link")" = "$cdir/shim" ] && [ "$(realpath_of "$sh/real dir/../shim")" = "$cdir/shim" ]
+  need "...the same with python shims first on PATH" [ "$(PATH="$sh:$PATH" realpath_of "$sh/dir-link/hop")" = "$cdir/real dir/target" ]
+  printf 'open("%s/hostile-fired", "a").write("sitecustomize\\n")\n' "$sh" > "$hostile/sitecustomize.py"
+  PYTHONPATH="$hostile" "$PYBIN" -c pass; need "control: a python started with that PYTHONPATH runs its sitecustomize" [ -e "$sh/hostile-fired" ]; rm -f "$sh/hostile-fired"
+  PYTHONPATH="$hostile" realpath_of "$sh/link" >/dev/null; need "realpath_of is isolated: a hostile PYTHONPATH never fires" [ ! -e "$sh/hostile-fired" ]
+  RESOLVER_PYTHONS="$sh/not-there $sh/not-executable" run realpath_of "$sh/link"; need "with no executable resolver realpath_of fails loudly (exit 1)" [ "$RC" = 1 ]
+  need "...saying so" grep -q 'none of the resolver pythons' <<<"$OUT"
   need "no shim ran, whatever was asked" [ ! -e "$sh/sentinel" ]
 }
 # ---- lifecycle interleavings (findings 3, 19): the barrier holds one caller inside the lock, the other must wait ----
@@ -1978,7 +2056,7 @@ check "retire: durable rename to <name>.retired.<epoch>, never replaces" t_retir
 check "append-index: O_APPEND whole lines, 0600, id charset, fsync order, never through a symlink" t_append_index
 check "lock: exclusive, bounded wait, released by process death" t_lock
 check "lock-held: asks about the descriptor the body was handed, never opens, creates or steals the lock" t_lock_held
-check "check-state: a symlink, the wrong kind of node or another owner is refused at each of the ten state paths" t_check_state
+check "check-state: a symlink, the wrong kind of node or another owner is refused at each of the eleven state paths, and a root that is not exactly 0700 (--owner-only: no access for group and other)" t_check_state
 check "write-record, rec-read, retire, publish: no symlink is followed, a FIFO is never waited on, only your regular files" t_records
 check "lock: the directory and file are opened without following symlinks, owned by you, identity re-checked after the flock" t_lock_state
 check "launch-exec: publishes the intent for its own pid and start time, then execs with exactly the variables named" t_launch_exec
@@ -1992,12 +2070,13 @@ check "B14: bash 3.2, no bash-4 constructs, seeded declare -A fails both" t_b14
 check "other subcommands exit 2 (not implemented in M1)" t_unimplemented
 check "every _-prefixed name and every library function is rejected by the public parser" t_private_subcommands
 check "a locked body run without the lock refuses" t_lock_bypass
-check "a symlinked state root, lock, record, venv or Vanth home is refused by every command; nothing it points at is touched" t_unsafe_state
+check "a symlinked state root, lock, record, venv, Vanth home, allowlist or launch log is refused by every command; nothing it points at is touched" t_unsafe_state
+check "a state root that is not exactly 0700 is refused by ensure-daemon, restart-daemon and install-vanth, and by doctor when group or other can reach it" t_loose_root
 check "a lock or record swapped for a symlink after the lock is held is refused, and nothing is launched or signalled" t_lock_swapped
-check "state is checked again once the lock is held, and a record is never read through a link put there late" t_state_swapped
+check "state (venv, allowlist, launch log) is checked again once the lock is held, and a record is never read through a link put there late" t_state_swapped
 check "R11: a hostile PYTHONPATH, user site, BASH_ENV, ENV or wait value never runs anything of velo-task's" t_hostile_env
 check "R11: each process velo-task starts gets exactly the environment the design lists, names only" t_child_env
-check "the suite's python is an absolute path chosen once; a python3 shim on PATH is never executed" t_suite_python
+check "the suite's python is an absolute path chosen once and resolved by an isolated python of its own; a python3 shim on PATH is never executed" t_suite_python
 check "B33: allowlist table, one row per rule of R11, never echoes values" t_allowlist_rejects
 check "B33: whole allowlists, every bad line reported, restart-daemon applies the same rules" t_allowlist_lists
 check "B21: allowlisted key delivered, nothing else inherited, no secret at rest" t_secrets
@@ -2089,7 +2168,7 @@ prove "lock-held does not ask whether the descriptor is still the file the path 
 prove "lock-held follows a symlink at the lock path" t_lock_state $S '        named = os.lstat(path)  # never creates the lock file' '        named = os.stat(path)  # never creates the lock file'
 prove "lock-held accepts a descriptor that is not a regular file" t_lock_held $S '    problem = node_problem("descriptor %d" % fd, mine, "file")' '    problem = None'
 prove "lock-held says held when nobody holds the lock" t_lock_held $S '    return not_held("nobody holds the lock on %s" % path)' '    return 0'
-for rel in "" lock lock/daemon venv venv/.velo-task-installed vanth vanth/daemon.json daemon.intent daemon.provenance daemon.launch.log; do
+for rel in "" lock lock/daemon venv venv/.velo-task-installed vanth vanth/daemon.json vanth.env.allow daemon.intent daemon.provenance daemon.launch.log; do
   case "$rel" in ""|lock|venv|vanth) kind=dir ;; *) kind=file ;; esac
   prove "check-state does not look at ${rel:-the state root}" t_check_state $S "(\"$rel\", \"$kind\")" '("not-a-state-path", "file")'
 done
@@ -2100,6 +2179,18 @@ prove "a symlink is not called one" t_check_state $S $'    if stat.S_ISLNK(info.
 prove "a file is accepted where a directory is expected" t_check_state $S '    if kind == "dir" and not stat.S_ISDIR(info.st_mode):' '    if False:'
 prove "a directory is accepted where a regular file is expected" t_check_state $S '    if kind == "file" and not stat.S_ISREG(info.st_mode):' '    if False:'
 prove "check-state accepts a node another user owns" t_check_state $S '    if info.st_uid != os.getuid():' '    if False:'
+prove "check-state does not look at the mode of the state root" t_check_state $S '        if not problem and not rel:  # the home itself' '        if False:  # the home itself'
+prove "the strict rule is weakened to the owner-only one: a root nobody can write to is accepted" t_check_state $S \
+  '            elif not owner_only and mode != STATE_ROOT_MODE:' '            elif not owner_only and mode & 0o077:'
+prove "--owner-only lets through a state root that its group can reach" t_check_state $S '            if owner_only and mode & 0o077:' '            if owner_only and mode & 0o007:'
+prove "--owner-only skips the symlink, kind and owner checks" t_check_state $S '        problem = node_problem(path, info, kind)' '        problem = None if owner_only else node_problem(path, info, kind)'
+prove "a loose state root is accepted (the mode of the root is not checked)" t_loose_root $S '        if not problem and not rel:  # the home itself' '        if False:  # the home itself'
+prove "a state root nobody can write to is accepted by the lifecycle commands (strict rule weakened to the owner-only one)" t_loose_root $S \
+  '            elif not owner_only and mode != STATE_ROOT_MODE:' '            elif not owner_only and mode & 0o077:'
+prove "doctor accepts a state root that its group can reach (--owner-only ignores the group bits)" t_loose_root $S '            if owner_only and mode & 0o077:' '            if owner_only and mode & 0o007:'
+prove "check-state does not look at vanth.env.allow, so a swap is not caught under the lock" t_state_swapped $S '("vanth.env.allow", "file")' '("not-a-state-path", "file")'
+prove "check-state does not look at daemon.launch.log, so a swap is not caught under the lock" t_state_swapped $S '("daemon.launch.log", "file")' '("not-a-state-path", "file")'
+prove "check-state does not look at a symlinked vanth.env.allow" t_unsafe_state $S '("vanth.env.allow", "file")' '("not-a-state-path", "file")'
 prove "rec-read accepts a record another user owns" t_records $S '    if info.st_uid != os.getuid():' '    if False:'
 prove "lock accepts a directory another user owns" t_lock_state $S '    if info.st_uid != os.getuid():' '    if False:'
 prove "write-record accepts an lstart with a newline in it" t_records $S '"lstart": (lstart, r"[^\n]+")' '"lstart": (lstart, r"[\s\S]+")'
@@ -2208,7 +2299,10 @@ prove "assert_lock_held accepts a lock held on some other file" t_lock_bypass $L
 
 # ---- state safety and the environment: checked before use, checked again under the lock, nothing of the caller's reaches what is started ----
 prove "need_state checks nothing" t_unsafe_state $L '  why=$(stl check-state "$VELO_TASK_HOME") || rc=$?' '  :'
-prove "doctor reads the state without checking it" t_unsafe_state $L '  if ! why=$(stl check-state "$VELO_TASK_HOME"); then bad' '  if false; then bad'
+prove "need_state checks nothing, so a loose root is accepted" t_loose_root $L '  why=$(stl check-state "$VELO_TASK_HOME") || rc=$?' '  :'
+prove "doctor reads the state without checking it" t_unsafe_state $L '  if ! why=$(stl check-state --owner-only "$VELO_TASK_HOME"); then bad' '  if false; then bad'
+prove "doctor holds the state root to the strict rule, so a root nobody can write to is refused" t_doctor_readonly $L \
+  '  if ! why=$(stl check-state --owner-only "$VELO_TASK_HOME"); then bad' '  if ! why=$(stl check-state "$VELO_TASK_HOME"); then bad'
 prove "locked_ensure does not look at the state again once it holds the lock" t_state_swapped $L \
   $'  prep_env; assert_lock_held "${1:-}"; need_state\n  need_install; need_allowlist; need_modes\n  local pid' $'  prep_env; assert_lock_held "${1:-}"\n  need_install; need_allowlist; need_modes\n  local pid'
 prove "locked_restart does not look at the state again once it holds the lock" t_state_swapped $L \
@@ -2250,6 +2344,9 @@ prove "the locked body is not given the allowlisted names" t_child_env $L \
   '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL $ALLOW_NAMES; do' '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL; do'
 PYTHON_CANDIDATES=python3 prove_env "the suite finds its python through the caller's PATH" t_suite_python
 PYTHON_UNCHECKED=1 prove_env "the suite accepts a python that resolves into its own temp tree" t_suite_python
+RESOLVER_PYTHONS=python3 prove_env "realpath_of finds its python through the caller's PATH" t_suite_python
+RESOLVER_CODE='import os, sys; print(os.path.abspath(sys.argv[1]))' prove_env "realpath_of follows no symlink (abspath in place of realpath)" t_suite_python
+RESOLVER_FLAGS= prove_env "realpath_of runs its python without -I" t_suite_python
 
 # ---- the allowlist: one proof per rule, and for the shape of a name ----
 RULES="PATH HOME IFS ENV BASH_ENV SHELLOPTS PYTHON DYLD_ LD_ VANTH_ VELO_TASK_ AGENT_BG_ TMPDIR"
