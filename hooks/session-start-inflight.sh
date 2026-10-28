@@ -82,10 +82,9 @@ fi
 # layer up), the escalation just sits in attention.jsonl until something
 # asks. Ask here, sourcing the same library the daemon and velo-attention use
 # so "unhandled" means the same thing in all three places. Resolved relative
-# to THIS script's own directory, not an installed copy: hooks run from
-# $CLAUDE_PROJECT_DIR/.agents/hooks/ per .claude/settings.json, and are never
-# copied into ~/.agents by install.sh, so the sibling bin/ next to the
-# checked-out hook is the only copy guaranteed to exist here.
+# to THIS script's own directory: hooks run from ~/.agents/hooks/ (installed by
+# install.sh) per the Velostream .claude/settings.json, so the sibling bin/ next
+# to the hook is the installed tooling, and in a checkout it is that checkout's.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH_LIB="$HOOK_DIR/../bin/velo-orch-lib.sh"
 ATTENTION_LINES=""

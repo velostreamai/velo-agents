@@ -1,0 +1,8 @@
+bin/*.bak
+bin/*.bak[0-9]
+bin/*.BAK
+tasks/*.result.jsonl
+tests/.tmp/
+__pycache__/
+*.pyc
+.DS_Store

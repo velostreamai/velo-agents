@@ -11,7 +11,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH="$HERE/../bin/velo-llm-bench"
-REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
+# The pinned commit is a Velostream commit: read it from the Velostream checkout.
+REPO="${VELO_BENCH_REPO:-$HOME/RustroverProjects/velostream}"
+STUB=""
 FAIL=0
 check() { if [[ "$2" == "$3" ]]; then echo "  ok   $1"; else echo "  FAIL $1: got '$2', want '$3'"; FAIL=1; fi; }
 T=$(mktemp -d); trap 'kill $STUB 2>/dev/null; wait $STUB 2>/dev/null; rm -rf "$T"' EXIT
