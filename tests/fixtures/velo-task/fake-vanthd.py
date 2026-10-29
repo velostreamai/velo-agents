@@ -9,7 +9,8 @@ launch (pid, umask, home, port, retention), the NAMES of its environment, a hash
 descriptor 9 (the one velo-task's locked body holds on its lock) reached it, to @E@/calls, secures its home like Vanth, writes
 daemon.json once it is listening, and exits on SIGTERM.
 
-Switches (files under @E@): fail-launch (exit 1 at once), ignore-term (ignore SIGTERM), bind-all (listen on 0.0.0.0),
+Switches (files under @E@): fail-launch (exit 1 at once), echo-key (exit 1 at once, its message holding NAME=value for the variable
+the file names, as a careless daemon's might), ignore-term (ignore SIGTERM), bind-all (listen on 0.0.0.0),
 seed.sqlite (copied to jobs.sqlite), bind-fail-delay (seconds to linger after a failed bind, default 1), start-delay (seconds
 to stay alive, recorded but not yet listening and without a daemon.json, before binding: a daemon that is starting or hung),
 loose-file (leave logs/daemon.log group- and world-readable although the launch set umask 077: Vanth creating a file with its
@@ -37,6 +38,10 @@ if not HOME_DIR:
     sys.exit(1)
 if os.path.exists(E + "/fail-launch"):
     sys.stderr.write("fake vanthd: refusing to start\n")
+    sys.exit(1)
+if os.path.exists(E + "/echo-key"):
+    echoed = open(E + "/echo-key").read().strip()
+    sys.stderr.write("fake vanthd: refusing to start (%s=%s)\n" % (echoed, os.environ.get(echoed, "unset")))
     sys.exit(1)
 port = int(os.environ.get("VANTH_DAEMON_PORT", "0"))
 

@@ -26,6 +26,11 @@ die()  { printf '\033[31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
 [[ -d "$SRC/bin" ]] || die "run this from a checkout: $SRC/bin not found"
 
+# The files this checkout ships from directory $1, NUL separated: python artifacts (__pycache__, *.pyc) are not tooling,
+# see the drift check below (#2091). Every walk of $SRC goes through this one function, so none can forget the
+# exclusion (the hook exec check below once did).
+tooling_files() { find "$1" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0; }
+
 # ── drift check ───────────────────────────────────────────────────────────────
 # Compare BOTH ways round. A file newer in the live copy is unpushed work; a
 # file newer here is a pending install. Both matter, and only one is fixed by
@@ -69,7 +74,7 @@ for d in bin rules skills hooks launchd requirements; do
       drift=1
     fi
     # Python artifacts excluded — see the note on the copy below.
-  done < <(find "$SRC/$d" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0)
+  done < <(tooling_files "$SRC/$d")
 done
 
 # Hooks are registered as `[ -x HOOK ] || exit 0; exec HOOK` (fail open when missing), so an installed hook that is
@@ -80,7 +85,7 @@ if [[ -d "$SRC/hooks" ]]; then
     if [[ -e "$DEST/$rel" && ! -x "$DEST/$rel" ]]; then
       warn "installed but NOT executable, so its registration guard skips it silently: $rel"; drift=1
     fi
-  done < <(find "$SRC/hooks" -type f -print0)
+  done < <(tooling_files "$SRC/hooks")
 fi
 
 if [[ $CHECK -eq 1 ]]; then
@@ -98,7 +103,7 @@ for d in bin rules skills hooks launchd requirements; do
     rel="${f#"$SRC"/}"
     mkdir -p "$DEST/$(dirname "$rel")"
     cp -p "$f" "$DEST/$rel"
-  done < <(find "$SRC/$d" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0)
+  done < <(tooling_files "$SRC/$d")
   # An install over a pre-#2091 live copy still carries the .pyc it shipped —
   # remove those. Python recreates them at runtime; they are not drift.
   while IFS= read -r -d '' p; do rm -rf "$p"; done \
@@ -106,14 +111,23 @@ for d in bin rules skills hooks launchd requirements; do
   ok "$d -> $DEST/$d"
 done
 
-# Every script, not a hand-listed subset — a missed chmod fails at dispatch time.
-chmod +x "$DEST"/bin/* 2>/dev/null || true
-ok "chmod +x on $(find "$DEST/bin" -type f | wc -l | tr -d ' ') scripts"
+# chmod +x on exactly the files this checkout ships from $SRC/$1, never on a file only the live copy has: the exec bit is
+# what switches a registered hook on (see the drift check above), so a hook someone switched off by removing it, or a
+# file that is not a hook, stays as it is.
+chmod_shipped() {  # <dir> <what>
+  local f n=0
+  while IFS= read -r -d '' f; do
+    chmod +x "$DEST/${f#"$SRC"/}"
+    n=$((n + 1))
+  done < <(tooling_files "$SRC/$1")
+  ok "chmod +x on $n $2"
+}
 
-# Every hook too: the exec bit is what switches a registered hook on (see the drift check above).
-if [[ -d "$DEST/hooks" ]]; then
-  find "$DEST/hooks" -type f -exec chmod +x {} +
-  ok "chmod +x on $(find "$DEST/hooks" -type f | wc -l | tr -d ' ') hook scripts"
+# Every script, not a hand-listed subset — a missed chmod fails at dispatch time.
+chmod_shipped bin scripts
+# Every hook too.
+if [[ -d "$SRC/hooks" ]]; then
+  chmod_shipped hooks "hook scripts"
 fi
 
 # Expose the orchestrator-facing skills to Claude Code. Review skills
