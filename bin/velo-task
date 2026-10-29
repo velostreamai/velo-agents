@@ -8,7 +8,7 @@
 #   velo-task wait <id>... [--any|--all] [--timeout S]   one `<id> <verdict>` line per id; exit 0 iff ok, 3 on timeout, 2 unknown id
 #   velo-task cancel <id> | --job <job_id>   vanth stop, then the verdict (killed)
 #   velo-task stop-override --reason <text>   let the current session end once although jobs are in flight (audited)
-# <id> is the job's name in Vanth; the newest job of that exact name is meant. Exit codes: 0 ok, 1 error, 2 usage/unknown id, 3 timeout,
+# <id> is the job's name in Vanth; the newest job of that exact name is meant. Exit codes: 0 ok, 1 error, 2 usage/unknown id, 3 wait timeout, 4 cancel of a finished job,
 # 5 idempotency conflict, 6 daemon refused/down. The functions live in velo-task-lib.sh; nothing in the library is a subcommand.
 set -euo pipefail
 

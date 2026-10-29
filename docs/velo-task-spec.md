@@ -31,13 +31,13 @@ velo-task stop-override --reason <text>         let the session end once with jo
   closed set below. Anything unclassifiable is `lost`, never `ok`; a status that is not a JSON object (or nests deeper than json reads) is exit 6.
 - **R6** Stop guard (Claude Code Stop hook): reads `jobs.sqlite` read-only and BLOCKS while any `session:<me>` job is queued, launching,
   running, paused, retrying or stopping, printing `velo-task wait <id>` per job. Other sessions never block; a lost job is not a blocker.
-  Fails closed on an unreadable, locked (>2 s) or wrong-schema database and on a missing library while a Vanth home exists; no Vanth home
-  allows. `stop-override` lets exactly one Stop through (single regular file of yours, O_NOFOLLOW).
+  Fails closed (the query runs in a child and must end in a success marker) on a missing, unreadable, locked (>2 s) or wrong-schema database and on a missing or
+  broken library while a Vanth home exists; no Vanth home allows. A failed/orphaned job with a restart pending counts as in flight, as in `status`. `stop-override` lets exactly one Stop through (a private regular file of yours holding `<time> uid=<n> reason=<text>`, published by temp+fsync+rename; anything else is not an override).
 - **R7** SessionStart hook prints this session's in-flight jobs with their wait commands, then `other sessions: N in flight`.
 - **R8** The daemon runs under `umask 077` with only the allowlisted variable NAMES in `vanth.env.allow` (never PATH, HOME, PYTHON*,
   DYLD_*, ...), passed by name so no value is in an argv; it listens on 127.0.0.1 only; a daemon is adopted only if a 3-field record
   (pid, start time, launch digest) written after it was proven ready matches. Anything else is exit 6 with the recovery command.
-- **R9** Exit codes: 0 ok, 1 error, 2 usage/unknown id, 3 wait timeout, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
+- **R9** Exit codes: 0 ok, 1 error, 2 usage/unknown id (or a job Vanth no longer knows: no verdict line), 3 wait timeout, 4 `cancel` of a job that already finished (its real verdict goes to stderr, `already-terminal`), 5 idempotency conflict, 6 daemon refused/down/misconfigured.
 - **R10** Two PreToolUse deny hooks (hooks/deny-vanth-cleanup.sh, hooks/deny-pgrep-wait-loop.sh; tests/test_velo_task_hooks.sh): no
   `vanth prune|restore`, no `until/while pgrep` wait loop. Kept as they were (bars B13, B29 hook half); all scripts run under bash 3.2 (B14).
 

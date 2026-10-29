@@ -10,7 +10,7 @@
 #   daemon.provenance pid, start time, launch digest of the daemon velo-task launched     daemon.launch.log vanthd stdout/stderr
 #   session the owner token run tags jobs with when $CLAUDE_SESSION_ID is unset      stop-override, overrides.log the Stop guard's one-shot escape
 # VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT, VELO_TASK_STOP_WAIT (seconds), VELO_TASK_POLL
-# (poll interval). Exit codes: 0 ok, 1 error, 2 usage, 3 timeout/unknown job, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
+# (poll interval). Exit codes: 0 ok, 1 error, 2 usage, 3 wait timeout, 4 cancel: already finished, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
 
 LIB_SRC="${BASH_SOURCE[0]}"
 LIB_SRC_DIR="${LIB_SRC%/*}"; [ "$LIB_SRC_DIR" != "$LIB_SRC" ] || LIB_SRC_DIR=.
@@ -361,7 +361,7 @@ read_verdict() {  # <job> <label> [extra verdict-of args]: sets VERDICT_LINE and
   out=$(vanth_env "$VANTH" --json status "$job" 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
     case "$out" in
-      *"unknown job"*) VERDICT_LINE="$label unknown-job"; VERDICT=unknown-job; return 0 ;;
+      *"unknown job"*) die 2 "job $job is unknown to Vanth (cleaned up after it was resolved?); no verdict" ;;
       *"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict was read; recover with: velo-task restart-daemon" ;;
       *) die 1 "vanth status failed (exit $rc): $out" ;;
     esac
@@ -381,13 +381,12 @@ target_args() {  # parses `<id>` or `--job <job_id>` into TARGET
   done
   [ "${#TARGET[@]}" -gt 0 ] || die 2 "usage: velo-task <status|cancel> <id> | --job <job_id>"
 }
-cmd_status() {  # prints `<id> <verdict>`; exit 0 whenever it printed one, 3 for a job Vanth no longer knows, 2 unknown id, 6 daemon down
+cmd_status() {  # prints `<id> <verdict>`; exit 0 whenever it printed one, 2 unknown id or a job Vanth no longer knows, 6 daemon down
   target_args "$@"
   [ -z "${CLAUDE_SESSION_ID:-}" ] || check_arg session "$CLAUDE_SESSION_ID"
   resolve "${TARGET[@]}"; need_daemon
   if [ "${TARGET[0]}" = --job ]; then read_verdict "$JOB" "$LABEL"; else read_verdict "$JOB" "$LABEL" --name "$LABEL"; fi  # an id's row must carry exactly that name
   printf '%s\n' "$VERDICT_LINE"
-  [ "$VERDICT" != unknown-job ] || return 3
 }
 cmd_wait() {  # one call, one verdict per id: --all (default) waits for every id, --any returns the first; exit 0 iff every printed verdict is ok
   local mode=all tmo=3600 ids=() jobs=() done_=() i n out deadline pending all_done=1 first=-1 worst=0
@@ -410,7 +409,6 @@ cmd_wait() {  # one call, one verdict per id: --all (default) waits for every id
       if [ -z "${done_[$i]:-}" ]; then
         read_verdict "${jobs[$i]}" "${ids[$i]}" --name "${ids[$i]}"
         [ "$VERDICT" != in-flight ] || { all_done=0; continue; }
-        [ "$VERDICT" != unknown-job ] || { VERDICT=lost; VERDICT_LINE="${ids[$i]} lost"; }
         done_[$i]="$VERDICT_LINE"
       fi
       [ "$first" -ge 0 ] || first="$i"
@@ -431,15 +429,19 @@ cmd_wait() {  # one call, one verdict per id: --all (default) waits for every id
     /bin/sleep "${VELO_TASK_POLL:-0.5}"
   done
 }
-cmd_cancel() {  # `vanth stop`, then the verdict Vanth reports: killed when the stop took
+cmd_cancel() {  # `vanth stop` a job in flight, then print the verdict once it is killed; a job that already finished prints its real verdict on stderr, exit 4
   local out rc=0
   target_args "$@"
   resolve "${TARGET[@]}"; need_daemon
-  out=$(vanth_env "$VANTH" --json stop "$JOB" --signal terminate --kill-after 5 2>&1) || rc=$?
   read_verdict "$JOB" "$LABEL"
-  printf '%s\n' "$VERDICT_LINE"
-  [ "$VERDICT" != in-flight ] || die 1 "the job is still in flight after vanth stop (exit $rc): $out"
-  [ "$VERDICT" = killed ]
+  if [ "$VERDICT" = in-flight ]; then
+    out=$(vanth_env "$VANTH" --json stop "$JOB" --signal terminate --kill-after 5 2>&1) || rc=$?
+    read_verdict "$JOB" "$LABEL"
+    [ "$VERDICT" != in-flight ] || die 1 "the job is still in flight after vanth stop (exit $rc): $out"
+  fi
+  if [ "$VERDICT" = killed ]; then printf '%s\n' "$VERDICT_LINE"; return 0; fi
+  printf '%s\n' "$VERDICT_LINE" >&2
+  die 4 "already-terminal: $LABEL finished as ${VERDICT} before it could be cancelled"
 }
 cmd_stop_override() {  # the Stop guard's one-shot escape: lets the current session end once, audited in overrides.log
   [ "${1:-}" = --reason ] && [ -n "${2:-}" ] && [ "$#" -eq 2 ] || die 2 "usage: velo-task stop-override --reason <text>"
@@ -449,15 +451,11 @@ cmd_stop_override() {  # the Stop guard's one-shot escape: lets the current sess
 }
 
 # ---- what the Stop guard and SessionStart read: Vanth's own database, read-only, no daemon needed ----------
-IN_FLIGHT_SQL="'queued','launching','running','paused','retrying','stopping'"  # the in-flight predicate; the helper's verdict-of holds the same set
-inflight_of() {  # <session>: this session's in-flight jobs, one `name job_id status` a line. Fails with the helper's exit when the database cannot be read
-  [ -e "$VH/jobs.sqlite" ] || return 0  # the daemon makes it before it accepts a job: no file, no job
-  st jobs-ro --cols name,job_id,status "$VH/jobs.sqlite" \
-    "SELECT name, job_id, status FROM jobs WHERE status IN ($IN_FLIGHT_SQL) AND instr(COALESCE(tags_json, ''), ?) > 0 ORDER BY created_at" "\"session:$1\""
+inflight_of() {  # <session>: this session's in-flight jobs, one `name job_id status` a line. A missing or unreadable database is a failure, never "no jobs"
+  st inflight "$VH/jobs.sqlite" "$1"
 }
 inflight_elsewhere() {  # <session>: how many in-flight jobs belong to other sessions
-  [ -e "$VH/jobs.sqlite" ] || { echo 0; return 0; }
-  st jobs-ro --cols n "$VH/jobs.sqlite" "SELECT count(*) AS n FROM jobs WHERE status IN ($IN_FLIGHT_SQL) AND instr(COALESCE(tags_json, ''), ?) = 0" "\"session:$1\""
+  st inflight "$VH/jobs.sqlite" "$1" --others
 }
 wait_hint() {  # <name> <job_id>: the command that clears one in-flight job
   if [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{2,63}$ ]]; then echo "velo-task wait $1"; else echo "velo-task status --job $2"; fi

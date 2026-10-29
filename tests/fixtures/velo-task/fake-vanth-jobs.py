@@ -13,7 +13,7 @@ The behaviour velo-task depends on follows Vanth 1.14.0 as probed against the re
   --json list [--all] [--name N] [--limit N]   newest first, capped at 1000, --name a substring match
   __inject <json>              (test only) a row as given; __bulk <n> <name-prefix> (test only) n completed rows
 Every call is appended to @E@/calls as `vanth <args>`, followed by `env=<the names in its environment>`. Switches (files under @E@):
-start-transport-error, start-fail, status-transport-error, status-fail, status-garbage.
+start-transport-error, start-fail, status-transport-error, status-fail, status-garbage, status-unknown.
 """
 import datetime
 import hashlib
@@ -82,6 +82,8 @@ def cmd_status(args):
         fail("vanth status: failed to reach daemon: connection refused")
     if os.path.exists(E + "/status-fail"):
         fail("vanth status: daemon error: boom")
+    if os.path.exists(E + "/status-unknown"):
+        fail("vanth status: unknown job %s" % args[0])
     if os.path.exists(E + "/status-garbage"):
         print("{not json")
         return 0

@@ -590,19 +590,39 @@ t_launch() {  # the process that becomes vanthd gets exactly the named variables
   run /usr/bin/env -i PATH=/usr/bin KEEP=1 "$PYBIN" -I "$R/bin/velo-task-state" launch /usr/bin/env KEEP ABSENT
   need "a named variable the environment does not hold is exit 1, and nothing is started" [ "$RC" = 1 ]; need "...naming it" grep -q 'not set in the environment: ABSENT' <<<"$OUT"
 }
-t_override() {  # the one-shot Stop override: a regular file of yours, written and consumed once, audited
+t_override() {  # the one-shot Stop override: a valid private file of yours, published atomically, consumed once, audited
   local h; mkhome; h=$E_HOME
   run ST override-take "$h"; need "nothing pending: take is exit 3" [ "$RC" = 3 ]
   run ST override-write "$h" 'closing the laptop'; need "write succeeds" [ "$RC" = 0 ]
   need "...a private regular file" [ -f "$h/stop-override" -a "$(stat -f %Lp "$h/stop-override")" = 600 ]
-  run ST override-write "$h" again; need "a second write while one is pending is refused (exit 1)" [ "$RC" = 1 ]
+  need "...holding one time, uid and reason line" grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z uid=[0-9]+ reason=closing the laptop$' "$h/stop-override"
+  need "...and no temp file is left" [ "$(ls -A "$h" | grep -c 'stop-override\.')" = 0 ]
+  run ST override-write "$h" again; need "a second write while a valid one is pending is refused (exit 1)" [ "$RC" = 1 ]
   run ST override-take "$h"; need "take consumes it (exit 0)" [ "$RC" = 0 ]; need "...it is gone" [ ! -e "$h/stop-override" ]
   run ST override-take "$h"; need "...and a second take finds none (exit 3)" [ "$RC" = 3 ]
   need "the log has the write, with the reason, and the use" [ "$(grep -c -e '^set .*reason=closing the laptop' -e '^used ' "$h/overrides.log")" = 2 ]
+  : > "$h/stop-override"; chmod 600 "$h/stop-override"; run ST override-take "$h"
+  need "an empty file is no override: not consumed (exit 3)" [ "$RC" = 3 -a -e "$h/stop-override" ]
+  printf 'garbage\n' > "$h/stop-override"; run ST override-take "$h"; need "a corrupt file is no override (exit 3)" [ "$RC" = 3 -a -e "$h/stop-override" ]
+  printf '2026-01-01T00:00:00Z uid=%s reason=x\n' "$(id -u)" > "$h/stop-override"; chmod 644 "$h/stop-override"; run ST override-take "$h"
+  need "a well-formed file open to group or other is no override (exit 3)" [ "$RC" = 3 -a -e "$h/stop-override" ]
+  printf '2026-01-01T00:00:00Z uid=0 reason=x\n' > "$h/stop-override"; chmod 600 "$h/stop-override"; run ST override-take "$h"
+  need "a line naming another uid is no override (exit 3)" [ "$RC" = 3 ]
+  run ST override-write "$h" 'replaces the corrupt one'; need "write replaces an invalid entry (exit 0)" [ "$RC" = 0 ]
+  run ST override-take "$h"; need "...which is then valid and consumed" [ "$RC" = 0 ]
   printf 'SENTINEL\n' > "$E/target"; ln -s "$E/target" "$h/stop-override"
   run ST override-take "$h"; need "a symlink is no override (exit 3)" [ "$RC" = 3 ]; need "...its target is untouched" [ "$(cat "$E/target")" = SENTINEL ]
-  run ST override-write "$h" x; need "...and write does not write through it (exit 1)" [ "$RC" = 1 ]; need "...target untouched" [ "$(cat "$E/target")" = SENTINEL ]
-  rm "$h/stop-override"; mkdir "$h/stop-override"; run ST override-take "$h"; need "a directory is no override (exit 3)" [ "$RC" = 3 ]; rmdir "$h/stop-override"
+  run ST override-write "$h" 'over a stale link'; need "write replaces a stale symlink (exit 0)" [ "$RC" = 0 -a ! -L "$h/stop-override" ]
+  need "...never writing through it" [ "$(cat "$E/target")" = SENTINEL ]
+  run ST override-take "$h"; need "...and the new file is consumed" [ "$RC" = 0 ]
+  ln -s "$E/dangling-nowhere" "$h/stop-override"; run ST override-write "$h" 'over a dangling link'; need "write replaces a dangling symlink" [ "$RC" = 0 ]; rm -f "$h/stop-override"
+  printf '2026-01-01T00:00:00Z uid=%s reason=x\n' "$(id -u)" > "$E/valid-target"; chmod 600 "$E/valid-target"; ln -s "$E/valid-target" "$h/stop-override"
+  run ST override-take "$h"; need "a symlink to a well-formed override is still no override (exit 3)" [ "$RC" = 3 -a -e "$E/valid-target" ]; rm -f "$h/stop-override"
+  mkdir -m 700 "$h/stop-override"; run ST override-take "$h"; need "a directory is no override (exit 3)" [ "$RC" = 3 ]
+  mkdir -m 700 "$h/stop-override"; : > "$h/stop-override/inside"; run ST override-write "$h" 'over a full directory'
+  need "write over a directory that is not empty fails loudly (exit 1)" [ "$RC" = 1 ]; need "...leaving no temp file" [ "$(ls -A "$h" | grep -c 'stop-override\.')" = 0 ]
+  rm -rf "$h/stop-override"; mkdir "$h/stop-override"
+  run ST override-write "$h" 'over an empty directory'; need "write replaces an empty directory" [ "$RC" = 0 -a -f "$h/stop-override" ]; rm -f "$h/stop-override"
   run ST override-write "$h" ''; need "an empty reason is a usage error (exit 2)" [ "$RC" = 2 ]
   run ST override-write "$h" $'two\nlines'; need "a reason with a newline is a usage error (exit 2)" [ "$RC" = 2 ]
 }
@@ -1300,17 +1320,31 @@ t_wait() {  # B4, B5, B15, B6
   wait $! 2>/dev/null; true
 }
 t_cancel() {
-  local j
+  local j n
   mkjobs; j=$(inject '{"name":"c-run","status":"running"}')
   run VT cancel c-run; need "cancel of a running job: killed, exit 0" [ "$RC" = 0 -a "$OUT" = "c-run killed" ]
   need "...through vanth stop" grep -q "^vanth --json stop $j" "$E_CALLS"
   need "...and the row says cancelled by the user" [ "$(sql 'SELECT status, stop_actor FROM jobs WHERE job_id = ?' "$j")" = "cancelled user" ]
-  run VT cancel c-run; need "cancel again: still killed" [ "$RC" = 0 -a "$OUT" = "c-run killed" ]
+  run VT cancel c-run; need "cancel again: still killed, exit 0" [ "$RC" = 0 -a "$OUT" = "c-run killed" ]
   inject '{"name":"c-done","status":"completed","exit_code":0}' >/dev/null
-  run VT cancel c-done; need "cancel of a finished job prints its verdict and exits 1" [ "$RC" = 1 -a "$OUT" = "c-done ok" ]
+  n=$(grep -c '^vanth --json stop' "$E_CALLS")
+  run VT cancel c-done; need "cancel of a finished job exits 4" [ "$RC" = 4 ]
+  need "...printing no 'ok' on stdout, as if it had been cancelled" not grep -qx 'c-done ok' <(VT cancel c-done 2>/dev/null)
+  need "...its real verdict on stderr" grep -q 'c-done ok' <<<"$OUT"; need "...naming already-terminal" grep -q 'already-terminal' <<<"$OUT"
+  need "...and never calling vanth stop" [ "$(grep -c '^vanth --json stop' "$E_CALLS")" = "$n" ]
+  inject '{"name":"c-bad","status":"failed","exit_code":3}' >/dev/null; run VT cancel c-bad; need "a failed job: exit 4" [ "$RC" = 4 ]; need "...its verdict named" grep -q 'failed(3)' <<<"$OUT"
   j=$(inject '{"name":"c-two","status":"queued"}'); run VT cancel --job "$j"; need "cancel --job works" [ "$OUT" = "$j killed" ]
   run VT cancel nobody-here; need "cancel of an unknown id: exit 2" [ "$RC" = 2 ]
   run VT cancel; need "no id: exit 2" [ "$RC" = 2 ]
+}
+t_vanished_job() {  # a job that is gone from Vanth after the id resolved: exit 2, no verdict line, in status, wait and cancel
+  local c
+  mkjobs; inject '{"name":"v-gone","status":"completed","exit_code":0}' >/dev/null
+  : > "$E/status-unknown"
+  for c in status wait cancel; do
+    run VT $c v-gone; need "$c: exit 2" [ "$RC" = 2 ]; need "$c: no verdict line" not grep -qE 'v-gone (ok|lost|unknown-job)' <<<"$OUT"
+    need "$c: says the job is unknown to Vanth" grep -q 'unknown to Vanth' <<<"$OUT"
+  done
 }
 t_session() {
   local t
@@ -1356,6 +1390,22 @@ t_stop_guard() {  # B-S: this session's in-flight jobs block; nothing else does
   waitfor 5 test -e "$E/held" || { echo "FAILED: the lock was never taken"; exit 1; }
   guard; need "a database locked for more than 2 s blocks" [ "$RC" = 2 ]; wait $! 2>/dev/null; true
   cp "$E/jobs.good" "$p"
+  rm -f "$p"; guard; need "a missing database under an existing Vanth home blocks" [ "$RC" = 2 ]; need "...naming the way out" grep -q 'stop-override --reason' <<<"$OUT"
+  ln -s "$E/nowhere.sqlite" "$p"; guard; need "a dangling jobs.sqlite blocks" [ "$RC" = 2 ]; rm -f "$p"; cp "$E/jobs.good" "$p"
+  inject "{\"name\":\"g-restart\",\"status\":\"failed\",\"exit_code\":1,\"policy_state_json\":{\"restart_after\":\"2099-01-01T00:00:00Z\"},\"tags_json\":[\"velo\",\"session:$SID\"]}" >/dev/null
+  guard; need "a failed job of this session with a restart pending blocks, as status calls it in-flight" [ "$RC" = 2 ]
+  need "...naming it" grep -q 'g-restart' <<<"$OUT"
+  sql 'DELETE FROM jobs' >/dev/null
+  tag_row g-run2 running "$SID" >/dev/null
+  PATH=/nonexistent run /bin/bash "$R/hooks/velo-task-stop-guard.sh" </dev/null; need "a broken PATH does not turn the guard off: still blocks" [ "$RC" = 2 ]
+  need "...for the job, not for a missing tool" grep -q 'g-run2' <<<"$OUT"
+  run /usr/bin/env -i /bin/bash "$R/hooks/velo-task-stop-guard.sh" </dev/null; need "no HOME and no state variables: blocks, cannot locate the state dir" [ "$RC" = 2 ]
+  mkdir -p "$E/corrupt/hooks" "$E/corrupt/bin"; cp "$R/hooks/velo-task-stop-guard.sh" "$E/corrupt/hooks/"
+  printf 'exit 0\n' > "$E/corrupt/bin/velo-task-lib.sh"
+  run /bin/bash "$E/corrupt/hooks/velo-task-stop-guard.sh" </dev/null; need "a readable library that calls exit 0 does not release the guard" [ "$RC" = 2 ]
+  printf ':\n' > "$E/corrupt/bin/velo-task-lib.sh"
+  run /bin/bash "$E/corrupt/hooks/velo-task-stop-guard.sh" </dev/null; need "a library that loads but defines nothing blocks" [ "$RC" = 2 ]
+  sql 'DELETE FROM jobs' >/dev/null
   mkdir -p "$E/hookonly/hooks"; cp "$R/hooks/velo-task-stop-guard.sh" "$E/hookonly/hooks/"
   run /bin/bash "$E/hookonly/hooks/velo-task-stop-guard.sh" </dev/null; need "a missing library blocks while a Vanth home exists" [ "$RC" = 2 ]
   need "...naming the way out" grep -q 'stop-override' <<<"$OUT"
@@ -1372,6 +1422,13 @@ t_stop_override() {  # one Stop, audited, and the block is back
   run VT stop-override; need "no reason: exit 2" [ "$RC" = 2 ]
   run VT stop-override --reason; need "an empty reason: exit 2" [ "$RC" = 2 ]
   ln -s "$E/target" "$E_HOME/stop-override"; guard; need "a symlink in the override's place does not release the block" [ "$RC" = 2 ]
+  rm "$E_HOME/stop-override"; : > "$E_HOME/stop-override"; chmod 600 "$E_HOME/stop-override"; guard
+  need "an empty override file does not release the block" [ "$RC" = 2 ]; need "...and is not consumed" [ -e "$E_HOME/stop-override" ]
+  printf 'half a line' > "$E_HOME/stop-override"; guard; need "a partial override does not release it" [ "$RC" = 2 -a -e "$E_HOME/stop-override" ]
+  run VT stop-override --reason 'after a corrupt one'; need "stop-override replaces the corrupt file (exit 0)" [ "$RC" = 0 ]
+  guard; need "...and then the Stop is allowed once" [ "$RC" = 0 ]
+  ln -s "$E/target" "$E_HOME/stop-override"; run VT stop-override --reason 'over a stale link'; need "stop-override works over a stale symlink" [ "$RC" = 0 ]
+  guard; need "...and releases once" [ "$RC" = 0 ]
 }
 t_session_start() {
   mkjobs; tag_row s-run running "$SID" >/dev/null; tag_row s-oth running other-1 >/dev/null; tag_row s-oth2 queued other-2 >/dev/null; tag_row s-done completed "$SID" >/dev/null
@@ -1381,6 +1438,7 @@ t_session_start() {
   need "...and not another session's" not grep -q 's-oth ' <<<"$OUT"
   need "...and counts the other sessions' jobs" grep -qx 'other sessions: 2 in flight' <<<"$OUT"
   sql 'DELETE FROM jobs' >/dev/null; sstart; need "with nothing in flight: only the count" [ "$OUT" = 'other sessions: 0 in flight' ]
+  rm -f "$E_VH/jobs.sqlite"; sstart; need "a missing database is said so, not 'nothing in flight'" grep -q 'cannot be read' <<<"$OUT"
   printf 'garbage\n' > "$E_VH/jobs.sqlite"; sstart; need "an unreadable database is said so, still exit 0" [ "$RC" = 0 ]; need "...in words" grep -q 'cannot be read' <<<"$OUT"
   VELO_TASK_HOME="$E/no-such-home" sstart; need "no Vanth home: silent, exit 0" [ "$RC" = 0 -a -z "$OUT" ]
 }
@@ -1500,7 +1558,8 @@ check "B-R1: an id is an exact name, whatever 1,100 newer jobs contain" t_resolv
 check "B1/B18/B26: verdicts through the whole path" t_status_verdicts
 check "status with the daemon down, broken or garbled" t_status_daemon
 check "B4/B5/B6/B15: wait --all, --any, timeout, unknown ids" t_wait
-check "cancel is vanth stop, then the verdict killed" t_cancel
+check "cancel is vanth stop, then the verdict killed; a finished job is exit 4" t_cancel
+check "a job that vanished after the id resolved is exit 2 with no verdict" t_vanished_job
 check "the session: id from the environment, else a token the state dir keeps" t_session
 echo "velo-task: hooks"
 check "B-S: the Stop guard blocks this session's in-flight jobs and fails closed" t_stop_guard
@@ -1605,9 +1664,7 @@ prove "verdict: a non-object status gets a verdict" t_verdict_cli $S $'    if no
 prove "verdict: the database is not consulted for a restart" t_verdict_cli $S 'if opts.get("db") and job and' 'if False and job and'
 prove "launch: the whole environment is passed" t_launch $S '{n: os.environ[n] for n in names}' 'dict(os.environ)'
 prove "launch: a name that is not set is ignored" t_launch $S 'missing = [n for n in names if n not in os.environ]' 'missing = []'
-prove "override: write replaces a pending one" t_override $S 'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)' 'os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)'
 prove "override: take follows a symlink" t_override $S 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK' 'os.O_RDONLY | os.O_NONBLOCK'
-prove "override: take accepts a directory" t_override $S 'if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():' 'if False:'
 prove "override: take does not consume it" t_override $S '    os.unlink(path)' '    pass'
 prove "override: a reason with a newline" t_override $S ' or "\n" in args[1]' ''
 # ---- run, status, wait, cancel ----
@@ -1636,20 +1693,10 @@ prove "wait: --all with a failed job is exit 0" t_wait $L '[ "${done_[$i]#* }" =
 prove "wait: a timeout is exit 1" t_wait $L 'die 3 "wait timed out' 'die 1 "wait timed out'
 prove "wait: --any waits for all" t_wait $L 'if [ "$mode" = any ] && [ "$first" -ge 0 ]; then' 'if false; then'
 prove "cancel: the job is not stopped" t_cancel $L 'out=$(vanth_env "$VANTH" --json stop "$JOB" --signal terminate --kill-after 5 2>&1) || rc=$?' 'out=""'
-prove "cancel: a finished job is exit 0" t_cancel $L $'  [ "$VERDICT" = killed ]\n}' $'  true\n}'
 prove "session: the token file may be a symlink" t_session $L '  [ -f "$SESSION_FILE" ] && [ ! -L "$SESSION_FILE" ] || die 6' '  true || die 6'
 # ---- hooks ----
-prove "Stop guard: always allows" t_stop_guard $H 'deny "$msg"' 'exit 0'
-prove "Stop guard: fails open on an unreadable database" t_stop_guard $H $'rows=$(inflight_of "$session" 2>&1) || deny "Vanth\'s database cannot be read: $rows"' $'rows=$(inflight_of "$session" 2>/dev/null) || rows=""'
-prove "Stop guard: any session blocks" t_stop_guard $L "AND instr(COALESCE(tags_json, ''), ?) > 0 ORDER BY created_at" "AND instr(COALESCE(tags_json, ''), ?) >= 0 ORDER BY created_at"
-prove "Stop guard: a session id that is a prefix matches" t_stop_guard $L $'ORDER BY created_at" "\\"session:$1\\""' $'ORDER BY created_at" "\\"session:$1"'
-prove "Stop guard: stopping does not block" t_stop_guard $L "'retrying','stopping'" "'retrying'"
-prove "Stop guard: a lost job blocks" t_stop_guard $L "'retrying','stopping'" "'retrying','stopping','orphaned'"
-prove "Stop guard: no Vanth home blocks nothing, a home allows" t_stop_guard $H '[ -d "$STATE/vanth" ] || exit 0' 'exit 0'
-prove "Stop guard: the override is always on" t_stop_override $H 'if st override-take "$VELO_TASK_HOME"; then' 'if true; then'
 prove "Stop guard: the override is not consumed" t_stop_override $S '    os.unlink(path)' '    pass'
 prove "SessionStart: lists nothing" t_session_start $HS 'if [ -n "$rows" ]; then' 'if false; then'
-prove "SessionStart: counts this session's jobs as others" t_session_start $L "instr(COALESCE(tags_json, ''), ?) = 0" "instr(COALESCE(tags_json, ''), ?) >= 0"
 prove "SessionStart: an unreadable database is silent" t_session_start $HS $'rows=$(inflight_of "$session" 2>&1) || { echo "velo-task: Vanth\'s database cannot be read, so in-flight jobs are unknown: $rows"; exit 0; }' $'rows=$(inflight_of "$session" 2>/dev/null) || rows=""'
 # ---- install, daemon: new anchors ----
 prove "install without --require-hashes" t_install_flags $L '--require-hashes --only-binary :all: -r "$LOCKFILE" </dev/null' '--only-binary :all: -r "$LOCKFILE" </dev/null'
@@ -1706,6 +1753,35 @@ prove "uv runs with the caller's PATH" t_no_path_tools $L 'run_uv() {  # uv sees
   /usr/bin/env -i PATH="$PATH"'
 prove "the parser routes library function names" t_private_subcommands $V '  *) die 2 "unknown subcommand' '  *) "$sub" "$@"; exit $?; die 2 "unknown subcommand'
 prove "the helper is not isolated from the caller's user site" t_hostile_env $L 'st() { /usr/bin/env -i "${HELPER_ENV[@]}" "$PYSYS" -I "$STATE_SCRIPT" "$@"; }' 'st() { /usr/bin/env -i "${HELPER_ENV[@]}" "$PYSYS" "$STATE_SCRIPT" "$@"; }'
+
+# ---- review round: Stop guard class, override, vanished job, cancel ----
+prove "Stop guard: always allows" t_stop_guard $H 'deny "this session still has jobs in flight' 'exit 0; deny "this session still has jobs in flight'
+prove "Stop guard: fails open when the query fails" t_stop_guard $H $'|| deny "Vanth\'s database cannot be read, or the check did not complete: $out"' '|| true' $H $'[ "${out##*$\'\\n\'}" = "$OK" ] || deny "the check did not complete (no success marker): $out"' 'true'
+prove "Stop guard: no success marker required" t_stop_guard $H $'[ "${out##*$\'\\n\'}" = "$OK" ] || deny "the check did not complete (no success marker): $out"' 'true'
+prove "Stop guard: any session blocks" t_stop_guard $S $'if \'"session:%s"\' % args[1] in (row.get("tags_json") or ""):' 'if True:'
+prove "Stop guard: a session id that is a prefix matches" t_stop_guard $S $'\'"session:%s"\' % args[1]' $'\'"session:%s\' % args[1]'
+prove "Stop guard: stopping does not block" t_stop_guard $S '"retrying", "stopping"))' '"retrying"))'
+prove "Stop guard: a lost job blocks" t_stop_guard $S 'return "lost"  # orphaned, any other cancelled, a status outside both sets' 'return "in-flight"'
+prove "Stop guard: a restart pending does not block" t_stop_guard $S 'if status in ("failed", "orphaned") and restart_pending(row):' 'if False:'
+prove "Stop guard: no Vanth home allows, a home does not" t_stop_guard $H '[ -d "$STATE/vanth" ] || exit 0' 'exit 0'
+prove "Stop guard: a missing database is no jobs" t_stop_guard $L $'  st inflight "$VH/jobs.sqlite" "$1"\n}' $'  [ -e "$VH/jobs.sqlite" ] || return 0; st inflight "$VH/jobs.sqlite" "$1"\n}'
+prove "Stop guard: no HOME allows" t_stop_guard $H '[ -n "${VELO_TASK_HOME:-}${VELO_STATE:-}${HOME:-}" ] || block' 'true || block'
+prove "Stop guard: a tool is looked up on PATH" t_stop_guard $H "/usr/bin/grep '^ROW '" "grep '^ROW '"
+prove "Stop guard: the override is always on" t_stop_override $H '. "$1" && st override-take "$VELO_TASK_HOME" && echo' '. "$1" && true && echo'
+prove "SessionStart: counts this session's jobs as others" t_session_start $S 'others += 1' 'others += 2'
+prove "override: write replaces a valid pending one" t_override $S $'    if valid_override(path):\n        die(1,' $'    if False:\n        die(1,'
+prove "override: write cannot replace a stale entry" t_override $S 'os.rename(tmp, path)  # replaces' 'os.link(tmp, path)  # replaces'
+prove "override: take accepts any file" t_override $S 'or info.st_mode & 0o077 or info.st_size > 4096:' 'or False:'
+prove "override: take accepts an open mode" t_override $S ' or info.st_mode & 0o077' ''
+prove "override: take accepts any content" t_override $S 'return bool(match) and int(match.group(1)) == os.getuid()' 'return True'
+prove "override: take accepts another uid" t_override $S ' and int(match.group(1)) == os.getuid()' ''
+prove "override: take accepts a non-regular entry" t_override $S 'if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or' 'if info.st_uid != os.getuid() or'
+prove "override: the temp file is left behind" t_override $S $'    except BaseException:\n        if os.path.lexists(tmp):\n            os.unlink(tmp)\n        raise' $'    except BaseException:\n        raise'
+prove "vanished job: exit 3" t_vanished_job $L '*"unknown job"*) die 2 "job $job is unknown' '*"unknown job"*) die 3 "job $job is unknown'
+prove "cancel: a finished job is stopped anyway" t_cancel $L $'  if [ "$VERDICT" = in-flight ]; then\n    out=$(vanth_env' $'  if true; then\n    out=$(vanth_env'
+prove "cancel: a finished job is exit 0" t_cancel $L 'die 4 "already-terminal' 'die 0 "already-terminal'
+prove "cancel: a finished job prints its verdict as a result" t_cancel $L $'  printf \'%s\\n\' "$VERDICT_LINE" >&2\n  die 4' $'  printf \'%s\\n\' "$VERDICT_LINE"\n  die 4'
+prove "cancel: a finished job is reported killed" t_cancel $L 'if [ "$VERDICT" = killed ]; then printf' 'if true; then printf'
 proof_drain   # every proof reported before anything else runs: the checks below reap the whole suite tree
 if [ "${VELO_TASK_NETWORK_TESTS:-}" = 1 ]; then
   echo "velo-task: the real Vanth (VELO_TASK_NETWORK_TESTS=1)"
