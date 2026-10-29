@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """A listener the velo-task tests use to hold a TCP port (run by absolute python path, never via PATH).
 
-  port-holder.py reserve <ready-file>             127.0.0.1:0 with SO_REUSEPORT: reserves a free port for a test while the fake
-                                                  vanthd (also SO_REUSEPORT) binds the same port; writes the port to <ready-file>
+  port-holder.py reserve <ready-file> [wild]      127.0.0.1:0 with SO_REUSEPORT: reserves a free port for a test while the fake
+                                                  vanthd (also SO_REUSEPORT) binds the same port; writes the port to <ready-file>.
+                                                  With `wild` the port is also held on 0.0.0.0 (bound, never listening), for a test
+                                                  whose daemon listens on every interface: the kernel then picks a port that nothing
+                                                  holds on any address, and a foreign server that binds that very number on the
+                                                  wildcard address (a port finder that bound 0, closed, and came back to the number)
+                                                  is refused. Beside the loopback listener alone it is not, and the daemon's own
+                                                  wildcard bind then fails with EADDRINUSE.
+                                                  PORT_HOLDER_MUTANT (tests only): loopback-only (ignore `wild`), listen-wild (the
+                                                  wildcard socket listens too)
   port-holder.py foreign <port> <ready-file> <signal-log>
-                                                  127.0.0.1:<port> WITHOUT SO_REUSEPORT: a foreign process on the daemon's port. It
+                                                  127.0.0.1:<port> (0: the kernel picks one; <ready-file> gets the number) WITHOUT
+                                                  SO_REUSEPORT: a foreign process on the daemon's port. It
                                                   appends the name of every catchable signal it receives to <signal-log> and keeps running
 """
+import os
 import signal
 import socket
 import sys
@@ -15,10 +25,20 @@ import time
 mode = sys.argv[1]
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 if mode == "reserve":
+    mutant = os.environ.get("PORT_HOLDER_MUTANT", "")
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(("127.0.0.1", 0))
     ready = sys.argv[2]
+    if sys.argv[3:] == ["wild"] and mutant != "loopback-only":
+        wide = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # first: the kernel picks a port nothing holds on any address
+        wide.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        wide.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        wide.bind(("0.0.0.0", 0))
+        if mutant == "listen-wild":
+            wide.listen(16)
+        sock.bind(("127.0.0.1", wide.getsockname()[1]))  # then the same number on loopback, where the fake daemon normally binds
+    else:
+        sock.bind(("127.0.0.1", 0))
 elif mode == "foreign":
     sock.bind(("127.0.0.1", int(sys.argv[2])))
     ready, log = sys.argv[3], sys.argv[4]

@@ -390,8 +390,9 @@ assert_lock_held() {  # <lock path>: a locked body runs only inside run_locked, 
 holder_alive() {  # a process's parent changes only when the parent dies: while the lock helper is still this shell's parent, the flock it holds is ours (lock-held alone cannot say whose it is: a second locker's holds it just as well)
   [ "$(/bin/ps -o ppid= -p "$$" 2>/dev/null | /usr/bin/tr -d ' ')" = "$LOCK_HOLDER" ]
 }
-hold_run() {  # <command...>: run a long step as a job of this body in a process group of its own, watching the lock helper; if it dies, or this body is signalled, the job is stopped and so is the body
+hold_run() {  # <command...>: run a long step as a job of this body in a process group of its own, watching the lock helper: it must be alive when the step starts, while it runs and when it has ended; if it dies, or this body is signalled, the job is stopped and so is the body
   local job rc=0
+  holder_alive || die 6 "$LOCK_HOLDER_GONE"  # a step is not started under a lock that is already lost
   set -m
   "$@" </dev/null &
   job=$!
@@ -407,6 +408,7 @@ hold_run() {  # <command...>: run a long step as a job of this body in a process
   done
   trap - TERM INT HUP
   wait "$job" || rc=$?
+  holder_alive || die 6 "$LOCK_HOLDER_GONE"  # the helper may have died as the step ended, between two polls of the loop: nothing that follows runs on a lock that was lost
   return "$rc"
 }
 still_locked() { assert_lock_held "$LOCK_FILE"; }  # right before an action that cannot be undone (a launch, a signal, replacing the venv)

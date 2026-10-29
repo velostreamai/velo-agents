@@ -17,16 +17,22 @@ names this environment actually sets, not the whole allowlist, so a daemon launc
 it differently is refused with `velo-task restart-daemon`. The tail of the launch log in a failure message is redacted
 with the values the body holds (and not shown at all if the redaction fails). The install body no longer outlives its lock
 helper: `assert_lock_held` also needs the helper (the body's parent) alive, `uv venv` and `uv pip install` run as a watched
-job that is stopped when the helper dies or the body is signalled, and the marker write and the removal of a venv that
+job that is stopped when the helper dies or the body is signalled, the job is not started under a lock that is already
+lost, and `hold_run` does not return from a step whose helper died as it ended (a moment the polling loop cannot see, and
+the next step would have run unlocked), and the marker write and the removal of a venv that
 failed verification re-check the lock. A malformed `daemon.json` is an error (exit 6, `doctor` FAIL), no longer an empty
 answer that skips the pid cross-check. `write_new`, which creates the temp file of `write-record`, `pending-write` and
 `session-token`, unlinks it when a write is cut short. B23's tampered-hash case
 is tested: a lock with one wrong hash must fail `install-vanth`. **M3c.** `\vanth prune` and `until \pgrep ...` were
 allowed because a backslash outside quotes stayed in the word; `install.sh` and `update.sh` walk the source and live trees
 through one python-artifact exclusion, and `chmod +x` only the hooks it ships; the vanth hook's header lists the
-redirection misses; the scan-speed bound is CPU time. **Prevents:** a key read off the process list, a second install
-rebuilding the venv under a first one whose lock was lost, a hand-started daemon adopted because its `daemon.json` did not
-parse, a stray `.tmp` record, and a hash check that nothing exercised.
+redirection misses; the scan-speed bound is CPU time. **Tests.** The port the foundation suite reserves for the test whose
+daemon listens on every interface is held on that address too, and the port-taken test uses a foreign holder from the
+start: a foreign server that bound the reserved number on `0.0.0.0` made the fake daemon's bind fail
+(`Address already in use`) once, and a reservation released and bound again left a window for another run's reservation.
+**Prevents:** a key read off the process list, a second install rebuilding the venv under a first one whose lock was lost,
+a hand-started daemon adopted because its `daemon.json` did not parse, a stray `.tmp` record, a hash check that nothing
+exercised, and a suite that fails on a port some other process took.
 
 ### Added — velo-task guard hooks, and a standing bash 3.2 sweep (#2769, M3c)
 

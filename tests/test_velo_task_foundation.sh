@@ -193,12 +193,18 @@ red_text() {  # what a red check printed: its first FAILED line, then the first 
 }
 
 # ---- fixtures --------------------------------------------------------------------------------------
-mkhome() {  # isolated VELO_TASK_HOME and a reserved port: sets E E_HOME E_VENV E_VH E_CALLS E_PORT
+mkhome() {  # [wild|foreign]: isolated VELO_TASK_HOME and a reserved port: sets E E_HOME E_VENV E_VH E_CALLS E_PORT E_HOLDER
   E=$(mktemp -d "$T/e.XXXXXX"); E_HOME="$E/home"; E_VENV="$E_HOME/venv"; E_VH="$E_HOME/vanth"; E_CALLS="$E/calls"
   mkdir -m 700 "$E_HOME"; : > "$E_CALLS"
   # A listener holds the port for the test's whole life (SO_REUSEPORT, so the fake vanthd can bind it as well): the port is
-  # never picked by bind-and-close, where another process could take it before the daemon does.
-  "$PYBIN" "$FIX/port-holder.py" reserve "$E/port" </dev/null >/dev/null 2>&1 &
+  # never picked by bind-and-close, where another process could take it before the daemon does. `wild`, for the test whose
+  # daemon listens on every interface, holds the wildcard address too: beside the loopback listener alone, a foreign server
+  # that binds the same number there is not refused, and the daemon's wildcard bind then fails with EADDRINUSE. `foreign`, for
+  # the test of a port that is taken: the holder is a foreign process from the start (no SO_REUSEPORT, so the daemon cannot bind;
+  # it logs the signals it gets to $E/signals), not a reservation released and bound again by another process.
+  if [ "${1:-}" = foreign ]; then "$PYBIN" "$FIX/port-holder.py" foreign 0 "$E/port" "$E/signals" </dev/null >/dev/null 2>&1 &
+  else "$PYBIN" "$FIX/port-holder.py" reserve "$E/port" ${1:+"$1"} </dev/null >/dev/null 2>&1 &
+  fi
   E_HOLDER=$!
   waitfor 5 test -s "$E/port" || { echo "no port reserved" >&2; exit 1; }
   E_PORT=$(cat "$E/port")
@@ -1469,11 +1475,7 @@ t_launch_failure() {
   need "...and no intent is left active for the daemon that died" [ ! -e "$E_HOME/daemon.intent" ]
 }
 t_port_collision() {  # finding 16: the daemon cannot bind because a foreign process holds the port
-  local fp; mkhome; mkvenv
-  kill "$E_HOLDER"; wait "$E_HOLDER" 2>/dev/null   # release the reservation, then hold the very same port as a foreign process
-  "$PYBIN" "$FIX/port-holder.py" foreign "$E_PORT" "$E/fready" "$E/signals" </dev/null >/dev/null 2>&1 &
-  fp=$!
-  waitfor 5 test -s "$E/fready" || { echo "FAILED: the foreign listener never came up"; exit 1; }
+  local fp; mkhome foreign; mkvenv; fp=$E_HOLDER   # a foreign process holds the port from the start, never released and bound again
   run VT ensure-daemon
   need "ensure-daemon fails (exit 6)" [ "$RC" = 6 ]; need "...saying the daemon did not become ready" grep -q 'did not become ready' <<<"$OUT"
   need "...with the daemon's own reason from the launch log" grep -q 'cannot bind' <<<"$OUT"
@@ -1496,7 +1498,8 @@ t_launch_requires_own_pid() {  # finding 16: the daemon that answers must be the
 }
 t_loopback() {  # finding 7: the daemon's real listener decides, not what daemon.json says
   local p p2 digest
-  mkhome; mkvenv; : > "$E/bind-all"
+  mkhome wild; mkvenv; : > "$E/bind-all"   # its daemons listen on 0.0.0.0, so the port is held there too
+  run can_bind 0.0.0.0 "$E_PORT" server; need "(setup) the reserved port is held on 0.0.0.0, where this test's daemon binds: a foreign server is refused" [ "$RC" = 1 ]
   run VT ensure-daemon
   need "a launch whose daemon listens on every interface is refused (exit 6)" [ "$RC" = 6 ]
   need "...naming the rule" grep -q "only 127.0.0.1:$E_PORT is allowed" <<<"$OUT"
@@ -1513,6 +1516,30 @@ t_loopback() {  # finding 7: the daemon's real listener decides, not what daemon
   run VT ensure-daemon
   need "a daemon with valid provenance that listens wide is not adopted (exit 6)" [ "$RC" = 6 ]
   need "...naming the rule" grep -q "only 127.0.0.1:$E_PORT is allowed" <<<"$OUT"; need "...and it was not signalled" alive "$p2"
+}
+can_bind() {  # <host> <port> <server|daemon>: whether a process can bind host:port as an ordinary server (SO_REUSEADDR) or as the fake vanthd (SO_REUSEADDR and SO_REUSEPORT); on stderr, why not
+  "$PYBIN" -I -c 'import socket, sys
+host, port, kind = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if kind == "daemon":
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+try:
+    s.bind((host, port))
+except OSError as exc:
+    sys.exit(exc.strerror)' "$@"
+}
+t_port_reservation() {  # the port reserved for a daemon that listens on every interface is held on that address too: a foreign server that binds the number there is refused, the fake daemon is not (t_loopback once failed with "cannot bind 0.0.0.0:P: Address already in use" when one got in)
+  local held
+  mkhome wild
+  run can_bind 0.0.0.0 "$E_PORT" server
+  need "a foreign server cannot bind the reserved port on 0.0.0.0 (exit 1)" [ "$RC" = 1 ]; need "...because the port is in use" grep -q 'Address already in use' <<<"$OUT"
+  run can_bind 127.0.0.1 "$E_PORT" server
+  need "...nor on 127.0.0.1 (exit 1)" [ "$RC" = 1 ]; need "...because the port is in use" grep -q 'Address already in use' <<<"$OUT"
+  run can_bind 0.0.0.0 "$E_PORT" daemon; need "control: the fake vanthd, which sets SO_REUSEPORT, binds 0.0.0.0 beside the reservation (exit 0)" [ "$RC" = 0 ]
+  run can_bind 127.0.0.1 "$E_PORT" daemon; need "...and 127.0.0.1 (exit 0)" [ "$RC" = 0 ]
+  held=$(/usr/sbin/lsof -nP -a -p "$E_HOLDER" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p' | tr '\n' ' ')
+  OUT="the reservation listens on: $held"; need "the reservation listens on 127.0.0.1 only: it holds 0.0.0.0 without answering there" [ "$held" = "127.0.0.1:$E_PORT " ]
 }
 t_before_install() {
   mkhome; run VT ensure-daemon; need "ensure-daemon before install-vanth exits 6" [ "$RC" = 6 ]
@@ -2059,6 +2086,45 @@ t_install_signalled() {  # a signal to the lock helper reaches the body, and thr
   need "uv was stopped with it" waitfor 10 not alive "$u"
   need "...and no install marker was written" [ ! -e "$E_VENV/.velo-task-installed" ]
 }
+t_hold_run_lost_lock() {  # hold_run starts no step under a lock whose helper is gone, and does not return from a step that outlived it: a helper that dies as the step ends falls between two polls of the loop, and the caller's next step would run unlocked
+  local d c
+  mkhome; d="$E/hr"; mkdir "$d"
+  cat > "$d/body.sh" <<'EOF'
+set -euo pipefail
+DIR="$3"; CASE="$2"
+trap 'echo "$?" > "$DIR/rc.$CASE"' EXIT
+. "$1"
+rc=0
+case "$CASE" in
+  entry)  # the lock helper is gone before the step is asked for; the step ignores SIGTERM, so that a start shows whatever the watch does
+    trap '' TERM
+    kill -9 "$LOCK_HOLDER"; while holder_alive; do /bin/sleep 0.05; done
+    step() { : > "$DIR/started"; /bin/sleep 0.2; }
+    ;;
+  end)  # the helper dies as the step ends, a second after the loop first looked, and the loop does not look again for two more
+    step() { /bin/sleep 1; kill -9 "$LOCK_HOLDER"; }
+    VELO_TASK_POLL=3
+    ;;
+  held)  # the helper lives throughout: the step's own status comes back
+    step() { return 3; }
+    ;;
+esac
+hold_run step || rc=$?
+echo "$rc" > "$DIR/ret.$CASE"
+EOF
+  for c in entry end held; do   # each body is a child of a bash standing for the lock helper, which the body (entry) or its step (end) kills
+    /bin/bash -c '"$@" & wait' x /bin/bash "$d/body.sh" "$R/bin/velo-task-lib.sh" "$c" "$d" 2> "$d/err.$c" &
+    waitfor 10 test -s "$d/rc.$c" || { echo "FAILED: [$c] the body never ended"; exit 1; }
+  done
+  OUT="exit $(cat "$d/rc.entry"), stderr: $(cat "$d/err.entry"), files: $(ls "$d" | tr '\n' ' ')"
+  need "[entry] a step is not started under a lock that is already lost: the body stops (exit 6)" [ "$(cat "$d/rc.entry")" = 6 ]
+  need "...the step never ran" [ ! -e "$d/started" ]; need "...and it said why" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$d/err.entry"
+  OUT="exit $(cat "$d/rc.end"), stderr: $(cat "$d/err.end"), files: $(ls "$d" | tr '\n' ' ')"
+  need "[end] a helper that died as the step ended stops the body, which does not go on to its next step (exit 6)" [ "$(cat "$d/rc.end")" = 6 ]
+  need "...hold_run did not return to its caller" [ ! -e "$d/ret.end" ]; need "...and it said why" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$d/err.end"
+  OUT="exit $(cat "$d/rc.held"), returned $(cat "$d/ret.held" 2>/dev/null), stderr: $(cat "$d/err.held")"
+  need "[held] control: with the lock helper alive hold_run returns the step's own status" [ "$(cat "$d/ret.held")" = 3 ]; need "...and the body goes on (exit 0)" [ "$(cat "$d/rc.held")" = 0 ]
+}
 t_ensure_orphan() {  # the same for a launch: an ensure-daemon body whose lock helper died launches nothing while a second ensure-daemon holds the lock
   local b1 b2 h body w1 w2
   mkhome; mkvenv; b1="$E/barrier-1"; b2="$E/barrier-2"
@@ -2377,6 +2443,7 @@ check "a daemon that dies at start is reported fast with its log" t_launch_failu
 check "a foreign process on the port: no provenance, intent retired, nothing signalled" t_port_collision
 check "another process answering is not a ready launch" t_launch_requires_own_pid
 check "the daemon's real listener must be 127.0.0.1 only, at launch, at adoption and in doctor" t_loopback
+check "the port reserved for a daemon that listens on every interface is held there too: a foreign server is refused" t_port_reservation
 check "the wrapper that becomes the daemon: a kill before it publishes leaves no daemon, a kill after leaves one with a valid intent" t_crash_in_launch
 check "crash after the wrapper started or after readiness: restart-daemon recovers, ensure-daemon refuses" t_crash_after_intent
 check "crash inside the intent's publish leaves both names and no daemon" t_crash_in_publish
@@ -2405,6 +2472,7 @@ check "install-vanth rebuilds a venv whose python does not run: reading daemon.j
 check "install-vanth: a body whose lock helper died stops at its next step, and stops the step it is in" t_install_orphan
 check "install-vanth: a lock helper that dies while the install is verified leaves no marker, and no venv removed" t_install_orphan_verify
 check "install-vanth: a signal to the lock helper stops uv too" t_install_signalled
+check "hold_run: no step starts under a lost lock, and none returns after the lock helper died as it ended" t_hold_run_lost_lock
 check "ensure-daemon: a body whose lock helper died launches nothing" t_ensure_orphan
 check "B23: a lock with a hash that is not its wheel's fails install-vanth and leaves nothing installed" t_install_hash_tamper
 check "B23: the lock is hashed, pinned and WHEELS ONLY (offline artifact-type check)" t_lock_file
@@ -2732,6 +2800,9 @@ prove "the loopback check always passes" t_loopback $L '  [ "$got" = "n127.0.0.1
 prove "the loopback check looks at the port only" t_loopback $L '  [ "$got" = "n127.0.0.1:$PORT " ] && return 0' $'  case "$got" in *":$PORT "*) return 0 ;; esac'
 prove "doctor does not check the listener" t_loopback $L \
   '    if check_loopback "$pid"; then ok "bind: 127.0.0.1:$PORT only (listener of pid $pid)"; else bad "bind: $LOOPBACK_WHY"; fi' '    ok "bind: 127.0.0.1:$PORT only (listener of pid $pid)"'
+PORT_HOLDER_MUTANT=loopback-only prove_env "the port reservation holds loopback only, so a foreign server can take the wildcard address" t_port_reservation
+PORT_HOLDER_MUTANT=listen-wild prove_env "the wildcard side of the port reservation listens too" t_port_reservation
+PORT_HOLDER_MUTANT=loopback-only prove_env "the loopback test reserves its port on loopback only" t_loopback
 
 # ---- state modes ----
 prove "ensure-daemon does not check the modes" t_modes_refuse $L $'  need_install; need_allowlist; need_modes\n  local pid' $'  need_install; need_allowlist\n  local pid'
@@ -2850,6 +2921,10 @@ prove "assert_lock_held does not ask whether the lock helper is alive (ensure-da
 prove "assert_lock_held does not ask whether the lock helper is alive (verification)" t_install_orphan_verify $L $'  holder_alive || die 6 "$LOCK_HOLDER_GONE"\n' ''
 prove "uv pip install is not watched for the lock helper's death" t_install_orphan $L '  hold_run run_uv pip install --no-config' '  run_uv pip install --no-config'
 prove "uv venv is not watched for the lock helper's death" t_install_orphan $L '  hold_run run_uv venv --no-config' '  run_uv venv --no-config'
+prove "hold_run does not look at the lock helper before it starts a step" t_hold_run_lost_lock $L \
+  $'  holder_alive || die 6 "$LOCK_HOLDER_GONE"  # a step is not started under a lock that is already lost\n' ''
+prove "hold_run does not look at the lock helper once the step has ended" t_hold_run_lost_lock $L \
+  $'  holder_alive || die 6 "$LOCK_HOLDER_GONE"  # the helper may have died as the step ended, between two polls of the loop: nothing that follows runs on a lock that was lost\n' ''
 prove "a signal to the install body is not passed on to uv" t_install_signalled $L \
   $'  trap \'kill -TERM -- "-$job" 2>/dev/null || :; exit 143\' TERM INT HUP' '  :'
 prove "a failed verification removes the venv without asking again whether the lock is held" t_install_orphan_verify $L \
