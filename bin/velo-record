@@ -35,7 +35,11 @@ repo_init || exit 0
 # without this, validating velo-record meant dropping stray files into master's
 # working tree, which is exactly the cross-contamination the worktree discipline
 # is there to prevent.
-ROOT="${VELO_RECORD_ROOT:-$HOME/RustroverProjects/${REPO_NAME}}"
+ROOT="$HOME/RustroverProjects/${REPO_NAME}"
+# VELO_RECORD_ROOT says where records are WRITTEN (RECORD_DIR below). The default repo's ROOT has always followed it and
+# still does; any other repo's never does: the base sha and the task spec are read from the checkout named above, after
+# repo_owns has accepted it, and from nowhere else.
+[[ $REPO_IS_DEFAULT -eq 0 ]] || ROOT="${VELO_RECORD_ROOT:-$ROOT}"
 LIB="$(dirname "${BASH_SOURCE[0]}")/velo-worktree-lib.sh"
 [[ -f "$LIB" ]] || LIB="$ROOT/.agents/bin/velo-worktree-lib.sh"
 # shellcheck source=/dev/null
@@ -67,11 +71,11 @@ done
 
 [[ -n "$ISSUE" && -n "$WORKTREE" ]] || { echo "velo-record: need <issue> and --worktree" >&2; exit 0; }
 
-# The tree read below (the base sha, the task spec) and the worktree measured must be REPO's own. Another repo's, under the
-# same directory name (the name is the same, the owner is not), would put its sha, its spec or its commits into this
-# repo's records: said, and nothing recorded, as for a base that cannot be found. VELO_RECORD_ROOT names a directory of
-# records, not a checkout, and is not asked.
-[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }
+# The checkout read below (the base sha, the task spec) and the worktree measured must be REPO's own. Another repo's, under
+# the same directory name (the name is the same, the owner is not), would put its sha, its spec or its commits into this
+# repo's records: said, and nothing recorded, as for a base that cannot be found. An explicit VELO_RECORD_ROOT moves the
+# records and changes nothing here.
+repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }
 repo_owns "$WORKTREE" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }
 
 # The ref commits are counted against. velo-dispatch hands its own down for a repo that is not the default; a hand run
@@ -208,8 +212,8 @@ fi
 #
 # $VELO_STATE already owns gate/, spec/ and dispatch/ state for exactly this
 # reason: it survives worktree removal, git clean, and branch switches.
-# VELO_RECORD_ROOT stays the test/override knob; it now names a directory that
-# CONTAINS records rather than a repo checkout.
+# VELO_RECORD_ROOT stays the test/override knob: the directory that CONTAINS
+# records. It decides this path and, for the default repo alone, ROOT above.
 RECORD_DIR="${VELO_RECORD_ROOT:+$VELO_RECORD_ROOT/records}"
 RECORD_DIR="${RECORD_DIR:-${VELO_STATE:-$HOME/.agents/state}/records}$REPO_SUB"
 mkdir -p "$RECORD_DIR"

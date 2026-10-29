@@ -11,6 +11,9 @@ set -uo pipefail
 STATUS="$(dirname "$0")/../bin/velo-status"
 WT="/tmp/velostream-999999"
 FAILED=0
+# exit_record_for reads REPO_IS_DEFAULT, which the real script has from repo_init before it is ever called. This suite is
+# the default repo's (a tree's legacy .agents/tasks record is read for it alone), and set -u makes a missing one loud.
+REPO_IS_DEFAULT=1
 
 ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }

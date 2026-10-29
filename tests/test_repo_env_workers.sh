@@ -14,6 +14,8 @@
 #   - not take a repo with Velostream's directory name and another owner (acme/velostream) for Velostream, nor Velostream's tree
 #     and workers for its own: every tree found by name passes an origin check first (spec-review, status, the orchestrator,
 #     dispatch, record)
+#   - read what a record needs (the base, the task spec) from the repo's own, checked tree, whatever VELO_RECORD_ROOT says: it
+#     moves the records and nothing else
 set -uo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/repo-env-lib.sh"
 
@@ -437,22 +439,48 @@ t_dispatch_foreign_worktree() {   # the path where $ALT's worker for #78 would b
   [ "$BAD" -eq 0 ]
 }
 t_record_foreign_tree() {   # nothing is recorded against Velostream's tree for $CLASH, nor for a Velostream worktree for $ALT
+                            # VELO_RECORD_ROOT moves the records and nothing else: not which tree the base and the spec are read from
+  local vt own root f
   sb_new && mk_clash || return 1
   fx_base main; XE="VELO_REPO=$CLASH"
   rec $CLASH_WIP "$H/RustroverProjects/velostream-$CLASH_WIP"
   eq "$RC" 0 "velo-record is observational and exits 0"
   want "$OUT" "$H/RustroverProjects/velostream is a checkout of $DEF, not $CLASH — nothing recorded" "the run of $CLASH was recorded against the Velostream tree: $(nonl "$OUT" 300)"
   [ ! -e "$S/records" ] || bad "a record was written for $CLASH: $(ls -R "$S/records" | tr '\n' ' ')"
+  # Naming the Velostream tree as the record root (it holds a task spec for #99 and a base of its own), or a plain directory, does
+  # not make a tree $CLASH's: the run is refused for the same tree, and nothing is written under the root
+  vt="$H/RustroverProjects/velostream"
+  mkdir -p "$vt/.agents/tasks" && printf '{"verified_against":"foreign","tests":{"fail_to_pass":["a","b","c"]}}\n' > "$vt/.agents/tasks/$CLASH_WIP.json" || return 1
+  for root in "$vt" "$SB/plain"; do
+    XE="VELO_REPO=$CLASH VELO_RECORD_ROOT=$root"
+    rec $CLASH_WIP "$H/RustroverProjects/velostream-$CLASH_WIP"
+    eq "$RC" 0 "velo-record with VELO_RECORD_ROOT=$root is observational and exits 0"
+    want "$OUT" "$vt is a checkout of $DEF, not $CLASH — nothing recorded" "VELO_RECORD_ROOT=$root: the run of $CLASH was recorded against a tree that is not $CLASH's: $(nonl "$OUT" 300)"
+    [ ! -e "$root/records" ] || bad "VELO_RECORD_ROOT=$root: a record was written for $CLASH: $(ls -R "$root/records" | tr '\n' ' ')"
+  done
   sb_new && mk_world || return 1
   fx_base main; XE="VELO_REPO=$ALT"
   rec $WIP "$H/RustroverProjects/velostream-$WIP"
   eq "$RC" 0 "velo-record is observational and exits 0"
   want "$OUT" "$H/RustroverProjects/velostream-$WIP is a checkout of $DEF, not $ALT — nothing recorded" "a Velostream worktree was recorded as $ALT's run: $(nonl "$OUT" 300)"
   [ ! -e "$S/records" ] || bad "a record was written for $ALT from a Velostream worktree: $(ls -R "$S/records" | tr '\n' ' ')"
-  # VELO_RECORD_ROOT names a directory of records, not a checkout: it is not asked for an origin
-  XE="VELO_REPO=$ALT VELO_RECORD_ROOT=$SB/recroot"
-  rec $WIP "$H/RustroverProjects/velo-agents-$WIP"
-  [ -s "$SB/recroot/records/$ALT_SUB/$WIP.result.jsonl" ] || bad "no record in an explicit VELO_RECORD_ROOT (exit $RC): $(nonl "$OUT" 300)"
+  # $ALT's own run is recorded wherever VELO_RECORD_ROOT says (a plain directory, or a decoy: another checkout of $ALT with a base
+  # and a task spec for #77 of its own), with the base and the spec of $ALT's own tree
+  own="$H/RustroverProjects/velo-agents"
+  mkdir -p "$own/.agents/tasks" && printf '{"verified_against":"own","tests":{"fail_to_pass":["a","b"]}}\n' > "$own/.agents/tasks/$WIP.json" \
+    && git clone -q "$SB/remote/velostreamai/velo-agents" "$SB/decoy" && git -C "$SB/decoy" $GITID commit -q --allow-empty -m decoy \
+    && git -C "$SB/decoy" update-ref refs/remotes/origin/main HEAD \
+    && mkdir -p "$SB/decoy/.agents/tasks" && printf '{"verified_against":"decoy","tests":{"fail_to_pass":["a","b","c"]}}\n' > "$SB/decoy/.agents/tasks/$WIP.json" || return 1
+  for root in "$SB/plain" "$SB/decoy"; do
+    XE="VELO_REPO=$ALT VELO_RECORD_ROOT=$root"
+    rec $WIP "$H/RustroverProjects/velo-agents-$WIP"
+    f="$root/records/$ALT_SUB/$WIP.result.jsonl"
+    [ -s "$f" ] || { bad "VELO_RECORD_ROOT=$root: no record there (exit $RC): $(nonl "$OUT" 300)"; continue; }
+    eq "$(jq -r .base_sha "$f")" "$(git -C "$own" rev-parse --short origin/main)" "VELO_RECORD_ROOT=$root: the record's base is not that of $ALT's own tree"
+    eq "$(jq -r .spec_sha "$f")" own "VELO_RECORD_ROOT=$root: the record's spec is not that of $ALT's own tree"
+    eq "$(jq -r .tests.fail_to_pass.declared "$f")" 2 "VELO_RECORD_ROOT=$root: the record's declared tests are not those of $ALT's own tree"
+  done
+  [ ! -e "$S/records" ] || bad "records went to the state dir though VELO_RECORD_ROOT named another directory: $(ls -R "$S/records" | tr '\n' ' ')"
   [ "$BAD" -eq 0 ]
 }
 
@@ -530,7 +558,7 @@ prove "a spec behind is behind master" t_dispatch_names_its_branch bin/velo-disp
 prove "triage-needed claims may not match master" t_dispatch_names_its_branch bin/velo-dispatch 'its claims may not match $BASE_BRANCH.' 'its claims may not match master.'
 prove "triage-needed advice says master" t_dispatch_names_its_branch bin/velo-dispatch 'against current $BASE_BRANCH, then remove the label.' 'against current master, then remove the label.'
 prove "an existing branch is not on master" t_dispatch_names_its_branch bin/velo-dispatch 'commit(s) not on $BASE_BRANCH.' 'commit(s) not on master.'
-prove "velo-record counts against the Velostream tree" t_record_alt bin/velo-record 'ROOT="${VELO_RECORD_ROOT:-$HOME/RustroverProjects/${REPO_NAME}}"' 'ROOT="${VELO_RECORD_ROOT:-$HOME/RustroverProjects/velostream}"'
+prove "velo-record counts against the Velostream tree" t_record_alt bin/velo-record 'ROOT="$HOME/RustroverProjects/${REPO_NAME}"' 'ROOT="$HOME/RustroverProjects/velostream"'
 prove "velo-record records against a base it could not find" t_record_alt bin/velo-record 'repo_base_branch || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' 'repo_base_branch || :'
 prove "velo-record shares its records" t_workers_two_repos_one_state_dir bin/velo-record '/records}$REPO_SUB"' '/records}"'
 prove "velo-native shares its records" t_workers_two_repos_one_state_dir bin/velo-native 'NATIVE_DIR="$VELO_STATE/native$REPO_SUB"' 'NATIVE_DIR="$VELO_STATE/native"'
@@ -567,9 +595,14 @@ prove "the orchestrator counts another repo's running workers" t_orchestrd_forei
 prove "the orchestrator escalates another repo's STOP" t_orchestrd_foreign_worktrees bin/velo-orchestrd 'repo_owns "$d" || continue
     issue=' 'issue='
 prove "a dispatch resumes another repo's worktree" t_dispatch_foreign_worktree bin/velo-dispatch '[[ ! -e "$WT" ]] || repo_owns "$WT" || die "$REPO_ERR' '[[ ! -e "$WT" ]] || repo_owns "$WT" || : "$REPO_ERR'
-prove "record records against another repo's tree" t_record_foreign_tree bin/velo-record '[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' ':'
+prove "record records against another repo's tree" t_record_foreign_tree bin/velo-record 'repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' ':'
 prove "record records another repo's worktree" t_record_foreign_tree bin/velo-record 'repo_owns "$WORKTREE" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' ':'
-prove "record asks an explicit record root for an origin" t_record_foreign_tree bin/velo-record '[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" ||' 'repo_owns "$ROOT" ||'
+prove "a record root exempts the tree from the origin check" t_record_foreign_tree bin/velo-record 'repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' '[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }'
+prove "a record root stands in for another repo's tree" t_record_foreign_tree bin/velo-record '[[ $REPO_IS_DEFAULT -eq 0 ]] || ROOT="${VELO_RECORD_ROOT:-$ROOT}"' 'ROOT="${VELO_RECORD_ROOT:-$ROOT}"'
+prove "a record root stands in for the tree, and is not asked" t_record_foreign_tree bin/velo-record '[[ $REPO_IS_DEFAULT -eq 0 ]] || ROOT="${VELO_RECORD_ROOT:-$ROOT}"' 'ROOT="${VELO_RECORD_ROOT:-$ROOT}"' bin/velo-record 'repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' '[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }'
+prove "records ignore the record root" t_record_foreign_tree bin/velo-record 'RECORD_DIR="${VELO_RECORD_ROOT:+$VELO_RECORD_ROOT/records}"' 'RECORD_DIR=""'
+prove "the spec is read from the record root" t_record_foreign_tree bin/velo-record 'VR_SPECDIR="$ROOT/.agents/tasks"' 'VR_SPECDIR="${VELO_RECORD_ROOT:-$ROOT}/.agents/tasks"'
+prove "the base is read from the record root" t_record_foreign_tree bin/velo-record 'BASE=$(git -C "$ROOT" rev-parse --short' 'BASE=$(git -C "${VELO_RECORD_ROOT:-$ROOT}" rev-parse --short'
 
 proofs_finish
 echo
