@@ -1,12 +1,16 @@
 #!/bin/bash
 # velo-task - detached-work coordination on a pinned, hash-locked Vanth (docs/velo-task-spec.md).
 #
-# M1 (foundation) implements only the install and daemon lifecycle:
+# M1 (foundation) is the install and daemon lifecycle, M2a adds run and status:
 #   velo-task install-vanth    build the pinned venv from requirements/vanth.lock (R11, R12)
 #   velo-task ensure-daemon    adopt the daemon velo-task launched, or launch one (R6, R11, R18)
 #   velo-task restart-daemon   SIGTERM the validated daemon pid, then a clean launch (R7, R18)
 #   velo-task doctor           read-only report on install, allowlist, modes, provenance, schema
-# Every other subcommand exits 2 ("not implemented in M1").
+#   velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd...   start a job, print its job_id (R2-R4, R17)
+#   velo-task status [--json] [--issue N] <id> | --job <job_id>   print `<id> <verdict>` (R1, R3): ok, failed(n), timeout,
+#                              killed, lost, upstream-failed(<parent>) or in-flight; exit 6 and `velo-task restart-daemon` when the daemon is down;
+#                              exit 3 for a job Vanth does not know, or an id whose start Vanth never received (pending-unsent: re-run it)
+# Every other subcommand exits 2 ("not implemented yet").
 #
 # Layout (VELO_TASK_HOME defaults to ${VELO_STATE:-~/.agents/state}/velo-task; tests override it):
 #   venv/               pinned Vanth install      vanth/              VANTH_HOME = AGENT_BG_HOME
@@ -31,7 +35,8 @@ case "$sub" in
   install-vanth|ensure-daemon|restart-daemon|doctor)
     [ "$#" -eq 0 ] || die 2 "$sub takes no arguments"
     "cmd_${sub//-/_}" ;;
+  run|status) "cmd_$sub" "$@" ;;
   -h|--help|help|'') usage ;;
   _*) die 2 "unknown subcommand '$sub'" ;;
-  *) die 2 "'$sub' is not implemented in M1 (available: install-vanth, ensure-daemon, restart-daemon, doctor)" ;;
+  *) die 2 "'$sub' is not implemented yet (available: install-vanth, ensure-daemon, restart-daemon, doctor, run, status)" ;;
 esac

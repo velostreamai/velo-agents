@@ -47,9 +47,9 @@ and the tests** — never from the worker's self-report.
     velo_oai_tools.py              local tools openai-agents does not ship
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
     velo-llm-bench                 same-prompt speed bench for a worker:local server; prompt pinned to a commit
-    velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); M1: install-vanth, ensure-daemon, restart-daemon, doctor
-    velo-task-lib.sh               the functions behind velo-task, sourced and never a subcommand: the locked bodies (ensure, restart, install), launch, records, doctor
-    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock (symlink-safe, hands the body its descriptor), lock-held, check-state, write-record, rec-read, launch-exec (the process that becomes vanthd), publish, retire, append-index, fp, sha256, json-get, modes-check, redact, jobs-ro, failpoint, test-capability
+    velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); M1: install-vanth, ensure-daemon, restart-daemon, doctor; M2a: run, status
+    velo-task-lib.sh               the functions behind velo-task, sourced and never a subcommand: the locked bodies (ensure, restart, install), launch, records, doctor, run, status
+    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock (symlink-safe, hands the body its descriptor), lock-held, check-state, write-record, rec-read, launch-exec (the process that becomes vanthd), publish, retire, append-index, fp, sha256, json-get, modes-check, redact, jobs-ro, verdict-of (the one place a verdict is computed), pending-write, remove, index-last, index-has, reconcile (an id's pending records against Vanth's own acceptance record), failpoint, test-capability
   tests/
     run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants
@@ -87,7 +87,8 @@ and the tests** — never from the worker's self-report.
     test_velo_task_bash32.sh       velo-task M3c, B14: every bin/velo-task* script parses, sweeps clean and runs under /bin/bash 3.2; a seeded declare -A fixture (fixtures/velo-task/bash4-seeded.sh) fails both halves; one seed per construct family
     bash32-sweep.sh                the bash-4 sweep and the 3.2 runner, sourced by those two suites; mutation-lib.sh is their shared mutation-proof harness (sourced, not suites)
     test_velo_task_foundation.sh   velo-task M1: install-vanth, state helper, daemon lifecycle; each check is proved red on a mutated copy; VELO_TASK_NETWORK_TESTS=1 adds the real install
-    fixtures/velo-task/            fake uv, vanth and vanthd, and a port holder, for the velo-task tests (the suite renders them into a temp tree)
+    test_velo_task_m2a.sh          velo-task M2a: verdict_of, run, status; sources the M1 harness, each check proved red on a mutated copy; VELO_TASK_ONLY="t_a t_b" runs just those, VELO_TASK_NO_PROOFS=1 skips the proofs
+    fixtures/velo-task/            fake uv, vanth and vanthd, a sqlite-backed fake vanth CLI (fake-vanth-jobs.py), and a port holder, for the velo-task tests (the suite renders them into a temp tree)
     fixtures/vanth-closure.txt     the distributions a real Vanth install has, checked in: the fake install reports this set and the lock must pin exactly it
   bench/local-models/
     README.md                      worker:local model results, method and verdicts — read before switching models

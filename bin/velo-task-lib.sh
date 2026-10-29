@@ -30,6 +30,8 @@
 #   daemon.provenance   the same for the daemon velo-task launched and proved ready
 #   *.retired.<epoch>   records retired for good      lock/daemon         per-home lock for install, ensure, restart
 #   daemon.launch.log   vanthd stdout/stderr
+#   names/<id>          the name index (R3): the job_ids run started under <id>, one per line, append-only
+#   pending/<nonce>     a start about to be sent to Vanth (R17): its canonical settings, deleted once its job_id is indexed
 # VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT, VELO_TASK_STOP_WAIT, VELO_TASK_LOCK_WAIT
 # (seconds) and VELO_TASK_POLL (the poll interval while a daemon starts or stops, default 0.2 s). Exit codes: 0 ok, 1 error,
 # 2 usage, 6 daemon refused/down/misconfigured.
@@ -54,6 +56,8 @@ PROV="$VELO_TASK_HOME/daemon.provenance"
 INTENT="$VELO_TASK_HOME/daemon.intent"
 LAUNCH_LOG="$VELO_TASK_HOME/daemon.launch.log"
 LOCK_FILE="$VELO_TASK_HOME/lock/daemon"
+NAMES="$VELO_TASK_HOME/names"
+PENDING="$VELO_TASK_HOME/pending"
 UV_PINNED=/opt/homebrew/bin/uv
 INSTALL_PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 SYS_PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -94,7 +98,7 @@ prep_env() {  # once per entry point, in the main shell: what the helper and the
   SEAM_ENV=()
   if [ -n "${TMPDIR:-}" ]; then HELPER_ENV[${#HELPER_ENV[@]}]="TMPDIR=$TMPDIR"; fi
   if [ -n "${LANG:-}" ]; then HELPER_ENV[${#HELPER_ENV[@]}]="LANG=$LANG"; fi
-  for v in VELO_TASK_TEST VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV; do
+  for v in VELO_TASK_TEST VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV VELO_TASK_RERUN_NONCE; do
     if [ -n "${!v:-}" ]; then seam=1; fi
   done
   [ "$seam" = 1 ] || return 0
@@ -107,6 +111,7 @@ prep_env() {  # once per entry point, in the main shell: what the helper and the
     for v in VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV; do
       if [ -n "${!v:-}" ]; then die 2 "$v is set but refused: it is honoured only for tests ($why)"; fi
     done
+    if [ -n "${VELO_TASK_RERUN_NONCE:-}" ]; then die 2 "VELO_TASK_RERUN_NONCE is set but refused: it is honoured only for tests ($why)"; fi
   fi
 }
 py_run() {  # <python> <helper args...>: the state helper, isolated (-I) and under the minimal environment, never the caller's
@@ -528,4 +533,146 @@ cmd_doctor() {
     else bad "schema: jobs-ro exit $? (4 locked, 5 mismatch)"; fi
   fi
   return "$rc"
+}
+
+# ---- run and status (R1-R5, R17): the verdict is computed by the helper alone, never here ------------
+need_daemon() {  # R6, R7: ensure-daemon first (its stdout is not ours); a daemon that cannot be reached or started is exit 6 and the recovery command, never a verdict
+  local rc=0
+  (cmd_ensure_daemon >/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || die 6 "daemon-down: ensure-daemon failed (exit $rc); recover with: velo-task restart-daemon"
+}
+check_arg() {  # <kind> <value>: the R3 charsets, matched against the whole value
+  local re
+  case "$1" in
+    id) re='^[a-z0-9][a-z0-9_-]{2,63}$' ;;
+    job) re='^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$' ;;
+    issue) re='^[0-9]{1,9}$' ;;
+    timeout) re='^[1-9][0-9]{0,8}$' ;;
+    stage) re='^[a-z0-9][a-z0-9_-]{0,31}$' ;;
+  esac
+  [[ "$2" =~ $re ]] || die 2 "invalid $1 '$2': must match $re"
+}
+rerun_nonce() {  # <attempt>: the R4 key suffix <epoch>_<pid>_<rand8>; VELO_TASK_RERUN_NONCE (tests only, see prep_env) is that suffix, or a comma list of them, one per attempt, the last repeating
+  local parts n
+  if [ -z "${VELO_TASK_RERUN_NONCE:-}" ]; then
+    printf '%s_%s_%s' "$(/bin/date +%s)" "$$" "$(/usr/bin/od -An -N4 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+    return 0
+  fi
+  IFS=, read -r -a parts <<<"$VELO_TASK_RERUN_NONCE"
+  n=$(( $1 < ${#parts[@]} ? $1 : ${#parts[@]} ))
+  printf '%s' "${parts[$((n - 1))]}"
+}
+start_refused() {  # <exit> <vanth output> <pending nonce>: vanth start returned no job
+  case "$2" in
+    *"idempotency_key was already used"*|*"idempotency_key refers to cleaned job"*)  # Vanth refused this request outright: nothing was started, so nothing is pending
+      st remove "$PENDING/$3"
+      die 5 "IDEMPOTENCY_CONFLICT: ${2#vanth start: }; this id was already started (with other settings, or its job was cleaned): use --rerun for a new execution" ;;
+    *"failed to reach daemon"*) die 6 "daemon-down: $2; whether the start was accepted is unknown, so $PENDING/$3 is kept; recover with: velo-task restart-daemon" ;;
+    *) die 1 "vanth start failed (exit $1): $2; whether it was accepted is unknown, so $PENDING/$3 is kept" ;;
+  esac
+}
+reconcile_id() {  # <id>: settle the id's pending records against Vanth's own acceptance record before its name index is read (R3, R17). Returns 3, after `pending-unsent <id>` on stderr, when a record is left that Vanth has no key for; anything else that goes wrong stops the caller
+  local rc=0
+  st reconcile "$PENDING" "$NAMES" "$VH/jobs.sqlite" "$1" || rc=$?
+  case "$rc" in 0|3) return "$rc" ;; esac
+  die 6 "reconcile of '$1' failed (helper exit $rc, see above); nothing was resolved"
+}
+cmd_run() {
+  local id timeout="" issue="" stage="" have_issue=0 have_stage=0 rerun=0 cmdline=() args=() n=0 key out rc pending job cwd known
+  [ "$#" -gt 0 ] || die 2 "usage: velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd..."
+  id="$1"; shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout|--issue|--stage)
+        [ "$#" -ge 2 ] || die 2 "$1 needs a value"
+        case "$1" in --timeout) timeout="$2" ;; --issue) issue="$2"; have_issue=1 ;; *) stage="$2"; have_stage=1 ;; esac
+        shift 2 ;;
+      --rerun) rerun=1; shift ;;
+      --) shift; cmdline=("$@"); break ;;
+      *) die 2 "unknown option '$1' (the command goes after --)" ;;
+    esac
+  done
+  check_arg id "$id"
+  [ -n "$timeout" ] || die 2 "--timeout S is required: every job is started with a deadline (R2)"
+  check_arg timeout "$timeout"
+  [ "$have_issue" = 0 ] || check_arg issue "$issue"
+  [ "$have_stage" = 0 ] || check_arg stage "$stage"
+  [ "${#cmdline[@]}" -gt 0 ] || die 2 "no command: expected -- cmd..."
+  prep_env
+  need_daemon
+  /bin/mkdir -p -m 700 "$NAMES" "$PENDING"
+  cwd=$(pwd -P)
+  rc=0; st index-last "$NAMES" "$id" >/dev/null || rc=$?  # an unsafe name index is found now, not after the job was started
+  [ "$rc" -le 1 ] || die 6 "the name index of '$id' is unsafe or unreadable (see above); nothing was started"
+  rc=0; reconcile_id "$id" || rc=$?  # a run that died after its start was accepted is indexed first, so the last line stays the last job started; 3 is reported on stderr, never replayed here
+  while :; do
+    n=$((n + 1))
+    key="velo_$id"
+    if [ "$rerun" = 1 ]; then key="${key}_$(rerun_nonce "$n")"; fi
+    args=(--name "$id" --timeout "$timeout" --idempotency-key "$key" --cwd "$cwd" --tag velo)
+    if [ "$have_issue" = 1 ]; then args=("${args[@]}" --tag "issue:$issue"); fi
+    if [ "$have_stage" = 1 ]; then args=("${args[@]}" --tag "stage:$stage"); fi
+    pending=$(st pending-write "$PENDING" -- "${args[@]}" -- "${cmdline[@]}")  # R17 (1): the settings are durable before anything is sent
+    stl failpoint pending.published
+    rc=0
+    out=$(vanth_env "$VANTH" --json start "${args[@]}" -- "${cmdline[@]}" 2>&1) || rc=$?  # R17 (2); exit 1 also comes with the JSON of a job that failed to start
+    job=$(printf '%s\n' "$out" | /usr/bin/grep -v '^vanth start:' | st json-get - job_id 2>/dev/null) || job=""
+    [ -n "$job" ] || start_refused "$rc" "$out" "$pending"
+    stl failpoint start.returned
+    known=0; st index-has "$NAMES" "$job" "$id" || known=$?  # 0 listed under this id, 1 not listed, else unreadable
+    [ "$known" -le 1 ] || die 6 "the name index is unsafe or unreadable (see above)"
+    if [ "$known" = 0 ] && [ "$rerun" = 1 ] && [ -e "$PENDING/$pending" ]; then  # R4: Vanth returned a job we already know, so the key collided with an earlier run; unless a reconcile settled this run's own record and indexed its job
+      st remove "$PENDING/$pending"
+      if [ "$n" -ge 5 ]; then die 5 "--rerun: Vanth returned an already indexed job for $n keys in a row; nothing new was started"; fi
+      continue
+    fi
+    if [ "$known" = 1 ]; then st append-index "$NAMES/$id" "$job"; stl failpoint index.appended; fi  # R17 (3)
+    st remove "$PENDING/$pending"  # R17 (4)
+    stl failpoint pending.unlinked
+    printf '%s\n' "$job"
+    return 0
+  done
+}
+cmd_status() {
+  local id="" job="" issue="" have_issue=0 json=0 absent=0 unsent=0 out rc=0 vargs
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --issue|--job)
+        [ "$#" -ge 2 ] || die 2 "$1 needs a value"
+        if [ "$1" = --job ]; then job="$2"; else issue="$2"; have_issue=1; fi
+        shift 2 ;;
+      -*) die 2 "unknown option '$1'" ;;
+      *) [ -z "$id" ] || die 2 "status takes one id"; id="$1"; shift ;;
+    esac
+  done
+  if [ -n "$id" ] && [ -z "$job" ]; then check_arg id "$id"
+  elif [ -z "$id" ] && [ -n "$job" ]; then check_arg job "$job"
+  else die 2 "usage: velo-task status [--json] [--issue N] <id> | --job <job_id>"; fi
+  [ "$have_issue" = 0 ] || check_arg issue "$issue"
+  prep_env
+  need_daemon
+  if [ -n "$id" ]; then  # R3: the last job run indexed under the id; never vanth list, which caps at 1,000 rows and matches names by substring
+    reconcile_id "$id" || unsent=$?  # a run that died after its start was accepted has its job indexed now
+    job=$(st index-last "$NAMES" "$id") || rc=$?
+    if [ "$rc" = 1 ] && [ "$unsent" = 3 ]; then die 3 "pending-unsent $id: Vanth has no record of this start, so it may never have been sent; re-run \`velo-task run $id ...\` (idempotent: the same key returns the existing job)"; fi
+    case "$rc" in
+      0) ;;
+      1) die 2 "no job named '$id' in the name index; address a job by its id with --job <job_id>" ;;
+      *) die 6 "the name index of '$id' is unsafe or unreadable (see above)" ;;
+    esac
+  fi
+  out=$(vanth_env "$VANTH" --json status "$job" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    case "$out" in
+      *"unknown job"*) absent=1 ;;
+      *"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict was read; recover with: velo-task restart-daemon" ;;
+      *) die 1 "vanth status failed (exit $rc): $out" ;;
+    esac
+  fi
+  vargs=(--names "$NAMES" --db "$VH/jobs.sqlite" --job "$job")
+  if [ -n "$id" ]; then vargs=("${vargs[@]}" --name "$id" --label "$id"); fi  # the row's name must equal the id exactly, whatever the index said
+  if [ "$have_issue" = 1 ]; then vargs=("${vargs[@]}" --issue "$issue"); fi
+  if [ "$json" = 1 ]; then vargs=("${vargs[@]}" --json); fi
+  if [ "$absent" = 1 ]; then st verdict-of --absent "${vargs[@]}"; else printf '%s\n' "$out" | st verdict-of "${vargs[@]}"; fi
 }
