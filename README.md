@@ -48,9 +48,9 @@ and the tests** — never from the worker's self-report.
     velo_oai_tools.py              local tools openai-agents does not ship
     velo-lmstudio-agent-sdk.py     local LM Studio worker runner
     velo-llm-bench                 same-prompt speed bench for a worker:local server; prompt pinned to a commit
-    velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); M1: install-vanth, ensure-daemon, restart-daemon, doctor; M2a: run, status (a job belongs to a session: $CLAUDE_SESSION_ID, else a token the state dir keeps; `status` with no id lists a session's jobs)
-    velo-task-lib.sh               the functions behind velo-task, sourced and never a subcommand: the locked bodies (ensure, restart, install), launch, records, doctor, run, status, session_id, reconcile_id
-    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock (symlink-safe, hands the body its descriptor), lock-held, check-state, write-record, rec-read, launch-exec (the process that becomes vanthd), publish, retire, append-index, fp, sha256, json-get, modes-check, redact, jobs-ro, verdict-of (the one place a verdict is computed, for one job or --list), session-token, pending-write, remove, index-last, index-has, reconcile (an id's pending records against Vanth's own acceptance record), failpoint, test-capability
+    velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); Vanth is the only state: install-vanth, ensure-daemon, restart-daemon, run (required --timeout; tags session/issue/stage), status, wait, cancel, stop-override
+    velo-task-lib.sh               the functions behind velo-task, sourced by it and by the two velo-task hooks, never a subcommand: the pinned install, the private daemon launch, run/status/wait/cancel, the in-flight query
+    velo-task-state                the stdlib-python helper behind velo-task: json-get (no jq), jobs-ro (read-only SQLite on Vanth's jobs.sqlite), verdict-of (the closed verdict set), launch (exec with only the named variables), override-write/take
   tests/
     run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants
@@ -91,8 +91,7 @@ and the tests** — never from the worker's self-report.
     test_velo_task_hooks.sh        velo-task M3c, B13 + B29 hook half: the two deny-* hooks: every denied form, the look-alikes that must pass, each known false negative pinned, fail-open, the README registration line, install; each check is proved red on a mutated copy
     test_velo_task_bash32.sh       velo-task M3c, B14: every bin/velo-task* script parses, sweeps clean and runs under /bin/bash 3.2; a seeded declare -A fixture (fixtures/velo-task/bash4-seeded.sh) fails both halves; one seed per construct family
     bash32-sweep.sh                the bash-4 sweep and the 3.2 runner, sourced by those two suites; mutation-lib.sh is their shared mutation-proof harness (sourced, not suites)
-    test_velo_task_foundation.sh   velo-task M1: install-vanth, state helper, daemon lifecycle; each check is proved red on a mutated copy; VELO_TASK_NETWORK_TESTS=1 adds the real install
-    test_velo_task_m2a.sh          velo-task M2a: verdict_of, run, status, sessions (the key, the tag, the token, the list); sources the M1 harness, each check proved red on a mutated copy; VELO_TASK_ONLY="t_a t_b" runs just those, VELO_TASK_NO_PROOFS=1 skips the proofs
+    test_velo_task.sh              velo-task v2: the state helper, daemon launch (secrets, privacy, provenance), the pinned install, run/status/wait/cancel against a fake Vanth with real state, the Stop guard and SessionStart; each check is proved red on a mutated copy; VELO_TASK_ONLY="t_a t_b" runs just those, VELO_TASK_NO_PROOFS=1 skips the proofs, VELO_TASK_NETWORK_TESTS=1 adds the real Vanth
     fixtures/velo-task/            fake uv, vanth and vanthd, a sqlite-backed fake vanth CLI (fake-vanth-jobs.py), and a port holder, for the velo-task tests (the suite renders them into a temp tree)
     fixtures/vanth-closure.txt     the distributions a real Vanth install has, checked in: the fake install reports this set and the lock must pin exactly it
   bench/local-models/
@@ -261,7 +260,7 @@ is skipped the same way, which is why `--check` looks for it):
 ```
 
 `session-start-inflight.sh` registers the same way under `SessionStart`. The two `deny-*` hooks are guardrails against
-the orchestrating model's own mistakes (docs/velo-task-spec.md R10, R15(i)), not isolation:
+the orchestrating model's own mistakes (docs/velo-task-spec.md), not isolation:
 
 | hook | denies | allows | known false negatives |
 |---|---|---|---|
@@ -271,6 +270,11 @@ the orchestrating model's own mistakes (docs/velo-task-spec.md R10, R15(i)), not
 Both read the payload with `jq` and fail open (exit 0) when `jq`, `guard-lib.sh` (the scanner they share, installed beside
 them) or the command is missing. `tests/test_velo_task_hooks.sh` pins every denied form, every look-alike that must pass and
 each false negative above, so closing a gap makes that test say so.
+
+`velo-task-stop-guard.sh` (event `Stop`) and `velo-task-session-start.sh` (event `SessionStart`) register the same way, with
+the same `[ -x ... ] || exit 0; exec ...` command form. The Stop guard blocks the session from ending while a job tagged with its
+own session is in flight in Vanth (it reads `jobs.sqlite` read-only and fails closed); `velo-task stop-override --reason <text>`
+lets one Stop through. SessionStart lists the session's in-flight jobs with the `velo-task wait` command for each.
 
 ---
 
