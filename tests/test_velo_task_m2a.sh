@@ -681,12 +681,12 @@ t_seam_nonce() {  # R21: VELO_TASK_RERUN_NONCE is honoured only under the test c
 }
 t_not_subcommands() {  # the new library functions are not reachable by name; run and status are the only new arms
   local s; mkhome; mkvenv
-  for s in cmd_run cmd_status need_daemon check_arg session_id rerun_nonce start_refused reconcile_id; do
+  for s in cmd_run cmd_status need_daemon check_arg session_id rerun_nonce start_refused reconcile_id hook_stop_guard hook_session_start override_take keep_blocking; do
     run VT "$s"; need "the library function $s is not a subcommand (exit 2)" [ "$RC" = 2 ]
     need "...it is simply not implemented" grep -q 'not implemented yet' <<<"$OUT"
   done
   need "none of them launched anything" [ "$(launches)" = 0 ]
-  need "run and status are named in the dispatcher by one arm" [ "$(grep -cE '^  run\|status\) ' "$R/bin/velo-task")" = 1 ]
+  need "run, status, ack and stop-override are named in the dispatcher by one arm" [ "$(grep -cE '^  run\|status\|ack\|stop-override\) ' "$R/bin/velo-task")" = 1 ]
 }
 t_b14_new() {  # B14: every bin/velo-task* script, the new code included, parses and runs under /bin/bash 3.2 and holds no bash-4 construct
   local f d n=0; d=$(mktemp -d "$T/b.XXXXXX")
@@ -1254,7 +1254,7 @@ prove "R8: the tags column is not part of the schema Vanth must have" t_status_l
 # B14: every new function is swept
 prove "the dispatcher runs session_id by name" t_not_subcommands $V $'  _*) die 2 "unknown subcommand \'$sub\'" ;;' $'  _*) die 2 "unknown subcommand \'$sub\'" ;;\n  session_id) "$sub" "$@" ;;'
 prove "B14: bash 4 in session_id" t_b14_new $L $'  [ "$s" != me ] || s="${CLAUDE_SESSION_ID:-}"' $'  declare -A seeded\n  [ "$s" != me ] || s="${CLAUDE_SESSION_ID:-}"'
-prove "B14: bash 4 in the dispatcher's run and status arm" t_b14_new $V '  run|status) "cmd_$sub" "$@" ;;' '  run|status) mapfile -t seeded < /dev/null; "cmd_$sub" "$@" ;;'
+prove "B14: bash 4 in the dispatcher's command arm" t_b14_new $V '  run|status|ack|stop-override) "cmd_${sub//-/_}" "$@" ;;' '  run|status|ack|stop-override) mapfile -t seeded < /dev/null; "cmd_${sub//-/_}" "$@" ;;'
 prove "B14: bash 4 in need_daemon" t_b14_new $L $'  (cmd_ensure_daemon >/dev/null) || rc=$?' $'  declare -A seeded\n  (cmd_ensure_daemon >/dev/null) || rc=$?'
 prove "B14: bash 4 in check_arg" t_b14_new $L $'  [[ "$2" =~ $re ]] || die 2' $'  declare -A seeded\n  [[ "$2" =~ $re ]] || die 2'
 prove "B14: bash 4 in rerun_nonce" t_b14_new $L '  IFS=, read -r -a parts <<<"$VELO_TASK_RERUN_NONCE"' $'  declare -A seeded\n  IFS=, read -r -a parts <<<"$VELO_TASK_RERUN_NONCE"'

@@ -11,6 +11,13 @@
 #                              killed, lost, upstream-failed(<parent>) or in-flight; exit 6 and `velo-task restart-daemon` when the daemon is down;
 #                              exit 3 for a job Vanth does not know, or an id whose start Vanth never received (pending-unsent: re-run it)
 #   velo-task status [--session <id>|me | --all] [--issue N] [--json]   list jobs, newest first, as `<id> <job_id> <verdict>` (default: this session's; no daemon needed)
+#   velo-task ack <job_id> [--any-session]   acknowledge a stopped job: publish <state>/acks/<job_id>, once and never edited (R9); a
+#                              second ack is a no-op. Exit 2 refusing a job that is in flight, and another session's job unless --any-session
+#   velo-task stop-override --reason <text>   log the override (time, session, uid, reason) in <state>/overrides.log and let this
+#                              session's Stop hook end it once (R8): a one-shot marker that the next guard run spends
+# The hooks read jobs.sqlite read-only through the same verdict (R1) `status --list` prints, and never ask the daemon:
+# hooks/velo-task-stop-guard.sh (Claude Code Stop: blocks on this session's jobs in flight, or lost and unacked) and
+# hooks/velo-task-session-start.sh (SessionStart: that list with the command that clears each, then one line on the other sessions).
 # A job belongs to a session: $CLAUDE_SESSION_ID, else the token in <state>/session (one per state dir, made on first use); `run` tags it session:<id>.
 # Every other subcommand exits 2 ("not implemented yet").
 #
@@ -37,8 +44,8 @@ case "$sub" in
   install-vanth|ensure-daemon|restart-daemon|doctor)
     [ "$#" -eq 0 ] || die 2 "$sub takes no arguments"
     "cmd_${sub//-/_}" ;;
-  run|status) "cmd_$sub" "$@" ;;
+  run|status|ack|stop-override) "cmd_${sub//-/_}" "$@" ;;
   -h|--help|help|'') usage ;;
   _*) die 2 "unknown subcommand '$sub'" ;;
-  *) die 2 "'$sub' is not implemented yet (available: install-vanth, ensure-daemon, restart-daemon, doctor, run, status)" ;;
+  *) die 2 "'$sub' is not implemented yet (available: install-vanth, ensure-daemon, restart-daemon, doctor, run, status, ack, stop-override)" ;;
 esac
