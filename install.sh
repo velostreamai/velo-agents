@@ -72,6 +72,17 @@ for d in bin rules skills hooks launchd requirements; do
   done < <(find "$SRC/$d" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0)
 done
 
+# Hooks are registered as `[ -x HOOK ] || exit 0; exec HOOK` (fail open when missing), so an installed hook that is
+# not executable is skipped without a word and the guard it implements is off. Content equality does not see that.
+if [[ -d "$SRC/hooks" ]]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#"$SRC"/}"
+    if [[ -e "$DEST/$rel" && ! -x "$DEST/$rel" ]]; then
+      warn "installed but NOT executable, so its registration guard skips it silently: $rel"; drift=1
+    fi
+  done < <(find "$SRC/hooks" -type f -print0)
+fi
+
 if [[ $CHECK -eq 1 ]]; then
   [[ $drift -eq 0 ]] && ok "live copy matches this checkout" || die "drift detected (see above)"
   exit 0
@@ -98,6 +109,12 @@ done
 # Every script, not a hand-listed subset — a missed chmod fails at dispatch time.
 chmod +x "$DEST"/bin/* 2>/dev/null || true
 ok "chmod +x on $(find "$DEST/bin" -type f | wc -l | tr -d ' ') scripts"
+
+# Every hook too: the exec bit is what switches a registered hook on (see the drift check above).
+if [[ -d "$DEST/hooks" ]]; then
+  find "$DEST/hooks" -type f -exec chmod +x {} +
+  ok "chmod +x on $(find "$DEST/hooks" -type f | wc -l | tr -d ' ') hook scripts"
+fi
 
 # Expose the orchestrator-facing skills to Claude Code. Review skills
 # (check-code, check-spec) are NOT linked here — workers get them inlined via

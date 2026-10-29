@@ -129,6 +129,12 @@ suite test_dispatch_wait.sh bash "$HERE/test_dispatch_wait.sh"
 suite test_pr_gate_wait.sh bash "$HERE/test_pr_gate_wait.sh"
 suite test_pr_gate_launch.sh bash "$HERE/test_pr_gate_launch.sh"
 echo
+echo "── velo-task guard hooks (vanth prune/restore, pgrep wait loops) ──"
+suite test_velo_task_hooks.sh bash "$HERE/test_velo_task_hooks.sh"
+echo
+echo "── velo-task B14: bash 3.2 sweep ─────────────────────"
+suite test_velo_task_bash32.sh bash "$HERE/test_velo_task_bash32.sh"
+echo
 echo "── brief fields ───────────────────────────────────────"
 suite test_brief_fields.sh bash "$HERE/test_brief_fields.sh"
 suite test_brief_ste.sh bash "$HERE/test_brief_ste.sh"
