@@ -18,20 +18,26 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   modes-check <home> [file...]             exit 8 and print the first path that group or other can access
   redact                                   stdin -> stdout with secrets replaced by ***
   jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
+  verdict-of [--names D] [--db P] [--job J] [--name N] [--issue I] [--label L] [--json] [--absent]   R1: the verdict of the status object (or jobs.sqlite row) on stdin, as `<label> <verdict>`; exit 2 when it is not the job asked about, 6 when it is not JSON; --absent: Vanth has no row for J (lost(pruned) when the name index lists J, else unknown-job, exit 3)
+  pending-write <dir> -- <vanth start args...>   R17 step 1: publish <dir>/<nonce> with the canonical settings of the request about to be sent; print the nonce
+  remove <file>                            R17 step 4: unlink a regular file of yours (already gone is fine), then fsync its directory
+  index-last <names-dir> <id>              the last job id in <names-dir>/<id> (R3); exit 1 when there is no such index
+  index-has <names-dir> <job_id> [<id>]    exit 0 when a name-index file (just <id>'s, when given) lists the job id, else 1
   failpoint <name>                         test-only crash/barrier point (see below)
   test-capability                          exit 0 when the test capability holds (see below), else 2
 
-Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists, 4 jobs-ro: database
-locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 8 modes-check: loose mode found, 9 unsafe state
-(a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire, append-index; for check-state
-also a home whose mode is not 0700), 75 lock or failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not
-held or unsafe. Any other code from `lock` is the command's own.
+Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job), 4 jobs-ro: database
+locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 6 verdict-of: the input is not JSON, 8 modes-check: loose
+mode found, 9 unsafe state (a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire,
+append-index, pending-write, remove, index-last, index-has; for check-state also a home whose mode is not 0700), 75 lock or
+failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from `lock` is the
+command's own.
 
 Test seams (spec R21): VELO_TASK_FAILPOINT=<name>[@<dest-name>][:exit|:wait=<barrier-file>], VELO_TASK_FSYNC_TRACE=<file>
-and, for velo-task itself, VELO_TASK_UV are honoured only when VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is
-set and the nearest .velo-task-test-root above VELO_TASK_HOME holds that nonce; otherwise any set value is
-refused (exit 2) on every invocation. `wait` creates <barrier-file>.reached, then polls for <barrier-file>.
-publish.linked@<dest-name> fires only for the publish whose destination file is named <dest-name>.
+and, for velo-task itself, VELO_TASK_UV and VELO_TASK_RERUN_NONCE (the --rerun key suffix) are honoured only when
+VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is set and the nearest .velo-task-test-root above VELO_TASK_HOME holds that
+nonce; otherwise any set value is refused (exit 2) on every invocation. `wait` creates <barrier-file>.reached, then
+polls for <barrier-file>. publish.linked@<dest-name> fires only for the publish whose destination file is named <dest-name>.
 The trace file gets one line per durable step: fsync file|dir <path>, link <src> <dest>, unlink <path>,
 rename <src> <dest>.
 """
@@ -49,9 +55,10 @@ import sys
 import time
 from urllib.parse import quote
 
-# A failpoint name is registered when its call site exists; a typo must not pass silently.
+# A failpoint name is registered when its call site exists; a typo must not pass silently. The last four are the steps of
+# `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked.
 FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready",
-              "restart.validated", "install.lock.held"}
+              "restart.validated", "install.lock.held", "pending.published", "start.returned", "index.appended", "pending.unlinked"}
 TEST_MARKER = ".velo-task-test-root"
 # Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
 # exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly
@@ -59,7 +66,7 @@ TEST_MARKER = ".velo-task-test-root"
 # exist yet is fine.
 STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "dir"), ("venv/.velo-task-installed", "file"),
                ("vanth", "dir"), ("vanth/daemon.json", "file"), ("vanth.env.allow", "file"), ("daemon.intent", "file"),
-               ("daemon.provenance", "file"), ("daemon.launch.log", "file"))
+               ("daemon.provenance", "file"), ("daemon.launch.log", "file"), ("names", "dir"), ("pending", "dir"))
 STATE_ROOT_MODE = 0o700
 LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
 RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
@@ -78,6 +85,12 @@ SECRET_SHAPES = [re.compile(p) for p in (
     r"ghp_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}",
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{6,}", r"AKIA[0-9A-Z]{8,}")]
 JOB_ID = re.compile(r"[A-Za-z0-9_-]+")  # used with fullmatch: `$` would also accept a trailing newline
+# R1: the one in-flight predicate (every component uses this set, the Stop guard included), and the reason Vanth 1.14.0 gives a job it
+# cancels because its trigger parent ended in another status than the awaited one (install-vanth asserts the installed package holds it).
+IN_FLIGHT = frozenset(("queued", "launching", "running", "paused", "retrying", "stopping"))
+TRIGGER_REASON = "trigger parent reached an incompatible terminal status"
+# The only `vanth start` flags velo-task sends besides --tag: --policy, --secret-env, --env and the wake options are not among them (R1, R11a).
+START_FLAGS = {"--name": "name", "--timeout": "timeout", "--idempotency-key": "key", "--cwd": "cwd"}
 
 
 def die(code, msg):
@@ -391,25 +404,31 @@ def cmd_retire(args):
     return 0
 
 
+def write_new(dest, data):
+    """Create dest holding data, durably and without replacing anything. The temp is created O_EXCL and O_NOFOLLOW, so nothing already
+    there (or planted there) is ever written through; it is then published like every record (publish_file). False when dest exists."""
+    dest = os.path.abspath(dest)
+    tmp = "%s.tmp.%d.%s" % (dest, os.getpid(), os.urandom(4).hex())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.write(fd, data) != len(data):
+            die(1, "short write to %s" % tmp)
+    finally:
+        os.close(fd)
+    return publish_file(tmp, dest)
+
+
 def write_record(dest, pid, lstart, digest, incarnation):
-    """The one writer of daemon.intent and daemon.provenance. The temp is created O_EXCL and O_NOFOLLOW, so nothing already
-    there (or planted there) is ever written through; it is then published like every record (publish_file). Exit 3 when
-    dest exists: a record is retired before it is replaced, never overwritten."""
+    """The one writer of daemon.intent and daemon.provenance (write_new). Exit 3 when dest exists: a record is retired before it
+    is replaced, never overwritten."""
     fields = {"pid": (pid, r"[0-9]+"), "lstart": (lstart, r"[^\n]+"), "digest": (digest, r"[0-9a-f]{64}"),
               "incarnation": (incarnation, RECORD_UUID.pattern)}
     for name, (value, pattern) in fields.items():
         if not re.fullmatch(pattern, str(value)):
             usage("write-record: %s %r is not a valid value" % (name, value))
     dest = os.path.abspath(dest)
-    tmp = "%s.tmp.%d.%s" % (dest, os.getpid(), os.urandom(4).hex())
     data = ("pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\n" % (pid, lstart, digest, incarnation)).encode()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        if os.write(fd, data) != len(data):
-            die(1, "write-record: short write to %s" % tmp)
-    finally:
-        os.close(fd)
-    if not publish_file(tmp, dest):
+    if not write_new(dest, data):
         die(3, "write-record: %s already exists (temp removed)" % dest)
 
 
@@ -667,10 +686,8 @@ def read_only_authorizer(action, arg1, arg2, db_name, source):
     return sqlite3.SQLITE_DENY
 
 
-def cmd_jobs_ro(args):
-    if len(args) != 2:
-        usage("jobs-ro: expected <db> <sql>")
-    db, sql = args
+def query_ro(db, sql, params=()):
+    """The rows (as dicts) of one SELECT on a Vanth database, read-only (R8); dies with the exit codes in the header."""
     try:
         # Three layers keep this read-only (R8): mode=ro opens the file read-only, query_only refuses writes on the
         # connection (attached databases included), and the authorizer, installed after the pragmas this function itself
@@ -683,15 +700,215 @@ def cmd_jobs_ro(args):
             die(5, "jobs-ro: schema mismatch, missing: %s" % ", ".join(missing))
         con.row_factory = sqlite3.Row
         con.set_authorizer(read_only_authorizer)
-        rows = [dict(r) for r in con.execute(sql)]
+        rows = [dict(r) for r in con.execute(sql, params)]
     except sqlite3.OperationalError as exc:
         if "locked" in str(exc):
             die(4, "jobs-ro: %s (waited 2000 ms)" % exc)
         die(1, "jobs-ro: %s" % exc)
     except sqlite3.DatabaseError as exc:  # not authorized, malformed database
         die(1, "jobs-ro: %s" % exc)
-    sys.stdout.write(json.dumps(rows, separators=(",", ":"), default=str) + "\n")
+    return rows
+
+
+def cmd_jobs_ro(args):
+    if len(args) != 2:
+        usage("jobs-ro: expected <db> <sql>")
+    sys.stdout.write(json.dumps(query_ro(*args), separators=(",", ":"), default=str) + "\n")
     return 0
+
+
+def _json_field(row, *names):
+    """The first of names present in row, parsed: a JSON column of a jobs.sqlite row is text, the same field of a status object is
+    already a value. None when absent or empty; text that is not JSON raises ValueError."""
+    value = next((row[name] for name in names if name in row), None)
+    return (json.loads(value) if value.strip() else None) if isinstance(value, str) else value
+
+
+def _restart_pending(row):
+    """Whether a restart policy has a relaunch pending (policy_state_json: restart_after, or pending_restart_after while it is being
+    claimed). ValueError when the state is not an object."""
+    state = _json_field(row, "policy_state_json")
+    if state is not None and not isinstance(state, dict):
+        raise ValueError("policy_state_json is not an object")
+    return bool(state and (state.get("restart_after") or state.get("pending_restart_after")))
+
+
+def verdict_of(row, known_job=lambda job_id: False):
+    """R1, the one place a verdict is computed: a `vanth --json status` object or a jobs.sqlite row in; one of ok, failed(n), timeout,
+    killed, lost, upstream-failed(<parent>), in-flight out. Total: whatever it cannot classify is `lost`, never `ok`. known_job(parent)
+    says whether a trigger parent is a row of jobs.sqlite or an entry of the name index."""
+    if not isinstance(row, dict) or not isinstance(row.get("status"), str):
+        return "lost"
+    status = row["status"]
+    if status in IN_FLIGHT:
+        return "in-flight"
+    try:
+        if status in ("failed", "orphaned") and _restart_pending(row):
+            return "in-flight"  # a policy relaunch is coming: the status is not final
+        trigger = _json_field(row, "trigger_json", "trigger") if status == "cancelled" else None
+    except ValueError:
+        return "lost"
+    if status == "completed":
+        return "ok"
+    if status == "timeout":
+        return "timeout"
+    if status == "failed":
+        code = row.get("exit_code")
+        return "failed(%d)" % code if isinstance(code, int) and not isinstance(code, bool) else "lost"
+    if status == "cancelled":
+        actor, parent = row.get("stop_actor"), trigger.get("job_id") if isinstance(trigger, dict) else None
+        if actor == "user":
+            return "killed"
+        if (actor == "daemon" and row.get("stop_reason") == TRIGGER_REASON and isinstance(parent, str)
+                and JOB_ID.fullmatch(parent) and known_job(parent)):
+            return "upstream-failed(%s)" % parent
+    return "lost"  # orphaned, any other cancelled, a status outside both sets
+
+
+def read_index(path):
+    """The job ids in one name-index file (R3), in order. Opened without following a symlink (and a FIFO is never waited on): it must be a
+    regular file of yours. None when it does not exist; exit 9 when it is unsafe or holds a line that is not a job id."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        die(9, "%s cannot be opened: %s" % (path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
+    problem = node_problem(path, os.fstat(fd), "file")
+    if problem:
+        os.close(fd)
+        die(9, problem)
+    with os.fdopen(fd, "rb") as fh:
+        ids = [line for line in fh.read().decode("utf-8", "surrogateescape").split("\n") if line]
+    for line in ids:
+        if not JOB_ID.fullmatch(line) or line.startswith("-"):  # a leading dash would reach `vanth status` as an option
+            die(9, "%s holds a line that is not a job id: %r" % (path, line))
+    return ids
+
+
+def index_has(directory, job_id, only=None):
+    """Whether a name-index file in directory (just the one called `only`, when given) lists job_id."""
+    try:
+        names = [only] if only else sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return False
+    return any(job_id in (read_index(os.path.join(directory, name)) or ()) for name in names)
+
+
+def job_row_exists(db, job_id):
+    return bool(query_ro(db, "SELECT 1 AS present FROM jobs WHERE job_id = ?", (job_id,)))
+
+
+def cmd_verdict_of(args):
+    """The verdict (R1) of the Vanth status object, or jobs.sqlite row, on stdin: `<label> <verdict>`, or one JSON object with --json.
+    --names and --db say where a trigger parent is looked up (the name index, the database). --job, --name and --issue are what the caller
+    resolved: a status for another job, under another name or without the issue tag is refused (exit 2), never reported as the job asked
+    about. --absent: Vanth has no row for --job (lost(pruned) when the name index lists it, else unknown-job, exit 3). Not JSON: exit 6."""
+    opts, flags, i = {}, set(), 0
+    while i < len(args):
+        if args[i] in ("--json", "--absent"):
+            flags.add(args[i])
+            i += 1
+        elif args[i] in ("--names", "--db", "--job", "--name", "--issue", "--label") and i + 1 < len(args):
+            opts[args[i][2:]] = args[i + 1]
+            i += 2
+        else:
+            usage("verdict-of: unexpected argument %r" % args[i])
+    names, db, job = opts.get("names"), opts.get("db"), opts.get("job")
+    if "--absent" in flags:
+        row = {}
+        verdict = "lost(pruned)" if job and names and index_has(names, job) else "unknown-job"
+    else:
+        try:
+            row = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+        except ValueError as exc:  # not JSON, or not UTF-8
+            die(6, "verdict-of: the status is not JSON: %s" % exc)
+        row = row if isinstance(row, dict) else {}
+        for key, want in (("job_id", job), ("name", opts.get("name"))):
+            if want is not None and row.get(key) != want:
+                die(2, "verdict-of: the status is for %s %r, not %r; refusing to report it for the job asked about" % (key, row.get(key), want))
+        if "issue" in opts and "issue:%s" % opts["issue"] not in (row["tags"] if isinstance(row.get("tags"), list) else []):
+            die(2, "verdict-of: the job does not carry the tag issue:%s" % opts["issue"])
+        if db and job and "policy_state_json" not in row and row.get("status") in ("failed", "orphaned"):
+            found = query_ro(db, "SELECT policy_state_json FROM jobs WHERE job_id = ?", (job,))  # `vanth status` omits it: a restart may be pending (R1)
+            row["policy_state_json"] = found[0]["policy_state_json"] if found else None
+        verdict = verdict_of(row, lambda parent: bool(names and index_has(names, parent)) or bool(db and job_row_exists(db, parent)))
+    label = opts.get("label") or job or "-"
+    if "--json" in flags:
+        print(json.dumps({"id": label, "job_id": row.get("job_id", job), "status": row.get("status"), "exit_code": row.get("exit_code"),
+                          "verdict": verdict}, sort_keys=True, separators=(",", ":")))
+    else:
+        print("%s %s" % (label, verdict))
+    return 3 if verdict == "unknown-job" else 0
+
+
+def parse_start(args):
+    """The canonical settings of a `vanth start` request (R3): what Vanth's request-equality covers, read from the very argv that is
+    sent, so the record cannot differ from the request. A flag velo-task does not send (--policy, --secret-env, --env, a wake option) is
+    refused. env and trigger are part of the record (R3) and empty until a caller sends them."""
+    settings = {"argv": [], "cwd": None, "env": {}, "key": None, "name": None, "tags": [], "timeout": None, "trigger": None}
+    i = 0
+    while i < len(args) and args[i] != "--":
+        flag = args[i]
+        if (flag != "--tag" and flag not in START_FLAGS) or i + 1 == len(args):
+            die(2, "pending-write: %r is not a flag velo-task sends, or it has no value" % flag)
+        if flag == "--tag":
+            settings["tags"].append(args[i + 1])
+        else:
+            settings[START_FLAGS[flag]] = int(args[i + 1]) if flag == "--timeout" else args[i + 1]
+        i += 2
+    settings["argv"] = args[i + 1:]
+    missing = [name for name in ("argv", "cwd", "key", "name", "timeout") if not settings[name]]
+    if missing:
+        die(2, "pending-write: the request has no %s" % ", ".join(missing))
+    return settings
+
+
+def cmd_pending_write(args):
+    if len(args) < 3 or args[1] != "--":
+        usage("pending-write: expected <dir> -- <vanth start args...>")
+    directory = os.path.abspath(args[0])
+    data = (json.dumps(parse_start(args[2:]), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    os.close(open_dir_nofollow(directory))  # a symlink in place of the directory, or one that is not yours, is refused (exit 9)
+    nonce = os.urandom(8).hex()
+    if not write_new(os.path.join(directory, nonce), data):
+        die(3, "pending-write: %s already exists" % nonce)
+    print(nonce)
+    return 0
+
+
+def cmd_remove(args):
+    if len(args) != 1:
+        usage("remove: expected <file>")
+    path = os.path.abspath(args[0])
+    try:
+        problem = node_problem(path, os.lstat(path), "file")
+    except FileNotFoundError:
+        return 0  # a step of run that reconcile may already have done
+    if problem:
+        die(9, "remove: %s" % problem)
+    trace("unlink", path)
+    os.unlink(path)
+    _sync_path(os.path.dirname(path), "dir")
+    return 0
+
+
+def cmd_index_last(args):
+    if len(args) != 2:
+        usage("index-last: expected <names-dir> <id>")
+    if args[1] in ("", ".", "..") or "/" in args[1]:
+        usage("index-last: %r is not an id" % args[1])
+    ids = read_index(os.path.join(*args))
+    if not ids:
+        return 1
+    print(ids[-1])
+    return 0
+
+
+def cmd_index_has(args):
+    if len(args) not in (2, 3) or (len(args) == 3 and (args[2] in ("", ".", "..") or "/" in args[2])):
+        usage("index-has: expected <names-dir> <job_id> [<id>]")
+    return 0 if index_has(*args) else 1
 
 
 def cmd_failpoint(args):
@@ -716,6 +933,8 @@ COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish
             "write-record": cmd_write_record, "rec-read": cmd_rec_read, "check-state": cmd_check_state,
             "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
             "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
+            "verdict-of": cmd_verdict_of, "pending-write": cmd_pending_write, "remove": cmd_remove,
+            "index-last": cmd_index_last, "index-has": cmd_index_has,
             "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 

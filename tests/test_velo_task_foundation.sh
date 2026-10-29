@@ -111,8 +111,10 @@ hidden_names() { grep -v -x -e PWD -e OLDPWD -e SHLVL -e _ -e LC_CTYPE -e __CF_U
 env_names() {  # <pid>: the names in the environment of a process, as ps -E shows it (for a Homebrew python; not for /bin/bash), without the ones its runtime adds
   /bin/ps -ww -E -o command= -p "$1" | tr ' ' '\n' | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | hidden_names | LC_ALL=C sort | tr '\n' ' '
 }
+only() { [ -z "${VELO_TASK_ONLY:-}" ] || [[ " $VELO_TASK_ONLY " == *" $1 "* ]]; }   # <check fn>: VELO_TASK_ONLY="t_a t_b" runs just those checks and their proofs; VELO_TASK_NO_PROOFS=1 skips the proofs
 check() {  # <label> <check fn>: the real code must pass; `note:` lines the check prints are shown
   local out line
+  only "$2" || return 0
   if out=$(trap reap EXIT; "$2" 2>&1); then
     pass "$1"
     while IFS= read -r line; do case "$line" in note:*) printf '        %s\n' "$line" ;; esac; done <<<"$out"
@@ -155,6 +157,7 @@ proof_start() {  # <check fn> <label> [<code root>]: start proof MUT_N in the ba
 }
 prove() {  # <label> <check fn> <file> <anchor> <replacement> [<file> <anchor> <replacement>]...: the check must go RED on the mutated copy
   local label="$1" fn="$2" m; shift 2
+  only "$fn" && [ "${VELO_TASK_NO_PROOFS:-}" != 1 ] || return 0
   MUT_N=$((MUT_N + 1))
   m="$T/pj$MUT_N/code"   # numbered, never named for the label: a label's words must not satisfy a grep on the path
   rm -rf "$m"; mkdir -p "$m"; cp -R "$REPO/bin" "$REPO/requirements" "$m/"; cp "$REPO/install.sh" "$m/"
@@ -172,6 +175,7 @@ PY
   proof_start "$fn" "$label" "$m"
 }
 prove_env() {  # <label> <check fn>: the check, on UNCHANGED code and with the environment the caller set (a fixture mutant), must go RED
+  only "$2" && [ "${VELO_TASK_NO_PROOFS:-}" != 1 ] || return 0
   MUT_N=$((MUT_N + 1))
   proof_start "$2" "$1"
 }
@@ -275,6 +279,29 @@ write_intent() { write_rec "$E_HOME/daemon.intent" "$@"; }
 snap_state() {  # <dir>: names, sizes, mtimes and modes of everything under it, for a before/after comparison
   ( cd "$1" && find . -print0 | LC_ALL=C sort -z | xargs -0 /usr/bin/stat -f '%N %z %Fm %Lp' )   # %Fm: modification time to the nanosecond
 }
+SWEEP_RE='declare[[:space:]]+-[a-zA-Z]*[Agn]|local[[:space:]]+-[a-zA-Z]*[An]|(^|[^A-Za-z_])(mapfile|readarray|coproc)([^A-Za-z_]|$)|\$\{[A-Za-z_][A-Za-z_0-9]*(,,?|\^\^?|@[QEPAaKk])[^}]*\}|\|&|&>>|;;&|;&|\[\[[[:space:]]+-v[[:space:]]|globstar|wait[[:space:]]+-n|EPOCHREALTIME|EPOCHSECONDS|\[-[0-9]+\]'
+t_real_home_untouched() {  # finding 15: nothing this suite ran touched the real home (snapshotted before HOME was switched)
+  need "the real ~/.agents/state and ~/.config are as they were (mtime, size), and no velo-task or vanth dir appeared" [ "$(snap_home)" = "$HOME_BEFORE" ]
+  need "...and ~/.claude.json gained no vanth or velo-task entry" [ "$(claude_json_marks)" -le "$MARKS_BEFORE" ]
+  need "...and the suite's HOME was the temp one throughout" [ "$HOME" = "$SUITE_HOME" ]
+  need "...and its PATH was the system directories only (no Homebrew, no user bin, no shims left behind)" [ "$PATH" = /usr/bin:/bin:/usr/sbin:/sbin ]
+}
+# The check above compares the real home. A production write to the real home cannot be provoked from a proof, so the same
+# check runs against a stand-in home (REAL_HOME, HOME_BEFORE and MARKS_BEFORE re-pointed in a subshell) that is then disturbed.
+stand_in_home() {
+  REAL_HOME="$T/stand-in-home"; rm -rf "$REAL_HOME"; mkdir -p "$REAL_HOME/.agents/state" "$REAL_HOME/.config"; printf '{}\n' > "$REAL_HOME/.claude.json"
+  HOME_BEFORE=$(snap_home); MARKS_BEFORE=$(claude_json_marks)
+}
+t_stand_in_untouched() { stand_in_home; t_real_home_untouched; }
+stray_velo_task_dir() { stand_in_home; mkdir "$REAL_HOME/.agents/state/velo-task"; t_real_home_untouched; }
+stray_vanth_dir() { stand_in_home; mkdir "$REAL_HOME/.agents/state/vanth"; t_real_home_untouched; }
+stray_state_touch() { stand_in_home; touch -t 200001010000 "$REAL_HOME/.agents/state"; t_real_home_untouched; }
+stray_config_touch() { stand_in_home; touch -t 200001010000 "$REAL_HOME/.config"; t_real_home_untouched; }
+stray_mcp_entry() { stand_in_home; printf '{"mcpServers":{"vanth":{}}}\n' > "$REAL_HOME/.claude.json"; t_real_home_untouched; }
+stray_real_home_env() { stand_in_home; HOME="$REAL_HOME"; t_real_home_untouched; }
+stray_homebrew_path() { stand_in_home; PATH="/opt/homebrew/bin:$PATH"; t_real_home_untouched; }
+# Everything above is the harness. tests/test_velo_task_m2a.sh sources this file with VELO_TASK_HARNESS_ONLY=1 and gets exactly that.
+[ "${VELO_TASK_HARNESS_ONLY:-}" != 1 ] || return 0
 
 # ---- helper: fp, sha256, publish, append-index ------------------------------------------------------
 t_fp() {
@@ -769,7 +796,6 @@ t_failpoint_gating() {  # R21: each gate condition is isolated, so each is indiv
 }
 
 # ---- front end: B14, not-implemented, allowlist, secrets, modes, provenance, concurrency, restart ----
-SWEEP_RE='declare[[:space:]]+-[a-zA-Z]*[Agn]|local[[:space:]]+-[a-zA-Z]*[An]|(^|[^A-Za-z_])(mapfile|readarray|coproc)([^A-Za-z_]|$)|\$\{[A-Za-z_][A-Za-z_0-9]*(,,?|\^\^?|@[QEPAaKk])[^}]*\}|\|&|&>>|;;&|;&|\[\[[[:space:]]+-v[[:space:]]|globstar|wait[[:space:]]+-n|EPOCHREALTIME|EPOCHSECONDS|\[-[0-9]+\]'
 t_b14() {
   local f d n=0; d=$(mktemp -d "$T/b.XXXXXX")
   for f in "$R"/bin/velo-task*; do
@@ -786,8 +812,8 @@ t_b14() {
 }
 t_unimplemented() {
   local s; mkhome
-  for s in run wait status ack cancel project reconcile; do
-    run VT $s; need "$s exits 2" [ "$RC" = 2 ]; need "$s says not implemented in M1" grep -q 'not implemented in M1' <<<"$OUT"
+  for s in wait ack cancel project reconcile; do
+    run VT $s; need "$s exits 2" [ "$RC" = 2 ]; need "$s says not implemented yet" grep -q 'not implemented yet' <<<"$OUT"
   done
   run VT install-vanth extra; need "an argument to install-vanth exits 2" [ "$RC" = 2 ]
 }
@@ -800,7 +826,7 @@ t_private_subcommands() {  # finding 2: no locked body is a subcommand, and ever
   need "none of them launched anything" [ "$(launches)" = 0 ]
   for s in locked_ensure locked-ensure locked_restart locked_install cmd_doctor cmd_ensure_daemon run_locked assert_lock_held launch_daemon; do
     run VT "$s"; need "the library function $s is not a subcommand (exit 2)" [ "$RC" = 2 ]
-    need "...it is simply not implemented" grep -q 'not implemented in M1' <<<"$OUT"
+    need "...it is simply not implemented" grep -q 'not implemented yet' <<<"$OUT"
   done
   need "none of them launched anything either" [ "$(launches)" = 0 ]
   need "the dispatcher has no case arm that names an underscore subcommand" [ -z "$(grep -nE '^[[:space:]]*_[A-Za-z0-9_-]+[|)]' "$R/bin/velo-task")" ]
@@ -2041,27 +2067,6 @@ t_network() {  # the real Vanth from PyPI and a real vanthd on a random port in 
   kill "$pid2"; waitfor 10 not alive "$pid2"
 }
 
-t_real_home_untouched() {  # finding 15: nothing this suite ran touched the real home (snapshotted before HOME was switched)
-  need "the real ~/.agents/state and ~/.config are as they were (mtime, size), and no velo-task or vanth dir appeared" [ "$(snap_home)" = "$HOME_BEFORE" ]
-  need "...and ~/.claude.json gained no vanth or velo-task entry" [ "$(claude_json_marks)" -le "$MARKS_BEFORE" ]
-  need "...and the suite's HOME was the temp one throughout" [ "$HOME" = "$SUITE_HOME" ]
-  need "...and its PATH was the system directories only (no Homebrew, no user bin, no shims left behind)" [ "$PATH" = /usr/bin:/bin:/usr/sbin:/sbin ]
-}
-# The check above compares the real home. A production write to the real home cannot be provoked from a proof, so the same
-# check runs against a stand-in home (REAL_HOME, HOME_BEFORE and MARKS_BEFORE re-pointed in a subshell) that is then disturbed.
-stand_in_home() {
-  REAL_HOME="$T/stand-in-home"; rm -rf "$REAL_HOME"; mkdir -p "$REAL_HOME/.agents/state" "$REAL_HOME/.config"; printf '{}\n' > "$REAL_HOME/.claude.json"
-  HOME_BEFORE=$(snap_home); MARKS_BEFORE=$(claude_json_marks)
-}
-t_stand_in_untouched() { stand_in_home; t_real_home_untouched; }
-stray_velo_task_dir() { stand_in_home; mkdir "$REAL_HOME/.agents/state/velo-task"; t_real_home_untouched; }
-stray_vanth_dir() { stand_in_home; mkdir "$REAL_HOME/.agents/state/vanth"; t_real_home_untouched; }
-stray_state_touch() { stand_in_home; touch -t 200001010000 "$REAL_HOME/.agents/state"; t_real_home_untouched; }
-stray_config_touch() { stand_in_home; touch -t 200001010000 "$REAL_HOME/.config"; t_real_home_untouched; }
-stray_mcp_entry() { stand_in_home; printf '{"mcpServers":{"vanth":{}}}\n' > "$REAL_HOME/.claude.json"; t_real_home_untouched; }
-stray_real_home_env() { stand_in_home; HOME="$REAL_HOME"; t_real_home_untouched; }
-stray_homebrew_path() { stand_in_home; PATH="/opt/homebrew/bin:$PATH"; t_real_home_untouched; }
-
 # ---- run -------------------------------------------------------------------------------------------
 echo "velo-task M1: state helper"
 check "fp: row fingerprint vectors" t_fp
@@ -2082,7 +2087,7 @@ check "jobs-ro: read-only by authorizer (no ATTACH, DDL, DML, PRAGMA writes), 20
 check "failpoints and seams: root marker + nonce capability, hostile TMPDIR refused (R21)" t_failpoint_gating
 echo "velo-task M1: front end"
 check "B14: bash 3.2, no bash-4 constructs, seeded declare -A fails both" t_b14
-check "other subcommands exit 2 (not implemented in M1)" t_unimplemented
+check "other subcommands exit 2 (not implemented yet)" t_unimplemented
 check "every _-prefixed name and every library function is rejected by the public parser" t_private_subcommands
 check "a locked body run without the lock refuses" t_lock_bypass
 check "a symlinked state root, lock, record, venv, Vanth home, allowlist or launch log is refused by every command; nothing it points at is touched" t_unsafe_state
@@ -2212,13 +2217,13 @@ prove "write-record accepts an lstart with a newline in it" t_records $S '"lstar
 prove "write-record accepts a pid that is not a number" t_records $S '"pid": (pid, r"[0-9]+")' '"pid": (pid, r".+")'
 prove "write-record accepts a digest of any length" t_records $S '"digest": (digest, r"[0-9a-f]{64}")' '"digest": (digest, r"[0-9a-f]+")'
 prove "write-record accepts an incarnation that is not a UUID" t_records $S 'RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")' 'RECORD_UUID = re.compile(r".+")'
-prove "write-record replaces a record that exists" t_records $S $'    if not publish_file(tmp, dest):\n        die(3, "write-record: %s already exists (temp removed)" % dest)' '    os.replace(tmp, dest)'
+prove "write-record replaces a record that exists" t_records $S '    return publish_file(tmp, dest)' $'    os.replace(tmp, dest)\n    return True'
 prove "write-record reports a record that exists as a plain error" t_records $S 'die(3, "write-record: %s already exists (temp removed)" % dest)' 'die(1, "write-record: %s already exists (temp removed)" % dest)'
 prove "write-record creates a record others can read" t_records $S 'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)' 'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)'
 prove "rec-read follows a symlink" t_records $S 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK' 'os.O_RDONLY | os.O_NONBLOCK)  # NONBLOCK'
 prove "rec-read waits for a writer on a FIFO" t_records $S 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK' 'os.O_RDONLY | os.O_NOFOLLOW)  # NONBLOCK'
 prove "rec-read reports an unsafe record as an absent one (exit 1)" t_records $S $'        os.close(fd)\n        print(problem)\n        return 9' $'        os.close(fd)\n        print(problem)\n        return 1'
-prove "retire follows a symlink" t_records $S '        problem = node_problem(path, os.lstat(path), "file")' '        problem = node_problem(path, os.stat(path), "file")'
+prove "retire follows a symlink" t_records $S $'        problem = node_problem(path, os.lstat(path), "file")\n    except FileNotFoundError:\n        die(1,' $'        problem = node_problem(path, os.stat(path), "file")\n    except FileNotFoundError:\n        die(1,'
 prove "publish accepts a symlink as its source" t_records $S '    problem = node_problem(src, os.lstat(src), "file")' '    problem = node_problem(src, os.stat(src), "file")'
 prove "lock opens its directory through a symlink" t_lock_state $S 'os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)' 'os.O_RDONLY | os.O_DIRECTORY)'
 prove "lock opens its file through a symlink" t_lock_state $S 'os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)' 'os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o600, dir_fd=dirfd)'
@@ -2249,7 +2254,7 @@ prove "modes-check does not treat symlinks as symlinks" t_modes_check $S $'    i
 prove "modes-check treats an unreadable directory as private" t_modes_check $S $'    def fail(exc):\n        raise exc' $'    def fail(exc):\n        return'
 prove "modes-check exits 0 on a loose file" t_modes_check $S $'            print(problem)\n            return 8' $'            print(problem)\n            return 0'
 prove "modes-check skips the home itself" t_modes_check $S '    paths = [home]' '    paths = []'
-prove "modes-check reports a missing path as a problem" t_modes_check $S $'    except FileNotFoundError:\n        return None' $'    except FileNotFoundError:\n        return "%s does not exist" % path'
+prove "modes-check reports a missing path as a problem" t_modes_check $S $'        info = os.lstat(path)\n    except FileNotFoundError:\n        return None' $'        info = os.lstat(path)\n    except FileNotFoundError:\n        return "%s does not exist" % path'
 VALUES='values = {v for k, v in os.environ.items() if v and (k in allowed or SECRET_NAME.search(k))}'
 prove "redact ignores env names matching key|token" t_redact $S "$VALUES" 'values = {v for k, v in os.environ.items() if v and (k in allowed)}'
 prove "redact ignores the allowlist" t_redact $S "$VALUES" 'values = {v for k, v in os.environ.items() if v and (SECRET_NAME.search(k))}'
@@ -2404,9 +2409,9 @@ prove "the intent is not retired once the daemon is proved ready" t_modes_env $L
   $'  write_record "$PROV" "$pid" "$started" "$digest" "$inc"\n  retire_record "$INTENT"' '  write_record "$PROV" "$pid" "$started" "$digest" "$inc"'
 prove "the provenance incarnation is constant" t_restart $L 'inc=$(/usr/bin/uuidgen)' 'inc=00000000-0000-4000-8000-000000000001'
 prove "records are written without the helper's durable publish" t_crash_in_publish $S \
-  $'    if not publish_file(tmp, dest):\n        die(3, "write-record: %s already exists (temp removed)" % dest)' '    os.replace(tmp, dest)'
+  '    return publish_file(tmp, dest)' $'    os.replace(tmp, dest)\n    return True'
 prove "the provenance is written without the helper's durable publish" t_crash_in_provenance_publish $S \
-  $'    if not publish_file(tmp, dest):\n        die(3, "write-record: %s already exists (temp removed)" % dest)' '    os.replace(tmp, dest)'
+  '    return publish_file(tmp, dest)' $'    os.replace(tmp, dest)\n    return True'
 prove "the publish failpoint ignores which destination it was armed for" t_crash_in_provenance_publish $S \
   'if not spec or spec[0] != name or (spec[3] and spec[3] != os.path.basename(dest or "")):' 'if not spec or spec[0] != name:'
 prove "the publish failpoint ignores which destination it was armed for (helper)" t_publish $S \
