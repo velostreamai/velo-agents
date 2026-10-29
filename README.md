@@ -49,7 +49,7 @@ and the tests** — never from the worker's self-report.
     velo-llm-bench                 same-prompt speed bench for a worker:local server; prompt pinned to a commit
     velo-task                      detached work on a pinned, hash-locked Vanth (docs/velo-task-spec.md); M1: install-vanth, ensure-daemon, restart-daemon, doctor; M2a: run, status
     velo-task-lib.sh               the functions behind velo-task, sourced and never a subcommand: the locked bodies (ensure, restart, install), launch, records, doctor, run, status
-    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock (symlink-safe, hands the body its descriptor), lock-held, check-state, write-record, rec-read, launch-exec (the process that becomes vanthd), publish, retire, append-index, fp, sha256, json-get, modes-check, redact, jobs-ro, verdict-of (the one place a verdict is computed), pending-write, remove, index-last, index-has, failpoint, test-capability
+    velo-task-state                the durable-state helper behind velo-task (stdlib python): lock (symlink-safe, hands the body its descriptor), lock-held, check-state, write-record, rec-read, launch-exec (the process that becomes vanthd), publish, retire, append-index, fp, sha256, json-get, modes-check, redact, jobs-ro, verdict-of (the one place a verdict is computed), pending-write, remove, index-last, index-has, reconcile (an id's pending records against Vanth's own acceptance record), failpoint, test-capability
   tests/
     run.sh                         every suite — run when touching .agents/
     test_runner_accounting.py      usage / leak / cost-provenance invariants

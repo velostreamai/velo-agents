@@ -274,7 +274,7 @@ crash() {  # <failpoint> <id>: a run killed at the failpoint (R21); it exits 137
   VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="$1:exit" rj "$2" 0
   need "a run killed at $1 exits 137" [ "$RC" = 137 ]
 }
-t_run_crash() {  # R17: the on-disk state at each crash window is the one M2b's reconcile reads
+t_run_crash() {  # R17: the on-disk state at each crash window is the one reconcile reads (the t_reconcile_* checks settle it)
   local f j
   mkjobs
   crash pending.published cw-1
@@ -295,7 +295,8 @@ t_run_crash() {  # R17: the on-disk state at each crash window is the one M2b's 
   rj cw-2 0
   need "run again after that crash: exit 0, the job that was started" [ "$RC" = 0 -a "$OUT" = "$j" ]
   need "...without running the command again" [ "$(runs)" = 1 -a "$(njobs)" = 1 ]
-  need "...and the index lists it" [ "$(cat "$E_HOME/names/cw-2")" = "$j" ]
+  need "...the index lists it once" [ "$(cat "$E_HOME/names/cw-2")" = "$j" ]
+  need "...and the killed run's record is settled, not left to pile up" [ "$(pending_for velo_cw-2)" = 0 ]
   crash index.appended cw-3
   j=$(dbq "SELECT job_id FROM jobs WHERE name='cw-3'")
   need "killed after the index append and before the pending record is unlinked: the index lists the job" [ "$(cat "$E_HOME/names/cw-3")" = "$j" ]
@@ -315,6 +316,155 @@ t_run_fsync_order() {  # R17: the pending record is durable before anything is s
     'fsync file names/ord-1' 'fsync dir names' 'unlink pending/REC' 'fsync dir pending')
   need "the pending record is fsynced, linked, its directory fsynced; then the index line is fsynced (and its new directory); then the record is unlinked and its directory fsynced" \
     [ "$got" = "$want" ]
+}
+
+# ---- reconcile (R3, R17, B25 recovery): a run that died after vanth start returned does not lose its job -----------
+# The records come from `crash` (a run killed at a failpoint), so each check starts from the very state a dead run leaves.
+t_reconcile_status() {  # B25 recovery: status <id> finds the job of a run killed after vanth start returned, through Vanth's own record
+  local j
+  mkjobs
+  crash start.returned rc-1
+  j=$(dbq "SELECT job_id FROM jobs WHERE name='rc-1'")
+  need "premise: Vanth accepted and ran it, and the name index has no line for it" [ -n "$j" -a "$(runs)" = 1 -a ! -e "$E_HOME/names/rc-1" ]
+  run VT status rc-1
+  need "status of the id recovers the job: its verdict, exit 0" [ "$RC" = 0 -a "$OUT" = "rc-1 ok" ]
+  need "...the name index lists it once" [ "$(cat "$E_HOME/names/rc-1")" = "$j" ]
+  need "...the pending record is gone" [ "$(pend)" = 0 ]
+  need "...the command ran once, and the only start sent is the killed run's" [ "$(runs)" = 1 -a "$(njobs)" = 1 -a "$(starts)" = 1 ]
+  run VT status rc-1
+  need "a second status finds the same job and changes nothing" [ "$OUT" = "rc-1 ok" -a "$(cat "$E_HOME/names/rc-1")" = "$j" ]
+  run VT status --job "$j"
+  need "...and the job_id reports it too" [ "$OUT" = "$j ok" ]
+}
+t_reconcile_run() {  # R3: run settles the id's records before it starts anything, so the last line of the index is the last job started
+  local j1 j2
+  mkjobs
+  crash start.returned ro-1
+  j1=$(dbq "SELECT job_id FROM jobs WHERE name='ro-1'")
+  rj ro-1 5 --rerun; j2=$OUT
+  need "a --rerun after a run that died with its start accepted is a new job: exit 0" [ "$RC" = 0 -a "$j2" != "$j1" -a "$(runs)" = 2 ]
+  need "...the index lists the job that died first, then the new one" [ "$(cat "$E_HOME/names/ro-1")" = "$(printf '%s\n%s' "$j1" "$j2")" ]
+  need "...nothing is left pending" [ "$(pend)" = 0 ]
+  run VT status ro-1; need "the id is the last job started, not the one that was recovered" [ "$OUT" = "ro-1 failed(5)" ]
+}
+t_reconcile_bulk() {  # B25 recovery: also after 1,100 newer jobs whose names contain the id, which vanth list (capped at 1,000 rows) cannot show
+  local j
+  mkjobs
+  crash start.returned bk-1
+  j=$(dbq "SELECT job_id FROM jobs WHERE name='bk-1'")
+  fv __bulk 1100 bk-1-n
+  need "premise: vanth list, capped at 1,000, no longer shows the job" [ "$(fv list --all --name bk-1 --limit 1000 | grep -c "$j")" = 0 ]
+  run VT status bk-1
+  need "the job is recovered from Vanth's own record and reports its own verdict" [ "$RC" = 0 -a "$OUT" = "bk-1 ok" ]
+  need "...the index lists it once and the record is gone" [ "$(cat "$E_HOME/names/bk-1")" = "$j" -a "$(pend)" = 0 ]
+  need "...it ran once, and no second start was sent" [ "$(runs)" = 1 -a "$(starts)" = 1 ]
+}
+t_reconcile_unsent() {  # R3: a record Vanth has no key for is reported, never replayed; status of the id is exit 3 and says how to settle it
+  mkjobs
+  crash pending.published us-1
+  run VT status us-1
+  need "status of an id whose start Vanth never received is exit 3" [ "$RC" = 3 ]
+  need "...reporting pending-unsent <id> on its own line" grep -q '^pending-unsent us-1$' <<<"$OUT"
+  need "...and saying how to settle it: re-run, which is idempotent" grep -qF 'velo-task run us-1 ...` (idempotent' <<<"$OUT"
+  need "...nothing was started, run or created" [ "$(starts)" = 0 -a "$(njobs)" = 0 -a "$(runs)" = 0 ]
+  need "...the record stays and the name index has nothing" [ "$(pending_for velo_us-1)" = 1 -a ! -e "$E_HOME/names/us-1" ]
+  rj us-1 0
+  need "running it again starts the job once: exit 0" [ "$RC" = 0 -a "$(runs)" = 1 -a "$(njobs)" = 1 ]
+  need "...the run reported the old record rather than replaying it" grep -q '^pending-unsent us-1$' <<<"$OUT"
+  run VT status us-1
+  need "the next status settles the old record, whose key is Vanth's now: the verdict, exit 0" [ "$RC" = 0 -a "$OUT" = "us-1 ok" ]
+  need "...nothing is pending and the index lists the job once" [ "$(pend)" = 0 -a "$(wc -l < "$E_HOME/names/us-1" | tr -d ' ')" = 1 ]
+  rj us-2 0
+  VELO_TASK_TEST=1 VELO_TASK_FAILPOINT=pending.published:exit rj us-2 0 --rerun
+  run VT status us-2
+  need "an unsent --rerun beside an older job: that job's verdict, the report before it, exit 0" [ "$RC" = 0 -a "$OUT" = "$(printf 'pending-unsent us-2\nus-2 ok')" ]
+  need "...and nothing new was started" [ "$(njobs)" = 2 -a "$(runs)" = 2 ]
+}
+t_reconcile_exact() {  # B25 mutants: the key is matched exactly; one that contains it, extends it or only differs in case is not Vanth's record of this start
+  local jd
+  mkjobs
+  crash pending.published ex-1
+  jd=$(fv __inject '{"name":"decoy","status":"completed","exit_code":0}')
+  dbx "INSERT INTO local_start_requests (idempotency_key, request_hash, job_id, created_at) VALUES ('velo_ex-1_nonce', 'h', '$jd', 't'), ('zz_velo_ex-1', 'h', '$jd', 't'), ('VELO_EX-1', 'h', '$jd', 't')"
+  run VT status ex-1
+  need "keys that extend, contain or case-fold the record's key do not settle it: still pending-unsent, exit 3" [ "$RC" = 3 ]
+  need "...nothing was indexed and the record stays" [ ! -e "$E_HOME/names/ex-1" -a "$(pending_for velo_ex-1)" = 1 ]
+}
+t_reconcile_redo() {  # R17: a reconcile killed between the index line and the unlink is redone from what is on disk, with no second line
+  local j
+  mkjobs
+  crash start.returned rd-1
+  j=$(dbq "SELECT job_id FROM jobs WHERE name='rd-1'")
+  VELO_TASK_TEST=1 VELO_TASK_FAILPOINT=reconcile.indexed:exit run VT status rd-1
+  need "a reconcile killed after it indexed the job fails (exit 6)" [ "$RC" = 6 ]; need "...naming the helper's exit 137" grep -q 'helper exit 137' <<<"$OUT"
+  need "...the index lists the job and the record is still there" [ "$(cat "$E_HOME/names/rd-1")" = "$j" -a "$(pending_for velo_rd-1)" = 1 ]
+  run VT status rd-1
+  need "the next status finishes it: the verdict" [ "$RC" = 0 -a "$OUT" = "rd-1 ok" ]
+  need "...the index still lists the job once and the record is gone" [ "$(cat "$E_HOME/names/rd-1")" = "$j" -a "$(pend)" = 0 ]
+  crash index.appended rd-2
+  j=$(dbq "SELECT job_id FROM jobs WHERE name='rd-2'")
+  run VT status rd-2
+  need "the state a killed run leaves after its index line is settled the same way" [ "$OUT" = "rd-2 ok" -a "$(cat "$E_HOME/names/rd-2")" = "$j" -a "$(pend)" = 0 ]
+}
+t_reconcile_scope() {  # R3: status <id> settles that id's records only; another id's accepted record is not indexed, its unsent one is not reported
+  mkjobs
+  crash start.returned sc-1
+  crash pending.published sc-2
+  rj sc-3 0
+  run VT status sc-3
+  need "status of an id with no record of its own reports its verdict and nothing else" [ "$RC" = 0 -a "$OUT" = "sc-3 ok" ]
+  need "...the other ids' records are untouched" [ "$(pend)" = 2 -a ! -e "$E_HOME/names/sc-1" -a ! -e "$E_HOME/names/sc-2" ]
+}
+t_reconcile_unsafe() {  # an unsafe or unreadable record, database or index stops status and run (exit 6) before anything is resolved or started: nothing is skipped
+  local d before
+  d=$(mktemp -d "$T/ru.XXXXXX"); mkdir -m 700 "$d/ext"; printf 'SENTINEL\n' > "$d/ext/target"
+  mkjobs
+  crash pending.published us-1
+  before=$(starts)
+  printf 'not json\n' > "$E_HOME/pending/aaaaaaaaaaaaaaaa"
+  run VT status us-1; need "a pending record that is not JSON stops status (exit 6)" [ "$RC" = 6 ]
+  need "...and it is not reported as an unsent start" not grep -q '^pending-unsent' <<<"$OUT"
+  run VT run us-1 --timeout 5 -- /bin/true; need "...and run, before it starts anything" [ "$RC" = 6 -a "$(starts)" = "$before" ]
+  printf '{"name":"us-1"}\n' > "$E_HOME/pending/aaaaaaaaaaaaaaaa"
+  run VT status us-1; need "a JSON object with no key is not a record (exit 6)" [ "$RC" = 6 ]
+  rm "$E_HOME/pending/aaaaaaaaaaaaaaaa"
+  crash start.returned us-4
+  mv "$E_HOME/pending/$(grep -l '"key":"velo_us-4"' "$E_HOME"/pending/* | sed 's#.*/##')" "$d/ext/rec"; ln -s "$d/ext/rec" "$E_HOME/pending/cccccccccccccccc"
+  run VT status us-4; need "a valid record that is a symlink is refused, not followed (exit 6)" [ "$RC" = 6 -a ! -e "$E_HOME/names/us-4" ]
+  rm "$E_HOME/pending/cccccccccccccccc"
+  printf 'x\n' > "$E_HOME/pending/aaaaaaaaaaaaaaaa.tmp.1.deadbeef"; printf 'x\n' > "$E_HOME/pending/README"
+  run VT status us-1; need "files beside the records that are not named like one are not records: us-1 is still pending-unsent (exit 3)" [ "$RC" = 3 ]
+  mv "$E_VH/jobs.sqlite" "$E/jobs.away"
+  run VT status us-1; need "a database that cannot be read is exit 6, not an unsent start" [ "$RC" = 6 ]
+  need "...naming the helper's exit" grep -q 'helper exit' <<<"$OUT"; need "...and reporting no pending-unsent" not grep -q '^pending-unsent' <<<"$OUT"
+  mv "$E/jobs.away" "$E_VH/jobs.sqlite"
+  crash pending.published us-2
+  dbx "INSERT INTO local_start_requests (idempotency_key, request_hash, job_id, created_at) VALUES ('velo_us-2', 'h', '-x', 't')"
+  run VT status us-2; need "a job id that starts with a dash, which vanth would read as an option, is refused (exit 6)" [ "$RC" = 6 -a ! -e "$E_HOME/names/us-2" ]
+  crash start.returned us-3
+  ln -s "$d/ext" "$E_HOME/names/us-3"
+  run VT status us-3; need "a name index that is a symlink is refused (exit 6)" [ "$RC" = 6 ]
+  need "...and nothing was written through it" [ "$(ls "$d/ext" | tr '\n' ' ')" = "rec target " -a "$(cat "$d/ext/target")" = SENTINEL ]
+  run ST reconcile "$d/p" "$d/n" "$d/db"; need "reconcile with too few arguments is a usage error (exit 2)" [ "$RC" = 2 ]
+  run ST reconcile "$d/p" "$d/n" "$d/db" ../x; need "...and so is an id that is a path" [ "$RC" = 2 ]
+}
+t_reconcile_inflight() {  # R4: a status that settles the record of a run still in flight must not make that run start a second job
+  local mode id pid opt
+  mkjobs
+  for mode in plain rerun; do
+    id="fl-$mode"; opt=""; [ "$mode" = rerun ] && opt="--rerun"
+    VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="start.returned:wait=$E/go-$mode" VT run "$id" --timeout 30 $opt -- /bin/sh -c "echo r >> '$E/runs'; exit 0" </dev/null >"$E/$id.out" 2>&1 &
+    pid=$!
+    waitfor 20 test -e "$E/go-$mode.reached" || { kill -9 "$pid" 2>/dev/null; echo "FAILED: the $mode run never reached start.returned"; exit 1; }
+    run VT status "$id"
+    need "$mode: a status while the run waits after vanth start returned settles its record: the verdict" [ "$RC" = 0 -a "$OUT" = "$id ok" ]
+    : > "$E/go-$mode"
+    wait "$pid"; RC=$?; OUT=$(cat "$E/$id.out")
+    need "$mode: the run then finishes: exit 0" [ "$RC" = 0 ]
+    need "...printing the job that status found" [ "$OUT" = "$(cat "$E_HOME/names/$id")" ]
+    need "...one job and one execution for the id, and nothing pending" [ "$(dbq "SELECT count(*) FROM jobs WHERE name='$id'")" = 1 -a "$(pend)" = 0 ]
+  done
+  need "two ids, two executions in all" [ "$(runs)" = 2 ]
 }
 
 # ---- status: B1, B18, B26 through the CLI, B25 (read side), R6, R7 ---------------------------------------------
@@ -509,7 +659,7 @@ t_seam_nonce() {  # R21: VELO_TASK_RERUN_NONCE is honoured only under the test c
 }
 t_not_subcommands() {  # the new library functions are not reachable by name; run and status are the only new arms
   local s; mkhome; mkvenv
-  for s in cmd_run cmd_status need_daemon check_arg rerun_nonce start_refused; do
+  for s in cmd_run cmd_status need_daemon check_arg rerun_nonce start_refused reconcile_id; do
     run VT "$s"; need "the library function $s is not a subcommand (exit 2)" [ "$RC" = 2 ]
     need "...it is simply not implemented" grep -q 'not implemented yet' <<<"$OUT"
   done
@@ -526,7 +676,7 @@ t_b14_new() {  # B14: every bin/velo-task* script, the new code included, parses
   done
   need "at least one script matched bin/velo-task*" [ "$n" -ge 1 ]
   need "/bin/bash is 3.2" [ "$(/bin/bash -c 'echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}')" = 3.2 ]
-  need "the library holds run, status and what they call" [ "$(grep -cE '^(cmd_run|cmd_status|need_daemon|check_arg|rerun_nonce|start_refused)\(\)' "$R/bin/velo-task-lib.sh")" = 6 ]
+  need "the library holds run, status and what they call" [ "$(grep -cE '^(cmd_run|cmd_status|need_daemon|check_arg|rerun_nonce|start_refused|reconcile_id)\(\)' "$R/bin/velo-task-lib.sh")" = 7 ]
   printf '#!/bin/bash\nset -e\ndeclare -A seeded\nseeded[a]=1\n' > "$d/seeded.sh"
   need "the seeded declare -A fixture is caught by the sweep" grep -qE "$SWEEP_RE" "$d/seeded.sh"
   need "...and fails when run under /bin/bash" not /bin/bash "$d/seeded.sh"
@@ -543,6 +693,15 @@ check "B10: the --rerun key suffix is <epoch>_<pid>_<rand8>, new on every call" 
 check "vanth start returned no job: a refusal leaves nothing pending, anything else keeps the record" t_run_failures
 check "R17 crash windows: killed at each failpoint, the on-disk state is the one reconcile reads" t_run_crash
 check "R17: the pending record, the index line and the unlink are fsynced in order" t_run_fsync_order
+check "B25 recovery: status <id> finds the job of a run killed after vanth start returned, from Vanth's own record, with one execution" t_reconcile_status
+check "R3: run settles the id's records first, so the last line of the index is the last job started" t_reconcile_run
+check "B25 recovery: the same after 1,100 newer jobs, which vanth list (capped at 1,000 rows) cannot show" t_reconcile_bulk
+check "R3: a record Vanth has no key for is reported pending-unsent and never replayed; status of the id is exit 3" t_reconcile_unsent
+check "R3: the key is matched exactly: one that extends, contains or case-folds it does not settle a record" t_reconcile_exact
+check "R17: a reconcile killed between the index line and the unlink is redone, with no second line" t_reconcile_redo
+check "R3: status <id> settles that id's records only" t_reconcile_scope
+check "an unsafe record, name index or database, or a job id that is not one, stops status and run (exit 6); nothing is skipped" t_reconcile_unsafe
+check "R4: a status that settles the record of a run in flight does not make that run start a second job" t_reconcile_inflight
 check "B1 B18 B26 through status: every verdict, injected rows, restart pending, --issue" t_status_verdicts
 check "B25 read side: an id resolves through the name index; the name is checked; --job needs no index; no match is exit 2" t_status_resolution
 check "R6 R7: a daemon that cannot be reached is exit 6 and velo-task restart-daemon, never a verdict" t_status_daemon
@@ -631,7 +790,7 @@ prove "R7: a transport error from vanth start is exit 1" t_run_failures $L '    
 prove "R7: a start failure does not name restart-daemon" t_run_failures $L 'is kept; recover with: velo-task restart-daemon" ;;' 'is kept" ;;'
 
 # run --rerun (B10, R4)
-prove "B10: --rerun does not look for a colliding key" t_rerun_collision $L 'if [ "$known" = 0 ] && [ "$rerun" = 1 ]; then' 'if [ "$known" = 99 ] && [ "$rerun" = 1 ]; then'
+prove "B10: --rerun does not look for a colliding key" t_rerun_collision $L 'if [ "$known" = 0 ] && [ "$rerun" = 1 ] && [ -e' 'if [ "$known" = 99 ] && [ "$rerun" = 1 ] && [ -e'
 prove "B10: a --rerun retry reuses the nonce" t_rerun_collision $L 'key="${key}_$(rerun_nonce "$n")"' 'key="${key}_$(rerun_nonce 1)"'
 prove "B10: --rerun gives up after 3 attempts" t_rerun_collision $L 'if [ "$n" -ge 5 ]; then die 5' 'if [ "$n" -ge 3 ]; then die 5'
 prove "B10: --rerun tries 9 times" t_rerun_collision $L 'if [ "$n" -ge 5 ]; then die 5' 'if [ "$n" -ge 9 ]; then die 5'
@@ -659,6 +818,49 @@ prove "R17: the pending directory is not fsynced after the link" t_run_fsync_ord
 prove "R17: the name index's new directory entry is not fsynced" t_run_fsync_order $S $'    if created:\n        _sync_path(os.path.dirname(path), "dir")\n    return 0' $'    return 0'
 prove "R17: the name index line is not fsynced" t_run_fsync_order $S $'        _sync_fd(fd, "file", path)\n    finally:' $'        pass\n    finally:'
 prove "R17: an unsafe name index is found after the job was started" t_state_paths $L $'  rc=0; st index-last "$NAMES" "$id" >/dev/null || rc=$?  # an unsafe name index is found now, not after the job was started\n  [ "$rc" -le 1 ] ||' $'  [ 0 -le 1 ] ||'
+
+# reconcile (R3, R17, B25 recovery): the mutants the brief names (replays vanth start, uses vanth list, appends twice, matches the key by substring) and the rest
+RCI='        if not index_has(names, job, ident):'
+RCA='            cmd_append_index([os.path.join(names, ident), job])'
+RCQ='"SELECT job_id FROM local_start_requests WHERE idempotency_key = ?", (record["key"],))'
+RCV='[home + "/venv/bin/vanth", "--json", '    # a mutant reaches the fake Vanth CLI by the layout of the home: <home>/vanth/jobs.sqlite is db, <home>/venv/bin/vanth the CLI
+RCE='env={"VANTH_HOME": os.path.dirname(os.path.abspath(db)), "PATH": "/usr/bin:/bin"}'
+RCH='home = os.path.dirname(os.path.dirname(os.path.abspath(db)))'
+prove "R3: status does not reconcile before it reads the index" t_reconcile_status $L '    reconcile_id "$id" || unsent=$?' '    :'
+prove "R3: a record whose key is present is not indexed" t_reconcile_status $S "$RCI"$'\n'"$RCA" $'        if False:\n'"$RCA"
+prove "R3: a settled record is not unlinked" t_reconcile_status $S $'        failpoint("reconcile.indexed")\n        cmd_remove([path])' $'        failpoint("reconcile.indexed")'
+prove "R3: reconcile appends the job id twice" t_reconcile_status $S "$RCA"$'\n' "$RCA"$'\n'"$RCA"$'\n'
+prove "R3: run does not reconcile before it starts anything" t_reconcile_run $L '  rc=0; reconcile_id "$id" || rc=$?' '  rc=0; :'
+prove "R3: run does not reconcile before it starts anything (a killed run's record piles up)" t_run_crash $L '  rc=0; reconcile_id "$id" || rc=$?' '  rc=0; :'
+prove "B25: reconcile reads vanth list instead of local_start_requests" t_reconcile_bulk \
+  $S "        found = query_ro(db, $RCQ" \
+     "        $RCH"$'\n'"        listed = json.loads(subprocess.run($RCV\"list\", \"--all\", \"--name\", ident, \"--limit\", \"1000\"], $RCE, capture_output=True, text=True).stdout)"$'\n''        found = [{"job_id": row["job_id"]} for row in listed if row["name"] == ident][:1]'
+prove "B25: reconcile replays vanth start for a key Vanth has not seen" t_reconcile_unsent \
+  $S $'        if not found:\n            unsent = True\n            continue' \
+     $'        if not found:\n'"            $RCH"$'\n'"            subprocess.run($RCV\"start\", \"--name\", record[\"name\"], \"--timeout\", str(record[\"timeout\"]), \"--idempotency-key\", record[\"key\"], \"--cwd\", record[\"cwd\"], \"--tag\", \"velo\", \"--\"] + record[\"argv\"], $RCE, check=False, capture_output=True)"$'\n            unsent = True\n            continue'
+prove "R3: reconcile unlinks a record Vanth has no key for" t_reconcile_unsent $S $'        if not found:\n            unsent = True\n            continue' $'        if not found:\n            unsent = True\n            cmd_remove([path])\n            continue'
+prove "R3: an unsent record is exit 0" t_reconcile_unsent $S '    return 3 if unsent else 0' '    return 0'
+prove "R3: an unsent record is not reported on stderr" t_reconcile_unsent $S '        sys.stderr.write("pending-unsent %s\n" % ident)' '        pass'
+prove "R3: an unsent record is a failure of reconcile" t_reconcile_unsent $L '  case "$rc" in 0|3) return "$rc" ;; esac' '  case "$rc" in 0) return "$rc" ;; esac'
+prove "R3: status of an unsent id is exit 2" t_reconcile_unsent $L '[ "$unsent" = 3 ]; then die 3 ' '[ "$unsent" = 3 ]; then die 2 '
+prove "R3: status of an unsent id does not say how to settle it" t_reconcile_unsent $L '; re-run \`velo-task run $id ...\` (idempotent: the same key returns the existing job)"' '"'
+prove "R3: reconcile matches the key as a substring" t_reconcile_exact $S "$RCQ" '"SELECT job_id FROM local_start_requests WHERE instr(idempotency_key, ?) > 0", (record["key"],))'
+prove "R3: reconcile matches the key as a prefix" t_reconcile_exact $S "$RCQ" '"SELECT job_id FROM local_start_requests WHERE idempotency_key LIKE ?", (record["key"] + "%",))'
+prove "R3: reconcile matches the key without regard to case" t_reconcile_exact $S "$RCQ" '"SELECT job_id FROM local_start_requests WHERE idempotency_key LIKE ?", (record["key"],))'
+prove "R17: reconcile appends the job id without checking that it is listed" t_reconcile_redo $S "$RCI" '        if True:'
+prove "R17: reconcile unlinks the record before it indexes the job" t_reconcile_redo $S "$RCI"$'\n'"$RCA"$'\n        failpoint("reconcile.indexed")\n        cmd_remove([path])' $'        cmd_remove([path])\n        failpoint("reconcile.indexed")\n'"$RCI"$'\n'"$RCA"
+prove "R21: the reconcile.indexed failpoint is gone" t_reconcile_redo $S $'        failpoint("reconcile.indexed")\n' $'        pass\n'
+prove "R3: reconcile settles the records of every id" t_reconcile_scope $S '        if record is None or record["name"] != ident:' '        if record is None:'
+prove "R3: a pending record that is not a record is skipped" t_reconcile_unsafe $S '        die(9, "%s is not a pending record" % path)' '        return None'
+prove "R3: a database that cannot be read is read as an unsent start" t_reconcile_unsafe \
+  $S "        found = query_ro(db, $RCQ" \
+     $'        try:\n'"            found = query_ro(db, $RCQ"$'\n        except SystemExit:\n            found = []'
+prove "R3: a job id that starts with a dash is indexed" t_reconcile_unsafe $S 'or not JOB_ID.fullmatch(job) or job.startswith("-"):' 'or not JOB_ID.fullmatch(job):'
+prove "R3: files beside the records are read as records" t_reconcile_unsafe $S 'if PENDING_NONCE.fullmatch(name))' 'if True)'
+prove "R3: reconcile reads a record through a symlink" t_reconcile_unsafe $S $'        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n    except FileNotFoundError:' $'        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)\n    except FileNotFoundError:'
+prove "R3: a failure to reconcile is ignored" t_reconcile_unsafe $L $'  die 6 "reconcile of \'$1\' failed (helper exit $rc, see above); nothing was resolved"' '  return 0'
+prove "R3: reconcile takes a path for an id" t_reconcile_unsafe $S '    if len(args) != 4 or args[3] in ("", ".", "..") or "/" in args[3]:' '    if False:'
+prove "R4: run takes the job a status settled for a colliding key" t_reconcile_inflight $L '[ "$rerun" = 1 ] && [ -e "$PENDING/$pending" ]; then' '[ "$rerun" = 1 ]; then'
 
 # status (B1, B18, B25, B26, R1, R5, R20)
 prove "B1: status prints ok whatever the row says" t_status_verdicts $L $'  if [ "$absent" = 1 ]; then st verdict-of --absent "${vargs[@]}"; else printf \'%s\\n\' "$out" | st verdict-of "${vargs[@]}"; fi' $'  printf \'%s ok\\n\' "${id:-$job}"'
@@ -716,7 +918,7 @@ prove "R17: remove follows a symlink" t_remove $S $'        problem = node_probl
 prove "R17: remove of a file that is gone is an error" t_remove $S '        return 0  # a step of run that reconcile may already have done' '        return 1  # a step of run that reconcile may already have done'
 prove "R21: VELO_TASK_RERUN_NONCE alone does not count as a seam" t_seam_nonce $L 'for v in VELO_TASK_TEST VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV VELO_TASK_RERUN_NONCE; do' 'for v in VELO_TASK_TEST VELO_TASK_FAILPOINT VELO_TASK_FSYNC_TRACE VELO_TASK_UV; do'
 prove "R21: VELO_TASK_RERUN_NONCE is not refused without the capability" t_seam_nonce $L '    if [ -n "${VELO_TASK_RERUN_NONCE:-}" ]; then die 2 "VELO_TASK_RERUN_NONCE is set but refused: it is honoured only for tests ($why)"; fi' '    :'
-prove "the dispatcher runs a library function by name" t_not_subcommands $V $'  _*) die 2 "unknown subcommand \'$sub\'" ;;' $'  _*) die 2 "unknown subcommand \'$sub\'" ;;\n  cmd_*|need_daemon|check_arg|rerun_nonce|start_refused) "$sub" "$@" ;;'
+prove "the dispatcher runs a library function by name" t_not_subcommands $V $'  _*) die 2 "unknown subcommand \'$sub\'" ;;' $'  _*) die 2 "unknown subcommand \'$sub\'" ;;\n  cmd_*|need_daemon|check_arg|rerun_nonce|start_refused|reconcile_id) "$sub" "$@" ;;'
 
 # B14: every new function is swept
 prove "B14: bash 4 in the dispatcher's run and status arm" t_b14_new $V '  run|status) "cmd_$sub" "$@" ;;' '  run|status) mapfile -t seeded < /dev/null; "cmd_$sub" "$@" ;;'
@@ -724,6 +926,7 @@ prove "B14: bash 4 in need_daemon" t_b14_new $L $'  (cmd_ensure_daemon >/dev/nul
 prove "B14: bash 4 in check_arg" t_b14_new $L $'  [[ "$2" =~ $re ]] || die 2' $'  declare -A seeded\n  [[ "$2" =~ $re ]] || die 2'
 prove "B14: bash 4 in rerun_nonce" t_b14_new $L '  IFS=, read -r -a parts <<<"$VELO_TASK_RERUN_NONCE"' $'  declare -A seeded\n  IFS=, read -r -a parts <<<"$VELO_TASK_RERUN_NONCE"'
 prove "B14: bash 4 in start_refused" t_b14_new $L $'  case "$2" in\n' $'  declare -A seeded\n  case "$2" in\n'
+prove "B14: bash 4 in reconcile_id" t_b14_new $L $'  local rc=0\n  st reconcile' $'  declare -A seeded\n  local rc=0\n  st reconcile'
 prove "B14: bash 4 in cmd_run" t_b14_new $L $'cmd_run() {\n' $'cmd_run() {\n  declare -A seeded\n'
 prove "B14: bash 4 in cmd_status" t_b14_new $L $'cmd_status() {\n' $'cmd_status() {\n  declare -A seeded\n'
 

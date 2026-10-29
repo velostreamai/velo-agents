@@ -23,13 +23,14 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   remove <file>                            R17 step 4: unlink a regular file of yours (already gone is fine), then fsync its directory
   index-last <names-dir> <id>              the last job id in <names-dir>/<id> (R3); exit 1 when there is no such index
   index-has <names-dir> <job_id> [<id>]    exit 0 when a name-index file (just <id>'s, when given) lists the job id, else 1
+  reconcile <pending-dir> <names-dir> <db> <id>   R3, R17: settle <id>'s pending records against Vanth's local_start_requests (read-only, the key matched exactly): key present = index the job id (unless listed), unlink the record; key absent = leave it, print `pending-unsent <id>` on stderr, exit 3
   failpoint <name>                         test-only crash/barrier point (see below)
   test-capability                          exit 0 when the test capability holds (see below), else 2
 
-Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job), 4 jobs-ro: database
+Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job; reconcile: a record Vanth has no key for), 4 jobs-ro: database
 locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 6 verdict-of: the input is not JSON, 8 modes-check: loose
 mode found, 9 unsafe state (a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire,
-append-index, pending-write, remove, index-last, index-has; for check-state also a home whose mode is not 0700), 75 lock or
+append-index, pending-write, remove, index-last, index-has, reconcile; for check-state also a home whose mode is not 0700), 75 lock or
 failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from `lock` is the
 command's own.
 
@@ -56,9 +57,9 @@ import time
 from urllib.parse import quote
 
 # A failpoint name is registered when its call site exists; a typo must not pass silently. The last four are the steps of
-# `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked.
+# `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked (reconcile.indexed: the same, in reconcile).
 FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready",
-              "restart.validated", "install.lock.held", "pending.published", "start.returned", "index.appended", "pending.unlinked"}
+              "restart.validated", "install.lock.held", "pending.published", "start.returned", "index.appended", "pending.unlinked", "reconcile.indexed"}
 TEST_MARKER = ".velo-task-test-root"
 # Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
 # exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly
@@ -85,6 +86,7 @@ SECRET_SHAPES = [re.compile(p) for p in (
     r"ghp_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}",
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{6,}", r"AKIA[0-9A-Z]{8,}")]
 JOB_ID = re.compile(r"[A-Za-z0-9_-]+")  # used with fullmatch: `$` would also accept a trailing newline
+PENDING_NONCE = re.compile(r"[0-9a-f]{16}")  # the name pending-write gives a record; a temp file beside it, or anything else, is not one
 # R1: the one in-flight predicate (every component uses this set, the Stop guard included), and the reason Vanth 1.14.0 gives a job it
 # cancels because its trigger parent ended in another status than the awaited one (install-vanth asserts the installed package holds it).
 IN_FLIGHT = frozenset(("queued", "launching", "running", "paused", "retrying", "stopping"))
@@ -765,9 +767,9 @@ def verdict_of(row, known_job=lambda job_id: False):
     return "lost"  # orphaned, any other cancelled, a status outside both sets
 
 
-def read_index(path):
-    """The job ids in one name-index file (R3), in order. Opened without following a symlink (and a FIFO is never waited on): it must be a
-    regular file of yours. None when it does not exist; exit 9 when it is unsafe or holds a line that is not a job id."""
+def read_state_file(path):
+    """The bytes of one control file (a name index, a pending record). Opened without following a symlink (and a FIFO is never waited on):
+    it must be a regular file of yours. None when it does not exist; exit 9 when it is unsafe."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -779,7 +781,16 @@ def read_index(path):
         os.close(fd)
         die(9, problem)
     with os.fdopen(fd, "rb") as fh:
-        ids = [line for line in fh.read().decode("utf-8", "surrogateescape").split("\n") if line]
+        return fh.read()
+
+
+def read_index(path):
+    """The job ids in one name-index file (R3), in order. None when it does not exist; exit 9 when it is unsafe or holds a line that is
+    not a job id."""
+    data = read_state_file(path)
+    if data is None:
+        return None
+    ids = [line for line in data.decode("utf-8", "surrogateescape").split("\n") if line]
     for line in ids:
         if not JOB_ID.fullmatch(line) or line.startswith("-"):  # a leading dash would reach `vanth status` as an option
             die(9, "%s holds a line that is not a job id: %r" % (path, line))
@@ -911,6 +922,55 @@ def cmd_index_has(args):
     return 0 if index_has(*args) else 1
 
 
+def read_pending(path):
+    """The settings in one pending record (R17), read like a name index. None when it is gone; exit 9 when it is unsafe or not a record."""
+    data = read_state_file(path)
+    if data is None:
+        return None
+    try:
+        record = json.loads(data.decode("utf-8"))
+    except ValueError:  # not JSON, or not UTF-8
+        record = None
+    if not isinstance(record, dict) or not all(isinstance(record.get(field), str) for field in ("key", "name")):
+        die(9, "%s is not a pending record" % path)
+    return record
+
+
+def cmd_reconcile(args):
+    """R3, R17: settle the pending records named <id> against Vanth's own acceptance record, so a run that died after `vanth start` returned
+    does not lose its job. The record's key is looked up in local_start_requests, read-only and matched exactly (never through `vanth list`,
+    which caps at 1,000 rows and matches names by substring). Present: the start was accepted, so the job id goes to <names-dir>/<id> unless
+    it is already listed, and then the record is unlinked; a crash between the two is redone from what is on disk. Absent: the outcome is
+    indeterminate, so the record stays, nothing is sent, and `pending-unsent <id>` is printed on stderr (exit 3)."""
+    if len(args) != 4 or args[3] in ("", ".", "..") or "/" in args[3]:
+        usage("reconcile: expected <pending-dir> <names-dir> <db> <id>")
+    pending, names, db, ident = args
+    unsent = False
+    try:
+        nonces = sorted(name for name in os.listdir(pending) if PENDING_NONCE.fullmatch(name))
+    except FileNotFoundError:
+        return 0
+    for nonce in nonces:
+        path = os.path.join(pending, nonce)
+        record = read_pending(path)
+        if record is None or record["name"] != ident:  # None: settled by another reconcile since the listing
+            continue
+        found = query_ro(db, "SELECT job_id FROM local_start_requests WHERE idempotency_key = ?", (record["key"],))
+        if not found:
+            unsent = True
+            continue
+        job = found[0]["job_id"]
+        if not isinstance(job, str) or not JOB_ID.fullmatch(job) or job.startswith("-"):
+            die(9, "Vanth's job id for %s is not a job id: %r" % (record["key"], job))
+        if not index_has(names, job, ident):
+            cmd_append_index([os.path.join(names, ident), job])
+        failpoint("reconcile.indexed")
+        cmd_remove([path])
+    if unsent:
+        sys.stderr.write("pending-unsent %s\n" % ident)
+    return 3 if unsent else 0
+
+
 def cmd_failpoint(args):
     if len(args) != 1:
         usage("failpoint: expected <name>")
@@ -934,7 +994,7 @@ COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish
             "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
             "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
             "verdict-of": cmd_verdict_of, "pending-write": cmd_pending_write, "remove": cmd_remove,
-            "index-last": cmd_index_last, "index-has": cmd_index_has,
+            "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile,
             "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 

@@ -8,7 +8,8 @@
 #   velo-task doctor           read-only report on install, allowlist, modes, provenance, schema
 #   velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd...   start a job, print its job_id (R2-R4, R17)
 #   velo-task status [--json] [--issue N] <id> | --job <job_id>   print `<id> <verdict>` (R1, R3): ok, failed(n), timeout,
-#                              killed, lost, upstream-failed(<parent>) or in-flight; exit 6 and `velo-task restart-daemon` when the daemon is down
+#                              killed, lost, upstream-failed(<parent>) or in-flight; exit 6 and `velo-task restart-daemon` when the daemon is down;
+#                              exit 3 for a job Vanth does not know, or an id whose start Vanth never received (pending-unsent: re-run it)
 # Every other subcommand exits 2 ("not implemented yet").
 #
 # Layout (VELO_TASK_HOME defaults to ${VELO_STATE:-~/.agents/state}/velo-task; tests override it):

@@ -571,6 +571,12 @@ start_refused() {  # <exit> <vanth output> <pending nonce>: vanth start returned
     *) die 1 "vanth start failed (exit $1): $2; whether it was accepted is unknown, so $PENDING/$3 is kept" ;;
   esac
 }
+reconcile_id() {  # <id>: settle the id's pending records against Vanth's own acceptance record before its name index is read (R3, R17). Returns 3, after `pending-unsent <id>` on stderr, when a record is left that Vanth has no key for; anything else that goes wrong stops the caller
+  local rc=0
+  st reconcile "$PENDING" "$NAMES" "$VH/jobs.sqlite" "$1" || rc=$?
+  case "$rc" in 0|3) return "$rc" ;; esac
+  die 6 "reconcile of '$1' failed (helper exit $rc, see above); nothing was resolved"
+}
 cmd_run() {
   local id timeout="" issue="" stage="" have_issue=0 have_stage=0 rerun=0 cmdline=() args=() n=0 key out rc pending job cwd known
   [ "$#" -gt 0 ] || die 2 "usage: velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd..."
@@ -598,6 +604,7 @@ cmd_run() {
   cwd=$(pwd -P)
   rc=0; st index-last "$NAMES" "$id" >/dev/null || rc=$?  # an unsafe name index is found now, not after the job was started
   [ "$rc" -le 1 ] || die 6 "the name index of '$id' is unsafe or unreadable (see above); nothing was started"
+  rc=0; reconcile_id "$id" || rc=$?  # a run that died after its start was accepted is indexed first, so the last line stays the last job started; 3 is reported on stderr, never replayed here
   while :; do
     n=$((n + 1))
     key="velo_$id"
@@ -614,7 +621,7 @@ cmd_run() {
     stl failpoint start.returned
     known=0; st index-has "$NAMES" "$job" "$id" || known=$?  # 0 listed under this id, 1 not listed, else unreadable
     [ "$known" -le 1 ] || die 6 "the name index is unsafe or unreadable (see above)"
-    if [ "$known" = 0 ] && [ "$rerun" = 1 ]; then  # R4: Vanth returned a job we already know, so the key collided with an earlier run
+    if [ "$known" = 0 ] && [ "$rerun" = 1 ] && [ -e "$PENDING/$pending" ]; then  # R4: Vanth returned a job we already know, so the key collided with an earlier run; unless a reconcile settled this run's own record and indexed its job
       st remove "$PENDING/$pending"
       if [ "$n" -ge 5 ]; then die 5 "--rerun: Vanth returned an already indexed job for $n keys in a row; nothing new was started"; fi
       continue
@@ -627,7 +634,7 @@ cmd_run() {
   done
 }
 cmd_status() {
-  local id="" job="" issue="" have_issue=0 json=0 absent=0 out rc=0 vargs
+  local id="" job="" issue="" have_issue=0 json=0 absent=0 unsent=0 out rc=0 vargs
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --json) json=1; shift ;;
@@ -646,7 +653,9 @@ cmd_status() {
   prep_env
   need_daemon
   if [ -n "$id" ]; then  # R3: the last job run indexed under the id; never vanth list, which caps at 1,000 rows and matches names by substring
+    reconcile_id "$id" || unsent=$?  # a run that died after its start was accepted has its job indexed now
     job=$(st index-last "$NAMES" "$id") || rc=$?
+    if [ "$rc" = 1 ] && [ "$unsent" = 3 ]; then die 3 "pending-unsent $id: Vanth has no record of this start, so it may never have been sent; re-run \`velo-task run $id ...\` (idempotent: the same key returns the existing job)"; fi
     case "$rc" in
       0) ;;
       1) die 2 "no job named '$id' in the name index; address a job by its id with --job <job_id>" ;;
