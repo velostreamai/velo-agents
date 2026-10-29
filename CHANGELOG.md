@@ -6,6 +6,25 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — velo-task guard hooks, and a standing bash 3.2 sweep (#2769, M3c)
+
+Two ways the orchestrating model could blind velo-task, and one way a bash-4 construct could slip into it.
+`vanth prune` deletes terminal job rows and `vanth restore` swaps the database for an older one, so a job
+velo-task has not yet reported could vanish from `velo-task status` and from the Stop guard:
+`hooks/deny-vanth-cleanup.sh` denies both command forms (spec R15(i)). Six near-identical `until pgrep -f ...`
+loops stacked on one condition is how velo-task started, and a process list cannot tell success from a crash,
+a kill or a timeout: `hooks/deny-pgrep-wait-loop.sh` denies a `pgrep` inside a `while`/`until` loop and points
+at `velo-task wait` (R10). Both read the command at command position only (`hooks/guard-lib.sh`), so
+`git commit -m "never run vanth prune"` and a heredoc that mentions the loop still pass, and both fail open when
+`jq`, the lib or the command is missing, so a broken install never wedges Bash. `install.sh` now makes every
+installed hook executable and `--check` reports one that is not: a registered hook that is not executable is
+skipped without a word, which switches its guard off. B14: `tests/test_velo_task_bash32.sh` runs every
+`bin/velo-task*` script under /bin/bash 3.2 and sweeps it for bash-4 constructs. The M1 form of that check
+skipped any script whose first line was not exactly `#!/bin/bash`, so a later `#!/usr/bin/env bash` script would
+have escaped it; this one fails on it, and a seeded `declare -A` fixture must fail both halves. **Prevents:** a
+job row deleted behind velo-task's back, a wait loop that reads a crash as success, a hook that is installed but
+silently off, and a bash-4 construct that passes on a developer's Homebrew bash and breaks on macOS's 3.2.
+
 ### Fixed — a gate leg that did not run can no longer read as a pass (#2231)
 
 Four PRs (#2756, #2758, #2761, #2762) went `gate:passed` with check-code posted as "NOT RUN (declared)",
