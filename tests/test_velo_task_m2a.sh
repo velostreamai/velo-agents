@@ -123,9 +123,12 @@ TABLE
   done
   # M2a, B18: a policy column nested deeper than the interpreter's json can read raises RecursionError, which is not a verdict and not a
   # traceback out of the middle of one: the row cannot be classified, so it is lost, never ok.
-  "$PYBIN" -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO jobs (job_id, name, status, command, policy_state_json) VALUES (?, ?, ?, ?, ?)", ("job_deep", "deep", "failed", "x", "[" * 4000 + "]" * 4000)); c.commit()' "$d/jobs.sqlite"
+  "$PYBIN" -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO jobs (job_id, name, status, command, policy_state_json) VALUES (?, ?, ?, ?, ?)", ("job_deep", "deep", "failed", "x", "[" * 2000000 + "]" * 2000000)); c.commit()' "$d/jobs.sqlite"
   run ST verdict-of --label x --job job_deep --names "$d/names" --db "$d/jobs.sqlite" <<<'{"job_id":"job_deep","status":"failed","exit_code":1}'
   need "a policy column nested deeper than json can read is lost, not a traceback and not ok" [ "$RC" = 0 -a "$OUT" = "x lost" ]
+  # The same depth in the status itself (Python 3.14 reads 100,000 levels and fails only past that): not JSON this interpreter can read, exit 6.
+  run sh -c '"$1" -I -c "import sys; sys.stdout.write(\"[\" * 2000000 + \"]\" * 2000000)" | "$2" verdict-of --label x' sh "$PYBIN" "$R/$S"
+  need "a status nested deeper than json can read is exit 6, not a traceback" [ "$RC" = 6 ]
 }
 t_verdict_cli() {  # what verdict-of does around the mapping: identity checks, output forms, unreadable input, the absent row
   local d j; d=$(mktemp -d "$T/vc.XXXXXX"); mkdir "$d/names"; printf 'job_listed\n' > "$d/names/gate-1"
@@ -1224,6 +1227,9 @@ prove "M2a: the id lock is not taken, so a settle can land inside another's crit
 prove "R17: a temp file a crash left is never swept" t_sweep_temps $S '        pid = temp_writer(name)' '        pid = None'
 prove "R17: a temp file of a writer that is still running is swept too" t_sweep_temps $S '        if pid is None or not writer_gone(pid):' '        if pid is None:'
 prove "R4: the spec gives the plain key without the session part" t_spec_key docs/velo-task-spec.md '`velo_<s8>_<id>` for a plain `run`' '`velo_<id>` for a plain `run`'
+prove "B18: a status that is not a JSON object is read as an empty row (exit 2, job_id None)" t_verdict_table $S $'        if not isinstance(row, dict):\n' $'        if False:\n'
+prove "B18: a policy column nested too deep for json raises instead of being lost" t_verdict_table $S $'    except (ValueError, RecursionError):\n        # M2a, B18' $'    except ValueError:\n        # M2a, B18'
+prove "B18: a status nested too deep for json raises instead of being refused (exit 6)" t_verdict_table $S $'        except (ValueError, RecursionError) as exc:' $'        except ValueError as exc:'
 prove "R5: status exits non-zero for a verdict that is not ok (it mirrors the verdict like wait)" t_status_verdicts $S $'    return 3 if verdict == "unknown-job" else 0' $'    return 3 if verdict == "unknown-job" else (0 if verdict in ("ok", "in-flight") else 1)'
 if [ "${VELO_TASK_NETWORK_TESTS:-}" = 1 ]; then
   prove "R3: the session tag is not sent to Vanth (real Vanth: the tag never returns)" t_vanth_tags_real $L '--cwd "$cwd" --tag velo --tag "session:$session")' '--cwd "$cwd" --tag velo)'
