@@ -57,13 +57,14 @@ OVERRIDE-DIRECTIVES: the 'Read first' CLAUDE.md requirement and its STOP trigger
   GATE_PATH_RE="state/$GATE_SUBDIR/[0-9]+/"
 }
 
-# repo_checkout <dir> — 0 when <dir> is a git checkout of REPO: it has a .git and its origin names REPO. REPO_ERR says
-# what is there when it is not, so a refusal can name the path it tried.
+# repo_checkout <dir> — 0 when <dir> is a git checkout of REPO: it has a .git and its origin names REPO, spelled as git
+# keeps it (https, ssh or a path; with or without a .git or a trailing slash; in any case). REPO_ERR says what is there
+# when it is not, so a refusal can name the path it tried.
 repo_checkout() {
   local have
   [[ -e "$1/.git" ]] || { REPO_ERR="$1 is not a git checkout"; return 1; }
-  have=$(git -C "$1" remote get-url origin 2>/dev/null \
-    | sed -E 's#^.*[:/]([^/:]+/[^/]+)$#\1#; s#\.git$##' | tr '[:upper:]' '[:lower:]')
+  have=$(git -C "$1" remote get-url origin 2>/dev/null | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's#/+$##; s#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#')
   [[ "$have" == "$(tr '[:upper:]' '[:lower:]' <<<"$REPO")" ]] \
     || { REPO_ERR="$1 is a checkout of ${have:-nothing (it has no origin)}, not $REPO"; return 1; }
 }

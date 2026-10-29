@@ -11,7 +11,8 @@
 #   2 the variable reaches every gh call, and the default is spelled once (bin/ and hooks/): scanned in the source AND observed
 #   3 state paths are scoped       PR 12 of two repos never share a gate dir (post-once markers, gated.sha, prune)
 #   4 no cwd fallback              a tree that is missing, belongs to another repo, or is on another branch is refused, by
-#                                  path; the Velostream tree is never read for another repo, even as the cwd on the same branch
+#                                  path; the Velostream tree is never read for another repo, even as the cwd on the same branch;
+#                                  its origin names the repo in every spelling git keeps it in (.git, a trailing slash, ssh, case)
 #   5 a plan for that repo's diff  tier and legs, with check-spec triggered by a closing OR a referencing issue
 #
 # The worker-side tools (dispatch, record, status, native, orchestrd, watch, the SessionStart hook) are in
@@ -378,6 +379,40 @@ t_worktree_found() {
   only_alt_git
   [ "$BAD" -eq 0 ]
 }
+origin_verdict() {   # <origin url, or - for none>: what repo_checkout of the code under test says of a tree with that origin, for $ALT
+  local d
+  d=$(/usr/bin/mktemp -d "$T/origin.XXXXXX") && git init -q "$d" || return 1
+  [ "$1" = - ] || git -C "$d" remote add origin "$1" || return 1
+  env -i PATH="$PATH" HOME="$d" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 R="$R" VELO_REPO="$ALT" D="$d" bash -c '
+    . "$R/bin/velo-repo-lib.sh" || exit 8
+    repo_init || exit 9
+    if repo_checkout "$D"; then echo ok; else echo "no: ${REPO_ERR#"$D" }"; fi'
+}
+t_origin_forms() {   # a checkout of $ALT is one however git keeps its origin, and another repo's is not one in any of those spellings
+  local u v
+  for u in "https://github.com/$ALT.git" "https://github.com/$ALT" "https://github.com/$ALT/" "https://github.com/$ALT.git/" "https://github.com/$ALT//" \
+           "git@github.com:$ALT.git" "git@github.com:$ALT" "git@github.com:$ALT/" "ssh://git@github.com/$ALT.git" "ssh://git@ssh.github.com:443/$ALT.git/" \
+           "https://x-access-token:tok@github.com/$ALT.git" "git://github.com/$ALT.git" "file:///srv/git/$ALT.git" "/srv/git/$ALT" "/srv/git/$ALT/" \
+           "https://github.com/VeloStreamAI/Velo-Agents.git" "https://GitHub.com/VELOSTREAMAI/VELO-AGENTS/" "git@github.com:VeloStreamAI/Velo-Agents.GIT"; do
+    v=$(origin_verdict "$u")
+    eq "$v" ok "origin '$u' is a checkout of $ALT and was not taken for one"
+  done
+  # refused, and for the right reason: the refusal names whose checkout it is, so a URL that was not read at all would not pass
+  for u in "https://github.com/acme/velo-agents.git|acme/velo-agents" "https://github.com/acme/velo-agents/|acme/velo-agents" \
+           "git@github.com:acme/velo-agents.git/|acme/velo-agents" "git@github.com:velostreamai/velostream.git|velostreamai/velostream" \
+           "https://github.com/velostreamai/velo-agents-extra/|velostreamai/velo-agents-extra" "https://github.com/notvelostreamai/velo-agents|notvelostreamai/velo-agents" \
+           "-|nothing (it has no origin)"; do
+    v=$(origin_verdict "${u%%|*}")
+    eq "$v" "no: is a checkout of ${u#*|}, not $ALT" "origin '${u%%|*}' is not a checkout of $ALT"
+  done
+  # a caller sees the same: the gate reviews the tree of $ALT whose origin ends in a slash, and does not refuse it
+  sb_new && mk_world || return 1
+  git -C "$H/RustroverProjects/velo-agents" remote set-url origin "$(git -C "$H/RustroverProjects/velo-agents" remote get-url origin)/" || return 1
+  alt_gate feat/gate
+  [ "$RC" -eq 0 ] || bad "a tree of $ALT whose origin ends in a slash was refused: $(nonl "$OUT" 300)"
+  want "$(cat "$S/gate/$ALT_SUB/$PR/review-brief.md" 2>&1)" "WORKTREE: $H/RustroverProjects/velo-agents (head" "the brief does not review the tree of $ALT whose origin ends in a slash"
+  [ "$BAD" -eq 0 ]
+}
 
 # bar 5
 t_plan_alt() {
@@ -552,6 +587,7 @@ check "a clone of another repo at the repo's name: refused" t_worktree_wrong_rep
 check "a plain directory inside an enclosing repo: refused" t_worktree_not_a_checkout
 check "the repo's tree on another branch: refused, naming each tree" t_worktree_wrong_branch
 check "the repo's tree, or its worker worktree, is found by branch" t_worktree_found
+check "an origin names the repo in every spelling git keeps it in: .git, a trailing slash, ssh, a path, case" t_origin_forms
 echo "== bar 5: a plan for the repo's diff"
 check "velo-pr-gate --plan and velo-gate --plan print tier and legs" t_plan_alt
 check "the tier follows the diff" t_plan_by_diff
@@ -618,6 +654,13 @@ prove "a worker's worktree is not looked for" t_worktree_found $LIB 'for d in "$
 prove "the branch of a tree is not compared" t_worktree_wrong_branch $LIB 'if [[ "$cur" == "$1" ]]; then REPO_WT="$d"; return 0; fi' 'if true; then REPO_WT="$d"; return 0; fi'
 prove "the branch of a tree is not compared" t_worktree_found $LIB 'if [[ "$cur" == "$1" ]]; then REPO_WT="$d"; return 0; fi' 'if true; then REPO_WT="$d"; return 0; fi'
 prove "the refusal names no path" t_worktree_missing $LIB 'Looked in $base/$REPO_NAME and $base/$REPO_NAME-*:' 'Looked nowhere:'
+prove "the slash that ends an origin is not stripped" t_origin_forms $LIB 's#/+$##; ' ''
+prove "only one slash that ends an origin is stripped" t_origin_forms $LIB 's#/+$##' 's#/$##'
+prove "the .git that ends an origin is not stripped" t_origin_forms $LIB 's#\.git$##; ' ''
+prove "the .git of an origin is stripped before its slash" t_origin_forms $LIB 's#/+$##; s#\.git$##; ' 's#\.git$##; s#/+$##; '
+prove "the case of an origin is kept" t_origin_forms $LIB "2>/dev/null | tr '[:upper:]' '[:lower:]' \\" '2>/dev/null \'
+prove "the owner of an origin is not compared" t_origin_forms $LIB '[[ "$have" == ' '[[ "${have##*/}" == ' $LIB '<<<"$REPO")" ]] \' '<<<"${REPO##*/}")" ]] \'
+prove "an origin whose name only starts like the repo's is taken for it" t_origin_forms $LIB '<<<"$REPO")" ]] \' '<<<"$REPO")"* ]] \'
 # the scripts: Velostream's way of finding the tree is used for another repo
 prove "the caller's worktree list answers for another repo" t_worktree_missing bin/velo-pr-gate 'if [[ $REPO_IS_DEFAULT -eq 1 ]]; then
   WTPATH=$(git worktree list' 'if true; then
