@@ -6,6 +6,8 @@
 # A guard that greps the raw command text blocks `git commit -m "never run vanth prune"` and `gh pr create --body ...`.
 # So the command is first reduced to its command-position text: one segment per line, where
 #   - quoted text is dropped (a quoted span that is one plain word is kept, so "$HOME/bin/vanth" still names vanth),
+#   - a backslash outside quotes is dropped and the character after it is plain word text (\vanth is vanth, \\vanth is
+#     not, vanth\ prune is one word); a backslash-newline joins the lines,
 #   - heredoc bodies and comments are dropped (a comment may hold an apostrophe that would otherwise swallow the rest),
 #   - $( ), backticks, ( ), ; | & and newlines start a new segment, and the body of a $( ) inside double quotes is
 #     scanned like any other command, because it runs.
@@ -49,7 +51,7 @@ BEGIN { st = "N"; prev = "\n" }
       qadd(c, "[ \t\n&;|()<>]"); i++; continue
     }
     if (ar > 0) { if (c == "(") ar++; else if (c == ")") ar--; put(c); i++; continue }
-    if (c == "\\") { if (c1 != "\n") put(c c1); i += 2; continue }   # backslash-newline is deleted, as the shell does
+    if (c == "\\") { if (c1 != "\n") { put(c1 ~ /[ \t]/ ? "\002" : c1); prev = c } i += 2; continue }   # backslash-newline is deleted, as the shell does; any other escaped character is plain word text (\vanth is vanth) and never opens a comment or an ANSI-C quote
     if (c == "'") { st = (prev == "$") ? "A" : "S"; qb = ""; qs = 1; i++; continue }
     if (c == "\"") { st = "D"; qb = ""; qs = 1; i++; continue }
     if (c == "#" && prev ~ /[ \t\n&;|()]/) { i = n; continue }

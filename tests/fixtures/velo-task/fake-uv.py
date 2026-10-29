@@ -8,21 +8,27 @@ outside that root, has a symlink in any component below it, or is itself a symli
 passes a symlinked or external venv path must not be able to remove or overwrite a real file: a fixture once wrote through a
 venv symlink and clobbered the Homebrew python3.
 
-  uv venv ... <dir>             a complete fake Vanth install: bin/python, bin/vanth (fake-vanth.sh), bin/vanthd (fake-vanthd.py)
-  uv pip install ...            logged only
+  uv venv ... <dir>             a complete fake Vanth install: bin/python, bin/vanth (fake-vanth.sh), bin/vanthd (fake-vanthd.py).
+                                hold-venv holds it, before it creates anything, as hold-pip holds the install
+  uv pip install ...            logged. With --require-hashes (B23) it refuses, as uv does, a pin whose hash in the lock -r names is not
+                                the sha256 that the reviewed manifest beside the lock records for that wheel (the wheel's real hash);
+                                a pin the manifest has no row for is not checked. If @E@/hold-pip exists it creates hold-pip.reached
+                                and waits for hold-pip.release, so a test can act while the install is running
   uv pip freeze ...             the checked-in closure fixture (tests/fixtures/vanth-closure.txt), NOT derived from the lock;
-                                the variant extra adds a distribution, missing drops starlette
+                                the variant extra adds a distribution, missing drops starlette. hold-freeze holds it, as hold-pip does
 Every call is logged to @E@/uv.log with the PATH it was given and the names of its environment.
 """
 import os
+import re
 import sys
+import time
 
 E = "@E@"
 FIX = "@FIX@"
 PY3 = "@PY3@"
 CLOSURE = "@CLOSURE@"
 VARIANT = "@VARIANT@"
-MUTANT = "@MUTANT@"  # empty, except in the fixture's own mutation proofs: noguard (no path guard) or fromlock (installed set = the lock)
+MUTANT = "@MUTANT@"  # empty, except in the fixture's own mutation proofs: noguard (no path guard), fromlock (installed set = the lock) or nohash (--require-hashes not enforced)
 UNSAFE = MUTANT == "noguard"
 
 
@@ -53,6 +59,43 @@ def guard(target):
         refuse("%s is not canonical" % path)
 
 
+def norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def check_hashes(lock):
+    """What uv does under --require-hashes, with the manifest standing in for the wheels: each pin it has a row for must carry that
+    row's sha256 (a wheel is hashed as downloaded; here the reviewed hash is what the wheel has). A pin it has no row for is not
+    checked: the closure tests add pins of their own, and the fake has no wheel to hash for them."""
+    rows = {}
+    for line in open(os.path.join(os.path.dirname(lock), "vanth.wheels.tsv")).read().split("\n"):
+        if line.strip() and not line.startswith("#"):
+            name, ver, _wheel, _platform, sha = line.split("\t")
+            rows[(norm(name), ver)] = sha
+    pin = None
+    for line in open(lock).read().split("\n"):
+        m = re.match(r"^([A-Za-z0-9._-]+)==(\S+) \\$", line)
+        if m:
+            pin = (m.group(1), m.group(2))
+            continue
+        h = re.match(r"^\s+--hash=sha256:([0-9a-f]{64})\s", line)
+        if h and pin and rows.get((norm(pin[0]), pin[1]), h.group(1)) != h.group(1):
+            refuse("Hash mismatch for %s==%s: the lock expects sha256:%s, the wheel has sha256:%s"
+                   % (pin[0], pin[1], h.group(1), rows[(norm(pin[0]), pin[1])]))
+
+
+def hold(step):
+    """If @E@/hold-<step> exists: say that the step is running (hold-<step>.reached) and wait, bounded, for hold-<step>.release."""
+    if not os.path.exists(E + "/hold-" + step):
+        return
+    open(E + "/hold-" + step + ".reached", "w").close()
+    deadline = time.monotonic() + 60
+    while not os.path.exists(E + "/hold-" + step + ".release"):
+        if time.monotonic() > deadline:
+            refuse("hold-%s was never released" % step)
+        time.sleep(0.02)
+
+
 def render(template, dest, mode):
     guard(dest)
     # The placeholder names are split so the harness's own substitution of this file leaves them alone.
@@ -69,6 +112,7 @@ log("path=" + os.environ.get("PATH", ""))
 log("env=" + " ".join(sorted(os.environ)))  # the NAMES of its environment, never a value
 args = sys.argv[1:]
 if args[:1] == ["venv"]:
+    hold("venv")
     d = args[-1]
     guard(d)
     guard(os.path.join(d, "bin"))
@@ -92,10 +136,14 @@ if args[:1] == ["venv"]:
     render("fake-vanth.sh", os.path.join(d, "bin", "vanth"), 0o755)
     render("fake-vanthd.py", os.path.join(d, "bin", "vanthd"), 0o755)
 elif args[:2] == ["pip", "install"]:
+    if "--require-hashes" in args and MUTANT != "nohash":
+        check_hashes(args[args.index("-r") + 1])
     if MUTANT == "fromlock":
         with open(E + "/lock-used", "w") as fh:
             fh.write(args[args.index("-r") + 1])
+    hold("pip")
 elif args[:2] == ["pip", "freeze"]:
+    hold("freeze")
     if MUTANT == "fromlock":  # the circular design finding 21 removed: what is "installed" is read off the lock itself
         pins = [ln.split(" ")[0] for ln in open(open(E + "/lock-used").read()) if ln[:1].isalnum() and "==" in ln]
         lines = pins

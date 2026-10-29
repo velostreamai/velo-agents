@@ -11,8 +11,10 @@
 # list. An accepted false positive is asserted DENIED the same way.
 #
 # Checks: t_vanth_denied/_wrappers/_control/_allowed/_false_negatives, t_pgrep_denied/_nesting/_allowed/_false_negatives,
-# t_scanner (quoting, heredocs, comments, substitutions), t_noglob, t_utf8, t_messages, t_failopen, t_scan_speed,
-# t_readme_registration (the registration line in README.md, run as Claude Code would run it), t_hook_files, t_install_hooks.
+# t_scanner (quoting, backslashes, heredocs, comments, substitutions), t_noglob, t_utf8, t_messages, t_failopen,
+# t_scan_speed (CPU time, see t_scan_clock), t_readme_registration (the registration line in README.md, run as Claude Code
+# would run it), t_hook_files, t_hook_docs (each pinned false negative is in the header and the README), t_install_hooks,
+# t_install_exec_scope, t_install_pycache.
 # Hooks run as Claude Code runs them: the PreToolUse JSON on stdin, exit 2 = block, exit 0 = allow.
 #
 # Every check is also proved RED on a mutated COPY of the code under test (tests/mutation-lib.sh): the repo's files are never
@@ -49,6 +51,24 @@ fpos()  {  # <hook> <command> <why>: an accepted false positive
   if [ "$RC" = 2 ]; then echo "note: accepted false positive ($3): $(show "$2")"
   else bad "${1%.sh} no longer denies an accepted false positive ($3): move it to the allowed list: $(show "$2")"; fi
 }
+cpu_run() {  # <timefile> <command...>: runs the command (stdin as given, output discarded); sets RC to its exit code and CPU to the user + system seconds it and its children used
+  local tf=$1 u s fmt='%3U %3S'
+  shift
+  [ "${SCAN_CLOCK:-cpu}" != wall ] || fmt='%3R 0.000'   # the mutant the clock proof runs: wall time, which a loaded host stretches
+  { TIMEFORMAT=$fmt; time "$@" >/dev/null 2>&1; } 2> "$tf"; RC=$?
+  read -r u s < "$tf"
+  [[ $u =~ ^[0-9]+\.[0-9]+$ && $s =~ ^[0-9]+\.[0-9]+$ ]] || { echo "FAILED: no CPU time was reported for $*: [$(cat "$tf")]"; exit 1; }
+  CPU=$(/usr/bin/awk -v u="$u" -v s="$s" 'BEGIN { printf "%.3f", u + s }')
+}
+below() { /usr/bin/awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; }   # <a> < <b>, as numbers
+install_tree() {  # a throwaway checkout (the real install.sh, the real hooks, one script) and its destination: sets src and dest from the caller's d, defines inst
+  src="$d/src"; dest="$d/dest"
+  mkdir -p "$src/bin" "$src/hooks" "$d/home" "$d/skills"
+  cp "$R/install.sh" "$src/install.sh"
+  cp "$R"/hooks/*.sh "$src/hooks/"
+  printf '#!/bin/bash\n' > "$src/bin/stub"
+  inst() { env -i HOME="$d/home" PATH=/usr/bin:/bin VELO_AGENTS_HOME="$dest" VELO_CLAUDE_SKILLS="$d/skills" /bin/bash "$src/install.sh" "$@"; }
+}
 
 # ---- deny-vanth-cleanup.sh (B29, hook half) ----
 t_vanth_denied() {  # vanth prune and vanth restore, in every form the hook claims
@@ -67,7 +87,8 @@ t_vanth_denied() {  # vanth prune and vanth restore, in every form the hook clai
     'cd /tmp && vanth prune --yes' 'echo y | vanth prune --yes' 'true || vanth prune' 'vanth status; vanth prune' \
     $'echo hi\nvanth prune' 'out=$(vanth prune --yes)' 'echo "$(vanth prune)"' 'echo `vanth prune`' 'echo "`vanth prune`"' \
     '( vanth prune )' 'cat <(vanth prune)' 'case x in x) vanth prune ;; esac' \
-    $'vanth \\\nprune --yes' $'van\\\nth prune'
+    $'vanth \\\nprune --yes' $'van\\\nth prune' \
+    '\vanth prune' 'v\anth prune' '\vanth --json restore' '\/usr/bin/vanth prune' '\python3 -m vanth prune' 'python3 -m \vanth prune' 'sudo \vanth prune'
   do deny $V "$c"; done
   [ "$BAD" = 0 ]
 }
@@ -103,7 +124,8 @@ t_vanth_allowed() {  # look-alikes that must pass: other subcommands, help, the 
     "echo 'vanth restore'" 'vanthd prune' 'my-vanth prune' 'vanth_prune' 'ls vanth-prune.txt' 'cat docs/vanth-restore.md' \
     'pip install vanth' 'uv pip install vanth==1.14.0' 'python3 -m vanth status' 'python3 -m vanth.server prune' \
     'python3 script.py vanth prune' 'python3 script.py -m vanth prune' 'python3 -c "print(1)" vanth prune' 'python3 -Im json.tool prune' \
-    'until pgrep -f foo; do sleep 5; done' 'velo-task wait gate-1' 'velo-task status' 'echo ok'
+    'until pgrep -f foo; do sleep 5; done' 'velo-task wait gate-1' 'velo-task status' 'echo ok' \
+    '\\vanth prune' 'vanth\ prune' $'vanth\\\tprune' '"\vanth" prune' '\vanth status'
   do allow $V "$c"; done
   [ "$BAD" = 0 ]
 }
@@ -148,7 +170,9 @@ t_pgrep_denied() {  # a literal pgrep loop is denied, in every shape the hook cl
     'for i in 1 2; do until pgrep -f x; do sleep 1; done; done' 'r=$(until pgrep -f x; do sleep 1; done)' \
     '( while pgrep -f x; do sleep 1; done )' 'waitfor() { until pgrep -f "$1"; do sleep 1; done; }' \
     'while :; do if pgrep -f x; then sleep 1; else break; fi; done' 'while pgrep -f x | grep -q .; do sleep 1; done' \
-    'while sleep 1; do pgrep -f x && continue; break; done'
+    'while sleep 1; do pgrep -f x && continue; break; done' \
+    'until \pgrep -f x; do sleep 1; done' 'until p\grep -f x; do sleep 1; done' 'while \pgrep -f x >/dev/null; do sleep 1; done' \
+    'until sudo \pgrep -f x; do sleep 1; done' 'while true; do \pgrep -f x || break; sleep 5; done'
   do deny $P "$c"; done
   [ "$BAD" = 0 ]
 }
@@ -171,7 +195,8 @@ t_pgrep_allowed() {  # velo-task wait, and everything that merely looks like a w
     'pgrep -f x | xargs kill' 'while read l; do echo $l; done < <(pgrep -f foo)' \
     'git commit -m "deny until pgrep loops"' 'echo "while pgrep -f x; do sleep 1; done"' $'cat <<EOF\nwhile pgrep -f x; do sleep 1; done\nEOF' \
     '# until pgrep -f x; do sleep 1; done' 'while true; do sleep 1; done' 'until pgrepx -f x; do sleep 1; done' 'until mypgrep -f x; do sleep 1; done' \
-    'sleep 5' 'echo pgrep' 'vanth prune' 'vanth status'
+    'sleep 5' 'echo pgrep' 'vanth prune' 'vanth status' \
+    'until pgrep\ -f x; do sleep 1; done' 'until \\pgrep -f x; do sleep 1; done' '\pgrep -f x'
   do allow $P "$c"; done
   [ "$BAD" = 0 ]
 }
@@ -231,6 +256,8 @@ t_scanner() {
   deny  $V 'echo a#b; vanth prune'
   deny  $V 'echo $#; vanth prune'
   deny  $V 'x=abc; echo ${#x}; vanth prune'
+  deny  $V 'echo \;# x; vanth prune'
+  deny  $V 'echo \ # x; vanth prune'
   # quotes: single quotes are literal, double quotes run $( ) and backticks, ANSI-C quotes take backslash escapes
   allow $V "echo '\$(vanth prune)'"
   allow $V 'echo "\$(vanth prune)"'
@@ -243,6 +270,7 @@ t_scanner() {
   allow $V 'echo "$(date) vanth prune"'
   deny  $V $'echo $\'it\\\'s\'; vanth prune'
   deny  $V 'echo \"; vanth prune'
+  deny  $V $'echo \\$\'a\\\'; vanth prune'
   deny  $V 'echo "a $(echo "b $(vanth prune)")"'
   deny  $V 'echo "$( (cd /x); vanth prune )"'
   deny  $V "echo \"\$(echo 'a)b'; vanth prune)\""
@@ -337,8 +365,8 @@ t_failopen() {  # no jq, no lib, a lib that does not load, a payload with nothin
   done
   [ "$BAD" = 0 ]
 }
-t_scan_speed() {  # a hook runs before every Bash call: about 300 KB of command in any shape must not take seconds
-  local d name el rc
+t_scan_speed() {  # a hook runs before every Bash call: about 300 KB of command in any shape must not take seconds of CPU (not of wall time: a loaded host stretches that)
+  local d name hook
   d=$(/usr/bin/mktemp -d "$T/sp.XXXXXX") || exit 1
   /usr/bin/awk 'BEGIN { for (i = 0; i < 27000; i++) printf "echo \"a\" ; "; print "vanth prune" }' | jq -Rs '{tool_input:{command:.}}' > "$d/many-segments.json"
   /usr/bin/awk 'BEGIN { for (i = 0; i < 10000; i++) printf "echo \"line %d some text here\"\n", i; print "vanth prune" }' | jq -Rs '{tool_input:{command:.}}' > "$d/many-lines.json"
@@ -349,14 +377,26 @@ t_scan_speed() {  # a hook runs before every Bash call: about 300 KB of command 
   # one word, unquoted (150 KB) and quoted (600 KB): quadratic without the caps in the scanner (66 s for 300 KB unquoted), linear with them
   /usr/bin/awk 'BEGIN { for (i = 0; i < 150000; i++) printf "a"; print "; vanth prune" }' | jq -Rs '{tool_input:{command:.}}' > "$d/one-word.json"
   /usr/bin/awk 'BEGIN { printf "echo \""; for (i = 0; i < 600000; i++) printf "a"; print "\"; vanth prune" }' | jq -Rs '{tool_input:{command:.}}' > "$d/one-quoted-word.json"
+  # CPU seconds, not elapsed ones: the slow mutants below burn 8 to 16 s of CPU where the real scanner needs 1.5 s, and a host
+  # busy with other suites or with four parallel proof jobs stretches elapsed time past a fixed bound without the scanner changing.
   for name in many-segments many-lines one-string heredoc vanth-segments loops one-word one-quoted-word; do
-    s=$SECONDS
-    case $name in loops) "$R/hooks/$P" < "$d/$name.json" >/dev/null 2>&1; rc=$? ;; *) "$R/hooks/$V" < "$d/$name.json" >/dev/null 2>&1; rc=$? ;; esac
-    el=$((SECONDS - s))
-    [ "$rc" = 2 ] || bad "$name: the hook exited $rc, want 2 (the command ends in the denied form)"
-    [ "$el" -lt 5 ] || bad "$name: the hook took ${el}s on a $(wc -c < "$d/$name.json" | tr -d ' ') byte command (bound 5 s)"
-    echo "note: $name, $(wc -c < "$d/$name.json" | tr -d ' ') bytes: ${el}s"
+    case $name in loops) hook=$P ;; *) hook=$V ;; esac
+    cpu_run "$d/clock" "$R/hooks/$hook" < "$d/$name.json"
+    [ "$RC" = 2 ] || bad "$name: the hook exited $RC, want 2 (the command ends in the denied form)"
+    below "$CPU" 5 || bad "$name: the hook used ${CPU}s of CPU on a $(wc -c < "$d/$name.json" | tr -d ' ') byte command (bound 5 s)"
+    echo "note: $name, $(wc -c < "$d/$name.json" | tr -d ' ') bytes: ${CPU}s of CPU"
   done
+  [ "$BAD" = 0 ]
+}
+t_scan_clock() {  # the clock t_scan_speed reads is CPU time: a second of sleeping costs almost none, a busy loop costs some
+  local tf
+  tf=$(/usr/bin/mktemp "$T/clk.XXXXXX") || exit 1
+  cpu_run "$tf" /bin/sleep 1
+  [ "$RC" = 0 ] || { echo "FAILED: sleep exited $RC"; return 1; }
+  below "$CPU" 0.5 || bad "a second of sleeping cost ${CPU}s: the clock counts elapsed time, which a loaded host stretches"
+  cpu_run "$tf" /usr/bin/awk 'BEGIN { for (i = 0; i < 3000000; i++) x += i }'
+  [ "$RC" = 0 ] || { echo "FAILED: awk exited $RC"; return 1; }
+  below 0.05 "$CPU" || bad "a busy loop cost ${CPU}s: the clock does not see CPU time"
   [ "$BAD" = 0 ]
 }
 
@@ -429,6 +469,57 @@ t_install_hooks() {  # install.sh puts the hooks where the registration looks, e
   case $out in *'not installed: hooks/guard-lib.sh'*) ;; *) bad "--check does not name the hook that is not installed: $out" ;; esac
   [ "$BAD" = 0 ]
 }
+t_install_exec_scope() {  # install.sh makes exactly the hooks and scripts it ships executable: a file only the live copy has keeps its mode
+  local d src dest out rc n
+  d=$(/usr/bin/mktemp -d "$T/ix.XXXXXX") || exit 1
+  install_tree
+  chmod -x "$src/bin/stub" "$src/hooks/deny-vanth-cleanup.sh"   # a checkout that lost the exec bit
+  mkdir -p "$dest/hooks" "$dest/bin"
+  : > "$dest/hooks/local-hook.sh"; : > "$dest/hooks/notes.txt"; : > "$dest/bin/notes.txt"
+  chmod 644 "$dest/hooks/local-hook.sh" "$dest/hooks/notes.txt" "$dest/bin/notes.txt"   # a hook someone switched off, and two files that are no hook
+  out=$(inst 2>&1); rc=$?
+  [ "$rc" = 0 ] || { echo "FAILED: install.sh exited $rc: $out"; return 1; }
+  [ -x "$dest/hooks/deny-vanth-cleanup.sh" ] || bad "a shipped hook whose checkout lost the exec bit is not executable after the install"
+  [ -x "$dest/bin/stub" ] || bad "a shipped script whose checkout lost the exec bit is not executable after the install"
+  [ ! -x "$dest/hooks/local-hook.sh" ] || bad "install.sh switched on hooks/local-hook.sh, a hook it does not ship"
+  [ ! -x "$dest/hooks/notes.txt" ] || bad "install.sh made hooks/notes.txt, a file it does not ship, executable"
+  [ ! -x "$dest/bin/notes.txt" ] || bad "install.sh made bin/notes.txt, a file it does not ship, executable"
+  n=$(ls "$src/hooks" | wc -l | tr -d ' ')
+  case $out in *"chmod +x on $n hook scripts"*) ;; *) bad "install.sh does not report the $n hooks it shipped: $out" ;; esac
+  [ "$BAD" = 0 ]
+}
+t_install_pycache() {  # a __pycache__ under hooks/ is not tooling: it is not shipped, and an installed .pyc is not read as a hook that lost its exec bit (#2091)
+  local d src dest out rc
+  d=$(/usr/bin/mktemp -d "$T/ip.XXXXXX") || exit 1
+  install_tree
+  mkdir -p "$src/hooks/__pycache__"; printf 'bytecode\n' > "$src/hooks/__pycache__/guard.cpython-314.pyc"
+  out=$(inst 2>&1); rc=$?
+  [ "$rc" = 0 ] || { echo "FAILED: install.sh exited $rc: $out"; return 1; }
+  [ ! -e "$dest/hooks/__pycache__" ] || bad "install.sh shipped hooks/__pycache__"
+  mkdir -p "$dest/hooks/__pycache__"; printf 'bytecode written by a run in the live copy\n' > "$dest/hooks/__pycache__/guard.cpython-314.pyc"
+  out=$(inst --check 2>&1); rc=$?
+  [ "$rc" = 0 ] || bad "--check reports drift for a .pyc python wrote under hooks/ (exit $rc): $out"
+  case $out in *pyc*) bad "--check mentions a python artifact: $out" ;; esac
+  [ "$BAD" = 0 ]
+}
+t_hook_docs() {  # every known false negative the tests pin is listed in the hook's header and in its README row, not only in the tests
+  local hook phrase head row
+  local -a common vanth phrases
+  common=('a redirection in front of the command name' 'more than 1 KB of text in front of the command')
+  vanth=('the output of a command substitution naming the program' 'xargs substitution' 'a quoted command path that contains a space')
+  for hook in $V $P; do
+    head=$(/usr/bin/awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); printf "%s ", $0; next } NR > 1 { exit }' "$R/hooks/$hook")
+    row=$(grep -F "| \`$hook\` |" "$R/README.md")
+    [ -n "$row" ] || { bad "README.md has no table row for $hook"; continue; }
+    phrases=("${common[@]}")
+    [ "$hook" != "$V" ] || phrases=("${phrases[@]}" "${vanth[@]}")
+    for phrase in "${phrases[@]}"; do
+      case $head in *"$phrase"*) ;; *) bad "the header of $hook does not list the known false negative: $phrase" ;; esac
+      case $row in *"$phrase"*) ;; *) bad "the README row of $hook does not list the known false negative: $phrase" ;; esac
+    done
+  done
+  [ "$BAD" = 0 ]
+}
 
 echo "velo-task M3c: guard hooks"
 echo " deny-vanth-cleanup.sh (B29, hook half)"
@@ -450,9 +541,13 @@ echo " behaviour"
 check "the messages say what was matched and what to do; an allow is silent" t_messages
 check "fail open: no jq, no lib, a lib that does not load, nothing to scan" t_failopen
 check "about 300 KB of command in eight shapes is scanned in seconds" t_scan_speed
+check "...measured in CPU time: a second of sleeping costs none, a busy loop costs some" t_scan_clock
 check "the registration line in README.md: absent hook skipped, present hook denies, not executable skipped" t_readme_registration
 check "the hooks parse under /bin/bash, carry no bash-4 construct and are executable" t_hook_files
 check "install.sh installs the hooks executable and --check notices a hook that is not" t_install_hooks
+check "install.sh makes exactly the hooks and scripts it ships executable, not a file only the live copy has" t_install_exec_scope
+check "a __pycache__ under hooks/ is not shipped and not read as a hook without its exec bit" t_install_pycache
+check "each known false negative the tests pin is listed in the hook's header and its README row" t_hook_docs
 
 echo "mutation proofs"
 LIB=hooks/guard-lib.sh; HV=hooks/deny-vanth-cleanup.sh; HP=hooks/deny-pgrep-wait-loop.sh
@@ -544,13 +639,19 @@ prove "& does not end a command" t_vanth_denied $LIB 'if (c == ";" || c == "|" |
 prove "( does not start a command" t_vanth_denied $LIB 'sd[sp]++; brk();' 'sd[sp]++;'
 prove ") does not end a command" t_vanth_denied $LIB '--sd[sp] == 0) pop(); brk();' '--sd[sp] == 0) pop();'
 prove "a backtick does not end a command" t_vanth_denied $LIB 'sk[sp] == "`") pop(); brk();' 'sk[sp] == "`") pop();'
-prove "a backslash outside quotes is not an escape" t_scanner $LIB 'if (c == "\\") { if (c1 != "\n") put(c c1); i += 2; continue }' ''
+prove "a backslash outside quotes is not an escape" t_scanner $LIB 'if (c == "\\") { if (c1 != "\n") { put(c1 ~ /[ \t]/ ? "\002" : c1); prev = c } i += 2; continue }' ''
 prove "an empty quoted word is a command name" t_scanner $LIB '(qs && length(qb) > 0) ? qb : "\002"' 'qs ? qb : "\002"'
 prove "a comment after a separator is scanned" t_scanner $LIB 'cur = ""; prev = "\n" }' 'cur = ""; prev = "" }'
 prove "a comment at the start is scanned" t_scanner $LIB 'BEGIN { st = "N"; prev = "\n" }' 'BEGIN { st = "N" }'
 prove "a quoted word is never a command name" t_vanth_denied $LIB 'function word() { return (qs && length(qb) > 0) ? qb : "\002" }' 'function word() { return "\002" }'
 prove "a quoted string with a space is a command name" t_scanner $LIB 'function word() { return (qs && length(qb) > 0) ? qb : "\002" }' 'function word() { return qb }'
-prove "a backslash-newline is kept" t_vanth_denied $LIB 'if (c1 != "\n") put(c c1);' 'put(c c1);'
+prove "a backslash-newline is kept" t_vanth_denied $LIB 'if (c1 != "\n") {' '{'
+prove "the backslash is kept in the word: \vanth is not vanth (item 1 mutant)" t_vanth_denied $LIB 'put(c1 ~ /[ \t]/ ? "\002" : c1)' 'put(c c1)'
+prove "the backslash is kept in the word: \pgrep is not pgrep (item 1 mutant)" t_pgrep_denied $LIB 'put(c1 ~ /[ \t]/ ? "\002" : c1)' 'put(c c1)'
+prove "an escaped space or tab splits the word: vanth\ prune is read as vanth prune" t_vanth_allowed $LIB 'c1 ~ /[ \t]/ ? "\002" : c1' 'c1'
+prove "an escaped space or tab splits the word: pgrep\ -f is read as pgrep -f" t_pgrep_allowed $LIB 'c1 ~ /[ \t]/ ? "\002" : c1' 'c1'
+prove "a character after an escape can open a comment: \;# is read as a comment" t_scanner $LIB '"\002" : c1); prev = c }' '"\002" : c1); prev = ";" }'
+prove "a quote after an escaped dollar opens an ANSI-C quote: \$'a\' swallows the rest" t_scanner $LIB '"\002" : c1); prev = c }' '"\002" : c1); prev = "$" }'
 prove "command text is glob-expanded" t_noglob $LIB 'set -f   # command text is only ever word-split below, never glob-expanded' ':'
 prove "the scanner runs in the caller's locale" t_utf8 $LIB 'export LC_ALL=C' ':'
 # messages, fail-open, speed
@@ -581,7 +682,19 @@ prove "a hook is not executable" t_hook_files %hooks/deny-vanth-cleanup.sh 644 '
 prove "a hook starts with another interpreter" t_hook_files $HP $'#!/bin/bash\n# Claude Code PreToolUse hook for Bash, beside' $'#!/usr/bin/env bash\n# Claude Code PreToolUse hook for Bash, beside'
 prove "the lib gains a bash-4 construct" t_hook_files $LIB 'export LC_ALL=C' $'export LC_ALL=C\ndeclare -A seeded'
 prove "the lib no longer parses" t_hook_files $LIB 'export LC_ALL=C' $'export LC_ALL=C\nif then fi'
-prove "install.sh leaves the installed hooks as they were" t_install_hooks install.sh '  find "$DEST/hooks" -type f -exec chmod +x {} +' '  :'
+prove "install.sh leaves the installed hooks as they were" t_install_hooks install.sh '  chmod_shipped hooks "hook scripts"' '  :'
+prove "install.sh makes every file in the installed hooks directory executable (item 4 mutant)" t_install_exec_scope install.sh '  chmod_shipped hooks "hook scripts"' '  find "$DEST/hooks" -type f -exec chmod +x {} +'
+prove "install.sh makes every file in the installed bin directory executable" t_install_exec_scope install.sh 'chmod_shipped bin scripts' 'chmod +x "$DEST"/bin/*'
+prove "the hook exec check walks hooks/__pycache__ too (item 3 mutant)" t_install_pycache install.sh 'done < <(tooling_files "$SRC/hooks")' 'done < <(find "$SRC/hooks" -type f -print0)'
+prove "the walks of the source tree forget the python exclusion" t_install_pycache install.sh "-type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0; }" '-type f -print0; }'
+prove_env "the scan-speed clock is elapsed time, not CPU time (item 5 mutant)" t_scan_clock SCAN_CLOCK=wall
+prove "the vanth header omits the redirection misses (item 2 mutant)" t_hook_docs $HV 'a redirection in front of the command name (>out vanth prune,' 'a redirection (>out vanth prune,'
+prove "the pgrep header omits the redirection miss" t_hook_docs $HP 'a redirection in front of the command name (until >/dev/null pgrep' 'a redirection (until >/dev/null pgrep'
+prove "the vanth README row omits the redirection misses" t_hook_docs README.md 'a redirection in front of the command name (`>out vanth prune`)' 'a redirection (`>out vanth prune`)'
+prove "the pgrep README row omits the redirection miss" t_hook_docs README.md 'a redirection in front of the command name (`until >/dev/null pgrep ...`)' 'a redirection (`until >/dev/null pgrep ...`)'
+prove "the vanth header omits xargs substitution" t_hook_docs $HV 'xargs substitution (echo vanth |' 'xargs (echo vanth |'
+prove "the vanth README row omits the quoted path with a space" t_hook_docs README.md 'a quoted command path that contains a space, xargs' 'a quoted command path, xargs'
+prove "the vanth header omits the 1 KB cap" t_hook_docs $HV 'more than 1 KB' 'a long segment'
 prove "install.sh --check ignores a hook that is not executable" t_install_hooks install.sh 'if [[ -e "$DEST/$rel" && ! -x "$DEST/$rel" ]]; then' 'if false; then'
 prove "install.sh does not copy hooks" t_install_hooks install.sh $'for d in bin rules skills hooks launchd requirements; do\n  [[ -d "$SRC/$d" ]] || continue\n  mkdir -p "$DEST/$d"' $'for d in bin rules skills launchd requirements; do\n  [[ -d "$SRC/$d" ]] || continue\n  mkdir -p "$DEST/$d"'
 prove "install.sh --check does not compare hooks" t_install_hooks install.sh $'for d in bin rules skills hooks launchd requirements; do\n  [[ -d "$SRC/$d" ]] || continue\n  # __pycache__' $'for d in bin rules skills launchd requirements; do\n  [[ -d "$SRC/$d" ]] || continue\n  # __pycache__'

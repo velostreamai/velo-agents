@@ -15,11 +15,16 @@
 # Not denied: `vanth prune --help` (and -h), which only prints help; any other vanth subcommand; any mention of the
 # words in a quoted string, a heredoc or a comment (git commit -m "..", gh pr create --body ..).
 #
-# Known false negatives (tests/test_velo_task_hooks.sh pins each one, so closing a gap makes that test say so):
-# a string handed to bash -c / sh -c / eval, a variable or alias or function holding the program ($VANTH prune), a
-# script file that runs it, find -exec, a wrapper option that takes a word (sudo -u neil), a differently cased name
-# on a case-insensitive volume, and the other cleanup paths of R15(i): POST /cleanup by curl, the MCP job_cleanup
-# tool, `python -c 'from vanth.cli import main; ...'`, and automatic retention (VANTH_RETENTION_SECONDS).
+# Known false negatives (tests/test_velo_task_hooks.sh pins each one, so closing a gap makes that test say so, and
+# checks that each is listed here and in the README table):
+# a string handed to bash -c / sh -c / eval, a variable or alias or function holding the program ($VANTH prune), the
+# output of a command substitution naming the program ("$(echo vanth)" prune), xargs substitution (echo vanth |
+# xargs -I{} {} prune), a script file that runs it, find -exec, a wrapper option that takes a word (sudo -u neil), a
+# differently cased name on a case-insensitive volume, a redirection in front of the command name (>out vanth prune,
+# 2>&1 vanth prune), a quoted command path that contains a space ("/Users/me/My Venv/bin/vanth" prune), more than 1 KB
+# of text in front of the command in one segment (the scanner keeps a segment's first 1024 characters), and the other
+# cleanup paths of R15(i): POST /cleanup by curl, the MCP job_cleanup tool, `python -c 'from vanth.cli import main;
+# ...'`, and automatic retention (VANTH_RETENTION_SECONDS).
 #
 # Contract (same as require-wait.sh): stdin JSON {"tool_input":{"command":...}}; exit 0 allows, exit 2 + stderr blocks.
 # Fails open: no jq, no lib beside it, malformed JSON or no command all exit 0, so a broken install never wedges Bash.
