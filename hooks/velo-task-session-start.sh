@@ -13,7 +13,7 @@
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || exit 0
 LIB="${VELO_TASK_LIB:-$HOOK_DIR/../bin/velo-task-lib.sh}"
-/usr/bin/cat >/dev/null 2>&1 || true   # drain the payload, read nothing from it (see above)
+/bin/cat >/dev/null 2>&1 || true   # drain the payload, read nothing from it (see above)
 out=$(
   {
     . "$LIB" || exit 90                  # 90: no library beside the hook, so nothing to report (fails open, like the guard)

@@ -13,9 +13,10 @@
 # read and the one way out, `velo-task stop-override --reason <text>`. Nothing releases a block after N runs, and a job that is
 # acknowledged and then runs again blocks again: the ack marker closes a stopped row, never a running one.
 #
-# Read-only: jobs.sqlite through the state helper's verdict-of/job-info (read-only queries), no daemon, no writes. The Stop
-# payload on stdin is not read: the session is velo-task's own resolution ($CLAUDE_SESSION_ID, else the state dir's token), so
-# a payload from another tool cannot name the session this hook guards.
+# Read-only: jobs.sqlite through the state helper's verdict-of/job-info (read-only queries), no daemon, no writes -- beyond the
+# session token, made on first use the way `velo-task status` resolves the same session. The Stop payload on stdin is not read:
+# the session is velo-task's own resolution ($CLAUDE_SESSION_ID, else the state dir's token), so a payload from another tool
+# cannot name the session this hook guards.
 #
 # Contract: exit 0 lets the session stop (silent when nothing blocks), exit 2 blocks with the reason on stderr. Anything else
 # that goes wrong is turned into exit 2 by construction: a guard that cannot run is a guard that fails closed, and the message
@@ -24,7 +25,7 @@
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || exit 0
 LIB="${VELO_TASK_LIB:-$HOOK_DIR/../bin/velo-task-lib.sh}"
-/usr/bin/cat >/dev/null 2>&1 || true   # drain the payload, read nothing from it (see above)
+/bin/cat >/dev/null 2>&1 || true   # drain the payload, read nothing from it (see above)
 out=$(
   {
     . "$LIB" || exit 90                  # 90: no library beside the hook, so nothing to guard (fails open)
@@ -32,7 +33,11 @@ out=$(
   } 2>&1
 )
 rc=$?
-if [ "$rc" = 0 ] || [ "$rc" = 90 ]; then exit 0; fi
+if [ "$rc" = 90 ]; then exit 0; fi          # no library beside the hook: nothing to guard (fails open)
+if [ "$rc" = 0 ]; then
+  [ -z "$out" ] || printf '%s\n' "$out"   # an allow that has something to say: the override it just spent, and nothing else
+  exit 0
+fi
 printf '%s\n' "$out" >&2
 if [ "$rc" != 2 ]; then
   printf 'the Stop guard could not run (velo-task exit %s), so it blocks (R8)\n' "$rc" >&2

@@ -302,8 +302,8 @@ t_sstart_quiet() {  # a session with nothing to do, and a state that cannot be r
   need "...and says what it could not read" grep -q 'the job state cannot be read' <<<"$OUT"
   need "...and does not claim to know the others' count" grep -q '^other sessions: unknown in flight' <<<"$OUT"
 }
-t_hook_files() {  # both hooks are bash 3.2 scripts, executable, and documented where the registration reads them from
-  local f first
+t_hook_files() {  # both hooks are bash 3.2 scripts, executable, run only tools that are there, and are documented where the registration reads them from
+  local f first p
   for f in "$R/$HD" "$R/$HS"; do
     [ -f "$f" ] || { echo "FAILED: $f is missing"; return 1; }
     first=$(/usr/bin/head -n 1 "$f")
@@ -312,6 +312,10 @@ t_hook_files() {  # both hooks are bash 3.2 scripts, executable, and documented 
     need "${f##*/} parses under /bin/bash" /bin/bash -n "$f"
     bash4_hits "$f" >/dev/null
     need "${f##*/} uses no bash-4 construct" [ $? = 1 ]
+    # every absolute tool the hook names must be there: a hook that calls /usr/bin/ls is silent, and a silent guard reads as "allow"
+    for p in $(/usr/bin/grep -oE '/(usr/)?bin/[A-Za-z0-9._-]+' "$f" | /usr/bin/grep -v '\.sh$' | /usr/bin/sort -u); do
+      need "${f##*/} runs $p, which is there and executable" [ -x "$p" ]
+    done
   done
   need "the README documents the guarded Stop registration" /usr/bin/grep -q -F 'velo-task-stop-guard.sh\" ] || exit 0' "$R/README.md"
   need "the README documents the guarded SessionStart registration" /usr/bin/grep -q -F 'velo-task-session-start.sh\" ] || exit 0' "$R/README.md"
@@ -410,6 +414,8 @@ exit 2'
 # the hook files themselves
 prove "a hook that is not a bash script" t_hook_files $HD \
   '#!/bin/bash' '#!/bin/sh'
+prove "a hook names a tool that is not on this machine" t_hook_files $HS \
+  '/bin/cat >/dev/null' '/usr/bin/cat >/dev/null'
 prove "the README drops the guarded Stop registration" t_hook_files 'README.md' \
   'velo-task-stop-guard.sh\" ] || exit 0; exec' 'velo-task-stop-guard.sh\"; exec'
 

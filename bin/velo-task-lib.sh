@@ -797,7 +797,7 @@ hook_listing() {  # <session>: its jobs, `<name> <job_id> <verdict>` each; 1 and
   out=$(stl check-state --owner-only "$VELO_TASK_HOME") || { printf 'state: %s\n' "${out:-the state check failed}"; return 1; }
   if [ ! -e "$VH/jobs.sqlite" ]; then
     # R8: no database, but the name index or a pending record says a job exists: unreadable, never "nothing to block"
-    if [ -n "$(/usr/bin/ls -A "$NAMES" 2>/dev/null)$(/usr/bin/ls -A "$PENDING" 2>/dev/null)" ]; then
+    if [ -n "$(/bin/ls -A "$NAMES" 2>/dev/null)$(/bin/ls -A "$PENDING" 2>/dev/null)" ]; then
       printf 'the state is at %s but %s/jobs.sqlite is missing, while the name index or a pending record is not\n' "$VELO_TASK_HOME" "$VH"
       return 1
     fi
