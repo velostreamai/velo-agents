@@ -203,7 +203,7 @@ mkdb() {  # <path> [drop column]: a SQLite file with the tables and columns the 
   "$PYBIN" -I - "$1" "${2:-}" <<'PY'
 import sqlite3, sys
 path, drop = sys.argv[1:3]
-jobs = "job_id name status exit_code stop_actor stop_reason trigger_json created_at ended_at policy_state_json command".split()
+jobs = "job_id name status exit_code stop_actor stop_reason trigger_json created_at ended_at policy_state_json tags_json command".split()
 con = sqlite3.connect(path)
 con.execute("CREATE TABLE jobs (%s)" % ", ".join(c for c in jobs if c != drop))
 con.execute("CREATE TABLE local_start_requests (idempotency_key, request_hash, job_id, created_at)")
@@ -231,7 +231,7 @@ EOF
   { [ "$v" = noreason ] && echo 'REASON = "something else"' || echo 'REASON = "trigger parent reached an incompatible terminal status"'; } > "$E/site/vanth/server.py"
   cat > "$E/site/vanth/migrations.py" <<EOF
 def migrate(db, home):
-    cols = "job_id name status exit_code stop_actor stop_reason trigger_json created_at ended_at policy_state_json".split()
+    cols = "job_id name status exit_code stop_actor stop_reason trigger_json created_at ended_at policy_state_json tags_json".split()
     db.execute("CREATE TABLE jobs (%s)" % ", ".join(c for c in cols if c != "$([ "$v" = nocolumn ] && echo ended_at)"))
     db.execute("CREATE TABLE local_start_requests (idempotency_key, request_hash, job_id, created_at)")
     db.commit()
