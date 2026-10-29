@@ -3,7 +3,7 @@
 # Generated 2026-10-28 from the artifacts themselves: each wheel the lock's `# wheel:` comment names was downloaded from PyPI and
 # hashed. The hash is the same as PyPI's own digest for that file and as the lock's, for all rows. The platform tag is the last
 # part of the wheel file name (any, or macosx_<major>_<minor>_arm64 / universal2).
-# tests/test_velo_task_foundation.sh (t_lock_file) requires every hash in the lock to equal the sha256 here for its pin, with the
+# tests/test_velo_task.sh (t_lock_file) requires every hash in the lock to equal the sha256 here for its pin, with the
 # same wheel file name, and every row to have its pin. A hash that is not of the named wheel (an sdist's, say, under a wheel's
 # comment) therefore cannot enter the lock without a change to this file as well. An upgrade changes both in one reviewed commit.
 annotated-types	0.8.0	annotated_types-0.8.0-py3-none-any.whl	any	f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0

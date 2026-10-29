@@ -9,6 +9,7 @@ The behaviour velo-task depends on follows Vanth 1.14.0 as probed against the re
   --json start ... -- cmd...   idempotency_key 8..128 of [A-Za-z0-9_-]; the same key and request returns the existing job
                                (idempotent_replay), the same key and another request is an error; exit 1 with the JSON for a
                                job that did not complete (as Vanth does)
+  --json stop <job> ...        a job in flight becomes cancelled (stop_actor user); any other is an error
   --json list [--all] [--name N] [--limit N]   newest first, capped at 1000, --name a substring match
   __inject <json>              (test only) a row as given; __bulk <n> <name-prefix> (test only) n completed rows
 Every call is appended to @E@/calls as `vanth <args>`, followed by `env=<the names in its environment>`. Switches (files under @E@):
@@ -154,6 +155,22 @@ def cmd_start(args):
     return 1 if status in FAILED else 0
 
 
+def cmd_stop(args):
+    """vanth stop <job> [--signal S] [--kill-after N]: a job in flight becomes cancelled by the user; any other is an error, as in Vanth."""
+    if os.path.exists(E + "/status-transport-error"):
+        fail("vanth stop: failed to reach daemon: connection refused")
+    con = db()
+    row = con.execute("SELECT * FROM jobs WHERE job_id = ?", (args[0],)).fetchone()
+    if row is None:
+        fail("vanth stop: unknown job %s" % args[0])
+    if row["status"] not in ("queued", "launching", "running", "paused", "retrying", "stopping"):
+        fail("vanth stop: job %s is not running (%s)" % (args[0], row["status"]))
+    with con:
+        con.execute("UPDATE jobs SET status = 'cancelled', stop_actor = 'user', stop_reason = 'stop requested' WHERE job_id = ?", (args[0],))
+    print(json.dumps({"job_id": args[0], "status": "cancelled"}))
+    return 0
+
+
 def cmd_list(args):
     name, limit, show_all, i = None, 50, False, 0
     while i < len(args):
@@ -183,6 +200,8 @@ def main(argv):
         return cmd_start(args)
     if cmd == "list":
         return cmd_list(args)
+    if cmd == "stop":
+        return cmd_stop(args)
     if cmd == "__inject":
         row = json.loads(args[0])
         con = db()
