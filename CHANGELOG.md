@@ -20,7 +20,14 @@ helper: `assert_lock_held` also needs the helper (the body's parent) alive, `uv 
 job that is stopped when the helper dies or the body is signalled, the job is not started under a lock that is already
 lost, and `hold_run` does not return from a step whose helper died as it ended (a moment the polling loop cannot see, and
 the next step would have run unlocked), and the marker write and the removal of a venv that
-failed verification re-check the lock. A malformed `daemon.json` is an error (exit 6, `doctor` FAIL), no longer an empty
+failed verification re-check the lock. The bodies that wait for a daemon can lose their helper too, while vanthd starts or
+while it stops: a second caller then takes the lock, stops that daemon and launches one of its own, and the first body went
+on regardless: `abandon_launch` retired the intent file, which by then was the second caller's, and left that daemon
+unproven. Every record a locked body writes or retires, and every process it signals, now goes through `write_record`,
+`retire_record` and `signal_validated`, each of which asks whether the lock is still ours (helper alive, descriptor 9
+still the lock) right before it acts, so a call site cannot forget; the suite pins that nothing else in the library writes,
+retires or signals. `verify_install` asks again after `uv pip freeze` before it runs the venv's python or makes a scratch
+directory in the venv. A malformed `daemon.json` is an error (exit 6, `doctor` FAIL), no longer an empty
 answer that skips the pid cross-check. `write_new`, which creates the temp file of `write-record`, `pending-write` and
 `session-token`, unlinks it when a write is cut short. B23's tampered-hash case
 is tested: a lock with one wrong hash must fail `install-vanth`. **M3c.** `\vanth prune` and `until \pgrep ...` were
@@ -31,7 +38,8 @@ daemon listens on every interface is held on that address too, and the port-take
 start: a foreign server that bound the reserved number on `0.0.0.0` made the fake daemon's bind fail
 (`Address already in use`) once, and a reservation released and bound again left a window for another run's reservation.
 **Prevents:** a key read off the process list, a second install rebuilding the venv under a first one whose lock was lost,
-a hand-started daemon adopted because its `daemon.json` did not parse, a stray `.tmp` record, a hash check that nothing
+a launch abandoned after its lock was lost retiring (or writing over) the records of the launch that replaced it, a
+hand-started daemon adopted because its `daemon.json` did not parse, a stray `.tmp` record, a hash check that nothing
 exercised, and a suite that fails on a port some other process took.
 
 ### Added — velo-task guard hooks, and a standing bash 3.2 sweep (#2769, M3c)

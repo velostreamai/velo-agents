@@ -1446,14 +1446,19 @@ t_restart_pid_replaced() {  # finding 17: the pid the validation saw is gone by 
   need "...the process started in the meantime was not signalled" alive "$by"
   need "...and nothing was launched over the gap" [ "$(launches)" = 1 ]
 }
-t_signal_revalidation() {  # finding 17: signal_validated given a LIVE pid whose start time is not the validated one
+t_signal_revalidation() {  # finding 17: signal_validated given a LIVE pid whose start time is not the validated one; and, as a locked body runs it, only while the lock is still ours
   local dp; mkhome; mkvenv; dp=$(decoy vanthd)
-  run /bin/bash -c '. "$1"; signal_validated TERM "$2" "$3"' x "$R/bin/velo-task-lib.sh" "$dp" 'Mon Jan 1 00:00:00 2001'
+  # The function runs the way a locked body runs it: a child of the real lock helper, handed the lock on descriptor 9.
+  run ST lock --timeout 5 --child-fd 9 "$E_HOME/lock/daemon" -- /bin/bash -c 'set -euo pipefail; . "$1"; shift; "$@"' velo-task "$R/bin/velo-task-lib.sh" signal_validated TERM "$dp" 'Mon Jan 1 00:00:00 2001'
   need "a live pid with another start time than the validated one is refused (exit 6)" [ "$RC" = 6 ]
   need "...saying so" grep -q "refusing to signal pid $dp" <<<"$OUT"
   need "...and it was not signalled" alive "$dp"
   run /bin/bash -c '. "$1"; signal_validated TERM "$2" "$3"' x "$R/bin/velo-task-lib.sh" "$dp" "$(lstart_of "$dp")"
-  need "control: with the right start time the signal is sent" [ "$RC" = 0 ]
+  need "the right start time, but no lock held: refused (exit 2)" [ "$RC" = 2 ]
+  need "...saying it will not run without the lock" grep -q 'refusing to run without the lock' <<<"$OUT"
+  need "...and it was not signalled" alive "$dp"
+  run ST lock --timeout 5 --child-fd 9 "$E_HOME/lock/daemon" -- /bin/bash -c 'set -euo pipefail; . "$1"; shift; "$@"' velo-task "$R/bin/velo-task-lib.sh" signal_validated TERM "$dp" "$(lstart_of "$dp")"
+  need "control: with the right start time and the lock held the signal is sent" [ "$RC" = 0 ]
   waitfor 5 not alive "$dp" || { echo "FAILED: the process did not receive SIGTERM"; exit 1; }
 }
 t_stop_failure() {  # R7: a bounded wait, no SIGKILL escalation, no second daemon launched over a live one
@@ -2068,11 +2073,32 @@ t_install_orphan_verify() {  # the lock helper dies while install-vanth verifies
     need "[$v] the first body, its verification released, ends" waitfor 10 not alive "$body"
     OUT=$(grep -v 'Killed: 9' "$E/o1" || true); need "[$v] ...saying why" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o1"
     need "[$v] ...it wrote no install marker" [ ! -e "$E_VENV/.velo-task-installed" ]
+    need "[$v] ...ran none of the venv's python (the second install-vanth may be rebuilding that venv)" [ ! -e "$E/pyenv.log" ]
     need "[$v] ...and removed no venv" [ -x "$E_VENV/bin/python" ]
     : > "$b"; wait "$w2"; OUT=$(cat "$E/o2")
     if [ "$v" = ok ]; then need "[$v] control: the second install-vanth, which holds the lock, completes (exit 0)" [ "$(cat "$E/rc2")" = 0 ]
     else need "[$v] control: the second install-vanth, which holds the lock, is the one that removes the venv (exit 1)" [ "$(cat "$E/rc2")" = 1 ]; fi
   done
+}
+t_install_orphan_marker() {  # the lock helper dies after install-vanth verified what uv installed and before it marks the install as done, and a second install-vanth takes the lock: the first body does not write the marker, which says the venv the second is building is good
+  local h body ba bb w1 w2
+  mkhome; mkuv ok; ba="$E/barrier-a"; bb="$E/barrier-b"
+  ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VELO_TASK_FAILPOINT="install.verified:wait=$ba" VT install-vanth > "$E/o1" 2>&1; echo $? > "$E/rc1" ) & w1=$!
+  waitfor 10 test -e "$ba.reached" || { echo "FAILED: the first install-vanth never finished verifying"; exit 1; }
+  h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_install")
+  need "(setup) there is one lock helper" sole "$h"; need "(setup) ...and one body under it" sole "$body"
+  need "(setup) the venv is built" [ -x "$E_VENV/bin/python" ]; need "(setup) ...and not yet marked" [ ! -e "$E_VENV/.velo-task-installed" ]
+  kill -9 "$h"; wait "$w1"
+  ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VELO_TASK_FAILPOINT="install.lock.held:wait=$bb" VT install-vanth > "$E/o2" 2>&1; echo $? > "$E/rc2" ) & w2=$!
+  waitfor 10 test -e "$bb.reached" || { echo "FAILED: the second install-vanth never took the lock the first one lost"; exit 1; }
+  : > "$ba"
+  need "the first body, released, ends" waitfor 10 not alive "$body"
+  OUT=$(grep -v 'Killed: 9' "$E/o1" || true)
+  need "...it wrote no install marker" [ ! -e "$E_VENV/.velo-task-installed" ]
+  need "...saying why" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o1"
+  : > "$bb"; wait "$w2"; OUT=$(cat "$E/o2")
+  need "control: the second install-vanth, which holds the lock, completes (exit 0)" [ "$(cat "$E/rc2")" = 0 ]
+  need "...and the marker is its own: the lock's hash" [ "$(cat "$E_VENV/.velo-task-installed")" = "$(ST sha256 "$R/requirements/vanth.lock")" ]
 }
 t_install_signalled() {  # a signal to the lock helper reaches the body, and through it the step that runs in a process group of its own: uv is not left running without the lock
   local h u w
@@ -2142,6 +2168,151 @@ t_ensure_orphan() {  # the same for a launch: an ensure-daemon body whose lock h
   OUT=$(grep -v 'Killed: 9' "$E/o1" || true); need "...and said why it stopped" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o1"
   : > "$b2"; wait "$w2"
   need "the second ensure-daemon starts the daemon (exit 0)" [ "$(cat "$E/rc2")" = 0 ]; need "...the only one" [ "$(launches)" = 1 ]
+}
+intent_is() { rec_ok "$E_HOME/daemon.intent" && [ "$(intent pid)" = "$1" ]; }   # <pid>: the active intent is complete and names that pid
+lost_lock_takeover() {  # <label> <failpoint>: ensure-daemon (A) is parked at the failpoint and its lock helper is SIGKILLed; restart-daemon (B) takes the lock, stops the daemon A launched and starts one of its own, parked just after that daemon published its intent. Sets LL_BA LL_BB (the barriers), LL_A LL_B (the background jobs), LL_BODY (A's body), LL_D1 LL_D2 (the two daemons)
+  local h
+  LL_BA="$E/barrier-a-$1"; LL_BB="$E/barrier-b-$1"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="$2:wait=$LL_BA" VT ensure-daemon > "$E/oA" 2>&1; echo $? > "$E/rcA" ) & LL_A=$!
+  waitfor 10 test -e "$LL_BA.reached" || { echo "FAILED: [$1] the first ensure-daemon never reached $2"; exit 1; }
+  waitfor 10 test -s "$E_HOME/daemon.intent" || { echo "FAILED: [$1] the daemon the first ensure-daemon launched never published its intent"; exit 1; }
+  LL_D1=$(intent pid)
+  h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); LL_BODY=$(child_of "$h" "velo-task-lib.sh locked_ensure")
+  need "[$1] (setup) there is one lock helper" sole "$h"; need "[$1] (setup) ...and one body under it" sole "$LL_BODY"
+  kill -9 "$h"; wait "$LL_A"
+  ( VELO_TASK_TEST=1 VELO_TASK_START_WAIT=60 VELO_TASK_FAILPOINT="launch.intent:wait=$LL_BB" VT restart-daemon > "$E/oB" 2>&1; echo $? > "$E/rcB" ) & LL_B=$!
+  waitfor 20 test -e "$LL_BB.reached" || { echo "FAILED: [$1] restart-daemon never got its daemon to publish an intent"; sed 's/^/    | /' "$E/oB"; exit 1; }
+  LL_D2=$(intent pid)
+  need "[$1] (setup) the first body outlives its lock helper, as an orphan" alive "$LL_BODY"
+  need "[$1] (setup) restart-daemon stopped the daemon the first body launched" not alive "$LL_D1"
+  need "[$1] (setup) ...and its own daemon published an intent that names it" intent_is "$LL_D2"
+  need "[$1] (setup) ...a different daemon" [ "$LL_D2" != "$LL_D1" ]
+  need "[$1] (setup) restart-daemon retired the intent of the launch it replaced, and only that" [ "$(retired daemon.intent)" = 1 ]
+}
+lost_lock_released() {  # <label>: the first body is released and ends; OUT is what it said
+  : > "$LL_BA"
+  need "[$1] released, the first body ends" waitfor 15 not alive "$LL_BODY"
+  OUT=$(grep -v 'Killed: 9' "$E/oA" || true)
+}
+lost_lock_said() {  # <label>: the first body said why it stopped (asserted after what it did or left undone, so that a mutant's first red is the damage and not this)
+  need "[$1] ...saying that its lock helper is gone" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/oA"
+}
+lost_lock_finished() {  # <label>: restart-daemon (B), released, completes with a daemon and records of its own
+  : > "$LL_BB"; wait "$LL_B"
+  OUT=$(cat "$E/oB"); need "[$1] control: restart-daemon, which holds the lock, completes (exit 0)" [ "$(cat "$E/rcB")" = 0 ]
+  need "[$1] ...its provenance names its own daemon" [ "$(prov pid)" = "$LL_D2" ]; need "[$1] ...which is the one that answers" [ "$(daemon_pid)" = "$LL_D2" ]
+  need "[$1] ...it retired its own intent: none is active" [ ! -e "$E_HOME/daemon.intent" ]
+  need "[$1] ...and two are retired in all, the first launch's and its own" [ "$(retired daemon.intent)" = 2 ]
+}
+t_lost_lock_abandon() {  # A's launch is waiting for a daemon that does not come up when its lock helper dies; restart-daemon takes the lock, stops that daemon and launches one of its own; A, finding its daemon gone, abandons the launch, and must not retire the intent, which is the new holder's now
+  mkhome; mkvenv; echo 60 > "$E/start-delay"   # the daemon A launches is alive and never listens
+  lost_lock_takeover abandon launch.started
+  lost_lock_released abandon
+  need "[abandon] the new holder's intent is still the active one, untouched" intent_is "$LL_D2"
+  need "[abandon] ...and it is the only intent restart-daemon retired" [ "$(retired daemon.intent)" = 1 ]
+  need "[abandon] the abandoned launch wrote no provenance" [ ! -e "$E_HOME/daemon.provenance" ]
+  lost_lock_said abandon
+  rm "$E/start-delay"; lost_lock_finished abandon
+}
+t_lost_lock_record() {  # A's daemon is up and A is about to write its provenance when its lock helper dies; restart-daemon takes the lock, stops that daemon and launches one of its own: A must not publish a provenance, for a daemon that is gone, in the slot the new holder's goes in
+  mkhome; mkvenv
+  lost_lock_takeover record launch.ready
+  lost_lock_released record
+  need "[record] A published no provenance for the daemon it launched" [ ! -e "$E_HOME/daemon.provenance" ]
+  need "[record] the new holder's intent is still the active one, untouched" intent_is "$LL_D2"
+  lost_lock_said record
+  lost_lock_finished record
+}
+t_lost_lock_retire() {  # A has written its provenance and is about to retire its intent when its lock helper dies; restart-daemon takes the lock, retires A's records, stops that daemon and launches one of its own: A must not retire the intent, which is the new holder's now
+  mkhome; mkvenv
+  lost_lock_takeover retire launch.recorded
+  need "[retire] (setup) restart-daemon retired the provenance A had written" [ "$(retired daemon.provenance)" = 1 ]
+  lost_lock_released retire
+  need "[retire] the new holder's intent is still the active one, untouched" intent_is "$LL_D2"
+  need "[retire] ...and it is the only intent restart-daemon retired" [ "$(retired daemon.intent)" = 1 ]
+  need "[retire] no provenance was written over the new holder's slot" [ ! -e "$E_HOME/daemon.provenance" ]
+  lost_lock_said retire
+  lost_lock_finished retire
+}
+t_lost_lock_adopt() {  # A is adopting a daemon whose launch left an intent behind, and is about to retire it, when its lock helper dies; restart-daemon takes the lock, replaces that daemon with one of its own: A must not retire the intent, which is the new holder's now
+  mkhome; mkvenv
+  VELO_TASK_TEST=1 VELO_TASK_FAILPOINT=publish.linked@daemon.provenance:exit run VT ensure-daemon   # a daemon, its provenance, and the intent its launch never retired
+  need "(setup) ensure-daemon killed inside the provenance publish (exit 137)" [ "$RC" = 137 ]
+  waitfor 10 test -s "$E_VH/daemon.json" || { echo "FAILED: the launched daemon never came up"; exit 1; }
+  lost_lock_takeover adopt ensure.adopting
+  lost_lock_released adopt
+  need "[adopt] the new holder's intent is still the active one, untouched" intent_is "$LL_D2"
+  need "[adopt] ...and it is the only intent restart-daemon retired" [ "$(retired daemon.intent)" = 1 ]
+  need "[adopt] A did not go on to report the daemon adopted" not grep -q adopted "$E/oA"
+  lost_lock_said adopt
+  lost_lock_finished adopt
+}
+t_lost_lock_abandon_signal() {  # A's launch gives up on a daemon that never comes up, and is about to stop it, when its lock helper dies and another process takes the lock: A signals nobody
+  local bA h body d1 w
+  mkhome; mkvenv; echo 60 > "$E/start-delay"; bA="$E/barrier-a"   # the daemon A launches is alive and never listens
+  ( VELO_TASK_TEST=1 VELO_TASK_START_WAIT=1 VELO_TASK_FAILPOINT="launch.started:wait=$bA" VT ensure-daemon > "$E/oA" 2>&1; echo $? > "$E/rcA" ) & w=$!
+  waitfor 10 test -e "$bA.reached" || { echo "FAILED: ensure-daemon never reached launch.started"; exit 1; }
+  waitfor 10 test -s "$E_HOME/daemon.intent" || { echo "FAILED: the launched daemon never published its intent"; exit 1; }
+  d1=$(intent pid); h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_ensure")
+  need "(setup) there is one lock helper" sole "$h"; need "(setup) ...and one body under it" sole "$body"
+  kill -9 "$h"; wait "$w"
+  hold_lock "$E_HOME/lock/daemon" "$E/held"   # someone else holds the lock now
+  : > "$bA"
+  need "released, the first body gives up on its daemon, finds its lock helper gone, and stops" waitfor 15 not alive "$body"
+  OUT=$(grep -v 'Killed: 9' "$E/oA" || true)
+  need "the daemon it was about to stop was not signalled" alive "$d1"
+  need "...and its intent is as it was" intent_is "$d1"
+  need "...the body said why it stopped" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/oA"
+  release_lock "$E/held"; kill "$d1"
+}
+t_lost_lock_restart() {  # restart-daemon (A) has validated the daemon and is about to signal it when its lock helper dies; another restart-daemon (B) takes the lock: A signals nothing
+  local p bA bB h body wA wB
+  mkhome; mkvenv; VT ensure-daemon >/dev/null; p=$(daemon_pid); bA="$E/barrier-a"; bB="$E/barrier-b"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="restart.validated:wait=$bA" VT restart-daemon > "$E/oA" 2>&1; echo $? > "$E/rcA" ) & wA=$!
+  waitfor 10 test -e "$bA.reached" || { echo "FAILED: the first restart-daemon never reached restart.validated"; exit 1; }
+  h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_restart")
+  need "(setup) there is one lock helper" sole "$h"; need "(setup) ...and one body under it" sole "$body"
+  kill -9 "$h"; wait "$wA"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="daemon.lock.held:wait=$bB" VT restart-daemon > "$E/oB" 2>&1; echo $? > "$E/rcB" ) & wB=$!
+  waitfor 10 test -e "$bB.reached" || { echo "FAILED: the second restart-daemon never took the lock the first one lost"; exit 1; }
+  : > "$bA"
+  need "released, the first body ends" waitfor 15 not alive "$body"
+  OUT=$(grep -v 'Killed: 9' "$E/oA" || true)
+  need "the daemon it had validated was not signalled" alive "$p"
+  need "...the body said that its lock helper is gone" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/oA"
+  : > "$bB"; wait "$wB"
+  OUT=$(cat "$E/oB"); need "control: the second restart-daemon, which holds the lock, completes (exit 0)" [ "$(cat "$E/rcB")" = 0 ]
+  need "...the old daemon is gone" not alive "$p"; need "...and a new one answers" alive "$(daemon_pid)"
+}
+t_primitives_need_lock() {  # write_record and retire_record, like signal_validated (t_signal_revalidation), refuse to act when they are not run by a locked body: nothing is written, nothing is retired
+  local dp; mkhome; mkvenv; dp=$(decoy vanthd)
+  write_intent "$dp" "$(lstart_of "$dp")"
+  run /bin/bash -c '. "$1"; retire_record "$INTENT"' x "$R/bin/velo-task-lib.sh"
+  need "retire_record outside a locked body is refused (exit 2)" [ "$RC" = 2 ]
+  need "...saying it will not run without the lock" grep -q 'refusing to run without the lock' <<<"$OUT"
+  need "...and the intent was not retired" rec_ok "$E_HOME/daemon.intent"
+  need "...nor renamed to a retired record" [ "$(retired daemon.intent)" = 0 ]
+  run /bin/bash -c '. "$1"; write_record "$PROV" "$2" "$3" "$4" "$5"' x "$R/bin/velo-task-lib.sh" "$dp" "$(lstart_of "$dp")" "$D64" "$UUID0"
+  need "write_record outside a locked body is refused (exit 2)" [ "$RC" = 2 ]
+  need "...saying it will not run without the lock" grep -q 'refusing to run without the lock' <<<"$OUT"
+  need "...and no provenance was written" [ ! -e "$E_HOME/daemon.provenance" ]
+}
+t_mutation_funnel() {  # the library writes a record, retires one and signals a process in three functions and nowhere else (bar a job it started itself), and each of the three asks whether the lock is still ours first: every locked body reaches them, so a call site added later cannot skip the check
+  local lib="$R/bin/velo-task-lib.sh" code writes retires sigs
+  code=$(grep -nvE '^[[:space:]]*#' "$lib")   # the code lines, not the comments, each led by its line number in the file
+  writes=$(printf '%s\n' "$code" | grep -E 'st write-record( |$)' || true)
+  retires=$(printf '%s\n' "$code" | grep -E 'st retire( |$)' || true)
+  sigs=$(printf '%s\n' "$code" | grep -E '(^|[ ;({&|!])kill ' | grep -vE 'kill -0 ' || true)   # kill -0 only asks whether a process is there
+  OUT="the helper is asked to write a record at: $(printf '%s' "$writes" | cut -c1-80 | tr '\n' '|')"
+  need "the library writes a record through the helper in one place" [ "$(printf '%s\n' "$writes" | grep -c .)" = 1 ]
+  need "...write_record, which asks about the lock first" grep -qE '^write_record\(\) \{ still_locked; st write-record ' "$lib"
+  OUT="the helper is asked to retire a record at: $(printf '%s' "$retires" | cut -c1-80 | tr '\n' '|')"
+  need "the library retires a record through the helper in one place" [ "$(printf '%s\n' "$retires" | grep -c .)" = 1 ]
+  need "...retire_record, which asks about the lock first" grep -qE '^retire_record\(\) \{ if rec_present "\$1"; then still_locked; st retire ' "$lib"
+  OUT="a process is signalled at: $(printf '%s' "$sigs" | cut -c1-80 | tr '\n' '|')"
+  need "the library signals a process in three places only" [ "$(printf '%s\n' "$sigs" | grep -c .)" = 3 ]
+  need "...signal_validated, which asks about the lock first" [ "$(grep -B1 'kill "-\$1" "\$2"' "$lib" | head -n 1)" = "  still_locked" ]
+  need "...and hold_run twice, to the job it started itself" [ "$(printf '%s\n' "$sigs" | grep -c 'kill -TERM -- "-\$job"')" = 2 ]
 }
 t_install_hash_tamper() {  # B23, offline: the fake uv refuses, as uv does under --require-hashes, a lock with a hash that is not the wheel's; install-vanth then fails and leaves nothing installed
   local m
@@ -2471,9 +2642,18 @@ check "install-vanth sees a daemon that runs from the venv: hand-started, or rec
 check "install-vanth rebuilds a venv whose python does not run: reading daemon.json never runs that python" t_install_broken_venv
 check "install-vanth: a body whose lock helper died stops at its next step, and stops the step it is in" t_install_orphan
 check "install-vanth: a lock helper that dies while the install is verified leaves no marker, and no venv removed" t_install_orphan_verify
+check "install-vanth: a lock helper that dies once the install is verified, before it is marked, leaves no marker" t_install_orphan_marker
 check "install-vanth: a signal to the lock helper stops uv too" t_install_signalled
 check "hold_run: no step starts under a lost lock, and none returns after the lock helper died as it ended" t_hold_run_lost_lock
 check "ensure-daemon: a body whose lock helper died launches nothing" t_ensure_orphan
+check "ensure-daemon: a launch abandoned after its lock helper died, and another process took the lock, retires nothing of the new holder's" t_lost_lock_abandon
+check "ensure-daemon: a provenance is not published for a daemon the new lock holder stopped" t_lost_lock_record
+check "ensure-daemon: the intent of a launch is not retired by a body that lost the lock, and another launched since" t_lost_lock_retire
+check "ensure-daemon: an adopted daemon's leftover intent is not retired by a body that lost the lock, and another launched since" t_lost_lock_adopt
+check "ensure-daemon: a launch about to stop its daemon after its lock helper died signals nobody" t_lost_lock_abandon_signal
+check "restart-daemon: a body whose lock helper died after it validated the daemon signals nothing" t_lost_lock_restart
+check "write_record and retire_record refuse to act outside a locked body: nothing is written, nothing is retired" t_primitives_need_lock
+check "the library writes, retires and signals in three functions only, each asking about the lock first" t_mutation_funnel
 check "B23: a lock with a hash that is not its wheel's fails install-vanth and leaves nothing installed" t_install_hash_tamper
 check "B23: the lock is hashed, pinned and WHEELS ONLY (offline artifact-type check)" t_lock_file
 check "the lock's pinned set equals the checked-in closure list, and the fake install does not follow the lock" t_lock_closure
@@ -2681,8 +2861,8 @@ prove "a record that is unsafe is treated as one that is missing" t_state_swappe
 prove "a record is read through its path, which may be a symlink" t_state_swapped $L '  text=$(st rec-read "$1") || rc=$?' '  text=$(/bin/cat "$1") || rc=$?'
 prove "ensure-daemon launches without asking again whether it still holds the lock" t_lock_swapped $L \
   $'  local args names pid started digest inc deadline\n  still_locked\n' $'  local args names pid started digest inc deadline\n'
-prove "restart-daemon signals without asking again whether it still holds the lock" t_lock_swapped $L \
-  $'validated above are what is signalled\n    still_locked\n' $'validated above are what is signalled\n'
+prove "restart-daemon signals without asking again whether it still holds the lock (signal_validated does not ask)" t_lock_swapped $L \
+  $'  still_locked\n  kill "-$1" "$2"\n' $'  kill "-$1" "$2"\n'
 prove "install-vanth replaces the venv without asking again whether it still holds the lock" t_lock_swapped $L \
   $'  still_locked\n  /bin/rm -f "$MARKER"' $'  /bin/rm -f "$MARKER"'
 prove "the helper is not isolated from the caller's user site" t_hostile_env $L \
@@ -2761,7 +2941,7 @@ prove "launch without VANTH_RETENTION_SECONDS=0" t_modes_env \
   $L 'VANTH_DAEMON_PORT VANTH_RETENTION_SECONDS"' 'VANTH_DAEMON_PORT"'
 prove "the provenance records the wrong pid" t_modes_env $L 'write_record "$PROV" "$pid" "$started" "$digest" "$inc"' 'write_record "$PROV" "$$" "$started" "$digest" "$inc"'
 prove "the intent is not retired once the daemon is proved ready" t_modes_env $L \
-  $'  write_record "$PROV" "$pid" "$started" "$digest" "$inc"\n  retire_record "$INTENT"' '  write_record "$PROV" "$pid" "$started" "$digest" "$inc"'
+  $'  retire_record "$INTENT"\n  need_modes\n' $'  need_modes\n'
 prove "the provenance incarnation is constant" t_restart $L 'inc=$(/usr/bin/uuidgen)' 'inc=00000000-0000-4000-8000-000000000001'
 prove "records are written without the helper's durable publish" t_crash_in_publish $S \
   '    return publish_file(tmp, dest)' $'    os.replace(tmp, dest)\n    return True'
@@ -2866,7 +3046,7 @@ prove "the wrapper renders its start time in another zone than the library compa
   'LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}' 'LSTART_ENV = {"LC_ALL": "C", "TZ": "Pacific/Kiritimati"}'
 prove "an interrupted launch is reported as an unproven daemon" t_crash_after_intent $L '      if rec_live "$INTENT"; then' '      if false; then'
 prove "a leftover intent is kept when its daemon is adopted" t_adopt_retires_intent $L \
-  '{ ! rec_live "$INTENT" || [ "$REC_PID" = "$pid" ]; }; then retire_record "$INTENT"; fi' '{ ! rec_live "$INTENT" || [ "$REC_PID" = "$pid" ]; }; then :; fi'
+  $'      stl failpoint ensure.adopting\n      retire_record "$INTENT"\n' $'      stl failpoint ensure.adopting\n      :\n'
 VELO_TASK_START_WAIT=3 prove "ensure-daemon launches over a live recorded process" t_hung_start $L '    if find_ours_live any; then' '    if false; then'   # the mutant waits out the start window: 3 s, not 10
 prove "a launch leaves a stale intent in place" t_stale_intent $L $'  retire_record "$PROV"; retire_record "$INTENT"\n' $'  retire_record "$PROV"\n'
 prove "a launch leaves a stale provenance in place" t_stale_intent $L $'  retire_record "$PROV"; retire_record "$INTENT"\n' $'  retire_record "$INTENT"\n'
@@ -2882,7 +3062,7 @@ prove "doctor ignores a schema mismatch" t_doctor $L '    else bad "schema: jobs
 prove "doctor ignores loose modes" t_doctor $L '    if modes_problem; then bad "modes: $MODES_WHY"; else ok "modes: private"; fi' '    ok "modes: private"'
 prove "doctor ignores a live interrupted launch" t_doctor $L '    if rec_live "$INTENT"; then bad "intent:' '    if false; then bad "intent:'
 prove "doctor retires a stale intent" t_doctor_readonly $L \
-  'else ok "intent: stale ($REC_WHY); ensure-daemon retires it"; fi' 'else retire_record "$INTENT"; ok "intent: stale ($REC_WHY); ensure-daemon retires it"; fi'
+  'else ok "intent: stale ($REC_WHY); ensure-daemon retires it"; fi' 'else st retire "$INTENT"; ok "intent: stale ($REC_WHY); ensure-daemon retires it"; fi'   # st, not retire_record: that refuses to run outside a locked body, so a doctor that called it would change nothing
 prove "doctor touches the lock file" t_doctor_readonly $L $'cmd_doctor() {\n  local rc=0 pid' $'cmd_doctor() {\n  /usr/bin/touch "$LOCK_FILE"\n  local rc=0 pid'
 
 # ---- no caller-PATH tool ----
@@ -2929,8 +3109,55 @@ prove "a signal to the install body is not passed on to uv" t_install_signalled 
   $'  trap \'kill -TERM -- "-$job" 2>/dev/null || :; exit 143\' TERM INT HUP' '  :'
 prove "a failed verification removes the venv without asking again whether the lock is held" t_install_orphan_verify $L \
   $'  still_locked\n  /bin/rm -rf "$VENV"; die 1 "install-vanth failed' $'  /bin/rm -rf "$VENV"; die 1 "install-vanth failed'
-prove "the install marker is written without asking again whether the lock is held" t_install_orphan_verify $L \
+prove "the install marker is written without asking again whether the lock is held" t_install_orphan_marker $L \
   $'  verify_install\n  still_locked\n  st sha256 "$LOCKFILE" > "$MARKER"' $'  verify_install\n  st sha256 "$LOCKFILE" > "$MARKER"'
+prove "the venv's python is run after uv pip freeze without asking again whether the lock is held" t_install_orphan_verify $L \
+  '  still_locked  # uv pip freeze is not watched by hold_run' '  :  # uv pip freeze is not watched by hold_run'
+
+# ---- a lock lost during a wait: what a body writes, retires or signals afterwards goes through write_record, retire_record and signal_validated, which ask again ----
+# The guard dropped from each of the three (every call site goes unguarded at once) ...
+LL_WRITE_G='write_record() { still_locked; st write-record "$@"; }'
+LL_RETIRE_G='retire_record() { if rec_present "$1"; then still_locked; st retire "$1"'
+LL_SIGNAL_G=$'  still_locked\n  kill "-$1" "$2"\n'
+prove "write_record does not ask whether the lock is still ours" t_lost_lock_record $L "$LL_WRITE_G" 'write_record() { st write-record "$@"; }'
+prove "retire_record does not ask whether the lock is still ours (an abandoned launch)" t_lost_lock_abandon $L \
+  "$LL_RETIRE_G" 'retire_record() { if rec_present "$1"; then st retire "$1"'
+prove "retire_record does not ask whether the lock is still ours (a launch that recorded its provenance)" t_lost_lock_retire $L \
+  "$LL_RETIRE_G" 'retire_record() { if rec_present "$1"; then st retire "$1"'
+prove "retire_record does not ask whether the lock is still ours (an adopted daemon)" t_lost_lock_adopt $L \
+  "$LL_RETIRE_G" 'retire_record() { if rec_present "$1"; then st retire "$1"'
+prove "signal_validated does not ask whether the lock is still ours (an abandoned launch)" t_lost_lock_abandon_signal $L "$LL_SIGNAL_G" $'  kill "-$1" "$2"\n'
+prove "signal_validated does not ask whether the lock is still ours (restart-daemon)" t_lost_lock_restart $L "$LL_SIGNAL_G" $'  kill "-$1" "$2"\n'
+prove "signal_validated does not ask whether the lock is still ours (called outside a locked body)" t_signal_revalidation $L "$LL_SIGNAL_G" $'  kill "-$1" "$2"\n'
+prove "write_record does not ask whether the lock is still ours (called outside a locked body)" t_primitives_need_lock $L "$LL_WRITE_G" 'write_record() { st write-record "$@"; }'
+prove "retire_record does not ask whether the lock is still ours (called outside a locked body)" t_primitives_need_lock $L \
+  "$LL_RETIRE_G" 'retire_record() { if rec_present "$1"; then st retire "$1"'
+# ... and one call site at a time going round the primitive, which the primitives' own guards would otherwise hide:
+LL_WRITE_PROV='  write_record "$PROV" "$pid" "$started" "$digest" "$inc"'
+LL_RETIRE_ABANDON=$'  retire_record "$INTENT"\n  die 6 "$why"'
+LL_SIGNAL_ABANDON='    signal_validated TERM "$pid" "$started"'
+prove "the launch writes its provenance without asking again whether the lock is held" t_lost_lock_record $L \
+  "$LL_WRITE_PROV" '  st write-record "$PROV" "$pid" "$started" "$digest" "$inc"'
+prove "the launch retires its intent without asking again whether the lock is held" t_lost_lock_retire $L \
+  $'launch.recorded  # the provenance is published, the intent not yet retired\n  retire_record "$INTENT"\n' \
+  $'launch.recorded  # the provenance is published, the intent not yet retired\n  st retire "$INTENT"\n'
+prove "an abandoned launch signals its daemon without asking again whether the lock is held" t_lost_lock_abandon_signal $L \
+  "$LL_SIGNAL_ABANDON" '    kill -TERM "$pid"'
+prove "an abandoned launch retires the intent without asking again whether the lock is held" t_lost_lock_abandon $L \
+  "$LL_RETIRE_ABANDON" $'  st retire "$INTENT"\n  die 6 "$why"'
+prove "ensure-daemon retires an adopted daemon's intent without asking again whether the lock is held" t_lost_lock_adopt $L \
+  $'      stl failpoint ensure.adopting\n      retire_record "$INTENT"\n' $'      stl failpoint ensure.adopting\n      st retire "$INTENT"\n'
+prove "restart-daemon signals the old daemon without asking again whether the lock is held" t_lost_lock_restart $L \
+  '    signal_validated TERM "$OURS_PID" "$OURS_LSTART"' '    kill -TERM "$OURS_PID"'
+# ... and the same shapes against the static check that nothing but the three writes, retires or signals:
+prove "write_record does not ask whether the lock is still ours (static)" t_mutation_funnel $L "$LL_WRITE_G" 'write_record() { st write-record "$@"; }'
+prove "retire_record does not ask whether the lock is still ours (static)" t_mutation_funnel $L \
+  "$LL_RETIRE_G" 'retire_record() { if rec_present "$1"; then st retire "$1"'
+prove "signal_validated does not ask whether the lock is still ours (static)" t_mutation_funnel $L "$LL_SIGNAL_G" $'  kill "-$1" "$2"\n'
+prove "a record is written through the helper beside write_record" t_mutation_funnel $L \
+  "$LL_WRITE_PROV" '  st write-record "$PROV" "$pid" "$started" "$digest" "$inc"'
+prove "a record is retired through the helper beside retire_record" t_mutation_funnel $L "$LL_RETIRE_ABANDON" $'  st retire "$INTENT"\n  die 6 "$why"'
+prove "a process is signalled beside signal_validated" t_mutation_funnel $L "$LL_SIGNAL_ABANDON" '    kill -TERM "$pid"'
 prove "a failed uv pip install is not a failed install" t_install_hash_tamper $L '--require-hashes --only-binary :all: -r "$LOCKFILE" || fail_install "uv pip install"' '--require-hashes --only-binary :all: -r "$LOCKFILE" || true'
 prove "install without --require-hashes accepts a lock whose hash is not its wheel's" t_install_hash_tamper $L '    --require-hashes --only-binary :all: -r "$LOCKFILE"' '    --only-binary :all: -r "$LOCKFILE"'
 FAKE_UV_MUTANT=nohash prove_env "the fake uv does not enforce --require-hashes" t_install_hash_tamper

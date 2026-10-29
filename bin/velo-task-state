@@ -64,8 +64,9 @@ from urllib.parse import quote
 
 # A failpoint name is registered when its call site exists; a typo must not pass silently. The last four are the steps of
 # `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked (reconcile.indexed: the same, in reconcile).
-FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready",
-              "restart.validated", "install.lock.held", "pending.published", "start.returned", "index.appended", "pending.unlinked", "reconcile.indexed"}
+FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready", "launch.recorded",
+              "ensure.adopting", "restart.validated", "install.lock.held", "install.verified", "pending.published", "start.returned", "index.appended",
+              "pending.unlinked", "reconcile.indexed"}
 TEST_MARKER = ".velo-task-test-root"
 # Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
 # exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly

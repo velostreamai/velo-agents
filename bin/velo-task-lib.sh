@@ -24,7 +24,8 @@
 # read through rec-read and written through write-record (O_NOFOLLOW, O_EXCL). The lock is a descriptor (LOCK_FD) the body was
 # handed, checked against the path before every action that cannot be undone, and the lock helper that holds the flock must still
 # be the body's parent (holder_alive: lock-held cannot tell it from a second locker); a long step runs under hold_run, which
-# stops it, and the body, when the helper dies.
+# stops it, and the body, when the helper dies. A body that waits for a daemon to start or stop can lose its helper meanwhile, so
+# write_record, retire_record and signal_validated ask both again right before they act: it touches nothing of the lock's new holder.
 #
 # Layout (VELO_TASK_HOME defaults to ${VELO_STATE:-~/.agents/state}/velo-task; tests override it):
 #   venv/               pinned Vanth install      vanth/              VANTH_HOME = AGENT_BG_HOME
@@ -149,10 +150,11 @@ bad_daemon_json() { die 6 "$VH/daemon.json cannot be read as JSON (see above), s
 within_5s() {  # <epoch> <epoch>
   [ -n "$1" ] && [ -n "$2" ] && [ $(( $1 > $2 ? $1 - $2 : $2 - $1 )) -le 5 ]
 }
-signal_validated() {  # <signal> <pid> <expected lstart>: re-checks pid AND start time right before signalling
+signal_validated() {  # <signal> <pid> <expected lstart>: re-checks pid AND start time, and that the lock is still ours, right before signalling
   local now
   now=$(ps_lstart "$2")
   [ -n "$now" ] && [ "$now" = "$3" ] || die 6 "refusing to signal pid $2: start time is '${now:-gone}', expected '$3'"
+  still_locked
   kill "-$1" "$2"
 }
 
@@ -183,8 +185,13 @@ rec_live() {  # <file>: the record is complete and its pid runs with the recorde
   [ -n "$live" ] || { REC_WHY="${1##*/}: pid $REC_PID is not running"; return 1; }
   [ "$live" = "$REC_LSTART" ] || { REC_WHY="${1##*/}: pid $REC_PID started '$live', the record says '$REC_LSTART' (reused pid)"; return 1; }
 }
-write_record() { st write-record "$@"; }  # <dest> <pid> <lstart> <digest> <incarnation>: the dest must be free (launch retires the old record first). The helper writes the temp O_EXCL|O_NOFOLLOW and publishes it (R17): fsync, no-clobber link, fsync the directory, unlink the temp, fsync its directory
-retire_record() { if rec_present "$1"; then st retire "$1" || die 6 "refusing to retire $1 (see above)"; fi; }  # durable rename to <file>.retired.<epoch>; a symlink or someone else's file is refused
+# Everything a locked body does to a record or a process after it has waited goes through these three: write_record, retire_record
+# and signal_validated each ask still_locked (the lock helper alive, the descriptor still the lock) right before they act, so a
+# body whose helper died while it waited for a daemon to start or stop writes, retires and signals nothing of the body that holds
+# the lock now. A call site cannot forget the check; nothing else in this file may write or retire a record through the helper, or
+# signal a process but a job it started itself (the suite pins that).
+write_record() { still_locked; st write-record "$@"; }  # <dest> <pid> <lstart> <digest> <incarnation>: the dest must be free (launch retires the old record first). The helper writes the temp O_EXCL|O_NOFOLLOW and publishes it (R17): fsync, no-clobber link, fsync the directory, unlink the temp, fsync its directory
+retire_record() { if rec_present "$1"; then still_locked; st retire "$1" || die 6 "refusing to retire $1 (see above)"; fi; }  # durable rename to <file>.retired.<epoch>; a symlink or someone else's file is refused
 
 # A live process is ours only when a record names it: pid, start time, launch digest and incarnation. The start time is
 # re-rendered now and must equal the recorded one, so a reused pid never qualifies. The digest is compared by ensure-daemon
@@ -350,6 +357,8 @@ launch_daemon() {
   pid=$!
   set +m
   started=$(ps_lstart "$pid")
+  # The lock helper can die during the wait below (up to VELO_TASK_START_WAIT), or in abandon_launch's wait for the daemon to stop:
+  # whatever this body writes or signals afterwards goes through write_record, retire_record or signal_validated, which ask again.
   stl failpoint launch.started
   deadline=$((SECONDS + ${VELO_TASK_START_WAIT:-20}))
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -364,6 +373,7 @@ launch_daemon() {
   check_loopback "$pid" || abandon_launch "$pid" "$started" "$LOOPBACK_WHY"
   stl failpoint launch.ready
   write_record "$PROV" "$pid" "$started" "$digest" "$inc"
+  stl failpoint launch.recorded  # the provenance is published, the intent not yet retired
   retire_record "$INTENT"
   need_modes
   printf 'daemon up pid=%s port=%s (started)\n' "$pid" "$PORT"
@@ -436,7 +446,10 @@ locked_ensure() {  # R18: probe only once the lock is held; another caller may h
     fi
     pid="$REC_PID"
     check_loopback "$pid" || die 6 "$LOOPBACK_WHY; refusing to adopt it. Run: velo-task restart-daemon"
-    if rec_present "$INTENT" && { ! rec_live "$INTENT" || [ "$REC_PID" = "$pid" ]; }; then retire_record "$INTENT"; fi  # the launch it recorded is done
+    if rec_present "$INTENT" && { ! rec_live "$INTENT" || [ "$REC_PID" = "$pid" ]; }; then  # the launch it recorded is done
+      stl failpoint ensure.adopting
+      retire_record "$INTENT"
+    fi
     printf 'daemon up pid=%s port=%s (adopted)\n' "$pid" "$PORT"
   else
     # Nothing answers. A live process a record names is a daemon velo-task launched (starting, hung, or a launch that was
@@ -458,8 +471,7 @@ locked_restart() {  # R7, R18: signal only a process a record proves is ours, re
   local deadline
   if find_ours_live; then
     stl failpoint restart.validated  # nothing after this point re-reads the records: the pid and start time validated above are what is signalled
-    still_locked
-    signal_validated TERM "$OURS_PID" "$OURS_LSTART"
+    signal_validated TERM "$OURS_PID" "$OURS_LSTART"  # which asks again whether the lock is still ours, right before it signals
     deadline=$((SECONDS + ${VELO_TASK_STOP_WAIT:-20}))
     while kill -0 "$OURS_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do /bin/sleep "${VELO_TASK_POLL:-0.2}"; done
     ! kill -0 "$OURS_PID" 2>/dev/null || die 6 "vanthd pid $OURS_PID still running ${VELO_TASK_STOP_WAIT:-20}s after SIGTERM; not escalating"
@@ -506,6 +518,7 @@ verify_install() {
   installed=$(run_uv pip freeze --no-config --python "$PY" | norm_names | LC_ALL=C /usr/bin/sort -u) || fail_install "uv pip freeze"
   [ "$locked" = "$installed" ] \
     || fail_install "installed distributions differ from the lock: $(/usr/bin/diff <(echo "$locked") <(echo "$installed") | /usr/bin/tr '\n' ' ')"
+  still_locked  # uv pip freeze is not watched by hold_run and can have outlived the lock: the venv's own python is not run, nor a scratch directory made in the venv, under a lock that was lost
   site=$("$PY" -I -c 'import os, vanth; print(os.path.dirname(vanth.__file__))') || fail_install "vanth is not importable"
   /usr/bin/grep -rqF --include='*.py' 'trigger parent reached an incompatible terminal status' "$site" \
     || fail_install "the pinned trigger-parent stop reason is absent from the installed Vanth (R1)"
@@ -514,6 +527,7 @@ verify_install() {
     || fail_install "the installed Vanth could not create its schema"
   st jobs-ro "$tmp/jobs.sqlite" 'SELECT 1 AS ok' >/dev/null || fail_install "the installed Vanth schema lacks columns the spec reads (R8)"
   /bin/rm -rf "$tmp"
+  stl failpoint install.verified  # verified, not yet marked as installed: the lock can still be lost before the caller writes the marker
 }
 cmd_install_vanth() {
   [ -f "$LOCKFILE" ] || die 1 "lock file not found: $LOCKFILE"
