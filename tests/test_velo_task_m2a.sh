@@ -1205,7 +1205,7 @@ prove "sessions: the token is rewritten on every call" t_session_token_file $S '
 prove "sessions: the token is read through a symlink" t_session_token_file $S '    ids = read_index(path)  # the safe reader of a one-line control file: not a symlink, not a FIFO, yours' '    ids = open(path).read().split()'
 prove "sessions: an empty token file is accepted" t_session_token_file $S $'    if not ids:\n        die(9, "%s holds no token" % path)' $'    if not ids:\n        ids = ["empty"]'
 prove "sessions: the token is world-readable" t_session_token_file $S '    write_new(path, (os.urandom(8).hex() + "\n").encode())  # False when the token exists already, the normal case' $'    write_new(path, (os.urandom(8).hex() + "\\n").encode())\n    os.chmod(path, 0o644)'
-prove "sessions: session-token is not a helper command" t_session_token_file $S '"index-has": cmd_index_has, "session-token": cmd_session_token,' '"index-has": cmd_index_has,'
+prove "sessions: session-token is not a helper command" t_session_token_file $S ' "session-token": cmd_session_token,' ''
 prove "sessions: session-token takes no file" t_session_token_file $S $'    if len(args) != 1:\n        usage("session-token: expected <file>")' $'    if False:\n        usage("session-token: expected <file>")'
 
 # sessions: run (B-S1)
