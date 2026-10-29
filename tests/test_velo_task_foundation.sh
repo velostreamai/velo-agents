@@ -167,6 +167,9 @@ prove() {  # <label> <check fn> <file> <anchor> <replacement> [<file> <anchor> <
   MUT_N=$((MUT_N + 1))
   m="$T/pj$MUT_N/code"   # numbered, never named for the label: a label's words must not satisfy a grep on the path
   rm -rf "$m"; mkdir -p "$m"; cp -R "$REPO/bin" "$REPO/requirements" "$m/"; cp "$REPO/install.sh" "$m/"
+  # the hooks and the README are under test too (M3b: the Stop guard and SessionStart hooks, and the registration the README shows)
+  [ ! -d "$REPO/hooks" ] || cp -R "$REPO/hooks" "$m/"
+  [ ! -f "$REPO/README.md" ] || cp "$REPO/README.md" "$m/"
   if ! "$PYBIN" -I - "$m" "$@" <<'PY'
 import sys
 root, args = sys.argv[1], sys.argv[2:]
