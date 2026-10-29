@@ -32,6 +32,7 @@
 #   daemon.launch.log   vanthd stdout/stderr
 #   names/<id>          the name index (R3): the job_ids run started under <id>, one per line, append-only
 #   pending/<nonce>     a start about to be sent to Vanth (R17): its canonical settings, deleted once its job_id is indexed
+#   session             the owner token run tags jobs with (session:<id>) when $CLAUDE_SESSION_ID is unset: made on first use, one per state dir
 # VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT, VELO_TASK_STOP_WAIT, VELO_TASK_LOCK_WAIT
 # (seconds) and VELO_TASK_POLL (the poll interval while a daemon starts or stops, default 0.2 s). Exit codes: 0 ok, 1 error,
 # 2 usage, 6 daemon refused/down/misconfigured.
@@ -58,6 +59,7 @@ LAUNCH_LOG="$VELO_TASK_HOME/daemon.launch.log"
 LOCK_FILE="$VELO_TASK_HOME/lock/daemon"
 NAMES="$VELO_TASK_HOME/names"
 PENDING="$VELO_TASK_HOME/pending"
+SESSION_FILE="$VELO_TASK_HOME/session"
 UV_PINNED=/opt/homebrew/bin/uv
 INSTALL_PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 SYS_PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -549,8 +551,15 @@ check_arg() {  # <kind> <value>: the R3 charsets, matched against the whole valu
     issue) re='^[0-9]{1,9}$' ;;
     timeout) re='^[1-9][0-9]{0,8}$' ;;
     stage) re='^[a-z0-9][a-z0-9_-]{0,31}$' ;;
+    session) re='^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' ;;
   esac
   [[ "$2" =~ $re ]] || die 2 "invalid $1 '$2': must match $re"
+}
+session_id() {  # [<id>|me]: <id> as given, else $CLAUDE_SESSION_ID, else the token this state dir keeps (made on first use; a script cannot tell shells apart, so every shell without an id shares it)
+  local s="${1:-me}"
+  [ "$s" != me ] || s="${CLAUDE_SESSION_ID:-}"
+  [ -n "$s" ] || s=$(st session-token "$SESSION_FILE") || die 6 "the session token is unsafe or unreadable (see above)"
+  check_arg session "$s"; printf '%s' "$s"
 }
 rerun_nonce() {  # <attempt>: the R4 key suffix <epoch>_<pid>_<rand8>; VELO_TASK_RERUN_NONCE (tests only, see prep_env) is that suffix, or a comma list of them, one per attempt, the last repeating
   local parts n
@@ -578,7 +587,7 @@ reconcile_id() {  # <id>: settle the id's pending records against Vanth's own ac
   die 6 "reconcile of '$1' failed (helper exit $rc, see above); nothing was resolved"
 }
 cmd_run() {
-  local id timeout="" issue="" stage="" have_issue=0 have_stage=0 rerun=0 cmdline=() args=() n=0 key out rc pending job cwd known
+  local id timeout="" issue="" stage="" have_issue=0 have_stage=0 rerun=0 cmdline=() args=() n=0 key out rc pending job cwd known session s8
   [ "$#" -gt 0 ] || die 2 "usage: velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd..."
   id="$1"; shift
   while [ "$#" -gt 0 ]; do
@@ -598,18 +607,21 @@ cmd_run() {
   [ "$have_issue" = 0 ] || check_arg issue "$issue"
   [ "$have_stage" = 0 ] || check_arg stage "$stage"
   [ "${#cmdline[@]}" -gt 0 ] || die 2 "no command: expected -- cmd..."
+  [ -z "${CLAUDE_SESSION_ID:-}" ] || check_arg session "$CLAUDE_SESSION_ID"  # refused now, before the daemon is touched
   prep_env
   need_daemon
   /bin/mkdir -p -m 700 "$NAMES" "$PENDING"
+  session=$(session_id) || exit "$?"
+  s8=$(printf '%s' "$session" | st sha256) || exit "$?"; s8="${s8:0:8}"  # two sessions starting the same id get different keys, so different jobs
   cwd=$(pwd -P)
   rc=0; st index-last "$NAMES" "$id" >/dev/null || rc=$?  # an unsafe name index is found now, not after the job was started
   [ "$rc" -le 1 ] || die 6 "the name index of '$id' is unsafe or unreadable (see above); nothing was started"
   rc=0; reconcile_id "$id" || rc=$?  # a run that died after its start was accepted is indexed first, so the last line stays the last job started; 3 is reported on stderr, never replayed here
   while :; do
     n=$((n + 1))
-    key="velo_$id"
+    key="velo_${s8}_$id"
     if [ "$rerun" = 1 ]; then key="${key}_$(rerun_nonce "$n")"; fi
-    args=(--name "$id" --timeout "$timeout" --idempotency-key "$key" --cwd "$cwd" --tag velo)
+    args=(--name "$id" --timeout "$timeout" --idempotency-key "$key" --cwd "$cwd" --tag velo --tag "session:$session")
     if [ "$have_issue" = 1 ]; then args=("${args[@]}" --tag "issue:$issue"); fi
     if [ "$have_stage" = 1 ]; then args=("${args[@]}" --tag "stage:$stage"); fi
     pending=$(st pending-write "$PENDING" -- "${args[@]}" -- "${cmdline[@]}")  # R17 (1): the settings are durable before anything is sent
@@ -634,23 +646,37 @@ cmd_run() {
   done
 }
 cmd_status() {
-  local id="" job="" issue="" have_issue=0 json=0 absent=0 unsent=0 out rc=0 vargs
+  local id="" job="" issue="" session="" have_id=0 have_job=0 have_issue=0 have_session=0 all=0 json=0 absent=0 unsent=0 out rc=0 vargs why
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --json) json=1; shift ;;
-      --issue|--job)
+      --all) all=1; shift ;;
+      --issue|--job|--session)
         [ "$#" -ge 2 ] || die 2 "$1 needs a value"
-        if [ "$1" = --job ]; then job="$2"; else issue="$2"; have_issue=1; fi
+        case "$1" in --job) job="$2"; have_job=1 ;; --session) session="$2"; have_session=1 ;; *) issue="$2"; have_issue=1 ;; esac
         shift 2 ;;
       -*) die 2 "unknown option '$1'" ;;
-      *) [ -z "$id" ] || die 2 "status takes one id"; id="$1"; shift ;;
+      *) [ "$have_id" = 0 ] || die 2 "status takes one id"; id="$1"; have_id=1; shift ;;
     esac
   done
-  if [ -n "$id" ] && [ -z "$job" ]; then check_arg id "$id"
-  elif [ -z "$id" ] && [ -n "$job" ]; then check_arg job "$job"
-  else die 2 "usage: velo-task status [--json] [--issue N] <id> | --job <job_id>"; fi
+  [ "$all$have_session" != 11 ] || die 2 "--session and --all exclude each other"
+  [ "$all" = 0 ] || [ "$have_id$have_job" = 00 ] || die 2 "--all lists the jobs of every session: it takes no id and no --job"
+  if [ "$have_id$have_job" = 11 ]; then die 2 "usage: velo-task status [--json] [--issue N] [--session S] <id> | --job <job_id>  or, to list: [--session S | --all] [--issue N] [--json]"
+  elif [ "$have_id" = 1 ]; then check_arg id "$id"
+  elif [ "$have_job" = 1 ]; then check_arg job "$job"; fi
   [ "$have_issue" = 0 ] || check_arg issue "$issue"
+  [ "$have_session" = 0 ] || [ "$session" = me ] || check_arg session "$session"
+  [ -z "${CLAUDE_SESSION_ID:-}" ] || check_arg session "$CLAUDE_SESSION_ID"  # as in run: refused whether or not this status uses it
   prep_env
+  if [ "$have_id$have_job" = 00 ]; then  # no id: list the jobs of one session (default: this caller's) or of all; jobs.sqlite is read read-only (R8), so no daemon is needed
+    why=$(stl check-state --owner-only "$VELO_TASK_HOME") || die 6 "state: ${why:-the state check failed}; nothing was read"
+    [ -e "$VH/jobs.sqlite" ] || return 0  # nothing has ever run here
+    vargs=(--list --names "$NAMES" --db "$VH/jobs.sqlite")
+    if [ "$all" = 0 ]; then session=$(session_id "$session") || exit "$?"; vargs=("${vargs[@]}" --session "$session"); fi
+    if [ "$have_issue" = 1 ]; then vargs=("${vargs[@]}" --issue "$issue"); fi
+    if [ "$json" = 1 ]; then vargs=("${vargs[@]}" --json); fi
+    st verdict-of "${vargs[@]}"; return
+  fi
   need_daemon
   if [ -n "$id" ]; then  # R3: the last job run indexed under the id; never vanth list, which caps at 1,000 rows and matches names by substring
     reconcile_id "$id" || unsent=$?  # a run that died after its start was accepted has its job indexed now
@@ -673,6 +699,7 @@ cmd_status() {
   vargs=(--names "$NAMES" --db "$VH/jobs.sqlite" --job "$job")
   if [ -n "$id" ]; then vargs=("${vargs[@]}" --name "$id" --label "$id"); fi  # the row's name must equal the id exactly, whatever the index said
   if [ "$have_issue" = 1 ]; then vargs=("${vargs[@]}" --issue "$issue"); fi
+  if [ "$have_session" = 1 ]; then session=$(session_id "$session") || exit "$?"; vargs=("${vargs[@]}" --session "$session"); fi  # any owner unless asked
   if [ "$json" = 1 ]; then vargs=("${vargs[@]}" --json); fi
   if [ "$absent" = 1 ]; then st verdict-of --absent "${vargs[@]}"; else printf '%s\n' "$out" | st verdict-of "${vargs[@]}"; fi
 }

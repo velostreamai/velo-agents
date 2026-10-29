@@ -14,6 +14,7 @@ The behaviour velo-task depends on follows Vanth 1.14.0 as probed against the re
 Every call is appended to @E@/calls as `vanth <args>`, followed by `env=<the names in its environment>`. Switches (files under @E@):
 start-transport-error, start-fail, status-transport-error, status-fail, status-garbage.
 """
+import datetime
 import hashlib
 import json
 import os
@@ -43,7 +44,7 @@ def db():
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, name TEXT, status TEXT, exit_code INTEGER, stop_actor TEXT,"
                 " stop_reason TEXT, trigger_json TEXT, created_at TEXT, ended_at TEXT, policy_state_json TEXT, command TEXT, cwd TEXT,"
-                " timeout_seconds INTEGER, tags TEXT, seq INTEGER)")
+                " timeout_seconds INTEGER, tags_json TEXT, seq INTEGER)")
     con.execute("CREATE TABLE IF NOT EXISTS local_start_requests (idempotency_key TEXT PRIMARY KEY, request_hash TEXT, job_id TEXT,"
                 " created_at TEXT)")
     return con
@@ -52,15 +53,15 @@ def db():
 def insert(con, row):
     row = dict(row)
     row.setdefault("seq", (con.execute("SELECT COALESCE(MAX(seq), 0) FROM jobs").fetchone()[0]) + 1)
-    row.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    row.setdefault("tags", "[]")
+    row.setdefault("created_at", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))  # microseconds: list order is by it
+    row.setdefault("tags_json", "[]")
     con.execute("INSERT INTO jobs (%s) VALUES (%s)" % (", ".join(row), ", ".join("?" * len(row))), list(row.values()))
 
 
 def status_object(row):
     trigger = json.loads(row["trigger_json"]) if row["trigger_json"] else None
     return {"job_id": row["job_id"], "status": row["status"], "command": row["command"], "cwd": row["cwd"],
-            "timeout_seconds": row["timeout_seconds"], "name": row["name"], "tags": json.loads(row["tags"] or "[]"), "env": {},
+            "timeout_seconds": row["timeout_seconds"], "name": row["name"], "tags": json.loads(row["tags_json"] or "[]"), "env": {},
             "trigger": trigger, "policy": None, "stop_actor": row["stop_actor"], "stop_reason": row["stop_reason"],
             "exit_code": row["exit_code"], "created_at": row["created_at"]}
 
@@ -144,7 +145,7 @@ def cmd_start(args):
     status, code = run_job(command, cwd, timeout)
     with con:
         insert(con, {"job_id": job_id, "name": opts.get("name"), "status": status, "exit_code": code, "command": command, "cwd": cwd,
-                     "timeout_seconds": timeout, "tags": json.dumps(tags),
+                     "timeout_seconds": timeout, "tags_json": json.dumps(tags),
                      "trigger_json": opts.get("trigger") if opts.get("trigger") else None})
         if key is not None:
             con.execute("INSERT INTO local_start_requests (idempotency_key, request_hash, job_id, created_at) VALUES (?, ?, ?, ?)",
@@ -187,7 +188,7 @@ def main(argv):
         con = db()
         row.setdefault("job_id", "job_inj" + os.urandom(5).hex())
         row.setdefault("status", "running")
-        for column in ("trigger_json", "policy_state_json", "tags"):
+        for column in ("trigger_json", "policy_state_json", "tags_json"):
             if column in row and not isinstance(row[column], str):
                 row[column] = json.dumps(row[column])
         with con:

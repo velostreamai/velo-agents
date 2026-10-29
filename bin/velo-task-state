@@ -18,7 +18,9 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   modes-check <home> [file...]             exit 8 and print the first path that group or other can access
   redact                                   stdin -> stdout with secrets replaced by ***
   jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
-  verdict-of [--names D] [--db P] [--job J] [--name N] [--issue I] [--label L] [--json] [--absent]   R1: the verdict of the status object (or jobs.sqlite row) on stdin, as `<label> <verdict>`; exit 2 when it is not the job asked about, 6 when it is not JSON; --absent: Vanth has no row for J (lost(pruned) when the name index lists J, else unknown-job, exit 3)
+  verdict-of [--names D] [--db P] [--job J] [--name N] [--issue I] [--session S] [--label L] [--json] [--absent]   R1: the verdict of the status object (or jobs.sqlite row) on stdin, as `<label> <verdict>`; exit 2 when it is not the job asked about, 6 when it is not JSON; --absent: Vanth has no row for J (lost(pruned) when the name index lists J, else unknown-job, exit 3)
+  verdict-of --list --db P --names D [--session S] [--issue I] [--json]   every job of jobs.sqlite that carries those tags, newest first, as `<name> <job_id> <verdict>` (--json: one object each)
+  session-token <file>                     the session token of a state dir with no CLAUDE_SESSION_ID: 16 hex characters, made on first use (never replaced), printed
   pending-write <dir> -- <vanth start args...>   R17 step 1: publish <dir>/<nonce> with the canonical settings of the request about to be sent; print the nonce
   remove <file>                            R17 step 4: unlink a regular file of yours (already gone is fine), then fsync its directory
   index-last <names-dir> <id>              the last job id in <names-dir>/<id> (R3); exit 1 when there is no such index
@@ -30,7 +32,7 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
 Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job; reconcile: a record Vanth has no key for), 4 jobs-ro: database
 locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 6 verdict-of: the input is not JSON, 8 modes-check: loose
 mode found, 9 unsafe state (a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire,
-append-index, pending-write, remove, index-last, index-has, reconcile; for check-state also a home whose mode is not 0700), 75 lock or
+append-index, pending-write, remove, index-last, index-has, reconcile, session-token; for check-state also a home whose mode is not 0700), 75 lock or
 failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from `lock` is the
 command's own.
 
@@ -67,7 +69,7 @@ TEST_MARKER = ".velo-task-test-root"
 # exist yet is fine.
 STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "dir"), ("venv/.velo-task-installed", "file"),
                ("vanth", "dir"), ("vanth/daemon.json", "file"), ("vanth.env.allow", "file"), ("daemon.intent", "file"),
-               ("daemon.provenance", "file"), ("daemon.launch.log", "file"), ("names", "dir"), ("pending", "dir"))
+               ("daemon.provenance", "file"), ("daemon.launch.log", "file"), ("names", "dir"), ("pending", "dir"), ("session", "file"))
 STATE_ROOT_MODE = 0o700
 LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
 RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
@@ -77,7 +79,7 @@ SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION = 20, 21, 31
 # Columns the spec reads from Vanth's database (R1, R8); install-vanth and every read check them.
 SCHEMA = {
     "jobs": ("job_id", "name", "status", "exit_code", "stop_actor", "stop_reason",
-             "trigger_json", "created_at", "ended_at", "policy_state_json"),
+             "trigger_json", "created_at", "ended_at", "policy_state_json", "tags_json"),
     "local_start_requests": ("idempotency_key", "job_id"),
 }
 SECRET_NAME = re.compile(r"token|secret|key|password|credential|auth", re.I)
@@ -810,22 +812,56 @@ def job_row_exists(db, job_id):
     return bool(query_ro(db, "SELECT 1 AS present FROM jobs WHERE job_id = ?", (job_id,)))
 
 
+def job_json(label, row, verdict, job=None):
+    """The --json object of one job, the same for the status of one job and for every row of a list."""
+    return json.dumps({"id": label, "job_id": row.get("job_id", job), "status": row.get("status"), "exit_code": row.get("exit_code"),
+                       "verdict": verdict}, sort_keys=True, separators=(",", ":"))
+
+
+def _tok(text):
+    """A field of a list line: as it is when it is one printable word with no double quote, else JSON-quoted, so a name any tool may set
+    cannot add a line or a field, and a field that starts with a double quote is always JSON."""
+    text = str(text)
+    return text if re.fullmatch(r"[\x21\x23-\x7e]+", text) else json.dumps(text)
+
+
+def list_jobs(db, known, opts, as_json):
+    """Every job of jobs.sqlite (read-only, R8) that carries the tags asked for (--session S, --issue I), newest first: `<name> <job_id> <verdict>`."""
+    if not db:
+        usage("verdict-of: --list needs --db")
+    want = ["%s:%s" % (key, opts[key]) for key in ("session", "issue") if key in opts]
+    for row in query_ro(db, "SELECT job_id, name, status, exit_code, stop_actor, stop_reason, trigger_json, policy_state_json, tags_json "
+                            "FROM jobs ORDER BY created_at DESC, job_id DESC"):
+        try:
+            tags = _json_field(row, "tags_json")
+        except ValueError:  # tags that are not JSON: the job belongs to no session
+            tags = None
+        if all(tag in (tags if isinstance(tags, list) else ()) for tag in want):
+            verdict = verdict_of(row, known)
+            print(job_json(row["name"], row, verdict) if as_json else "%s %s %s" % (_tok(row["name"] or "-"), _tok(row["job_id"]), verdict))
+    return 0
+
+
 def cmd_verdict_of(args):
     """The verdict (R1) of the Vanth status object, or jobs.sqlite row, on stdin: `<label> <verdict>`, or one JSON object with --json.
-    --names and --db say where a trigger parent is looked up (the name index, the database). --job, --name and --issue are what the caller
-    resolved: a status for another job, under another name or without the issue tag is refused (exit 2), never reported as the job asked
-    about. --absent: Vanth has no row for --job (lost(pruned) when the name index lists it, else unknown-job, exit 3). Not JSON: exit 6."""
+    --names and --db say where a trigger parent is looked up (the name index, the database). --job, --name, --issue and --session are what
+    the caller resolved: a status for another job, under another name or without the issue or session tag is refused (exit 2), never
+    reported as the job asked about. --absent: Vanth has no row for --job (lost(pruned) when the name index lists it, else unknown-job,
+    exit 3). Not JSON: exit 6. --list: no stdin, every job of --db (list_jobs)."""
     opts, flags, i = {}, set(), 0
     while i < len(args):
-        if args[i] in ("--json", "--absent"):
+        if args[i] in ("--json", "--absent", "--list"):
             flags.add(args[i])
             i += 1
-        elif args[i] in ("--names", "--db", "--job", "--name", "--issue", "--label") and i + 1 < len(args):
+        elif args[i] in ("--names", "--db", "--job", "--name", "--issue", "--session", "--label") and i + 1 < len(args):
             opts[args[i][2:]] = args[i + 1]
             i += 2
         else:
             usage("verdict-of: unexpected argument %r" % args[i])
     names, db, job = opts.get("names"), opts.get("db"), opts.get("job")
+    known = lambda parent: bool(names and index_has(names, parent)) or bool(db and job_row_exists(db, parent))
+    if "--list" in flags:
+        return list_jobs(db, known, opts, "--json" in flags)
     if "--absent" in flags:
         row = {}
         verdict = "lost(pruned)" if job and names and index_has(names, job) else "unknown-job"
@@ -838,16 +874,16 @@ def cmd_verdict_of(args):
         for key, want in (("job_id", job), ("name", opts.get("name"))):
             if want is not None and row.get(key) != want:
                 die(2, "verdict-of: the status is for %s %r, not %r; refusing to report it for the job asked about" % (key, row.get(key), want))
-        if "issue" in opts and "issue:%s" % opts["issue"] not in (row["tags"] if isinstance(row.get("tags"), list) else []):
-            die(2, "verdict-of: the job does not carry the tag issue:%s" % opts["issue"])
+        for key in ("issue", "session"):
+            if key in opts and "%s:%s" % (key, opts[key]) not in (row["tags"] if isinstance(row.get("tags"), list) else []):
+                die(2, "verdict-of: the job does not carry the tag %s:%s" % (key, opts[key]))
         if db and job and "policy_state_json" not in row and row.get("status") in ("failed", "orphaned"):
             found = query_ro(db, "SELECT policy_state_json FROM jobs WHERE job_id = ?", (job,))  # `vanth status` omits it: a restart may be pending (R1)
             row["policy_state_json"] = found[0]["policy_state_json"] if found else None
-        verdict = verdict_of(row, lambda parent: bool(names and index_has(names, parent)) or bool(db and job_row_exists(db, parent)))
+        verdict = verdict_of(row, known)
     label = opts.get("label") or job or "-"
     if "--json" in flags:
-        print(json.dumps({"id": label, "job_id": row.get("job_id", job), "status": row.get("status"), "exit_code": row.get("exit_code"),
-                          "verdict": verdict}, sort_keys=True, separators=(",", ":")))
+        print(job_json(label, row, verdict, job))
     else:
         print("%s %s" % (label, verdict))
     return 3 if verdict == "unknown-job" else 0
@@ -971,6 +1007,19 @@ def cmd_reconcile(args):
     return 3 if unsent else 0
 
 
+def cmd_session_token(args):
+    """The session token of a state dir whose caller has no CLAUDE_SESSION_ID: 16 hex characters, made on first use and never replaced."""
+    if len(args) != 1:
+        usage("session-token: expected <file>")
+    path = os.path.abspath(args[0])
+    write_new(path, (os.urandom(8).hex() + "\n").encode())  # False when the token exists already, the normal case
+    ids = read_index(path)  # the safe reader of a one-line control file: not a symlink, not a FIFO, yours
+    if not ids:
+        die(9, "%s holds no token" % path)
+    print(ids[0])
+    return 0
+
+
 def cmd_failpoint(args):
     if len(args) != 1:
         usage("failpoint: expected <name>")
@@ -994,7 +1043,7 @@ COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish
             "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
             "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
             "verdict-of": cmd_verdict_of, "pending-write": cmd_pending_write, "remove": cmd_remove,
-            "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile,
+            "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile, "session-token": cmd_session_token,
             "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 
