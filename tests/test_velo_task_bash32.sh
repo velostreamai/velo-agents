@@ -2,9 +2,8 @@
 # velo-task M3c, bar B14 (docs/velo-task-spec.md): every script matching the fixed glob bin/velo-task* runs under /bin/bash
 # 3.2.x and is swept for bash-4 constructs, and a seeded `declare -A` fixture fails BOTH halves.
 #
-# test_velo_task_foundation.sh keeps the M1 form of this check, which skips a script whose first line is not exactly
-# #!/bin/bash, so a later bin/velo-task-x written as #!/usr/bin/env bash would never be swept. This is the standing check:
-# such a script FAILS here, because B14 cannot vouch for a script it does not know how to run. The sweep and the runner
+# A script whose first line is not exactly #!/bin/bash must not be skipped, or a later bin/velo-task-x written as
+# #!/usr/bin/env bash would never be swept. This is the standing check: such a script FAILS here, because B14 cannot vouch for a script it does not know how to run. The sweep and the runner
 # are tests/bash32-sweep.sh; tests/test_velo_task_hooks.sh sweeps the hooks with the same code.
 #
 #   t_premise             the shell is bash 3.2.x                    red when B14_BASH names a bash 5
@@ -213,7 +212,7 @@ echo "mutation proofs"
 V=bin/velo-task; L=bin/velo-task-lib.sh; S=tests/bash32-sweep.sh; F=tests/fixtures/velo-task/bash4-seeded.sh
 prove_env "the shell is a bash 5" t_premise B14_BASH="$REPO/tests/fixtures/velo-task/fake-bash5.sh"
 prove "a bash-4 construct is added to the front end" t_sweep_real $V 'set -euo pipefail' $'set -euo pipefail\ndeclare -A seeded'
-prove "a bash-4 construct hides in a library function nothing runs" t_sweep_real $L 'cmd_doctor() {' $'cmd_doctor() {\n  mapfile -t unreached </dev/null'
+prove "a bash-4 construct hides in a library function nothing runs" t_sweep_real $L 'cmd_cancel() {' $'cmd_cancel() {\n  mapfile -t unreached </dev/null'
 prove "an empty array under set -u (parses, passes the sweep, dies at 3.2)" t_sweep_real $V 'set -euo pipefail' $'set -euo pipefail\nunreached=(); : "${unreached[@]}"'
 prove "a new bash script with a bash-4 construct appears under the glob" t_sweep_real +bin/velo-task-hook $'#!/bin/bash\ndeclare -A x\n' ''
 prove "a new script is written as #!/usr/bin/env bash" t_sweep_real +bin/velo-task-future $'#!/usr/bin/env bash\ndeclare -A x\n' ''
