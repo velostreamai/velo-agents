@@ -11,6 +11,9 @@
 #   - say that the Velostream-only prerequisites are skipped (the discovery index is not built; the worker's task opens with
 #     OVERRIDE-DIRECTIVES:), instead of failing on them
 #   - keep its state (logs, records, orchestrator events, native workers) apart from Velostream's, issue number for issue number
+#   - not take a repo with Velostream's directory name and another owner (acme/velostream) for Velostream, nor Velostream's tree
+#     and workers for its own: every tree found by name passes an origin check first (spec-review, status, the orchestrator,
+#     dispatch, record)
 set -uo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/repo-env-lib.sh"
 
@@ -337,6 +340,122 @@ t_watch_workers_scoped() {   # a worker of Velostream finishing does not wake a 
   [ "$BAD" -eq 0 ]
 }
 
+# ---- a repo that has Velostream's directory name ---------------------------------------------------------------------------
+# $CLASH (acme/velostream) is another repo than Velostream (velostreamai/velostream), but the tools look for its tree at the
+# same place, ~/RustroverProjects/velostream, and for its workers among velostream-*: Velostream's. A tool that finds a tree
+# by name must prove it is a checkout of the repo it was asked about (repo_owns) before it reads, writes or counts it.
+# mk_clash: Velostream's tree and worker velostream-77 at those paths, $CLASH's own worker velostream-99 beside them.
+t_spec_review_foreign_tree() {   # the spec of $CLASH's issue is not looked for, or attested, in Velostream's tree; nor is a --worktree of another repo reviewed
+  local brief spec plain wt
+  sb_new && mk_clash || return 1
+  brief="$FX/complete.md"; spec="$H/RustroverProjects/velostream/.agents/tasks/$ISS.json"; plain="$SB/plain"
+  fx_base main; fx_issue $ISS ''
+  printf '%s\n' 'WORKTREE: /w' 'Do NOT cd into it.' 'STOP and report if blocked.' 'Commit after each step.' \
+    'You may commit. Do NOT push.' 'cargo check --no-default-features' '## PRE-GATE SWEEP' > "$brief"
+  mkdir -p "${spec%/*}" && printf '{\n  "issue": %s,\n  "worker": "local"\n}\n' "$ISS" > "$spec" && cp "$spec" "$FX/spec.pristine" || return 1
+  XE="VELO_REPO=$CLASH"; x bash "$R/bin/velo-spec-review" $ISS "$brief" --by t
+  [ "$RC" -ne 0 ] || bad "an attestation for $CLASH went ahead on the Velostream tree: $(nonl "$OUT" 300)"
+  want "$OUT" "$H/RustroverProjects/velostream is a checkout of $DEF, not $CLASH" "the refusal does not say whose tree it found: $(nonl "$OUT" 300)"
+  cmp -s "$spec" "$FX/spec.pristine" || bad "an attestation for $CLASH was written into Velostream's spec: $(cat "$spec")"
+  [ ! -s "$GL" ] || bad "the refusal came after gh was asked: $(nonl "$(cat "$GL")" 200)"
+  # a worktree of Velostream given to a repo whose own tree is fine; then that repo's own worktree
+  sb_new && mk_world || return 1
+  XE="VELO_REPO=$ALT"; wt="$H/RustroverProjects/velostream-$WIP"
+  x bash "$R/bin/velo-spec-review" $ISS --check --worktree "$wt"
+  [ "$RC" -ne 0 ] || bad "a review for $ALT went ahead in the Velostream worktree $wt: $(nonl "$OUT" 300)"
+  want "$OUT" "--worktree: $wt is a checkout of $DEF, not $ALT" "the refusal does not say that the worktree is another repo's: $(nonl "$OUT" 300)"
+  x bash "$R/bin/velo-spec-review" $ISS --check --worktree "$H/RustroverProjects/velo-agents-$WIP"
+  want "$OUT" "no task spec in that worktree" "$ALT's own worktree is not accepted: $(nonl "$OUT" 300)"
+  unwant "$OUT" "is a checkout of" "$ALT's own worktree is refused as another repo's: $(nonl "$OUT" 300)"
+  # the default repo is not asked: a plain directory is a worktree for Velostream, as it has always been
+  mkdir -p "$plain"; XE=""
+  x bash "$R/bin/velo-spec-review" $ISS --check --worktree "$plain"
+  want "$OUT" "no task spec in that worktree" "Velostream's --worktree is asked for an origin: $(nonl "$OUT" 300)"
+  unwant "$OUT" "not a git checkout" "Velostream's --worktree is refused for having no .git: $(nonl "$OUT" 300)"
+  [ "$BAD" -eq 0 ]
+}
+t_status_foreign_worktrees() {   # status lists $CLASH's worker 99, not Velostream's 77, asks GitHub for 99's title only, and reads no record from the Velostream tree
+  local log legacy row
+  sb_new && mk_clash || return 1
+  log="$S/dispatch/$CLASH_SUB/$CLASH_WIP/velo-local-20261029T000000Z-4242.log"; legacy="$H/RustroverProjects/velostream/.agents/tasks/$CLASH_WIP.result.jsonl"
+  fx_base main; fx_issue $CLASH_WIP ''
+  # 99 has a log that is still moving; the Velostream tree holds a legacy record that says its run exited
+  mkdir -p "${log%/*}" "${legacy%/*}" && echo "worker output" > "$log" \
+    && jq -nc --arg l "$log" '{outcome:"landed", worker:"velo-local", wall_clock_s:5, cost:{}, work:{commits:1}, runner:{log:$l}}' > "$legacy" || return 1
+  XE="VELO_REPO=$CLASH"; x bash "$R/bin/velo-status"
+  eq "$RC" 0 "velo-status exit status"
+  want "$OUT" "fix/$CLASH_WIP-acme" "the table does not list $CLASH's own worker $CLASH_WIP: $(nonl "$OUT" 300)"
+  unwant "$OUT" "fix/$WIP-def" "the table lists Velostream's worker $WIP as $CLASH's"
+  row=$(grep "^$CLASH_WIP " <<<"$OUT")
+  want "$row" "live?" "the Velostream tree's legacy record ended $CLASH's run $CLASH_WIP: $(nonl "$row" 200)"
+  want "$(cat "$GL")" "issue view $CLASH_WIP --repo $CLASH " "the title of $CLASH's worker $CLASH_WIP was not fetched"
+  unwant "$(cat "$GL")" "issue view $WIP " "GitHub was asked for the title of Velostream's worker $WIP as $CLASH's"
+  x bash "$R/bin/velo-status" $CLASH_WIP
+  unwant "$OUT" "run 1/1" "the legacy record in the Velostream tree is listed as a run of $CLASH's $CLASH_WIP: $(nonl "$OUT" 300)"
+  [ "$BAD" -eq 0 ]
+}
+t_orchestrd_foreign_worktrees() {   # a running Velostream worker is not counted against $CLASH's cap, and its STOP is not $CLASH's
+  local q l
+  trap kill_decoys EXIT
+  sb_new && mk_clash || return 1
+  q="$S/orch/$CLASH_SUB/queue.jsonl"; l="$S/orch/$CLASH_SUB/orchestrd.log"
+  fx_base main; printf '[]\n' > "$FX/pr-list-running.json"
+  printf '2026-10-29T03:00:00Z STOP: velostream worker\n' > "$H/RustroverProjects/velostream-$WIP/agent.log"
+  printf '2026-10-29T04:00:00Z STOP: acme worker\n' > "$H/RustroverProjects/velostream-$CLASH_WIP/agent.log"
+  mkdir -p "${q%/*}" && echo x > "$q" || return 1
+  decoy "velo-openrouter-agent-sdk.py --cwd $H/RustroverProjects/velostream-$WIP" || return 1
+  XE="VELO_REPO=$CLASH VELO_ORCH_WIP_CAP=1"; x bash "$R/bin/velo-orchestrd" tick
+  unwant "$(cat "$l")" "WIP cap reached" "a running worker of Velostream counted against $CLASH's cap: $(nonl "$(cat "$l")" 300)"
+  x bash "$R/bin/velo-attention" list
+  want "$OUT" "stop:$CLASH_WIP:2026-10-29T04:00:00" "the tick missed the STOP of $CLASH's own worker $CLASH_WIP: $(nonl "$OUT" 300)"
+  unwant "$OUT" "stop:$WIP:" "the tick escalated the STOP of Velostream's worker $WIP as $CLASH's: $(nonl "$OUT" 300)"
+  # $CLASH's own worker running: counted, once
+  echo x > "$q"; decoy "velo-openrouter-agent-sdk.py --cwd $H/RustroverProjects/velostream-$CLASH_WIP" || return 1
+  x bash "$R/bin/velo-orchestrd" tick
+  want "$(cat "$l")" "WIP cap reached (1/1)" "the cap is not reached by $CLASH's own worker alone: $(nonl "$(cat "$l")" 300)"
+  kill_decoys
+  [ "$BAD" -eq 0 ]
+}
+t_dispatch_foreign_worktree() {   # the path where $ALT's worker for #78 would be cut holds a Velostream worktree: not resumed, not removed
+  local wt mode
+  sb_new && mk_world || return 1
+  wt="$H/RustroverProjects/velo-agents-$ISS"
+  git -C "$H/RustroverProjects/velostream" worktree add -q -b fix/$ISS-auto "$wt" origin/master || return 1
+  fx_base main; fx_issue $ISS ''; mk_brief "$FX/brief.md" "$wt"
+  XE="VELO_REPO=$ALT"
+  for mode in "--dry-run --resume" "--dry-run"; do
+    x bash "$R/bin/velo-dispatch" $ISS "$FX/brief.md" $mode
+    [ "$RC" -ne 0 ] || bad "a dispatch for $ALT ($mode) went ahead on the Velostream worktree $wt: $(nonl "$OUT" 300)"
+    want "$OUT" "$wt is a checkout of $DEF, not $ALT" "the refusal ($mode) does not say whose worktree it found: $(nonl "$OUT" 300)"
+  done
+  eq "$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>&1)" "fix/$ISS-auto" "the Velostream worktree's branch"
+  # $ALT's own worker is resumed as ever
+  fx_issue $WIP ''; mk_brief "$FX/brief-own.md" "$H/RustroverProjects/velo-agents-$WIP" fix/$WIP-alt
+  x bash "$R/bin/velo-dispatch" $WIP "$FX/brief-own.md" --branch fix/$WIP-alt --dry-run --resume
+  eq "$RC" 0 "a dry-run resume of $ALT's own worker (exit status): $(nonl "$OUT" 300)"
+  want "$OUT" "(RESUMED — kept as-is)" "$ALT's own worktree is not resumed: $(nonl "$OUT" 300)"
+  [ "$BAD" -eq 0 ]
+}
+t_record_foreign_tree() {   # nothing is recorded against Velostream's tree for $CLASH, nor for a Velostream worktree for $ALT
+  sb_new && mk_clash || return 1
+  fx_base main; XE="VELO_REPO=$CLASH"
+  rec $CLASH_WIP "$H/RustroverProjects/velostream-$CLASH_WIP"
+  eq "$RC" 0 "velo-record is observational and exits 0"
+  want "$OUT" "$H/RustroverProjects/velostream is a checkout of $DEF, not $CLASH — nothing recorded" "the run of $CLASH was recorded against the Velostream tree: $(nonl "$OUT" 300)"
+  [ ! -e "$S/records" ] || bad "a record was written for $CLASH: $(ls -R "$S/records" | tr '\n' ' ')"
+  sb_new && mk_world || return 1
+  fx_base main; XE="VELO_REPO=$ALT"
+  rec $WIP "$H/RustroverProjects/velostream-$WIP"
+  eq "$RC" 0 "velo-record is observational and exits 0"
+  want "$OUT" "$H/RustroverProjects/velostream-$WIP is a checkout of $DEF, not $ALT — nothing recorded" "a Velostream worktree was recorded as $ALT's run: $(nonl "$OUT" 300)"
+  [ ! -e "$S/records" ] || bad "a record was written for $ALT from a Velostream worktree: $(ls -R "$S/records" | tr '\n' ' ')"
+  # VELO_RECORD_ROOT names a directory of records, not a checkout: it is not asked for an origin
+  XE="VELO_REPO=$ALT VELO_RECORD_ROOT=$SB/recroot"
+  rec $WIP "$H/RustroverProjects/velo-agents-$WIP"
+  [ -s "$SB/recroot/records/$ALT_SUB/$WIP.result.jsonl" ] || bad "no record in an explicit VELO_RECORD_ROOT (exit $RC): $(nonl "$OUT" 300)"
+  [ "$BAD" -eq 0 ]
+}
+
 # ---- the checks ------------------------------------------------------------------------------------------------------
 echo "== dispatch"
 check "a dry run for another repo: its tree, its default branch, its notes" t_dispatch_dry_alt
@@ -355,6 +474,12 @@ check "the launchd agent is Velostream's alone" t_orchestrd_launchd_default_only
 echo "== watch and the SessionStart hook"
 check "reviewers are found by the repo's gate dir" t_gates_scoped
 check "a watch wakes for its own repo's workers only" t_watch_workers_scoped
+echo "== a repo that has Velostream's directory name"
+check "spec-review neither reads, writes nor reviews in another repo's tree" t_spec_review_foreign_tree
+check "status lists the repo's own workers and reads no record from another repo's tree" t_status_foreign_worktrees
+check "the orchestrator counts and escalates the repo's own workers only" t_orchestrd_foreign_worktrees
+check "a dispatch neither resumes nor removes another repo's worktree" t_dispatch_foreign_worktree
+check "record records nothing against another repo's tree or worktree" t_record_foreign_tree
 
 # ---- the mutants -----------------------------------------------------------------------------------------------------
 echo "== mutation proofs"
@@ -411,8 +536,10 @@ prove "velo-record shares its records" t_workers_two_repos_one_state_dir bin/vel
 prove "velo-native shares its records" t_workers_two_repos_one_state_dir bin/velo-native 'NATIVE_DIR="$VELO_STATE/native$REPO_SUB"' 'NATIVE_DIR="$VELO_STATE/native"'
 prove "velo-status lists Velostream's worktrees in its table" t_status_alt bin/velo-status '/${REPO_NAME}-*; do
   [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
+  repo_owns "$WT" || continue
   ISSUE=' '/velostream-*; do
   [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
+  repo_owns "$WT" || continue
   ISSUE='
 prove "velo-status carries on with no default branch" t_status_alt bin/velo-status 'repo_base_branch || { echo "velo-status: $REPO_ERR" >&2; exit 1; }' 'repo_base_branch || :'
 prove "velo-spec-review reads the Velostream tree" t_spec_review_tree bin/velo-spec-review 'ROOT="$HOME/RustroverProjects/${REPO_NAME}"' 'ROOT="$HOME/RustroverProjects/velostream"'
@@ -424,6 +551,25 @@ prove "reviewers are looked for under the default's gate dir" t_gates_scoped $LI
 prove "the hook reads the PR number from the default's gate dir" t_gates_scoped hooks/session-start-inflight.sh 'state/$GATE_SUBDIR/([0-9]+)/([a-z-]+)[.-].*%  PR #\2 - \3 still running (pid \1)%' 'state/gate/([0-9]+)/([a-z-]+)[.-].*%  PR #\2 - \3 still running (pid \1)%'
 prove "the watch reads the PR number from the default's gate dir" t_gates_scoped bin/velo-watch 'state/$GATE_SUBDIR/([0-9]+)/([a-z-]+)[.-].*#\2:\3#' 'state/gate/([0-9]+)/([a-z-]+)[.-].*#\2:\3#'
 prove "the watch counts Velostream's finished workers" t_watch_workers_scoped bin/velo-watch '"$HOME"/.agents/state/records$REPO_SUB/*.result.jsonl' '"$HOME"/.agents/state/records/*.result.jsonl'
+prove "spec-review reads and attests the tree of another repo of the same name" t_spec_review_foreign_tree bin/velo-spec-review 'repo_owns "$ROOT" || die "$REPO_ERR' 'repo_owns "$ROOT" || : "$REPO_ERR'
+prove "spec-review reviews in another repo's worktree" t_spec_review_foreign_tree bin/velo-spec-review 'repo_owns "$REVIEW_ROOT" || die "--worktree: $REPO_ERR"' ':'
+prove "spec-review asks the canonical tree, not the worktree it was given" t_spec_review_foreign_tree bin/velo-spec-review 'repo_owns "$REVIEW_ROOT" || die "--worktree: $REPO_ERR"' 'repo_owns "$ROOT" || die "--worktree: $REPO_ERR"'
+prove "any tree is accepted for another repo" t_spec_review_foreign_tree $LIB 'repo_owns() { [[ $REPO_IS_DEFAULT -eq 1 ]] || repo_checkout "$1"; }' 'repo_owns() { true; }'
+prove "Velostream's own trees are asked for an origin" t_spec_review_foreign_tree $LIB 'repo_owns() { [[ $REPO_IS_DEFAULT -eq 1 ]] || repo_checkout "$1"; }' 'repo_owns() { repo_checkout "$1"; }'
+prove "status fetches the titles of another repo's worktrees" t_status_foreign_worktrees bin/velo-status 'repo_owns "$WT" || continue
+  N=' 'N='
+prove "status lists another repo's worktrees" t_status_foreign_worktrees bin/velo-status 'repo_owns "$WT" || continue
+  ISSUE=' 'ISSUE='
+prove "status reads a legacy exit record from another repo's tree" t_status_foreign_worktrees bin/velo-status '[[ $REPO_IS_DEFAULT -eq 1 && -f "$res" ]] || return 0' '[[ -f "$res" ]] || return 0'
+prove "status lists a legacy record of another repo's tree" t_status_foreign_worktrees bin/velo-status 'if [[ $REPO_IS_DEFAULT -eq 1 && -f "$RES" && ( $VERBOSE -eq 1 || -n "$ONLY" ) ]]; then' 'if [[ -f "$RES" && ( $VERBOSE -eq 1 || -n "$ONLY" ) ]]; then'
+prove "the orchestrator counts another repo's running workers" t_orchestrd_foreign_worktrees bin/velo-orchestrd 'repo_owns "$d" || continue
+    pid=' 'pid='
+prove "the orchestrator escalates another repo's STOP" t_orchestrd_foreign_worktrees bin/velo-orchestrd 'repo_owns "$d" || continue
+    issue=' 'issue='
+prove "a dispatch resumes another repo's worktree" t_dispatch_foreign_worktree bin/velo-dispatch '[[ ! -e "$WT" ]] || repo_owns "$WT" || die "$REPO_ERR' '[[ ! -e "$WT" ]] || repo_owns "$WT" || : "$REPO_ERR'
+prove "record records against another repo's tree" t_record_foreign_tree bin/velo-record '[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' ':'
+prove "record records another repo's worktree" t_record_foreign_tree bin/velo-record 'repo_owns "$WORKTREE" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }' ':'
+prove "record asks an explicit record root for an origin" t_record_foreign_tree bin/velo-record '[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" ||' 'repo_owns "$ROOT" ||'
 
 proofs_finish
 echo

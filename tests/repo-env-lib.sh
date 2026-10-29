@@ -33,7 +33,8 @@ MUT_PATHS="bin hooks rules"
 . "$HERE/mutation-lib.sh"
 
 DEF=velostreamai/velostream; ALT=velostreamai/velo-agents; ALT_SUB=velostreamai__velo-agents
-PR=12; WIP=77; ISS=78; ISS_REAL=79
+CLASH=acme/velostream; CLASH_SUB=acme__velostream   # the same repo NAME as DEF, another owner: ~/RustroverProjects/velostream is DEF's
+PR=12; WIP=77; ISS=78; ISS_REAL=79; CLASH_WIP=99
 HEADSHA=1111111111111111111111111111111111111111; H9=111111111
 GITID='-c user.email=t@t -c user.name=t -c commit.gpgsign=false'
 GOLDEN="$HERE/fixtures/repo-env/default.golden"
@@ -151,6 +152,14 @@ mk_worker() {   # <name> <default branch> <branch>: the worktree ~/RustroverProj
 mk_world() {   # both repos' trees, each with a worker worktree
   mk_tree velostream master && mk_tree velo-agents main \
     && mk_worker velostream master fix/$WIP-def && mk_worker velo-agents main fix/$WIP-alt
+}
+mk_clash() {   # $CLASH has Velostream's directory name. ~/RustroverProjects/velostream is Velostream's tree, with its worker
+               # velostream-77; $CLASH's own clone is in ~/other, its worker is the worktree velostream-99 (both on main)
+  local rem="$SB/remote/acme/velostream" own="$H/other/velostream" wt="$H/RustroverProjects/velostream-$CLASH_WIP"
+  mk_tree velostream main && mk_worker velostream main fix/$WIP-def \
+    && git init -q -b main "$rem" && echo "seed acme" > "$rem/seed.txt" && git -C "$rem" add seed.txt && git -C "$rem" $GITID commit -q -m "seed acme" \
+    && git clone -q "$rem" "$own" && git -C "$own" worktree add -q -b fix/$CLASH_WIP-acme "$wt" origin/main \
+    && echo w > "$wt/w.txt" && git -C "$wt" add w.txt && git -C "$wt" $GITID commit -q -m worker
 }
 x() {   # <cmd...>: one command in the sandbox under $XE, from $CWD -> OUT RC
   OUT=$(cd "$CWD" && env "${ENVV[@]}" $XE "$@" 2>&1); RC=$?

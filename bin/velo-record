@@ -67,6 +67,13 @@ done
 
 [[ -n "$ISSUE" && -n "$WORKTREE" ]] || { echo "velo-record: need <issue> and --worktree" >&2; exit 0; }
 
+# The tree read below (the base sha, the task spec) and the worktree measured must be REPO's own. Another repo's, under the
+# same directory name (the name is the same, the owner is not), would put its sha, its spec or its commits into this
+# repo's records: said, and nothing recorded, as for a base that cannot be found. VELO_RECORD_ROOT names a directory of
+# records, not a checkout, and is not asked.
+[[ -n "${VELO_RECORD_ROOT:-}" ]] || repo_owns "$ROOT" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }
+repo_owns "$WORKTREE" || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }
+
 # The ref commits are counted against. velo-dispatch hands its own down for a repo that is not the default; a hand run
 # asks for itself, and a row counted against a ref that does not exist would say the worker committed nothing.
 if [[ -z "${WT_BASE_REF:-}" ]]; then

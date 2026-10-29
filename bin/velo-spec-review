@@ -73,6 +73,10 @@ fi
 # the gate refused a spec that had in fact been reviewed. Caught by testing the
 # two together; it would have looked like a flaky gate.
 ROOT="$HOME/RustroverProjects/${REPO_NAME}"
+# Another repo's tree under this directory name (the name is the same, the owner is not) is neither read nor written, and
+# the reviewer is never sent to it: a spec and its `reviewed` block belong to the repo the issue is in.
+repo_owns "$ROOT" || die "$REPO_ERR
+       velo-spec-review works on $REPO's task specs in the checkout at $ROOT and in no other repo's tree."
 
 # --check may review a spec that is not on master yet. Attest mode may NOT: the
 # paragraph above is why, and it still holds.
@@ -95,6 +99,7 @@ REVIEW_ROOT="$ROOT"
 if [[ -n "$REVIEW_WT" ]]; then
   [[ -d "$REVIEW_WT" ]] || die "--worktree not found: $REVIEW_WT"
   REVIEW_ROOT=$(cd "$REVIEW_WT" && pwd)
+  repo_owns "$REVIEW_ROOT" || die "--worktree: $REPO_ERR"
 fi
 SPEC="$REVIEW_ROOT/.agents/tasks/${ISSUE}.json"
 # Name which tree was searched: with --worktree the canonical path is not the

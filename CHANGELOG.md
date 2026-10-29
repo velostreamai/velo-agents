@@ -30,9 +30,15 @@ equals the default repo's trace today; a stub `gh` proves every call for another
 script but the lib spells the default and every `gh` call and state path is scoped; each check is proved red by a named
 mutant. Two existing suites moved with it: `test-timeouts.sh` exports `VELO_REPO_LIB` so a script a suite copies away from
 `bin/` still finds the lib, and `test_brief_sweep.sh` re-anchors two mutation anchors on the line that now carries
-`${REPO_SUB}` (the proofs still bite). **Prevents:** a gate or a worker acting on the wrong repository's PR or issue with the
+`${REPO_SUB}` (the proofs still bite). A repo that has Velostream's name and another owner (`acme/velostream`) resolves to the
+same `~/RustroverProjects/velostream` and `velostream-<n>` paths, so every tool that finds a tree by name asks `repo_owns`
+first (the `origin` must be the repo; the default repo is not asked): `velo-status` and `velo-orchestrd` skip another repo's
+worktree, `velo-spec-review` (its tree and any `--worktree`), `velo-dispatch` (the worktree at the issue's path) and `velo-record`
+(its tree and `--worktree`) refuse it, naming the path, and `velo-status` reads the legacy `.agents/tasks` record location for
+Velostream only, as `velo-dispatch` already did. **Prevents:** a gate or a worker acting on the wrong repository's PR or issue with the
 same number, a worker cut from the wrong tree or the wrong base branch, two repos' gate locks and records overwriting one
-another, and a non-Velostream run failing on prerequisites that only Velostream has — or silently skipping them.
+another, one owner's tools reading, attesting, counting or resuming another owner's checkout of the same name, and a
+non-Velostream run failing on prerequisites that only Velostream has — or silently skipping them.
 
 ### Added — velo-task guard hooks, and a standing bash 3.2 sweep (#2769, M3c)
 

@@ -27,7 +27,7 @@
 #                     (OVERRIDE-DIRECTIVES:). A variable, not a function: it is spliced into a heredoc, and a
 #                     command substitution would eat the newlines that end it
 #
-# repo_base_branch sets BASE_BRANCH and WT_BASE_REF; repo_checkout, repo_worktree and repo_scoped are described at
+# repo_base_branch sets BASE_BRANCH and WT_BASE_REF; repo_checkout, repo_owns, repo_worktree and repo_scoped are described at
 # their definitions. Callers that count a worktree's commits read ${WT_BASE_REF:-origin/master}, so a script run on
 # its own, with nothing set, is the Velostream one.
 
@@ -67,6 +67,12 @@ repo_checkout() {
   [[ "$have" == "$(tr '[:upper:]' '[:lower:]' <<<"$REPO")" ]] \
     || { REPO_ERR="$1 is a checkout of ${have:-nothing (it has no origin)}, not $REPO"; return 1; }
 }
+
+# repo_owns <dir> — 0 when <dir> may be used as REPO's tree. The default repo's trees are found by name, as they always
+# were, and are not asked. For any other repo the name is not enough: a repo that has the same name and another owner
+# (acme/velostream beside the default repo) has the same ~/RustroverProjects/$REPO_NAME and $REPO_NAME-*, so every tree
+# used by name, canonical or globbed, must pass repo_checkout first. REPO_ERR says why not.
+repo_owns() { [[ $REPO_IS_DEFAULT -eq 1 ]] || repo_checkout "$1"; }
 
 # repo_worktree <branch> — the worktree of REPO checked out on <branch>, in REPO_WT. For every repo but the default,
 # whose lookup (the caller's own `git worktree list`) is unchanged. Only ~/RustroverProjects/$REPO_NAME and

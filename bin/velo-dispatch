@@ -1113,6 +1113,12 @@ WT="$WORKTREE_BASE/${REPO_NAME}-$ISSUE"
 # (fetch already done in section 3a, before anchors were measured)
 BASE="${BASE_SHA:0:9}"
 
+# The worktree's path is the repo's name plus the issue, so a worktree of another repo can already be on it (the name is
+# the same, the owner is not). It is not resumed (that would run this repo's worker in the other repo's tree) and not
+# removed (a dry run, a resume and a fresh cut all read it first).
+[[ ! -e "$WT" ]] || repo_owns "$WT" || die "$REPO_ERR
+  $WT is where a worker for $REPO is cut, and it is not a worktree of $REPO. Move it away first."
+
 if [[ $DRY -eq 1 ]]; then
   echo
   echo "DRY RUN — would do:"

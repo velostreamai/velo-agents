@@ -368,6 +368,9 @@ list_active_worktrees() {   # -> one worktree path per line with a live worker p
   local d pid
   for d in $WORKTREE_GLOB; do
     [[ -d "$d" ]] || continue
+    # a worker of another repo under this directory name (the owner differs, the name does not) is not this repo's: it is
+    # neither counted against the cap nor escalated
+    repo_owns "$d" || continue
     pid=$(orch_running_pid_for "$d")
     [[ -n "$pid" ]] && printf '%s\n' "$d"
   done
@@ -500,6 +503,7 @@ step_wedge_and_stop() {
   local d issue
   for d in $WORKTREE_GLOB; do
     [[ -d "$d" ]] || continue
+    repo_owns "$d" || continue
     issue="${d##*-}"
     [[ "$issue" =~ ^[0-9]+$ ]] || issue="$(basename "$d")"
 

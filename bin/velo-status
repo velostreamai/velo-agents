@@ -165,7 +165,8 @@ exit_record_for() {
   local issue="$1" log="$2"
   local res="$ROOT/.agents/tasks/${issue}.result.jsonl"
   local out rc
-  [[ -f "$res" ]] || return 0
+  # That location holds Velostream's rows only, as in velo-dispatch: another repo's tree is never read for a record.
+  [[ $REPO_IS_DEFAULT -eq 1 && -f "$res" ]] || return 0
   # Return code is LOAD-BEARING and distinct from the output (#2102 review):
   #
   #   0 + output  a record exists — the run has exited
@@ -219,6 +220,8 @@ TITLE_DIR=$(mktemp -d)
 trap 'rm -rf "$TITLE_DIR"' EXIT
 for WT in "$WORKTREE_BASE"/${REPO_NAME}-*; do
   [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
+  # a worktree of another repo under this directory name (the owner differs, the name does not) is not this repo's worker
+  repo_owns "$WT" || continue
   N="${WT##*${REPO_NAME}-}"
   [[ "$N" =~ ^[0-9]+$ ]] || continue          # docsql / prgate etc. have no issue
   [[ -n "$ONLY" && "$N" != "$ONLY" ]] && continue
@@ -315,6 +318,7 @@ printf '%s\n' "─────────────────────�
 FOUND=0
 for WT in "$WORKTREE_BASE"/${REPO_NAME}-*; do
   [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
+  repo_owns "$WT" || continue
   ISSUE="${WT##*${REPO_NAME}-}"
   [[ -n "$ONLY" && "$ISSUE" != "$ONLY" ]] && continue
   FOUND=1
@@ -467,7 +471,7 @@ for WT in "$WORKTREE_BASE"/${REPO_NAME}-*; do
   # can only describe the run happening NOW. The record is what finished runs
   # left behind — and it is the only place cost and rework appear at all.
   RES="$ROOT/.agents/tasks/${ISSUE}.result.jsonl"
-  if [[ -f "$RES" && ( $VERBOSE -eq 1 || -n "$ONLY" ) ]]; then
+  if [[ $REPO_IS_DEFAULT -eq 1 && -f "$RES" && ( $VERBOSE -eq 1 || -n "$ONLY" ) ]]; then
     python3 - "$RES" <<'PYR'
 import json, sys
 # JSONL: a malformed line loses that ROW, never the file. The array format this
