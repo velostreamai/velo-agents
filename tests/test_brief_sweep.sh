@@ -446,9 +446,9 @@ APPEND='{ cat "$BRIEF_AS_WRITTEN"; printf '"'"'\n\n%s\n'"'"' "$SWEEP_TEXT"; } > 
 prove_dispatch "dispatch appends the sweep file to the brief" sc_dispatch_appends \
   "$APPEND" 'cp "$BRIEF_AS_WRITTEN" "$BRIEF" \'
 prove_dispatch "...to a COPY: the caller's file is never written to" sc_dispatch_appends \
-  'BRIEF="$VELO_STATE/dispatch/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"' 'BRIEF="$BRIEF_AS_WRITTEN"'
+  'BRIEF="$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"' 'BRIEF="$BRIEF_AS_WRITTEN"'
 prove_dispatch "...and the spec pin still holds for a second dispatch of the same file" sc_dispatch_pins_the_callers_file \
-  'BRIEF="$VELO_STATE/dispatch/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"' 'BRIEF="$BRIEF_AS_WRITTEN"'
+  'BRIEF="$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"' 'BRIEF="$BRIEF_AS_WRITTEN"'
 prove_dispatch "the dry run names the caller's file" sc_dispatch_appends \
   'echo "  brief    : $BRIEF_AS_WRITTEN"' 'echo "  brief    : $BRIEF"'
 prove_dispatch "...and the copy the worker gets" sc_dispatch_appends \

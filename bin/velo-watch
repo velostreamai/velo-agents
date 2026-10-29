@@ -19,6 +19,9 @@
 #
 # usage: velo-watch [--pr N]... [--interval SECS] [--max SECS] [--attention]
 set -u
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]:-$0}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 interval=60
 max=21600
 prs=()
@@ -66,14 +69,14 @@ if [ "$attention_mode" -eq 1 ]; then
 fi
 
 gates() {
-  ps -eo pid=,command= | grep -E "(codex review|claude -p).*state/gate/[0-9]+/" | grep -v grep \
-    | sed -E 's#^ *([0-9]+) .*state/gate/([0-9]+)/([a-z-]+)[.-].*#\2:\3#' | sort -u
+  ps -eo pid=,command= | grep -E "(codex review|claude -p).*$GATE_PATH_RE" | grep -v grep \
+    | sed -E "s#^ *([0-9]+) .*state/$GATE_SUBDIR/([0-9]+)/([a-z-]+)[.-].*#\2:\3#" | sort -u
 }
 # A worker's exit is recorded by its supervisor as a new line in
 # ~/.agents/state/records/<issue>.result.jsonl — that is the authoritative
 # signal (process command lines do not reliably carry the worktree path).
 workers() {
-  for f in "$HOME"/.agents/state/records/*.result.jsonl; do
+  for f in "$HOME"/.agents/state/records$REPO_SUB/*.result.jsonl; do
     [ -f "$f" ] && echo "$(basename "$f" .result.jsonl):$(wc -l < "$f" | tr -d ' ')"
   done | sort
 }
@@ -83,7 +86,7 @@ running_workers() {
 }
 ci_pending() {
   for p in "${prs[@]+"${prs[@]}"}"; do
-    if gh pr checks "$p" --repo velostreamai/velostream 2>/dev/null | grep -qE "\bpending\b"; then
+    if gh pr checks "$p" --repo "$REPO" 2>/dev/null | grep -qE "\bpending\b"; then
       echo "$p"
     fi
   done

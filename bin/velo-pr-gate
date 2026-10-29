@@ -135,7 +135,9 @@
 # "do NOT write any file" instruction becomes a request rather than a guarantee.
 
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 
 # Gate artefacts live under ~/.agents/state, NOT /tmp.
 #
@@ -250,9 +252,16 @@ fi
 
 WT=$(gh pr view "$PR" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null)
 [[ -n "$WT" ]] || die "could not read head branch for #$PR"
-WTPATH=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$WT" '
-  /^worktree /{p=$2} /^branch /{if($2==b) print p}' | head -1)
-[[ -n "$WTPATH" ]] || die "no local worktree checked out on '$WT' — a gate must read the tree it reviews"
+if [[ $REPO_IS_DEFAULT -eq 1 ]]; then
+  WTPATH=$(git worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$WT" '
+    /^worktree /{p=$2} /^branch /{if($2==b) print p}' | head -1)
+  [[ -n "$WTPATH" ]] || die "no local worktree checked out on '$WT' — a gate must read the tree it reviews"
+else
+  # Another repo's tree is found by name and origin, never from the caller's cwd: `git worktree list` there would
+  # answer with the cwd repo's worktrees, and a branch name proves nothing across repos.
+  repo_worktree "$WT" || die "$REPO_ERR"
+  WTPATH="$REPO_WT"
+fi
 
 ok "worktree: $WTPATH"
 
@@ -269,7 +278,7 @@ ok "worktree: $WTPATH"
 # A lock is the honest answer: refuse the second gate rather than let two
 # interleave and produce a report neither of them wrote. `mkdir` is atomic on
 # POSIX, so this is a real mutex, not a check-then-act.
-GATE_DIR="$VELO_STATE/gate/$PR"
+GATE_DIR="$VELO_STATE/${GATE_SUBDIR}/$PR"
 mkdir -p "$GATE_DIR"
 GATE_LOCK="$GATE_DIR/.lock"
 # Who holds the lock? A holder is KNOWN or it is not, and only a holder KNOWN to be gone makes the
@@ -339,7 +348,11 @@ trap 'rm -rf "$GATE_LOCK"' EXIT
 # and its mtime moves only when an entry is created or removed directly in it — so after a week
 # of re-gating PRs that already have a directory the ROOT is "older than 7 days", and without it
 # this deleted every PR's gate state, the lock taken above included.
-find "$VELO_STATE/gate" -maxdepth 1 -mindepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+find "$VELO_STATE/gate" -maxdepth 1 -mindepth 1 -type d ! -name '*__*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+# `! -name '*__*'` keeps another repo's directory (gate/<owner>__<name>, see velo-repo-lib.sh) out of that sweep: its own
+# mtime moves only when a PR directory is first created in it, so it reads as idle while its PRs are live. Its PR
+# directories are pruned by the same rule, from inside.
+[[ $REPO_IS_DEFAULT -eq 1 ]] || find "$VELO_STATE/$GATE_SUBDIR" -maxdepth 1 -mindepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 
 # >>> velo-gated-sha (extracted verbatim by tests/test_pr_gate_launch.sh)
 # Recorded at LAUNCH, before any gate is dispatched — not derived later from
@@ -500,7 +513,7 @@ dispatch_local() {  # $1 = skill, $2 = log suffix
   nohup "$WRAPPER" --model "$LOCAL_MODEL" --base-url "$LMSTUDIO_URL" \
       --policy "$POLICY" --skill "$skill" \
       --max-turns 200 --prompt-timeout 14400 --cwd "$WTPATH" \
-      --task "$(cat "$SCOPE")" > "$log" 2>&1 &
+      --task "${REPO_NOTE}$(cat "$SCOPE")" > "$log" 2>&1 &
   # Global, not local: the caller needs this pid for GATE_PIDS, and `local`
   # would die with the function's return.
   LAST_DISPATCH_PID=$!
@@ -559,7 +572,7 @@ write_check_code_agent_prompt() {   # [out-file] [reviewer] -> $1 (default $CODE
     echo "- Do not post anywhere (no gh, no network). Your final message IS the report."
     echo
     check_code_instructions
-    printf '%s\n\n' "$body"
+    printf '%s%s\n\n' "$REPO_NOTE" "$body"
     echo "OUTPUT — your final message, plain text, exactly this shape and nothing else:"
     echo
     echo "## check-code — PR $PR @ $HEAD"
@@ -584,6 +597,9 @@ write_check_code_agent_prompt() {   # [out-file] [reviewer] -> $1 (default $CODE
   } > "$out"
 }
 
+# The spec sidecars (.agents/tasks/<n>.json) and the Rust test names the check below greps for are Velostream's. Run
+# against another repo it would read the sidecar of whichever Velostream issue shares the number: skipped, and said.
+if [[ $REPO_IS_DEFAULT -eq 1 ]]; then
 # >>> velo-fail-to-pass-merge (extracted verbatim by tests/test_fail_to_pass.sh)
 # ---- the acceptance gate must name tests that WOULD HAVE FAILED ------------
 #
@@ -740,6 +756,9 @@ print('\n'.join(names))
   fi
 fi
 # <<< velo-fail-to-pass-merge
+else
+  echo "  fail_to_pass: skipped — it reads Velostream's .agents/tasks sidecars, and $REPO has none"
+fi
 
 # check-code is routed alongside code-review below (the free OpenRouter tier by default; a
 # read-only Sonnet agent the orchestrator launches, or the opus leg, on request) — see the routing
@@ -897,7 +916,7 @@ integration and performance binary and will burn your budget.
 EXECNOTE
 )
 
-WORKTREE: $WTPATH (head $HEAD)
+${REPO_NOTE}WORKTREE: $WTPATH (head $HEAD)
 
     git -C $WTPATH diff $RANGE
     gh pr view $PR --repo $REPO --comments
@@ -1144,13 +1163,13 @@ EOF
   # tool than one you are steered past.
   GPS="${HEAD:-}"
   [[ -n "$GPS" ]] && GPS=" --sha $GPS"
-  [[ $NEEDS_CODE  -eq 1 ]] && echo "    velo-gate-post $PR check-code  <report>$GPS"
-  [[ $NEEDS_SPEC  -eq 1 ]] && echo "    velo-gate-post $PR check-spec  <report>$GPS"
-  echo "    velo-gate-post $PR code-review <report>$GPS"
+  [[ $NEEDS_CODE  -eq 1 ]] && echo "    ${GATE_CMD_ENV}velo-gate-post $PR check-code  <report>$GPS"
+  [[ $NEEDS_SPEC  -eq 1 ]] && echo "    ${GATE_CMD_ENV}velo-gate-post $PR check-spec  <report>$GPS"
+  echo "    ${GATE_CMD_ENV}velo-gate-post $PR code-review <report>$GPS"
   # Never post it under a *review name: that stamp would move Codex's next range.
   [[ "${VELO_SECOND_OPINION:-1}" == "1" ]] && \
-    echo "    velo-gate-post $PR second-opinion <report>$GPS   (optional, non-blocking)"
-  echo "    velo-gate $PR --pass | --block"
+    echo "    ${GATE_CMD_ENV}velo-gate-post $PR second-opinion <report>$GPS   (optional, non-blocking)"
+  echo "    ${GATE_CMD_ENV}velo-gate $PR --pass | --block"
 fi
 
 # --brief-only with no code-review planned: there is no brief to prepare, and the
@@ -1188,7 +1207,7 @@ if [[ "${GATE_RUNNING_PENDING:-0}" -eq 1 ]]; then
   else
     warn "could not record gate:running for #$PR — the reviewers are running, but the PR is NOT labelled, so velo-orchestrd will not pick their results up."
     warn "velo-gate said: $(printf '%s' "$RUNNING_OUT" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-300)"
-    warn "Set it by hand: velo-gate $PR --running"
+    warn "Set it by hand: ${GATE_CMD_ENV}velo-gate $PR --running"
   fi
 fi
 

@@ -21,6 +21,10 @@
 # than the thing it measures.
 
 set -uo pipefail
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh. Observational like the rest of
+# this script: a repo it cannot resolve says so and records nothing, exiting 0.
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 0
+repo_init || exit 0
 
 # Records outlive the worktree they describe — a worktree is deleted after merge,
 # and the rework history is the most interesting part of the data — so they land
@@ -31,7 +35,7 @@ set -uo pipefail
 # without this, validating velo-record meant dropping stray files into master's
 # working tree, which is exactly the cross-contamination the worktree discipline
 # is there to prevent.
-ROOT="${VELO_RECORD_ROOT:-$HOME/RustroverProjects/velostream}"
+ROOT="${VELO_RECORD_ROOT:-$HOME/RustroverProjects/${REPO_NAME}}"
 LIB="$(dirname "${BASH_SOURCE[0]}")/velo-worktree-lib.sh"
 [[ -f "$LIB" ]] || LIB="$ROOT/.agents/bin/velo-worktree-lib.sh"
 # shellcheck source=/dev/null
@@ -62,6 +66,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$ISSUE" && -n "$WORKTREE" ]] || { echo "velo-record: need <issue> and --worktree" >&2; exit 0; }
+
+# The ref commits are counted against. velo-dispatch hands its own down for a repo that is not the default; a hand run
+# asks for itself, and a row counted against a ref that does not exist would say the worker committed nothing.
+if [[ -z "${WT_BASE_REF:-}" ]]; then
+  repo_base_branch || { echo "velo-record: $REPO_ERR — nothing recorded" >&2; exit 0; }
+fi
 
 FINISHED=$(date -u +%FT%TZ)
 
@@ -122,7 +132,7 @@ fi
 # workers — the same asterisk that made a published 98.6% need one.
 BRIEF_SHA=""
 [[ -n "$BRIEF" && -f "$BRIEF" ]] && BRIEF_SHA=$(shasum -a 256 "$BRIEF" | cut -c1-16)
-[[ -n "$BASE" ]] || BASE=$(git -C "$ROOT" rev-parse --short origin/master 2>/dev/null)
+[[ -n "$BASE" ]] || BASE=$(git -C "$ROOT" rev-parse --short ${WT_BASE_REF:-origin/master} 2>/dev/null)
 
 # ---- outcome ----------------------------------------------------------------
 # Order matters. A leaked tool call outranks everything: the run may look clean
@@ -194,7 +204,7 @@ fi
 # VELO_RECORD_ROOT stays the test/override knob; it now names a directory that
 # CONTAINS records rather than a repo checkout.
 RECORD_DIR="${VELO_RECORD_ROOT:+$VELO_RECORD_ROOT/records}"
-RECORD_DIR="${RECORD_DIR:-${VELO_STATE:-$HOME/.agents/state}/records}"
+RECORD_DIR="${RECORD_DIR:-${VELO_STATE:-$HOME/.agents/state}/records}$REPO_SUB"
 mkdir -p "$RECORD_DIR"
 OUT="$RECORD_DIR/${ISSUE}.result.jsonl"
 

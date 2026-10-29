@@ -115,6 +115,10 @@ echo
 echo "── dispatch preflight (end-to-end) ────────────────────"
 suite test_dispatch_preflight.sh bash "$HERE/test_dispatch_preflight.sh"
 echo
+echo "── VELO_REPO: the tools on another repo (velo-agents#17) ─"
+suite test_repo_env.sh bash "$HERE/test_repo_env.sh"
+suite test_repo_env_workers.sh bash "$HERE/test_repo_env_workers.sh"
+echo
 echo "── check-code skill inlining (#2301) ──────────────────"
 suite test_check_code_skill.sh bash "$HERE/test_check_code_skill.sh"
 echo

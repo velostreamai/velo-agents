@@ -13,8 +13,12 @@
 set -uo pipefail
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 
-REPO="velostreamai/velostream"
-ROOT="$HOME/RustroverProjects/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
+# The ref every worktree's commits are counted against: the repo's default branch (no GitHub call for the default repo).
+repo_base_branch || { echo "velo-status: $REPO_ERR" >&2; exit 1; }
+ROOT="$HOME/RustroverProjects/${REPO_NAME}"
 WORKTREE_BASE="$HOME/RustroverProjects"
 # Native (Agent-tool) workers are recorded by velo-native, which sits beside this script.
 NATIVE_BIN="$(dirname "${BASH_SOURCE[0]}")/velo-native"
@@ -213,9 +217,9 @@ with open(path, encoding="utf-8") as fh:
 # glance, so they are forked together and collected.
 TITLE_DIR=$(mktemp -d)
 trap 'rm -rf "$TITLE_DIR"' EXIT
-for WT in "$WORKTREE_BASE"/velostream-*; do
+for WT in "$WORKTREE_BASE"/${REPO_NAME}-*; do
   [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
-  N="${WT##*velostream-}"
+  N="${WT##*${REPO_NAME}-}"
   [[ "$N" =~ ^[0-9]+$ ]] || continue          # docsql / prgate etc. have no issue
   [[ -n "$ONLY" && "$N" != "$ONLY" ]] && continue
   ( gh issue view "$N" --repo "$REPO" --json title --jq .title 2>/dev/null \
@@ -309,9 +313,9 @@ printf '%-7s %-13s %-8s %-7s %-6s %-16s %-26s %s\n' ISSUE WORKER STATE COMMITS D
 printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 FOUND=0
-for WT in "$WORKTREE_BASE"/velostream-*; do
+for WT in "$WORKTREE_BASE"/${REPO_NAME}-*; do
   [[ -d "$WT/.git" || -f "$WT/.git" ]] || continue
-  ISSUE="${WT##*velostream-}"
+  ISSUE="${WT##*${REPO_NAME}-}"
   [[ -n "$ONLY" && "$ISSUE" != "$ONLY" ]] && continue
   FOUND=1
 
@@ -353,7 +357,7 @@ for WT in "$WORKTREE_BASE"/velostream-*; do
   # The shapes differ reliably: bookkeeping is `dispatch-<UTC>.log`, a runner log
   # is `<tag>-<UTC>-<pid>.log` since #2101, so the trailing `-<pid>` keeps even a
   # literal `dispatch` LOGTAG distinguishable.
-  LOG=$(ls -t "$VELO_STATE/dispatch/$ISSUE"/*.log 2>/dev/null \
+  LOG=$(ls -t "$VELO_STATE/dispatch${REPO_SUB}/$ISSUE"/*.log 2>/dev/null \
         | grep -vE '/(dispatch-[0-9]{8}T[0-9]{6}Z|zg-index)\.log$' | head -1)
   WORKER="-"
   if [[ -n "$PID" ]]; then
@@ -548,7 +552,7 @@ while IFS=$'\t' read -r NI NMODEL _ NFIN _ _ NWT _ NSAGE; do
 done <<<"$NATIVE_ROWS"
 [[ $NATIVE_RC -eq 0 ]] || echo "${RED}native records UNREADABLE${OFF}: velo-native rows exited $NATIVE_RC (reason on stderr). A worker whose record cannot be read is NOT shown."
 
-[[ $FOUND -eq 1 ]] || { echo "no velostream-* worktrees found"; exit 0; }
+[[ $FOUND -eq 1 ]] || { echo "no ${REPO_NAME}-* worktrees found"; exit 0; }
 echo "slots: $NATIVE_RUNNING native running, $DISPATCH_RUNNING dispatched running"
 
 # Stale stashes are a trap for the next worker, and stashes are REPO-GLOBAL:

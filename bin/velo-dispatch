@@ -32,8 +32,10 @@
 
 set -uo pipefail
 
-REPO="velostreamai/velostream"
-ROOT="$HOME/RustroverProjects/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
+ROOT="$HOME/RustroverProjects/${REPO_NAME}"
 WORKTREE_BASE="$HOME/RustroverProjects"
 # See velo-pr-gate's header: worker logs live under ~/.agents/state, not /tmp.
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
@@ -123,8 +125,8 @@ done
 
 # Open the audit log now: the issue number is validated, so the path is safe to
 # build, and everything from here on is a decision worth keeping.
-mkdir -p "$VELO_STATE/dispatch/${ISSUE}" 2>/dev/null || true
-DLOG="$VELO_STATE/dispatch/${ISSUE}/dispatch-$(date -u +%Y%m%dT%H%M%SZ).log"
+mkdir -p "$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}" 2>/dev/null || true
+DLOG="$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/dispatch-$(date -u +%Y%m%dT%H%M%SZ).log"
 : >> "$DLOG" 2>/dev/null || DLOG=""
 # $* is empty here — the flag loop above already shifted them away — so record
 # the PARSED mode instead, which is what an audit actually wants: --force is the
@@ -135,6 +137,23 @@ _audit "START issue=$ISSUE brief=$BRIEF dry_run=$DRY force=$FORCE branch=${BRANC
 [[ -s "$BRIEF" ]] || die "brief file is empty: $BRIEF"
 
 echo "── validating #$ISSUE ─────────────────────────────────"
+
+# ---- 0. which repo's tree ---------------------------------------------------
+# The default repo goes straight on, as it always has. Any other must prove its tree is a checkout of THAT repo
+# before one git command runs in it: a worker cut from Velostream's tree for another repo's issue is a wrong-repo run
+# nothing downstream would notice. Its worktrees are cut from the repo's own default branch, not from master.
+if [[ $REPO_IS_DEFAULT -eq 0 ]]; then
+  repo_checkout "$ROOT" || die "$REPO_ERR
+  A worker for $REPO is cut from the checkout at $ROOT (the repo's name under ~/RustroverProjects) and never from
+  another repo's tree. Clone $REPO there, or unset VELO_REPO to dispatch for the default repo."
+fi
+repo_base_branch || die "$REPO_ERR"
+if [[ $REPO_IS_DEFAULT -eq 0 ]]; then
+  ok "repo $REPO: tree $ROOT, worktree $WORKTREE_BASE/${REPO_NAME}-$ISSUE cut from $WT_BASE_REF"
+  warn "$REPO is not Velostream: the discovery index is not built, and the worker's task overrides the Velostream-only
+       directives (the CLAUDE.md read, ./run-commit.sh --fast, the STREAMING-COMPLIANCE-CHECK log) — its brief
+       must name this repo's own validation."
+fi
 
 # ---- 1. issue exists and is open -------------------------------------------
 META=$(gh issue view "$ISSUE" --repo "$REPO" --json state,title,labels,assignees 2>/dev/null) \
@@ -161,9 +180,9 @@ if [[ ",$LABELS," == *",blocked,"* ]]; then
 fi
 if [[ ",$LABELS," == *",triage-needed,"* ]]; then
   if [[ $FORCE -eq 0 ]]; then
-    die "#$ISSUE is labelled 'triage-needed' — its claims may not match master.
+    die "#$ISSUE is labelled 'triage-needed' — its claims may not match $BASE_BRANCH.
   FOUR issues in one session turned out already-fixed. Verify the issue's
-  file:line anchors against current master, then remove the label.
+  file:line anchors against current $BASE_BRANCH, then remove the label.
   Re-run with --force only if you have just verified it."
   fi
   warn "triage-needed present, proceeding under --force"
@@ -352,8 +371,9 @@ history_verdict() { # <last_worker> <last_outcome> <new_worker> <reason>
 # safe — the guard only ever compares worker/outcome — and a missing file is
 # indistinguishable from "no history", which is precisely the failure that
 # motivated moving them.
-RESULT_FILE="${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl"
-if [[ ! -f "$RESULT_FILE" ]]; then
+RESULT_FILE=$(repo_scoped "${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl")
+# The legacy paths hold Velostream's rows only: another repo's issue #N must not read #N's history from them.
+if [[ ! -f "$RESULT_FILE" && $REPO_IS_DEFAULT -eq 1 ]]; then
   for _legacy in "$ROOT/.agents/tasks/${ISSUE}.result.jsonl" \
                  "$HOME/.agents/tasks/${ISSUE}.result.jsonl"; do
     [[ -f "$_legacy" ]] && { RESULT_FILE="$_legacy"; warn "reading LEGACY record location: $_legacy"; break; }
@@ -557,8 +577,8 @@ git -C "$ROOT" worktree prune 2>/dev/null || true
 # landing mid-validation gave the worker a tree the anchors never described —
 # and the self-check compared against that same new ref, making the mismatch
 # invisible in every output (#2012 M1). This is #1965 through a narrower window.
-BASE_SHA=$(git -C "$ROOT" rev-parse origin/master) || die "cannot resolve origin/master"
-ok "validating against origin/master (${BASE_SHA:0:9}) — pinned for this run"
+BASE_SHA=$(git -C "$ROOT" rev-parse ${WT_BASE_REF:-origin/master}) || die "cannot resolve ${WT_BASE_REF:-origin/master}"
+ok "validating against ${WT_BASE_REF:-origin/master} (${BASE_SHA:0:9}) — pinned for this run"
 
 # ---- 3b. task spec sidecar (authoritative when present) ---------------------
 SPEC="$ROOT/.agents/tasks/${ISSUE}.json"
@@ -675,9 +695,9 @@ print('' if d is None else (json.dumps(d) if isinstance(d,(list,dict)) else d))
   # Anchors: SYMBOLS re-verified against the tree. Line numbers rot; symbols do not.
   ANCH=$(y anchors)
   if [[ "$ANCH" != "[]" && -n "$ANCH" ]]; then
-    STALE=$(python3 - "$ROOT" "$SPEC" "$BASE_SHA" <<'PYA'
+    STALE=$(python3 - "$ROOT" "$SPEC" "$BASE_SHA" "${WT_BASE_REF:-origin/master}" <<'PYA'
 import sys, json, subprocess
-root, spec, base = sys.argv[1], sys.argv[2], sys.argv[3]
+root, spec, base, ref = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 def at_origin(path):
     """File content as it exists at origin/master — NOT in the working tree.
@@ -704,19 +724,19 @@ for a in (json.load(open(spec)) or {}).get("anchors") or []:
         continue
     content = at_origin(f)
     if content is None:
-        bad.append(f"{f}: FILE MISSING at origin/master"); continue
+        bad.append(f"{f}: FILE MISSING at {ref}"); continue
     n = content.count(sym)
     if n == 0:
-        bad.append(f"{f}: symbol '{sym}' NOT FOUND at origin/master")
+        bad.append(f"{f}: symbol '{sym}' NOT FOUND at {ref}")
     elif exp is not None and n != exp:
-        bad.append(f"{f}: '{sym}' found {n}x at origin/master, spec says {exp}x")
+        bad.append(f"{f}: '{sym}' found {n}x at {ref}, spec says {exp}x")
 print("\n".join(bad))
 PYA
 )
     [[ -z "$STALE" ]] || die "spec: ANCHORS ARE STALE — the issue describes code that has moved.
 $STALE
-  Re-verify against master, update .agents/tasks/${ISSUE}.json, then retry."
-    ok "anchors verified against origin/master"
+  Re-verify against $BASE_BRANCH, update .agents/tasks/${ISSUE}.json, then retry."
+    ok "anchors verified against ${WT_BASE_REF:-origin/master}"
   fi
 
   # Blast radius: COMPUTE it. An author's estimate produced '1 call site' for 66.
@@ -730,7 +750,7 @@ $STALE
     DELTA=$(( ACT > BRR ? ACT - BRR : BRR - ACT ))
     LIM=$(( BRR / 10 + 2 ))
     [[ "$DELTA" -le "$LIM" ]] || die "spec: BLAST RADIUS MISMATCH for '$BRP'.
-  declared $BRR refs, actually $ACT (git grep of origin/master over src/ tests/ examples/).
+  declared $BRR refs, actually $ACT (git grep of ${WT_BASE_REF:-origin/master} over src/ tests/ examples/).
   A wrong estimate is how a worker burned its entire budget hand-editing 66
   call sites it was told was one. Re-measure and update the spec."
     # SCHEMA.md promises "computed refs/FILES vs declared -> refuse on mismatch"
@@ -860,9 +880,9 @@ for key in ('fail_to_pass', 'pass_to_stay'):
   fi
   # <<< velo-fail-to-pass
 
-  BEHIND=$(git -C "$ROOT" rev-list --count "$(y verified_against)..origin/master" 2>/dev/null || echo "?")
-  [[ "$BEHIND" == "0" || "$BEHIND" == "?" ]] && ok "spec verified at current master" \
-    || warn "spec verified $BEHIND commits behind master (anchors still check out)"
+  BEHIND=$(git -C "$ROOT" rev-list --count "$(y verified_against)..${WT_BASE_REF:-origin/master}" 2>/dev/null || echo "?")
+  [[ "$BEHIND" == "0" || "$BEHIND" == "?" ]] && ok "spec verified at current $BASE_BRANCH" \
+    || warn "spec verified $BEHIND commits behind $BASE_BRANCH (anchors still check out)"
 else
   warn "no task spec at .agents/tasks/${ISSUE}.json — validating brief only.
        See .agents/tasks/SCHEMA.md; a spec enables anchor + blast-radius checks."
@@ -878,7 +898,7 @@ fi
 # and velo-merge never look at, and its self-report is TRUE while the dispatch
 # branch sits empty.
 [[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
-WT="$WORKTREE_BASE/velostream-$ISSUE"
+WT="$WORKTREE_BASE/${REPO_NAME}-$ISSUE"
 
 # brief_prose (the fence masker) and the brief lint live in velo-brief-lint.sh, sourced above.
 
@@ -1036,7 +1056,7 @@ if ! velo_brief_has_sweep "$BRIEF"; then
   [[ -n "${SWEEP_TEXT//[[:space:]]/}" ]] || die "$SWEEP_FILE is EMPTY — there is nothing to append to the brief. Restore the file."
   velo_brief_has_sweep "$SWEEP_FILE" \
     || die "$SWEEP_FILE has no '## PRE-GATE SWEEP' heading, so appending it would not satisfy the lint. Restore the file."
-  BRIEF="$VELO_STATE/dispatch/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"
+  BRIEF="$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/brief-$(date -u +%Y%m%dT%H%M%SZ)-$$.md"
   { cat "$BRIEF_AS_WRITTEN"; printf '\n\n%s\n' "$SWEEP_TEXT"; } > "$BRIEF" \
     || die "could not write the brief with the sweep appended: $BRIEF"
   ok "brief had no PRE-GATE SWEEP: appended $SWEEP_FILE — the worker gets $BRIEF ($BRIEF_AS_WRITTEN is untouched)"
@@ -1088,7 +1108,7 @@ fi
 
 # ---- 6. worktree ------------------------------------------------------------
 [[ -n "$BRANCH" ]] || BRANCH="fix/${ISSUE}-auto"
-WT="$WORKTREE_BASE/velostream-$ISSUE"
+WT="$WORKTREE_BASE/${REPO_NAME}-$ISSUE"
 
 # (fetch already done in section 3a, before anchors were measured)
 BASE="${BASE_SHA:0:9}"
@@ -1096,6 +1116,7 @@ BASE="${BASE_SHA:0:9}"
 if [[ $DRY -eq 1 ]]; then
   echo
   echo "DRY RUN — would do:"
+  [[ $REPO_IS_DEFAULT -eq 1 ]] || echo "  repo     : $REPO  (tree $ROOT, base $WT_BASE_REF)"
   # A dry run that cannot describe the worktree it would use is the specific gap
   # #1914 names: it "reports a clean plan for a dispatch that would refuse (or
   # destroy) in reality". Say which of the three things will happen — resume,
@@ -1103,7 +1124,7 @@ if [[ $DRY -eq 1 ]]; then
   if [[ $RESUME -eq 1 ]]; then
     if [[ -d "$WT" ]]; then
       DR_BR=$(git -C "$WT" branch --show-current 2>/dev/null)
-      DR_AHEAD=$(git -C "$WT" log --oneline "origin/master..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+      DR_AHEAD=$(git -C "$WT" log --oneline "${WT_BASE_REF:-origin/master}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
       DR_DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
       echo "  worktree : $WT  (RESUMED — kept as-is)"
       echo "             on '$DR_BR', $DR_AHEAD commit(s) ahead, $DR_DIRTY dirty; nothing reset"
@@ -1113,7 +1134,7 @@ if [[ $DRY -eq 1 ]]; then
       echo "  worktree : $WT  (WOULD REFUSE — --resume but no worktree there)"
     fi
   elif [[ -d "$WT" ]]; then
-    DR_AHEAD=$(git -C "$WT" log --oneline "origin/master..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+    DR_AHEAD=$(git -C "$WT" log --oneline "${WT_BASE_REF:-origin/master}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
     DR_DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$DR_AHEAD" != "0" || "$DR_DIRTY" != "0" ]]; then
       if [[ $FORCE -eq 1 ]]; then
@@ -1123,10 +1144,10 @@ if [[ $DRY -eq 1 ]]; then
         echo "             --resume to keep them, --force to discard them"
       fi
     else
-      echo "  worktree : $WT  (branch $BRANCH off origin/master $BASE — existing tree is clean, recreated)"
+      echo "  worktree : $WT  (branch $BRANCH off ${WT_BASE_REF:-origin/master} $BASE — existing tree is clean, recreated)"
     fi
   else
-    echo "  worktree : $WT  (branch $BRANCH off origin/master $BASE)"
+    echo "  worktree : $WT  (branch $BRANCH off ${WT_BASE_REF:-origin/master} $BASE)"
   fi
   echo "  assign   : #$ISSUE -> $ASSIGNEE"
   echo "  worker   : $NAME"
@@ -1138,7 +1159,7 @@ if [[ $DRY -eq 1 ]]; then
   # overwrite the log velo-record reads for the previous run's cost (#2012 M3).
   # This line printed the untimestamped name — a path that never exists. A dry
   # run telling the operator where to look, wrongly.
-  echo "  log      : $VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-<UTC timestamp>.log"
+  echo "  log      : $VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/${LOGTAG}-<UTC timestamp>.log"
   exit 0
 fi
 
@@ -1177,7 +1198,7 @@ if [[ $RESUME -eq 1 ]]; then
   Pick one."
 
   [[ -d "$WT" ]] || die "--resume needs an existing worktree at $WT, and there is none.
-  Nothing to resume — dispatch normally and one will be cut from origin/master."
+  Nothing to resume — dispatch normally and one will be cut from ${WT_BASE_REF:-origin/master}."
 
   RES_BRANCH=$(git -C "$WT" branch --show-current 2>/dev/null)
   [[ -n "$RES_BRANCH" ]] || die "worktree $WT is not on a branch (detached HEAD).
@@ -1202,9 +1223,9 @@ if [[ $RESUME -eq 1 ]]; then
   done
 
   RES_DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-  RES_AHEAD=$(git -C "$WT" log --oneline "origin/master..HEAD" 2>/dev/null | wc -l | tr -d ' ')
-  RES_BEHIND=$(git -C "$WT" rev-list --count "HEAD..origin/master" 2>/dev/null || echo "?")
-  ok "resuming $WT on $RES_BRANCH ($RES_AHEAD commit(s), $RES_DIRTY dirty, $RES_BEHIND behind origin/master)"
+  RES_AHEAD=$(git -C "$WT" log --oneline "${WT_BASE_REF:-origin/master}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+  RES_BEHIND=$(git -C "$WT" rev-list --count "HEAD..${WT_BASE_REF:-origin/master}" 2>/dev/null || echo "?")
+  ok "resuming $WT on $RES_BRANCH ($RES_AHEAD commit(s), $RES_DIRTY dirty, $RES_BEHIND behind ${WT_BASE_REF:-origin/master})"
 
   # Unpushed commits are exactly what --force destroys, and the reason this flag
   # exists. Say so with the number, every time: pushing first makes the loss
@@ -1221,18 +1242,18 @@ if [[ $RESUME -eq 1 ]]; then
     warn "    git -C $WT push -u origin $BRANCH"
   fi
   if [[ "$RES_BEHIND" != "0" && "$RES_BEHIND" != "?" ]]; then
-    warn "the tree is $RES_BEHIND commit(s) behind origin/master."
-    warn "  The anchors and blast radius validated above describe origin/master —"
+    warn "the tree is $RES_BEHIND commit(s) behind ${WT_BASE_REF:-origin/master}."
+    warn "  The anchors and blast radius validated above describe ${WT_BASE_REF:-origin/master} —"
     warn "  a tree the worker is NOT looking at. Rebase first if the brief depends"
     warn "  on anything that landed since."
   fi
 elif [[ -d "$WT" ]]; then
   DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-  AHEAD=$(git -C "$WT" log --oneline origin/master..HEAD 2>/dev/null | wc -l | tr -d ' ')
+  AHEAD=$(git -C "$WT" log --oneline ${WT_BASE_REF:-origin/master}..HEAD 2>/dev/null | wc -l | tr -d ' ')
   if [[ "$DIRTY" != "0" || "$AHEAD" != "0" ]]; then
     [[ $FORCE -eq 1 ]] || die "worktree $WT already exists and HAS WORK ($DIRTY dirty, $AHEAD commits).
   It will not be reused or reset silently — inspect it first.
-    git -C $WT log --oneline origin/master..HEAD
+    git -C $WT log --oneline ${WT_BASE_REF:-origin/master}..HEAD
   Keep it and continue the work:  re-run with --resume
   Discard it and start over:      re-run with --force"
     warn "discarding existing worktree with work ($DIRTY dirty, $AHEAD commits) — --force"
@@ -1250,7 +1271,7 @@ elif [[ -d "$WT" ]]; then
   fi
   git -C "$ROOT" worktree remove "$WT" --force >/dev/null 2>&1 \
     || die "could not remove existing worktree $WT"
-  ok "removed stale worktree $WT (recreating from origin/master)"
+  ok "removed stale worktree $WT (recreating from ${WT_BASE_REF:-origin/master})"
 fi
 
 # Everything from here to the behind-master assertion CUTS A FRESH TREE, so none
@@ -1263,11 +1284,11 @@ if [[ $RESUME -eq 0 ]]; then
 # The branch may also survive an earlier dispatch. Delete it only when it has no
 # commits of its own; otherwise refuse rather than silently discard someone's work.
 if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
-  BR_AHEAD=$(git -C "$ROOT" rev-list --count "origin/master..$BRANCH" 2>/dev/null || echo 0)
+  BR_AHEAD=$(git -C "$ROOT" rev-list --count "${WT_BASE_REF:-origin/master}..$BRANCH" 2>/dev/null || echo 0)
   if [[ "$BR_AHEAD" != "0" ]]; then
-    [[ $FORCE -eq 1 ]] || die "branch '$BRANCH' already exists with $BR_AHEAD commit(s) not on master.
+    [[ $FORCE -eq 1 ]] || die "branch '$BRANCH' already exists with $BR_AHEAD commit(s) not on $BASE_BRANCH.
   Cutting a fresh worktree would abandon them.
-    git -C $ROOT log --oneline origin/master..$BRANCH
+    git -C $ROOT log --oneline ${WT_BASE_REF:-origin/master}..$BRANCH
   Keep them:    re-run with --resume — continues this branch, destroys nothing.
   Discard them: re-run with --force, or use --branch fix/${ISSUE}-v2."
     warn "deleting branch $BRANCH with $BR_AHEAD commit(s) — --force"
@@ -1279,14 +1300,14 @@ DELETED=$(git -C "$ROOT" branch -D "$BRANCH" 2>&1) \
 fi
 
 git -C "$ROOT" worktree add "$WT" -b "$BRANCH" "$BASE_SHA" -q \
-  || die "could not create worktree $WT on branch $BRANCH off origin/master"
-ok "worktree cut from origin/master: $WT ($BRANCH @ $BASE)"
+  || die "could not create worktree $WT on branch $BRANCH off ${WT_BASE_REF:-origin/master}"
+ok "worktree cut from ${WT_BASE_REF:-origin/master}: $WT ($BRANCH @ $BASE)"
 
 # Assert it, rather than trusting the command above — this is the dispatcher's
 # one core promise and it is the thing that silently broke.
-WT_BEHIND=$(git -C "$WT" rev-list --count HEAD..origin/master 2>/dev/null || echo "?")
+WT_BEHIND=$(git -C "$WT" rev-list --count HEAD..${WT_BASE_REF:-origin/master} 2>/dev/null || echo "?")
 [[ "$WT_BEHIND" == "0" ]] \
-  || die "internal: freshly-cut worktree is $WT_BEHIND commits behind origin/master"
+  || die "internal: freshly-cut worktree is $WT_BEHIND commits behind ${WT_BASE_REF:-origin/master}"
 
 fi   # end: cut a fresh tree (skipped entirely by --resume)
 
@@ -1294,7 +1315,7 @@ fi   # end: cut a fresh tree (skipped entirely by --resume)
 # below — not before LOG= further down. A redirect into a missing directory fails
 # the whole subshell, so every dispatch would have reported
 # "discovery index FAILED" no matter how healthy zg was.
-mkdir -p "$VELO_STATE/dispatch/${ISSUE}"
+mkdir -p "$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}"
 
 # ---- 6b. discovery index (#2032) --------------------------------------------
 #
@@ -1381,7 +1402,9 @@ INDEX_STATE="refused"     # overwritten below unless the guard refused
 # <<< velo-index-exclude
 
 INDEX_READY=0
-if [[ "$INDEX_SAFE" == "1" ]] \
+# Built for the default repo only: the ~35s index is sized for Velostream's tree, and another repo's dispatch says so
+# (the warn in the else) rather than failing on it.
+if [[ "$INDEX_SAFE" == "1" ]] && [[ $REPO_IS_DEFAULT -eq 1 ]] \
    && [[ "${VELO_SKIP_INDEX:-0}" != "1" ]] && [[ -x "$HOME/.agents/bin/zg" ]]; then
   printf '  .. building discovery index (~35s, skip with VELO_SKIP_INDEX=1)\n'
   # `--hidden` so the index contains `.agents/`, `.github/` and `.config/`
@@ -1400,17 +1423,21 @@ if [[ "$INDEX_SAFE" == "1" ]] \
   # zvec-grep's own `--hidden` still excludes `.git` and `.zvec-grep`, so this
   # does not index the object store or the index itself.
   if ( cd "$WT" && timeout 300 "$HOME/.agents/bin/zg" index --hidden \
-         --embedding local/potion-code-16m-v2 ) >"$VELO_STATE/dispatch/${ISSUE}/zg-index.log" 2>&1; then
+         --embedding local/potion-code-16m-v2 ) >"$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/zg-index.log" 2>&1; then
     INDEX_READY=1
     INDEX_STATE="built"
     ok "discovery index built ($(du -sh "$WT/.zvec-grep" 2>/dev/null | cut -f1)) — worker can run: zg query \"...\""
   else
     INDEX_STATE="failed"
-    warn "discovery index FAILED (see $VELO_STATE/dispatch/${ISSUE}/zg-index.log) — worker falls back to rg + ast-grep"
+    warn "discovery index FAILED (see $VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/zg-index.log) — worker falls back to rg + ast-grep"
   fi
 else
   [[ "$INDEX_SAFE" == "1" ]] && INDEX_STATE="skipped"
-  warn "discovery index skipped — worker has rg + ast-grep only"
+  if [[ $REPO_IS_DEFAULT -eq 1 ]]; then
+    warn "discovery index skipped — worker has rg + ast-grep only"
+  else
+    warn "discovery index skipped — it is built for the default repo only, not $REPO; worker has rg + ast-grep only"
+  fi
 fi
 
 # ---- 7. assign (only now that work is actually starting) --------------------
@@ -1430,7 +1457,7 @@ gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE" >/dev/null 2>&1
 # still-live second run as `done`. That is the same class of confident-wrong-state
 # bug as #2101 itself, reached by a different route. Fixed at the source: a run
 # identity that can collide cannot be disambiguated by any consumer downstream.
-LOG="$VELO_STATE/dispatch/${ISSUE}/${LOGTAG}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+LOG="$VELO_STATE/dispatch${REPO_SUB}/${ISSUE}/${LOGTAG}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 # Tell the worker whether the index EXISTS for this run.
 #
 # Without this the worker learns by failing: it runs `zg query`, gets
@@ -1460,6 +1487,7 @@ fi
 # Injected rather than reconciled-by-hand because hand-transcription is the thing
 # SCHEMA.md was promising to remove. The brief may still discuss these items in
 # prose; duplication is harmless, silence was not.
+if [[ $REPO_IS_DEFAULT -eq 1 || -f "$SPEC" ]]; then
 CONTRACT=$(SPEC_FILE="$SPEC" python3 <<'PYEOF'
 import json, os
 d = json.load(open(os.environ["SPEC_FILE"]))
@@ -1492,6 +1520,11 @@ block("STOP and report if", d.get("stop_conditions") or [])
 print("\n".join(out).rstrip())
 PYEOF
 ) || die "could not render the spec contract from $SPEC"
+else
+# Another repo needs no sidecar to be dispatched (a spec is a Velostream convention): say so, so the worker is not
+# left wondering whether an empty section was lost.
+CONTRACT="## SPEC CONTRACT — none: $REPO has no task sidecar for #$ISSUE ($SPEC), so the brief above is the whole task."
+fi
 
 TASK="$(cat "$BRIEF")
 
@@ -1500,6 +1533,8 @@ $CONTRACT
 
 ---
 $INDEX_NOTE"
+# Another repo's worker opens with the paragraph that overrides the Velostream-only directives (velo-repo-lib.sh).
+TASK="${REPO_NOTE}${TASK}"
 STARTED=$(date -u +%FT%TZ)
 
 # Recorded turn cap defaults to the real one; the codex route clears it because
@@ -1686,7 +1721,9 @@ fi
 # than after `&` returns, so a worker that finishes in the same second the
 # nohup is issued cannot be missed by a watcher that only starts counting once
 # the launch line has already returned control.
-WAIT_RECORD_FILE="${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl"
+WAIT_RECORD_FILE=$(repo_scoped "${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl")
+# velo-record counts commits against the ref resolved above, not one it would have to ask GitHub for after the run.
+[[ $REPO_IS_DEFAULT -eq 1 ]] || export WT_BASE_REF
 WAIT_BASELINE_LINES=0
 [[ -f "$WAIT_RECORD_FILE" ]] && WAIT_BASELINE_LINES=$(wc -l < "$WAIT_RECORD_FILE" | tr -d ' ')
 # The worktree's HEAD at launch, so velo-record scores the commits THIS run made.
@@ -1717,12 +1754,12 @@ echo "── dispatched ──────────────────�
 echo "  #$ISSUE  $TITLE"
 echo "  worker : $NAME   supervisor pid $PID"
 if [[ -n "$MODEL_LINE" ]]; then echo "  $MODEL_LINE"; fi
-echo "  branch : $BRANCH  (off origin/master $BASE)"
+echo "  branch : $BRANCH  (off ${WT_BASE_REF:-origin/master} $BASE)"
 echo "  log    : $LOG"
 echo "  record : .agents/tasks/${ISSUE}.result.jsonl  (appended on exit)"
 echo
 echo "  poll:   tail -3 $LOG"
-echo "  result: git -C $WT log --oneline origin/master..HEAD"
+echo "  result: git -C $WT log --oneline ${WT_BASE_REF:-origin/master}..HEAD"
 echo
 echo "  Detached. The supervisor records the outcome when the worker exits,"
 echo "  including on crash or timeout. Still verify from git and the tests,"
@@ -1754,8 +1791,8 @@ print(json.loads(sys.argv[1]).get("outcome","unknown"))' "$RESULT_LINE" 2>/dev/n
   echo "── #$ISSUE exited — outcome: $OUTCOME ──────────────────────────────"
   echo "$RESULT_LINE"
   echo
-  echo "  git -C $WT log --oneline origin/master..HEAD"
-  git -C "$WT" log --oneline origin/master..HEAD 2>&1 | sed 's/^/    /'
+  echo "  git -C $WT log --oneline ${WT_BASE_REF:-origin/master}..HEAD"
+  git -C "$WT" log --oneline ${WT_BASE_REF:-origin/master}..HEAD 2>&1 | sed 's/^/    /'
   echo
   if [[ -f "$WT/agent.log" ]]; then
     echo "  $WT/agent.log — STOP/REAL/MUTATION-PROOF lines:"

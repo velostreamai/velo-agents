@@ -68,6 +68,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PR_GATE="${VELO_PR_GATE_BIN:-$HERE/velo-pr-gate}"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh. Its gate dir is the one velo-pr-gate uses.
+. "${VELO_REPO_LIB:-$HERE/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 RETRY_DELAY="${VELO_GATE_RETRY_DELAY:-5}"
 POLL="${VELO_GATE_POLL:-5}"
@@ -232,7 +235,7 @@ fi
 # velo-pr-gate takes this lock itself and refuses a second gate on the same PR. The
 # check is repeated here, BEFORE this wrapper moves anything aside, because moving
 # a running gate's logs out from under it is worse than a refusal.
-GATE_DIR="$VELO_STATE/gate/$PR"
+GATE_DIR="$VELO_STATE/${GATE_SUBDIR}/$PR"
 LOCK="$GATE_DIR/.lock"
 # Who holds the lock? KNOWN or not: only a pid that names a live process is a running gate, only a
 # pid that names a dead one is a stale lock, and a lock whose pid cannot be told (not written yet,
@@ -556,7 +559,7 @@ next_steps() {
   fi
   # The finish command names the reports THIS plan has — both positionally, one by
   # flag. A line that names a report the plan never produces is a command that dies.
-  finish="velo-gate-finish $PR ${GATED_SHA:-<sha>} --pass|--block"
+  finish="${GATE_CMD_ENV}velo-gate-finish $PR ${GATED_SHA:-<sha>} --pass|--block"
   if [[ $have_cs -eq 1 ]]; then
     local named=""
     [[ $have_cc -eq 1 ]] && named="$named --check-code post-cc-$PR.md"
@@ -569,7 +572,7 @@ next_steps() {
   elif [[ $have_cr -eq 1 ]]; then
     echo "  then        $finish --code-review post-cr-$PR.md"
   else
-    echo "  then        no check-code or code-review report to post for this plan, so nothing for velo-gate-finish — record the verdict with: velo-gate $PR --pass|--block"
+    echo "  then        no check-code or code-review report to post for this plan, so nothing for velo-gate-finish — record the verdict with: ${GATE_CMD_ENV}velo-gate $PR --pass|--block"
   fi
 }
 

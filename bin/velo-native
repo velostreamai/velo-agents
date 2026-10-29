@@ -28,8 +28,12 @@
 # Orchestrators pass the token that start printed for that worker.
 
 set -uo pipefail
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh. Issue #N of two repos is two
+# records, so another repo's live in native/<owner>__<name>/.
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
-NATIVE_DIR="$VELO_STATE/native"
+NATIVE_DIR="$VELO_STATE/native$REPO_SUB"
 # Exit status of `native_store finish` when --token does not match. Shared with the
 # python below, which must exit with the same value.
 TOKEN_MISMATCH=3

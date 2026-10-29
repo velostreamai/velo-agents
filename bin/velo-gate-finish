@@ -37,7 +37,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE_POST="${VELO_GATE_POST_BIN:-$HERE/velo-gate-post}"
 GATE="${VELO_GATE_BIN:-$HERE/velo-gate}"
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 RETRY_DELAY="${VELO_GATE_RETRY_DELAY:-5}"
 MAX_RETRIES=3
@@ -120,7 +122,7 @@ for f in "$CC" "$CR" "$CS"; do
   [[ -s "$f" ]] || die "report file is empty: $f"
 done
 
-GATE_DIR="$VELO_STATE/gate/$PR"
+GATE_DIR="$VELO_STATE/${GATE_SUBDIR}/$PR"
 mkdir -p "$GATE_DIR" || die "could not create $GATE_DIR"
 
 # ---- what counts as transient ------------------------------------------------------

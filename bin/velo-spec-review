@@ -28,7 +28,9 @@
 # dispatch's: a brief without the `## PRE-GATE SWEEP` section. velo-dispatch appends it to a copy at
 # dispatch time, but the attestation pins the file AS WRITTEN, so here it must already be in the file.
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 # The brief lint, one definition shared with velo-dispatch (see velo-brief-lint.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/velo-brief-lint.sh" || die "velo-brief-lint.sh missing next to velo-spec-review"
@@ -70,7 +72,7 @@ fi
 # `reviewed` block that dispatch — reading the canonical repo — never saw, and
 # the gate refused a spec that had in fact been reviewed. Caught by testing the
 # two together; it would have looked like a flaky gate.
-ROOT="$HOME/RustroverProjects/velostream"
+ROOT="$HOME/RustroverProjects/${REPO_NAME}"
 
 # --check may review a spec that is not on master yet. Attest mode may NOT: the
 # paragraph above is why, and it still holds.
@@ -135,7 +137,9 @@ fi
 # Any edit to the spec resets the streak, because the thing under review changed.
 spec_check() {
   local round_log streak spec_now
-  mkdir -p "$STATE/spec/$ISSUE"
+  # The ref the reviewer is told the anchors live at (no GitHub call for the default repo).
+  repo_base_branch || die "$REPO_ERR"
+  mkdir -p "$STATE/spec${REPO_SUB}/$ISSUE"
   spec_now=$(shasum -a 256 "$SPEC" | cut -d' ' -f1)
 
   # Substitution is ALLOWED but never SILENT. The rule this encodes: on #1988 a
@@ -163,8 +167,8 @@ spec_check() {
       ;;
   esac
 
-  round_log="$STATE/spec/$ISSUE/review-$(date -u +%Y%m%dT%H%M%SZ).log"
-  local brief="$STATE/spec/$ISSUE/brief.md"
+  round_log="$STATE/spec${REPO_SUB}/$ISSUE/review-$(date -u +%Y%m%dT%H%M%SZ).log"
+  local brief="$STATE/spec${REPO_SUB}/$ISSUE/brief.md"
 
   {
     echo "You are reviewing a TASK SPEC before a worker is dispatched against it."
@@ -189,7 +193,7 @@ spec_check() {
     echo "at $ROOT (read-only; do not modify it)."
     echo
     echo "1. ANCHORS. For each entry in .anchors, does that file exist at"
-    echo "   origin/master and does the named symbol still appear in it? The spec"
+    echo "   ${WT_BASE_REF:-origin/master} and does the named symbol still appear in it? The spec"
     echo "   was verified against \$(jq -r .verified_against). Master has moved."
     echo "   A stale anchor sends the worker to a line that is not there."
     echo "2. TESTS. For each .tests.fail_to_pass, does that test EXIST, and does it"
@@ -201,7 +205,7 @@ spec_check() {
     echo "4. FORBIDDEN. If .forbidden exists, is each entry checkable after the"
     echo "   fact from a diff? An unverifiable prohibition is decoration."
     echo "5. BLAST RADIUS. Does .blast_radius.pattern still match the stated count"
-    echo "   at origin/master? Run the grep. Report the real number."
+    echo "   at ${WT_BASE_REF:-origin/master}? Run the grep. Report the real number."
     echo "6. SCOPE vs ISSUE. Does the spec implement what the issue asks, or"
     echo "   something adjacent? Quote the divergence."
     echo "7. ACHIEVABILITY. Could a worker with Read/Grep/Bash/Edit/Write and no"
@@ -226,12 +230,13 @@ spec_check() {
   # from a round that found nothing, so this line is the difference between a
   # verdict you can trust and one you cannot.
   R_HEAD=$(git -C "$REVIEW_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')
-  R_AHEAD=$(git -C "$REVIEW_ROOT" rev-list --count origin/master..HEAD 2>/dev/null || echo '?')
+  R_AHEAD=$(git -C "$REVIEW_ROOT" rev-list --count ${WT_BASE_REF:-origin/master}..HEAD 2>/dev/null || echo '?')
   R_DIRTY=$(git -C "$REVIEW_ROOT" status --porcelain -- .agents/tasks 2>/dev/null | wc -l | tr -d ' ')
-  printf '  reviewing %s (HEAD %s, %s commit(s) ahead of origin/master, %s uncommitted spec file(s))\n' \
-    "$REVIEW_ROOT" "$R_HEAD" "$R_AHEAD" "$R_DIRTY"
+  printf '  reviewing %s (HEAD %s, %s commit(s) ahead of %s, %s uncommitted spec file(s))\n' \
+    "$REVIEW_ROOT" "$R_HEAD" "$R_AHEAD" "${WT_BASE_REF:-origin/master}" "$R_DIRTY"
   if [[ "$REVIEW_ROOT" == "$ROOT" && "$R_AHEAD" == "0" && "$R_DIRTY" == "0" ]]; then
-    printf '  \033[2m(spec content equals origin/master — if you just edited it on a branch, pass --worktree <path>)\033[0m\n'
+    printf '  \033[2m(spec content equals %s — if you just edited it on a branch, pass --worktree <path>)\033[0m\n' \
+      "${WT_BASE_REF:-origin/master}"
   fi
   case "$SPEC_WORKER" in
     codex)
@@ -268,7 +273,7 @@ spec_check() {
   # happens is worthless precisely when it matters.
   findings=$(sed -nE 's/^VERDICT: FINDINGS ([0-9]+).*/\1/p' "$round_log" | tail -1 | tr -cd '0-9')
 
-  python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" "$verdict" "${findings:-0}" "$round_log" "$SPEC_WORKER" <<'PY'
+  python3 - "$STATE/spec${REPO_SUB}/$ISSUE/rounds.jsonl" "$spec_now" "$verdict" "${findings:-0}" "$round_log" "$SPEC_WORKER" <<'PY'
 import json, sys, os, datetime
 path, spec_sha, verdict, findings, log, worker = sys.argv[1:7]
 # Nothing here may raise. The round HAPPENED; a value we cannot parse is a
@@ -291,7 +296,7 @@ except Exception as exc:
     print(f"WARNING: could not append to the spec-review ledger: {exc}", file=sys.stderr)
 PY
 
-  streak=$(python3 - "$STATE/spec/$ISSUE/rounds.jsonl" "$spec_now" "$SPEC_WORKER" <<'PY'
+  streak=$(python3 - "$STATE/spec${REPO_SUB}/$ISSUE/rounds.jsonl" "$spec_now" "$SPEC_WORKER" <<'PY'
 import json, sys
 path, spec_sha, worker = sys.argv[1:4]
 n = 0
