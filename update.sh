@@ -42,7 +42,7 @@ for d in bin rules skills; do
       changed=1
       [[ $DRY -eq 1 ]] || cp "$f" "$dst"
     fi
-  done < <(find "$LIVE/$d" -type f -print0)
+  done < <(find "$LIVE/$d" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print0)   # python artifacts are not tooling (install.sh, #2091)
 done
 
 if [[ $changed -eq 0 ]]; then

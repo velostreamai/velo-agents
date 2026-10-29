@@ -78,6 +78,27 @@ VELO_AGENTS_HOME="$DEST" VELO_CLAUDE_SKILLS="$SKILLS" bash "$SRC/install.sh" --c
 check_exit "a real live edit still fails --check" "$?" "1"
 check "the failing --check names the edited file" "$(cat "$FAKE/drift.out")" "bin/velo-dispatch"
 
+# ── update.sh: python artifacts in the live copy are not pulled back into the checkout ──
+# update.sh copies the live tree back so a live fix can be committed. A .pyc in the live bin/ (python writes one wherever it
+# imports) is not tooling. Prevents: the walk of the LIVE tree forgetting the exclusion install.sh's walks have, which would
+# report every bytecode file as new work to commit and copy it into the checkout.
+UPSRC="$FAKE/up-src"
+UPLIVE="$FAKE/up-live"
+mkdir -p "$UPSRC/bin" "$UPLIVE/bin/__pycache__"
+cp "$HERE/../update.sh" "$UPSRC/update.sh"
+echo 'echo dispatch'      > "$UPSRC/bin/velo-dispatch"
+echo 'echo dispatch LIVE' > "$UPLIVE/bin/velo-dispatch"   # a live edit: it must come back
+echo 'echo new tool'      > "$UPLIVE/bin/velo-newtool"    # a file only the live copy has: it must come back too
+echo 'live bytecode'      > "$UPLIVE/bin/__pycache__/velo_runner_lib.cpython-314.pyc"
+echo 'stray bytecode'     > "$UPLIVE/bin/old_module.pyc"
+VELO_AGENTS_HOME="$UPLIVE" bash "$UPSRC/update.sh" > "$FAKE/update.out" 2>&1
+check_exit "update.sh succeeds" "$?" "0"
+check "update.sh copies a live edit back (control: it does copy)" "$(cat "$UPSRC/bin/velo-dispatch")" "LIVE"
+check "update.sh copies a file only the live copy has (control)" "$(cat "$UPSRC/bin/velo-newtool" 2>&1)" "new tool"
+deny "update.sh copies no .pyc file back" "$(find "$UPSRC" -name '*.pyc' -print)"
+deny "update.sh copies no __pycache__ directory back" "$(find "$UPSRC" -type d -name __pycache__ -print)"
+reject "update.sh never mentions python artifacts" "$(cat "$FAKE/update.out")" "pyc"
+
 echo
 [[ $RC -eq 0 ]] && echo "all install-check tests passed" || echo "FAILED"
 exit $RC

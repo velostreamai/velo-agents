@@ -43,6 +43,10 @@ nonce; otherwise any set value is refused (exit 2) on every invocation. `wait` c
 polls for <barrier-file>. publish.linked@<dest-name> fires only for the publish whose destination file is named <dest-name>.
 The trace file gets one line per durable step: fsync file|dir <path>, link <src> <dest>, unlink <path>,
 rename <src> <dest>.
+
+Secrets: --secrets-fd N, in front of any subcommand, reads NAME=value records (each ends in a NUL) from descriptor N until it ends,
+then runs this helper again with them added to its environment, which only the same user can read; a value handed over so is in no
+argv, which ps shows to everyone. With no record there is no second run.
 """
 import errno
 import fcntl
@@ -73,6 +77,7 @@ STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "
 STATE_ROOT_MODE = 0o700
 LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
 RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
+SECRET_ENV_NAME = re.compile(rb"[A-Z][A-Z0-9_]*")  # the shape of an allowlisted name (the lib's NAME_RE)
 # sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API;
 # the module only exports them as names from Python 3.11, and this helper must run on the system 3.9 as well.
 SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION = 20, 21, 31
@@ -417,6 +422,9 @@ def write_new(dest, data):
     try:
         if os.write(fd, data) != len(data):
             die(1, "short write to %s" % tmp)
+    except BaseException:  # die() is SystemExit: whatever stops the write, the temp does not stay behind
+        os.unlink(tmp)
+        raise
     finally:
         os.close(fd)
     return publish_file(tmp, dest)
@@ -1047,7 +1055,40 @@ COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish
             "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 
+def adopt_secrets(argv):
+    """`--secrets-fd N <subcommand> ...`: read the NAME=value records on descriptor N (NUL-terminated, to its end), so that no secret
+    value is ever in an argv. With no record, return the arguments after the option. Otherwise run this helper again, from its first
+    instruction and without the option, with the values added to its environment: a process's environment at exec is what ps -E
+    shows, and what the daemon this helper launches is built from. It does not return."""
+    if len(argv) < 3 or not argv[1].isdigit():
+        usage("--secrets-fd: expected N <subcommand> [args...]")
+    fd, rest, raw = int(argv[1]), argv[2:], b""
+    try:
+        while True:
+            part = os.read(fd, 65536)
+            if not part:
+                break
+            raw += part
+        os.close(fd)
+    except OSError as exc:
+        die(1, "--secrets-fd %d: %s" % (fd, exc.strerror))
+    records = [r for r in raw.split(b"\0") if r]
+    if not records:
+        return rest
+    env = dict(os.environb)
+    for record in records:
+        name, equals, value = record.partition(b"=")
+        if not equals or not SECRET_ENV_NAME.fullmatch(name):
+            die(2, "--secrets-fd: every record must be NAME=value, a name of capitals, digits and underscores")
+        env[name] = value
+    if not sys.executable:
+        die(1, "--secrets-fd: this interpreter has no path to run again")
+    os.execve(sys.executable, [sys.executable] + (["-I"] if sys.flags.isolated else []) + [sys.argv[0]] + rest, env)
+
+
 def main(argv):
+    if argv[:1] == ["--secrets-fd"]:
+        argv = adopt_secrets(argv)
     failpoint_spec()  # a stray VELO_TASK_FAILPOINT or VELO_TASK_FSYNC_TRACE is refused by every subcommand, not just the ones that use it
     load_trace()
     if not argv or argv[0] in ("-h", "--help", "help"):

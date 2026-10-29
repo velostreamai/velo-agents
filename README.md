@@ -226,8 +226,8 @@ velo-status
 
 ### Hooks
 
-`install.sh` copies `hooks/` to `~/.agents/hooks/` and makes every file there executable; `--check` reports a hook
-that is not. Copying registers nothing: a hook runs only once a Claude Code settings file (`~/.claude/settings.json`,
+`install.sh` copies `hooks/` to `~/.agents/hooks/` and makes each hook it copies executable (a file it does not ship is left as
+it is); `--check` reports a hook that is not. Copying registers nothing: a hook runs only once a Claude Code settings file (`~/.claude/settings.json`,
 or a project's `.claude/settings.json`) lists it. Register each one in this guarded form, so that a machine where the
 hook is not installed yet skips it instead of failing every Bash call (a hook that is installed but not executable
 is skipped the same way, which is why `--check` looks for it):
@@ -254,8 +254,8 @@ the orchestrating model's own mistakes (docs/velo-task-spec.md R10, R15(i)), not
 
 | hook | denies | allows | known false negatives |
 |---|---|---|---|
-| `deny-vanth-cleanup.sh` | `vanth prune` and `vanth restore` as a command: bare, by absolute path, `python -m vanth[.cli]`, behind `env`/`sudo`/`timeout`/`uv run` and the like, in a pipeline, `&&`, `$( )` or a loop | any other `vanth` subcommand, `vanth prune --help`, and the same words inside a quoted string, a heredoc or a comment (`git commit -m "..."`) | a `bash -c` or `eval` string, a variable or alias holding the program, a script file, `find -exec`, `sudo -u neil`, `curl -X POST .../cleanup`, the MCP `job_cleanup` tool, `VANTH_RETENTION_SECONDS` |
-| `deny-pgrep-wait-loop.sh` | a `pgrep` inside a `while` or `until` loop, in its condition or its body | `velo-task wait`, `pgrep` outside a loop, and the same words inside a string, a heredoc or a comment | a `bash -c` or `eval` string, `for` and `watch` polls, `ps` piped to `grep`, `pidof`, `kill -0`, pid and marker files |
+| `deny-vanth-cleanup.sh` | `vanth prune` and `vanth restore` as a command: bare, by absolute path, `python -m vanth[.cli]`, behind `env`/`sudo`/`timeout`/`uv run` and the like, in a pipeline, `&&`, `$( )` or a loop | any other `vanth` subcommand, `vanth prune --help`, and the same words inside a quoted string, a heredoc or a comment (`git commit -m "..."`) | a `bash -c` or `eval` string, a variable or alias holding the program, a script file, `find -exec`, `sudo -u neil`, `curl -X POST .../cleanup`, the MCP `job_cleanup` tool, `VANTH_RETENTION_SECONDS`, a redirection in front of the command name (`>out vanth prune`), a quoted command path that contains a space, xargs substitution, the output of a command substitution naming the program, more than 1 KB of text in front of the command in one segment |
+| `deny-pgrep-wait-loop.sh` | a `pgrep` inside a `while` or `until` loop, in its condition or its body | `velo-task wait`, `pgrep` outside a loop, and the same words inside a string, a heredoc or a comment | a `bash -c` or `eval` string, `for` and `watch` polls, `ps` piped to `grep`, `pidof`, `kill -0`, pid and marker files, a redirection in front of the command name (`until >/dev/null pgrep ...`), more than 1 KB of text in front of the command in one segment |
 
 Both read the payload with `jq` and fail open (exit 0) when `jq`, `guard-lib.sh` (the scanner they share, installed beside
 them) or the command is missing. `tests/test_velo_task_hooks.sh` pins every denied form, every look-alike that must pass and

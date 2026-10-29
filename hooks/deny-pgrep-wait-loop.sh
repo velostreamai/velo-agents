@@ -14,10 +14,12 @@
 # heredoc or a comment. Known false positive, accepted: a pgrep inside any while loop body, even a list producer:
 # `while read n; do for p in $(pgrep -f "$n"); do ...`.
 #
-# Known false negatives (tests/test_velo_task_hooks.sh pins each one, so closing a gap makes that test say so):
+# Known false negatives (tests/test_velo_task_hooks.sh pins each one, so closing a gap makes that test say so, and
+# checks that each is listed here and in the README table):
 # a loop in a string handed to bash -c / sh -c / eval, `for` and `watch` polls, other probes (ps | grep, pidof,
 # kill -0, a pid or marker file), a variable holding the program name ($PGREP), a script file, a wrapper option
-# that takes a word (sudo -u neil pgrep ...).
+# that takes a word (sudo -u neil pgrep ...), a redirection in front of the command name (until >/dev/null pgrep
+# -f x; do ...), and more than 1 KB of text in front of the command in one segment.
 #
 # Contract (same as require-wait.sh): stdin JSON {"tool_input":{"command":...}}; exit 0 allows, exit 2 + stderr blocks.
 # Fails open: no jq, no lib beside it, malformed JSON or no command all exit 0, so a broken install never wedges Bash.

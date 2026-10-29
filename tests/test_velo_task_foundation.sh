@@ -107,6 +107,12 @@ alive() { kill -0 "$1" 2>/dev/null; }
 procs_of() { /usr/bin/pgrep -f -- "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9_/-]/\\&/g')"; }   # <text>: the pids whose command line contains the text, matched literally
 names_of() { printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ' '; }   # the names given, sorted, on one line (a trailing space, like the fake daemon's names= line)
 has_proc() { procs_of "$1" >/dev/null; }   # <text>: some process has the text in its command line
+child_of() { /usr/bin/pgrep -P "$1" -f -- "$(printf '%s' "$2" | sed 's/[^A-Za-z0-9_/-]/\\&/g')"; }   # <ppid> <text>: the children of ppid whose command line contains the text (the lock helper's own command line holds its body's, so the text alone names both)
+sole() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }   # <pids>: succeeds for exactly one pid; an empty answer or a list of several fails (alive "a b" would also fail, and so make "not alive" pass without proving anything)
+capped() {  # <bytes> <state helper args...>: the helper with the size of any file it writes capped (RLIMIT_FSIZE; python ignores SIGXFSZ, so a write comes back short). Output through a pipe: the cap would cut a file's output as well
+  local n="$1"; shift
+  "$PYBIN" -I -c 'import resource, runpy, sys; n = int(sys.argv[1]); resource.setrlimit(resource.RLIMIT_FSIZE, (n, n)); sys.argv = sys.argv[2:]; runpy.run_path(sys.argv[0], run_name="__main__")' "$n" "$R/bin/velo-task-state" "$@" 2>&1
+}
 hidden_names() { grep -v -x -e PWD -e OLDPWD -e SHLVL -e _ -e LC_CTYPE -e __CF_USER_TEXT_ENCODING -e __PYVENV_LAUNCHER__ -e CPATH -e LIBRARY_PATH -e MANPATH -e SDKROOT; }   # stdin: names, one a line; drops those a runtime (bash, python, the Xcode shim) adds to its own environment
 env_names() {  # <pid>: the names in the environment of a process, as ps -E shows it (for a Homebrew python; not for /bin/bash), without the ones its runtime adds
   /bin/ps -ww -E -o command= -p "$1" | tr ' ' '\n' | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | hidden_names | LC_ALL=C sort | tr '\n' ' '
@@ -607,6 +613,55 @@ EOF
   run /usr/bin/env -i VELO_TASK_HOME="$d/h2" "$PYBIN" -I "$R/bin/velo-task-state" launch-exec "$d/h2/other.intent" "$D64" "$UUID0"
   need "too few arguments: usage error (exit 2)" [ "$RC" = 2 ]
 }
+t_secrets_fd() {  # --secrets-fd N (R11(a)): NAME=value records, each ending in a NUL, are read from descriptor N, and the helper runs itself again with them in its environment: no value is ever in an argv
+  local d prog bad v=$'a b=c\nd'; d=$(mktemp -d "$T/sf.XXXXXX"); prog="$d/prog.sh"
+  printf '#!/bin/bash\necho "FOO=[$FOO]"\necho "BAR=[$BAR]"\necho "KEEP=[$KEEP]"\nif [ -e /dev/fd/8 ]; then echo fd8=open; else echo fd8=closed; fi\n' > "$prog"; chmod +x "$prog"
+  KEEP=kept run ST --secrets-fd 8 launch-exec "$d/i1" "$D64" "$UUID0" "$prog" FOO BAR KEEP 8< <(printf 'FOO=%s\0BAR=\0' "$v")
+  need "the records are applied and the program runs (exit 0)" [ "$RC" = 0 ]
+  need "...it gets the values byte for byte: a space, an equals sign and a newline in one, and an empty one" [ "$OUT" = $'FOO=[a b=c\nd]\nBAR=[]\nKEEP=[kept]\nfd8=closed' ]
+  need "...and what the helper had in its environment is still there (KEEP)" grep -qx 'KEEP=\[kept\]' <<<"$OUT"
+  need "...and the descriptor the records came on is closed in what the helper runs" grep -qx 'fd8=closed' <<<"$OUT"
+  run ST --secrets-fd 8 launch-exec "$d/i2" "$D64" "$UUID0" "$prog" FOO 8< /dev/null
+  need "with no record the variable to pass on is not set, and launch-exec says so (exit 1)" [ "$RC" = 1 ]; need "...naming it" grep -q 'not set in the environment: FOO' <<<"$OUT"
+  run ST --secrets-fd 8 launch-exec "$d/i3" "$D64" "$UUID0" "$prog" 8< /dev/null
+  need "with no record the subcommand runs as it would without the option (exit 0)" [ "$RC" = 0 ]
+  need "...nothing is set, and the descriptor is closed" [ "$OUT" = $'FOO=[]\nBAR=[]\nKEEP=[]\nfd8=closed' ]
+  for bad in 'lower=1' 'NOEQUALS' '1BAD=x' '=x' 'A B=x'; do
+    run ST --secrets-fd 8 launch-exec "$d/ib" "$D64" "$UUID0" "$prog" 8< <(printf '%s\0' "$bad")
+    need "[$bad] a record that is not NAME=value with a capitalised name is refused (exit 2)" [ "$RC" = 2 ]; need "[$bad] ...saying so" grep -q 'every record must be NAME=value' <<<"$OUT"
+    need "[$bad] ...before anything was published or run" [ ! -e "$d/ib" ]
+  done
+  run ST --secrets-fd 77 launch-exec "$d/ib" "$D64" "$UUID0" "$prog" FOO
+  need "a descriptor that is not open is an error that says so (exit 1)" [ "$RC" = 1 ]; need "...naming the descriptor" grep -q -e '--secrets-fd 77: Bad file descriptor' <<<"$OUT"
+  run ST --secrets-fd 8; need "no subcommand after the option is a usage error (exit 2)" [ "$RC" = 2 ]
+  run ST --secrets-fd x launch-exec "$d/ib" "$D64" "$UUID0" "$prog"; need "a descriptor that is not a number is a usage error (exit 2)" [ "$RC" = 2 ]
+}
+t_write_record_short() {  # a record that cannot be written whole leaves no <dest>.tmp.* behind (the cap makes the write genuinely short)
+  local d out rc; d=$(mktemp -d "$T/ws.XXXXXX")
+  out=$(capped 40 write-record "$d/rec" 1234 'Mon Jan 1 00:00:00 2001' "$D64" "$UUID0"); rc=$?
+  OUT="$out"; need "a write cut short fails (exit 1)" [ "$rc" = 1 ]; need "...saying so" grep -q 'short write' <<<"$out"
+  OUT="left in the directory: $(ls "$d" | tr '\n' ' ')"; need "...and nothing is left behind: no temp file, no record" [ -z "$(ls "$d")" ]
+  run ST write-record "$d/rec2" 1234 'Mon Jan 1 00:00:00 2001' "$D64" "$UUID0"
+  need "control: without the limit the same call writes the record (exit 0)" [ "$RC" = 0 ]; need "...a complete one" rec_ok "$d/rec2"
+  need "...and leaves only it" [ "$(ls "$d")" = rec2 ]
+}
+# write_new is the one creator of a temp file in the helper: pending-write and session-token go through it as write-record does, so the same cut-short write is checked on each.
+t_pending_write_short() {
+  local d out rc; d=$(mktemp -d "$T/ws.XXXXXX")
+  out=$(capped 40 pending-write "$d" -- --name abc-1 --timeout 30 --idempotency-key velo_abc-1 --cwd /w --tag velo -- /bin/echo hello); rc=$?
+  OUT="$out"; need "a pending record cut short fails (exit 1)" [ "$rc" = 1 ]; need "...saying so" grep -q 'short write' <<<"$out"
+  OUT="left in the directory: $(ls "$d" | tr '\n' ' ')"; need "...and nothing is left behind: no temp file, no record" [ -z "$(ls "$d")" ]
+  run ST pending-write "$d" -- --name abc-1 --timeout 30 --idempotency-key velo_abc-1 --cwd /w --tag velo -- /bin/echo hello
+  need "control: without the limit the same call writes the record (exit 0)" [ "$RC" = 0 ]; need "...and leaves only it" [ "$(ls "$d")" = "$OUT" ]
+}
+t_session_token_short() {
+  local d out rc; d=$(mktemp -d "$T/ws.XXXXXX")
+  out=$(capped 8 session-token "$d/session"); rc=$?
+  OUT="$out"; need "a token cut short fails (exit 1)" [ "$rc" = 1 ]; need "...saying so" grep -q 'short write' <<<"$out"
+  OUT="left in the directory: $(ls "$d" | tr '\n' ' ')"; need "...and nothing is left behind: no temp file, no token" [ -z "$(ls "$d")" ]
+  run ST session-token "$d/session"
+  need "control: without the limit the same call makes the token (exit 0)" [ "$RC" = 0 ]; need "...and leaves only it" [ "$(ls "$d")" = session ]
+}
 t_json_get() {  # the helper replaces jq: process identity and provenance are read through it, never through a PATH tool
   local d; d=$(mktemp -d "$T/jg.XXXXXX")
   printf '%s\n' '{"pid":4242,"url":"http://127.0.0.1:48217","up":true,"down":false,"nothing":null,"ratio":1.5,"nested":{"a":[1,2]},"name":"a b","accent":"café"}' > "$d/j"
@@ -950,6 +1005,66 @@ t_secrets() {  # B21
   need "no secret value anywhere under the test directory (provenance, logs, state, stubs)" \
     not grep -rqF -e sk-live-AAAA1111BBBB2222 -e hunter2-unlisted-ZZZ9 "$E"
 }
+t_secret_argv() {  # R11(a): the allowlisted value goes down a descriptor and is in no argv env is given (ps -ww shows an argv to every user); the NAME is, for launch-exec to pass on
+  local k=sk-live-AAAA1111BBBB2222 s words want
+  mkhome; mkvenv; printf 'OPENROUTER_API_KEY\n' > "$E_HOME/vanth.env.allow"
+  s="$E/spy"; mkdir -p "$s"; cp -R "$R/bin" "$R/requirements" "$s/"; render env-spy.sh "$E/env-spy"
+  sed -i '' "s#/usr/bin/env#$E/env-spy#g" "$s/bin/velo-task-lib.sh"   # a copy of the library whose every env is the spy, which logs the argv it is given and runs the real env with it
+  OUT="the spy is called $(grep -c "$E/env-spy" "$s/bin/velo-task-lib.sh") times in the copied library"; need "precondition: the copied library runs its envs through the spy" [ "$(grep -c "$E/env-spy" "$s/bin/velo-task-lib.sh")" -ge 5 ]
+  OPENROUTER_API_KEY=$k run "$s/bin/velo-task" ensure-daemon
+  need "ensure-daemon through the spy succeeds (exit 0)" [ "$RC" = 0 ]
+  want=$(printf %s "$k" | /usr/bin/shasum -a 256 | cut -c1-64)
+  need "control: the daemon got the value all the same" grep -qx "keyhash=$want" "$E_CALLS"
+  words=$(tr '\0' '\n' < "$E/env-argv.log")
+  need "control: the spy saw the lock helper started (the body's environment is built there)" grep -qx -e '--child-fd' <<<"$words"
+  need "control: ...and the launch of the daemon" grep -qx launch-exec <<<"$words"
+  need "...the NAME is in argv, for launch-exec to pass on" grep -qx OPENROUTER_API_KEY <<<"$words"
+  OUT="the value is in $(grep -cF "$k" "$E/env-argv.log") of $(grep -c . "$E/env-argv.log") calls of env"
+  need "the value is in no argv env was given, neither the lock helper's nor the launch's" not grep -qF "$k" "$E/env-argv.log"
+}
+t_launch_log_redacted() {  # R11(a), B21: the end of the launch log reaches the error message with the allowlisted values this body holds replaced by ***
+  local k=plain-allowlisted-value-77 s
+  mkhome; mkvenv; printf 'MY_PASSPHRASE\n' > "$E_HOME/vanth.env.allow"; printf 'MY_PASSPHRASE\n' > "$E/echo-key"
+  MY_PASSPHRASE=$k run VT ensure-daemon
+  need "a daemon that dies at start, quoting an allowlisted value in its message: exit 6" [ "$RC" = 6 ]
+  need "...the message names the launch log" grep -qF "see $E_HOME/daemon.launch.log: " <<<"$OUT"
+  need "control: the log holds the daemon's words, value included (it is private, 0600)" grep -qF "MY_PASSPHRASE=$k" "$E_HOME/daemon.launch.log"
+  need "...the message gives them with the value replaced" grep -qF 'MY_PASSPHRASE=***' <<<"$OUT"
+  need "the value is nowhere in the message" not grep -qF "$k" <<<"$OUT"
+  # a redaction that itself fails shows nothing of the log: a log that could hold a value is not shown raw
+  s="$E/broken"; mkdir -p "$s"; cp -R "$R/bin" "$R/requirements" "$s/"
+  "$PYBIN" -I - "$s/bin/velo-task-state" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+head = "def cmd_redact(args):\n"
+assert text.count(head) == 1, "cmd_redact not found exactly once"
+open(path, "w").write(text.replace(head, head + '    die(1, "redact: broken on purpose")\n'))
+PY
+  MY_PASSPHRASE=$k run "$s/bin/velo-task" ensure-daemon
+  need "with a redaction that fails the launch still fails (exit 6)" [ "$RC" = 6 ]
+  need "...the message says the log is not shown" grep -qF '(the log is not shown: redacting it failed)' <<<"$OUT"
+  need "...and the value is nowhere in it" not grep -qF "$k" <<<"$OUT"
+}
+t_digest_inherited() {  # R11(d): the launch digest covers the allowlisted names this environment SETS, which are what the daemon gets: it is adopted only by an environment that would launch it the same
+  local pa want
+  mkhome; mkvenv; printf 'OPENROUTER_API_KEY\n' > "$E_HOME/vanth.env.allow"
+  run /usr/bin/env -u OPENROUTER_API_KEY "$R/bin/velo-task" ensure-daemon   # -u: the caller's own environment may hold the key; A must not
+  need "environment A (the name listed, not set) starts a daemon (exit 0)" [ "$RC" = 0 ]
+  need "...which got no key" grep -qx 'keyhash=unset' "$E_CALLS"; pa=$(daemon_pid)
+  OPENROUTER_API_KEY=value-of-B run VT ensure-daemon
+  need "environment B (the name set) does not adopt it (exit 6)" [ "$RC" = 6 ]
+  need "...because the launch digest differs" grep -q 'launch digest differs' <<<"$OUT"
+  need "...pointing at restart-daemon" grep -q 'velo-task restart-daemon' <<<"$OUT"
+  need "...the daemon is untouched" alive "$pa"; need "...and nothing new was launched" [ "$(launches)" = 1 ]
+  OPENROUTER_API_KEY=value-of-B run VT restart-daemon; need "restart-daemon from B replaces it (exit 0)" [ "$RC" = 0 ]
+  want=$(printf %s value-of-B | /usr/bin/shasum -a 256 | cut -c1-64)
+  need "...with B's key" grep -qx "keyhash=$want" "$E_CALLS"
+  OPENROUTER_API_KEY=value-of-B run VT ensure-daemon; need "B adopts the daemon it launched" grep -q adopted <<<"$OUT"
+  OPENROUTER_API_KEY=another-value run VT ensure-daemon; need "...so does an environment with another value of the key: the digest holds names, never values" grep -q adopted <<<"$OUT"
+  run /usr/bin/env -u OPENROUTER_API_KEY "$R/bin/velo-task" ensure-daemon
+  need "A, which would launch it without the key, does not adopt it (exit 6)" [ "$RC" = 6 ]; need "...pointing at restart-daemon" grep -q 'velo-task restart-daemon' <<<"$OUT"
+}
 t_modes_env() {  # B22
   local f; mkhome; mkvenv; run VT ensure-daemon; need "clean launch succeeds" [ "$RC" = 0 ]
   need "VANTH_HOME is 0700" [ "$(stat -f %Lp "$E_VH")" = 700 ]
@@ -1001,6 +1116,32 @@ t_provenance_refusals() {  # B22: one scenario per validity condition, the other
   need "...as adopted" grep -q adopted <<<"$OUT"
   need "...and the control never launched anything" [ "$(launches)" = 1 ]
   kill "$p"
+}
+t_daemon_json_malformed() {  # a daemon.json that cannot be parsed is an error that stops the command, never an empty answer that skips the pid cross-check (no daemon.json at all stays an empty one)
+  local p
+  mkhome; mkvenv; VT ensure-daemon >/dev/null; p=$(daemon_pid); cp "$E_VH/daemon.json" "$E/dj.good"
+  printf '{"pid": %s, "started_at": ' "$p" > "$E_VH/daemon.json"   # cut short; the fake vanth reads the pid from it with sed, so the daemon still answers
+  run VT restart-daemon
+  need "restart-daemon with a daemon.json it cannot parse refuses (exit 6)" [ "$RC" = 6 ]; need "...naming daemon.json" grep -q 'daemon.json cannot be read as JSON' <<<"$OUT"
+  need "...the daemon was not signalled" alive "$p"; need "...and nothing was launched" [ "$(launches)" = 1 ]
+  run VT ensure-daemon
+  need "ensure-daemon refuses it too (exit 6)" [ "$RC" = 6 ]; need "...naming daemon.json, not a pid mismatch" grep -q 'daemon.json cannot be read as JSON' <<<"$OUT"
+  need "...and launched nothing" [ "$(launches)" = 1 ]
+  run VT doctor
+  need "doctor reports it (exit 1)" [ "$RC" = 1 ]; need "...as a failure of the daemon check" grep -q 'FAIL daemon: up on port .*daemon.json cannot be read as JSON' <<<"$OUT"
+  cp "$E/dj.good" "$E_VH/daemon.json"; run VT restart-daemon
+  need "control: with daemon.json whole again restart-daemon replaces the daemon (exit 0)" [ "$RC" = 0 ]; need "...the old one is gone" not alive "$p"
+  # install-vanth: a daemon started by hand from the venv, no record names it, and the only evidence of it is a daemon.json that cannot be parsed
+  mkhome; mkuv ok; installv; echo stale > "$E_VENV/.velo-task-installed"
+  prestart 077 || { echo "FAILED: pre-start"; exit 1; }; p=$(daemon_pid)
+  printf '{"pid": %s, ' "$p" > "$E_VH/daemon.json"; : > "$E/uv.log"; installv
+  need "install-vanth does not take an unreadable daemon.json for no daemon (exit 6)" [ "$RC" = 6 ]; need "...naming daemon.json" grep -q 'daemon.json cannot be read as JSON' <<<"$OUT"
+  need "...the venv is as it was" [ -x "$E_VENV/bin/vanthd" ]; need "...nothing was built" [ ! -s "$E/uv.log" ]; need "...and the daemon runs on" alive "$p"; kill "$p"
+  # a daemon.json that is not there at all is still an empty answer: a record of a live process that does not answer is what stops the launch
+  mkhome; mkvenv; VT ensure-daemon >/dev/null; p=$(daemon_pid); rm "$E_VH/daemon.json"
+  run VT ensure-daemon
+  need "without a daemon.json the record of the live daemon is what refuses the launch (exit 6)" [ "$RC" = 6 ]; need "...saying it does not answer" grep -q 'does not answer' <<<"$OUT"
+  need "...the daemon was not signalled" alive "$p"; need "...and nothing was launched" [ "$(launches)" = 1 ]
 }
 rec_ok() {  # <file>: a record in the format velo-task writes: pid, start time, 64-hex digest, incarnation UUID
   [ -f "$1" ] && grep -Eq '^pid=[0-9]+$' "$1" && grep -Eq '^lstart=.+$' "$1" && grep -Eq '^digest=[0-9a-f]{64}$' "$1" \
@@ -1225,14 +1366,16 @@ t_restart_digest_change() {  # a daemon launched with an older configuration is 
   local p1 p2; mkhome; mkvenv; VT ensure-daemon >/dev/null; p1=$(daemon_pid)
   printf 'MY_NEW_KEY\n' > "$E_HOME/vanth.env.allow"
   run VT ensure-daemon
-  need "the allowlist changed, so the running daemon no longer matches: ensure-daemon refuses (exit 6)" [ "$RC" = 6 ]
+  need "an allowlisted name this environment does not set changes nothing the daemon would get, so the digest is the same: adopted" grep -q adopted <<<"$OUT"
+  MY_NEW_KEY=fresh-value run VT ensure-daemon
+  need "the allowlist changed and the name is set, so the running daemon no longer matches: ensure-daemon refuses (exit 6)" [ "$RC" = 6 ]
   need "...naming the launch digest" grep -q 'launch digest' <<<"$OUT"; need "...and restart-daemon" grep -q 'velo-task restart-daemon' <<<"$OUT"
   need "...the old daemon is untouched" alive "$p1"
   MY_NEW_KEY=fresh-value run VT restart-daemon
   need "restart-daemon accepts a record whose digest is an older configuration's and replaces the daemon (exit 0)" [ "$RC" = 0 ]
   p2=$(daemon_pid); need "...the old daemon is gone" not alive "$p1"; need "...a new one runs" alive "$p2"
   need "...which received the newly allowlisted key" grep -q '^names=.*MY_NEW_KEY' "$E_CALLS"
-  run VT ensure-daemon; need "...and is adopted by ensure-daemon" grep -q adopted <<<"$OUT"
+  MY_NEW_KEY=fresh-value run VT ensure-daemon; need "...and is adopted by ensure-daemon, from an environment that sets the key as the launch did" grep -q adopted <<<"$OUT"
 }
 t_restart_refuses_unproven() {  # findings 1, 17: restart-daemon signals only a process that a complete, matching record proves is ours
   local p dp other v ls want; mkhome; mkvenv
@@ -1836,6 +1979,116 @@ t_venv_in_use() {  # finding 3: install-vanth never replaces a venv a daemon run
   need "a recorded daemon that does not answer yet keeps install-vanth from replacing the venv (exit 6)" [ "$RC" = 6 ]
   need "...nothing was built" [ ! -s "$E/uv.log" ]; need "...and the daemon runs on" alive "$p"; kill "$p"
 }
+t_install_broken_venv() {  # a venv whose python does not run (a build that died half way) is rebuilt by install-vanth: what it checks first, daemon.json included, never runs that python
+  mkhome; mkuv ok; installv
+  rm "$E_VENV/.velo-task-installed"; printf 'SENTINEL\n' > "$E_VENV/bin/python"; chmod 755 "$E_VENV/bin/python"
+  : > "$E/uv.log"; installv
+  need "install-vanth over a venv whose python does not run rebuilds it (exit 0)" [ "$RC" = 0 ]
+  OUT="uv.log: $(tr '\n' ' ' < "$E/uv.log" | cut -c1-200)"; need "...by running uv venv" grep -q '^uv venv' "$E/uv.log"
+  need "...and marks the install" [ -s "$E_VENV/.velo-task-installed" ]
+  need "...with a python that runs" "$E_VENV/bin/python" -c 'pass'
+}
+t_install_orphan() {  # the lock helper dies (SIGKILL) while its install body goes on: the body stops at its next step, and stops a step it is in, instead of rebuilding the venv under whoever holds the lock now
+  local b1 b2 h body u s w1 w2
+  # (a) between steps: a second install-vanth has taken the lock by the time the orphan resumes
+  mkhome; mkuv ok; b1="$E/barrier-1"; b2="$E/barrier-2"
+  installv; echo stale > "$E_VENV/.velo-task-installed"; : > "$E/uv.log"   # an installed venv whose marker is out of date: the next install-vanth rebuilds it, and removes the marker first
+  ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VELO_TASK_FAILPOINT="install.lock.held:wait=$b1" VT install-vanth > "$E/o1" 2>&1; echo $? > "$E/rc1" ) & w1=$!
+  waitfor 10 test -e "$b1.reached" || { echo "FAILED: the first install-vanth never reached its barrier"; exit 1; }
+  h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_install")
+  need "(setup) there is one lock helper" sole "$h"; need "(setup) ...and one body under it" sole "$body"
+  kill -9 "$h"; wait "$w1"
+  ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VELO_TASK_FAILPOINT="install.lock.held:wait=$b2" VT install-vanth > "$E/o2" 2>&1; echo $? > "$E/rc2" ) & w2=$!
+  waitfor 10 test -e "$b2.reached" || { echo "FAILED: the second install-vanth never took the lock the first one lost"; exit 1; }
+  need "the first install's body outlives its lock helper, as an orphan" alive "$body"
+  : > "$b1"
+  need "released, the orphan ends" waitfor 10 not alive "$body"
+  OUT=$(cat "$E/uv.log"); need "it ran no uv while the second install-vanth held the lock" [ ! -s "$E/uv.log" ]
+  OUT=$(grep -v 'Killed: 9' "$E/o1" || true); need "...and said why it stopped" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o1"
+  OUT="the install marker holds: $(cat "$E_VENV/.velo-task-installed" 2>&1)"; need "...and left the install marker as it was: the new holder rebuilds, and removes it first" [ "$(cat "$E_VENV/.velo-task-installed" 2>/dev/null)" = stale ]
+  : > "$b2"; wait "$w2"
+  need "the second install-vanth completes (exit 0)" [ "$(cat "$E/rc2")" = 0 ]
+  OUT="uv venv: $(grep -c '^uv venv' "$E/uv.log"), uv pip install: $(grep -c '^uv pip install' "$E/uv.log")"
+  need "...with one venv and one pip install in all" [ "$OUT" = "uv venv: 1, uv pip install: 1" ]
+  # (b) inside a step: uv is running when the helper dies, in each of the two long steps
+  for s in venv pip; do
+    mkhome; mkuv ok; : > "$E/hold-$s"
+    ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VT install-vanth > "$E/o3" 2>&1; echo $? > "$E/rc3" ) & w1=$!
+    waitfor 10 test -e "$E/hold-$s.reached" || { echo "FAILED: [$s] uv $s never started"; exit 1; }
+    h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_install"); u=$(procs_of "$E/uvbin/uv $s")
+    need "[$s] (setup) there is one lock helper" sole "$h"; need "[$s] (setup) ...one body under it" sole "$body"; need "[$s] (setup) ...and one uv" sole "$u"
+    kill -9 "$h"; wait "$w1"
+    need "[$s] uv is stopped when the lock helper dies" waitfor 10 not alive "$u"
+    need "[$s] ...and so is the body" waitfor 10 not alive "$body"
+    need "[$s] ...it said why" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o3"
+    need "[$s] ...no install marker was written" [ ! -e "$E_VENV/.velo-task-installed" ]
+    rm "$E/hold-$s"; installv
+    need "[$s] control: install-vanth afterwards succeeds (exit 0)" [ "$RC" = 0 ]; need "[$s] ...and leaves the marker" [ -s "$E_VENV/.velo-task-installed" ]
+  done
+}
+t_install_orphan_verify() {  # the lock helper dies while install-vanth verifies what uv installed, and a second install-vanth takes the lock: the first body ends before it marks the install as done, and before it removes a venv that failed verification
+  local h body b w1 w2 v
+  for v in ok missing; do   # ok: verification passes; missing: it fails (the fake uv's closure lacks starlette)
+    mkhome; mkuv "$v"; : > "$E/hold-freeze"; b="$E/barrier-$v"
+    ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VT install-vanth > "$E/o1" 2>&1; echo $? > "$E/rc1" ) & w1=$!
+    waitfor 10 test -e "$E/hold-freeze.reached" || { echo "FAILED: [$v] the verification never reached uv pip freeze"; exit 1; }
+    h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_install")
+    need "[$v] (setup) there is one lock helper" sole "$h"; need "[$v] (setup) ...and one body under it" sole "$body"
+    kill -9 "$h"; wait "$w1"
+    ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VELO_TASK_FAILPOINT="install.lock.held:wait=$b" VT install-vanth > "$E/o2" 2>&1; echo $? > "$E/rc2" ) & w2=$!
+    waitfor 10 test -e "$b.reached" || { echo "FAILED: [$v] the second install-vanth never took the lock the first one lost"; exit 1; }
+    : > "$E/hold-freeze.release"
+    need "[$v] the first body, its verification released, ends" waitfor 10 not alive "$body"
+    OUT=$(grep -v 'Killed: 9' "$E/o1" || true); need "[$v] ...saying why" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o1"
+    need "[$v] ...it wrote no install marker" [ ! -e "$E_VENV/.velo-task-installed" ]
+    need "[$v] ...and removed no venv" [ -x "$E_VENV/bin/python" ]
+    : > "$b"; wait "$w2"; OUT=$(cat "$E/o2")
+    if [ "$v" = ok ]; then need "[$v] control: the second install-vanth, which holds the lock, completes (exit 0)" [ "$(cat "$E/rc2")" = 0 ]
+    else need "[$v] control: the second install-vanth, which holds the lock, is the one that removes the venv (exit 1)" [ "$(cat "$E/rc2")" = 1 ]; fi
+  done
+}
+t_install_signalled() {  # a signal to the lock helper reaches the body, and through it the step that runs in a process group of its own: uv is not left running without the lock
+  local h u w
+  mkhome; mkuv ok; : > "$E/hold-pip"
+  ( VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" VT install-vanth > "$E/o" 2>&1; echo $? > "$E/rc" ) & w=$!
+  waitfor 10 test -e "$E/hold-pip.reached" || { echo "FAILED: uv pip install never started"; exit 1; }
+  h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); u=$(procs_of "$E/uvbin/uv pip install")
+  need "(setup) there is one lock helper" sole "$h"; need "(setup) ...and one uv" sole "$u"
+  kill -TERM "$h"; wait "$w"
+  OUT=$(cat "$E/o"); need "install-vanth ends with the SIGTERM's status (143)" [ "$(cat "$E/rc")" = 143 ]
+  need "uv was stopped with it" waitfor 10 not alive "$u"
+  need "...and no install marker was written" [ ! -e "$E_VENV/.velo-task-installed" ]
+}
+t_ensure_orphan() {  # the same for a launch: an ensure-daemon body whose lock helper died launches nothing while a second ensure-daemon holds the lock
+  local b1 b2 h body w1 w2
+  mkhome; mkvenv; b1="$E/barrier-1"; b2="$E/barrier-2"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="daemon.lock.held:wait=$b1" VT ensure-daemon > "$E/o1" 2>&1; echo $? > "$E/rc1" ) & w1=$!
+  waitfor 10 test -e "$b1.reached" || { echo "FAILED: the first ensure-daemon never reached its barrier"; exit 1; }
+  h=$(procs_of "--child-fd 9 $E_HOME/lock/daemon"); body=$(child_of "$h" "velo-task-lib.sh locked_ensure")
+  need "(setup) there is one lock helper" sole "$h"; need "(setup) ...and one body under it" sole "$body"
+  kill -9 "$h"; wait "$w1"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="daemon.lock.held:wait=$b2" VT ensure-daemon > "$E/o2" 2>&1; echo $? > "$E/rc2" ) & w2=$!
+  waitfor 10 test -e "$b2.reached" || { echo "FAILED: the second ensure-daemon never took the lock the first one lost"; exit 1; }
+  need "the first body outlives its lock helper, as an orphan" alive "$body"
+  : > "$b1"
+  need "released, the orphan ends" waitfor 10 not alive "$body"
+  OUT="launches: $(launches)"; need "it launched nothing while the second ensure-daemon held the lock" [ "$(launches)" = 0 ]
+  OUT=$(grep -v 'Killed: 9' "$E/o1" || true); need "...and said why it stopped" grep -q 'the lock helper (pid .*) that held the lock for this run is gone' "$E/o1"
+  : > "$b2"; wait "$w2"
+  need "the second ensure-daemon starts the daemon (exit 0)" [ "$(cat "$E/rc2")" = 0 ]; need "...the only one" [ "$(launches)" = 1 ]
+}
+t_install_hash_tamper() {  # B23, offline: the fake uv refuses, as uv does under --require-hashes, a lock with a hash that is not the wheel's; install-vanth then fails and leaves nothing installed
+  local m
+  mkhome; mkuv ok; m="$E/tamper"; mkdir -p "$m"; cp -R "$R/bin" "$R/requirements" "$m/"
+  sed -i '' 's/--hash=sha256:f072f4d8/--hash=sha256:e072f4d8/' "$m/requirements/vanth.lock"
+  need "precondition: one hash in the copied lock is changed, in that copy only" [ "$(grep -c 'sha256:e072f4d8' "$m/requirements/vanth.lock")/$(grep -c 'sha256:f072f4d8' "$R/requirements/vanth.lock")" = 1/1 ]
+  VELO_TASK_TEST=1 VELO_TASK_UV="$E/uvbin/uv" run "$m/bin/velo-task" install-vanth
+  need "a lock with one hash that is not its wheel's fails install-vanth (exit 1)" [ "$RC" = 1 ]
+  need "...because uv refused that hash" grep -q 'Hash mismatch for annotated-types==0.8.0' <<<"$OUT"
+  need "...and install-vanth says it failed" grep -q 'install-vanth failed' <<<"$OUT"
+  need "...no install marker was written" [ ! -e "$E_VENV/.velo-task-installed" ]; need "...and no venv is left" [ ! -e "$E_VENV" ]
+  installv; need "control: the untampered lock installs (exit 0)" [ "$RC" = 0 ]; need "...and leaves the marker" [ -s "$E_VENV/.velo-task-installed" ]
+}
 norm_freeze() { awk -F'==' '{ n = tolower($1); gsub(/[-_.]+/, "-", n); print n "==" $2 }' | LC_ALL=C sort -u; }
 lock_problems() {  # <lock> [<manifest>]: what is wrong with it as a hash-locked requirements file of WHEELS for CPython 3.12 on macOS arm64, read offline; with a manifest, whether each hash is the one it records for that pin's wheel
   "$PYBIN" -I - "$@" <<'PY'
@@ -2080,6 +2333,10 @@ check "check-state: a symlink, the wrong kind of node or another owner is refuse
 check "write-record, rec-read, retire, publish: no symlink is followed, a FIFO is never waited on, only your regular files" t_records
 check "lock: the directory and file are opened without following symlinks, owned by you, identity re-checked after the flock" t_lock_state
 check "launch-exec: publishes the intent for its own pid and start time, then execs with exactly the variables named" t_launch_exec
+check "--secrets-fd: NAME=value records on a descriptor become the helper's environment, byte for byte, so no value is ever in an argv" t_secrets_fd
+check "write-record: a write cut short leaves no temp file behind" t_write_record_short
+check "pending-write: a write cut short leaves no temp file behind" t_pending_write_short
+check "session-token: a write cut short leaves no temp file behind" t_session_token_short
 check "json-get: jq-style values, missing is empty, malformed is an error" t_json_get
 check "modes-check: home, jobs.sqlite*, token, daemon.json, launch log, logs/ and events/ recursively" t_modes_check
 check "redact: R23(d) fixtures, error prints nothing" t_redact
@@ -2100,8 +2357,12 @@ check "the suite's python is an absolute path chosen once and resolved by an iso
 check "B33: allowlist table, one row per rule of R11, never echoes values" t_allowlist_rejects
 check "B33: whole allowlists, every bad line reported, restart-daemon applies the same rules" t_allowlist_lists
 check "B21: allowlisted key delivered, nothing else inherited, no secret at rest" t_secrets
+check "R11(a): an allowlisted value is in no argv that env is given (the name is), and still reaches the daemon" t_secret_argv
+check "the launch log's tail in an error message has the values the launching body holds replaced by ***" t_launch_log_redacted
+check "R11(d): the launch digest covers the allowlisted names the environment sets: a daemon is adopted only by an environment that would launch it the same" t_digest_inherited
 check "B22: modes 0700/0600, env -i keeps VANTH_HOME and port, intent retired" t_modes_env
 check "B22: daemons without valid provenance are refused" t_provenance_refusals
+check "a daemon.json that cannot be parsed stops restart-daemon, ensure-daemon, install-vanth and doctor; an absent one is still an empty answer" t_daemon_json_malformed
 check "B22: accepted under another locale, TZ and a fresh shell" t_locale_fresh_shell
 check "loose state is refused before any other action, restart-daemon included" t_modes_refuse
 check "a daemon that leaves a readable file is caught right after the launch" t_modes_after_launch
@@ -2140,6 +2401,12 @@ check "install-vanth is idempotent and rebuilds on a changed lock" t_install_ide
 check "install-vanth never replaces a venv under a running daemon" t_install_refuses_under_daemon
 check "install-vanth keeps the venv under a running daemon even when verification fails" t_install_failure_under_daemon
 check "install-vanth sees a daemon that runs from the venv: hand-started, or recorded and not yet listening" t_venv_in_use
+check "install-vanth rebuilds a venv whose python does not run: reading daemon.json never runs that python" t_install_broken_venv
+check "install-vanth: a body whose lock helper died stops at its next step, and stops the step it is in" t_install_orphan
+check "install-vanth: a lock helper that dies while the install is verified leaves no marker, and no venv removed" t_install_orphan_verify
+check "install-vanth: a signal to the lock helper stops uv too" t_install_signalled
+check "ensure-daemon: a body whose lock helper died launches nothing" t_ensure_orphan
+check "B23: a lock with a hash that is not its wheel's fails install-vanth and leaves nothing installed" t_install_hash_tamper
 check "B23: the lock is hashed, pinned and WHEELS ONLY (offline artifact-type check)" t_lock_file
 check "the lock's pinned set equals the checked-in closure list, and the fake install does not follow the lock" t_lock_closure
 check "install.sh ships requirements/ and the library beside bin/" t_install_ships_lock
@@ -2147,7 +2414,7 @@ check "install.sh ships requirements/ and the library beside bin/" t_install_shi
 echo "velo-task M1: mutation proofs (each check must go red on a mutated copy)"
 V=bin/velo-task; L=bin/velo-task-lib.sh; S=bin/velo-task-state
 # The lock, taken away: run_locked starts the body without the helper's lock, and assert_lock_held no longer asks whether it is held.
-NOLOCK_RUN=$'  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" lock --timeout "${VELO_TASK_LOCK_WAIT:-60}" --child-fd "$LOCK_FD" "$LOCK_FILE" -- \\\n    /bin/bash -c'
+NOLOCK_RUN=$'  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" --secrets-fd 8 lock --timeout "${VELO_TASK_LOCK_WAIT:-60}" --child-fd "$LOCK_FD" "$LOCK_FILE" -- \\\n    /bin/bash -c'
 NOLOCK_ASSERT='  [ "${1:-}" = "$LOCK_FILE" ] && stl lock-held --fd "$LOCK_FD" "$LOCK_FILE" \'
 
 # ---- the state helper ----
@@ -2237,6 +2504,17 @@ prove "launch-exec does not publish the intent" t_launch_exec $S '    write_reco
 prove "launch-exec publishes the intent for a pid that is not its own" t_launch_exec $S '    pid = os.getpid()' '    pid = os.getppid()'
 prove "launch-exec leaves SIGPIPE ignored for the program" t_launch_exec $S $'Python ignores these; vanthd gets the dispositions a plain exec would have given it\n        signal.signal(sig, signal.SIG_DFL)' $'Python ignores these; vanthd gets the dispositions a plain exec would have given it\n        pass'
 prove "launch-exec does not check that the variables to pass on are set" t_launch_exec $S '    missing = [n for n in names if n not in os.environ]' '    missing = []'
+prove "--secrets-fd reads the records and applies none" t_secrets_fd $S '        env[name] = value' '        pass'
+prove "--secrets-fd runs the helper again without the environment it had" t_secrets_fd $S '    env = dict(os.environb)' '    env = {}'
+prove "--secrets-fd ends a record at a newline, not at a NUL" t_secrets_fd $S '    records = [r for r in raw.split(b"\0") if r]' '    records = [r for r in raw.split(b"\n") if r]'
+prove "--secrets-fd leaves its descriptor open in what it runs" t_secrets_fd $S $'            raw += part\n        os.close(fd)\n' $'            raw += part\n'
+prove "--secrets-fd accepts a name of any shape" t_secrets_fd $S '        if not equals or not SECRET_ENV_NAME.fullmatch(name):' '        if not equals:'
+prove "--secrets-fd takes a descriptor it cannot read for an empty one" t_secrets_fd $S '        die(1, "--secrets-fd %d: %s" % (fd, exc.strerror))' '        return rest'
+CLEANUP=$'    except BaseException:  # die() is SystemExit: whatever stops the write, the temp does not stay behind\n        os.unlink(tmp)\n        raise\n    finally:'
+for pair in write-record:t_write_record_short pending-write:t_pending_write_short session-token:t_session_token_short; do   # <command>:<its check>: all three write through write_new
+  prove "${pair%%:*} leaves its temp behind when the write is cut short" "${pair##*:}" $S "$CLEANUP" '    finally:'
+  prove "${pair%%:*} removes its temp for an OSError only, not for the die() of a short write" "${pair##*:}" $S '    except BaseException:  # die() is SystemExit' '    except OSError:  # die() is SystemExit'
+done
 prove "json-get prints Python booleans" t_json_get $S 'print("true" if value else "false")' 'print(value)'
 prove "json-get prints a missing key as null" t_json_get $S $'    if value is None:\n        return 0\n' ''
 prove "json-get reads a malformed file as empty" t_json_get $S '    doc = json.loads(raw)' $'    try:\n        doc = json.loads(raw)\n    except ValueError:\n        return 0'
@@ -2334,7 +2612,7 @@ prove "a record that is unsafe is treated as one that is missing" t_state_swappe
   '    9) die 6 "unsafe state: $text; refusing. Remove or fix it by hand, then re-run" ;;' '    9) REC_WHY="$1 is unsafe"; return 1 ;;'
 prove "a record is read through its path, which may be a symlink" t_state_swapped $L '  text=$(st rec-read "$1") || rc=$?' '  text=$(/bin/cat "$1") || rc=$?'
 prove "ensure-daemon launches without asking again whether it still holds the lock" t_lock_swapped $L \
-  $'  local args names k pid started digest inc deadline\n  still_locked\n' $'  local args names k pid started digest inc deadline\n'
+  $'  local args names pid started digest inc deadline\n  still_locked\n' $'  local args names pid started digest inc deadline\n'
 prove "restart-daemon signals without asking again whether it still holds the lock" t_lock_swapped $L \
   $'validated above are what is signalled\n    still_locked\n' $'validated above are what is signalled\n'
 prove "install-vanth replaces the venv without asking again whether it still holds the lock" t_lock_swapped $L \
@@ -2344,7 +2622,7 @@ prove "the helper is not isolated from the caller's user site" t_hostile_env $L 
 prove "the helper is neither isolated nor given a clean environment" t_hostile_env $L \
   '  /usr/bin/env -i "${HELPER_ENV[@]}" "$py" -I "$STATE_SCRIPT" "$@"' '  /usr/bin/env "${HELPER_ENV[@]}" "$py" "$STATE_SCRIPT" "$@"'
 prove "the locked body inherits the caller's BASH_ENV" t_hostile_env $L \
-  '  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" lock --timeout' '  /usr/bin/env "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" lock --timeout'
+  '  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" --secrets-fd 8 lock --timeout' '  /usr/bin/env "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" --secrets-fd 8 lock --timeout'
 prove "a wait that is not a number is evaluated by bash arithmetic" t_hostile_env $L \
   '  case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac' '  :'
 prove "a poll interval that is not a number is passed to sleep" t_hostile_env $L \
@@ -2352,16 +2630,16 @@ prove "a poll interval that is not a number is passed to sleep" t_hostile_env $L
 prove "the helper is started with the caller's environment" t_child_env $L \
   '  /usr/bin/env -i "${HELPER_ENV[@]}" "$py" -I "$STATE_SCRIPT" "$@"' '  /usr/bin/env "${HELPER_ENV[@]}" "$py" -I "$STATE_SCRIPT" "$@"'
 prove "the locked body is started with the caller's environment" t_child_env $L \
-  '  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" lock --timeout' '  /usr/bin/env "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" lock --timeout'
+  '  /usr/bin/env -i "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" --secrets-fd 8 lock --timeout' '  /usr/bin/env "${body[@]}" "$LOCK_PY" -I "$STATE_SCRIPT" --secrets-fd 8 lock --timeout'
 prove "uv is started with the caller's environment" t_child_env $L '  /usr/bin/env -i "${uvenv[@]}" "$UV" "$@"' '  /usr/bin/env "${uvenv[@]}" "$UV" "$@"'
 prove "the wrapper that becomes the daemon is started with the caller's environment" t_child_env $L \
   'exec /usr/bin/env -i "${args[@]}" VELO_TASK_HOME=' 'exec /usr/bin/env "${args[@]}" VELO_TASK_HOME='
 prove "the helper is handed a variable the design does not list" t_child_env $L \
   '  HELPER_ENV=(PATH="$SYS_PATH" HOME="$HOME" VELO_TASK_HOME="$VELO_TASK_HOME")' '  HELPER_ENV=(PATH="$SYS_PATH" HOME="$HOME" VELO_TASK_HOME="$VELO_TASK_HOME" UNLISTED_SECRET="${UNLISTED_SECRET-}")'
 prove "the locked body is not given the tunables" t_child_env $L \
-  '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL $ALLOW_NAMES; do' '  for v in $ALLOW_NAMES; do'
-prove "the locked body is not given the allowlisted names" t_child_env $L \
-  '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL $ALLOW_NAMES; do' '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL; do'
+  '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL; do' '  for v in ; do'
+prove "the locked body is not given the allowlisted names (the lock helper's descriptor 8 is empty)" t_child_env $L \
+  '8< <(emit_secrets) || rc=$?' '8< /dev/null || rc=$?'
 PYTHON_CANDIDATES=python3 prove_env "the suite finds its python through the caller's PATH" t_suite_python
 PYTHON_UNCHECKED=1 prove_env "the suite accepts a python that resolves into its own temp tree" t_suite_python
 TEMP_ROOT_CANON=echo prove_env "the temp root is compared as it is spelled, not resolved" t_suite_python
@@ -2388,11 +2666,20 @@ prove "the allowlist check stops at the first bad line" t_allowlist_lists $L '(v
 
 # ---- the launch: environment, modes, records ----
 prove "the daemon inherits the wrapper's whole environment, not only the names it was told to pass on" t_secrets $S '    env = {n: os.environ[n] for n in names}' '    env = dict(os.environ)'
-prove "allowlisted values are never delivered" t_secrets $L '    if [ "${!k+set}" = set ]; then args[${#args[@]}]="$k=${!k}"; names="$names $k"; fi' '    :'
+prove "allowlisted values are never delivered" t_secrets $L '  names="$names $(inherited_names)"' '  :'
 prove "a secret value reaches the daemon argv" t_secrets $S '    os.execve(program, [program], env)' '    os.execve(program, [program, "--ignored=" + os.environ.get("OPENROUTER_API_KEY", "")], env)'
 prove "a secret value is written into a record" t_secrets $S \
   '    data = ("pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\n" % (pid, lstart, digest, incarnation)).encode()' \
   '    data = ("pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\nk=%s\n" % (pid, lstart, digest, incarnation, os.environ.get("OPENROUTER_API_KEY", ""))).encode()'
+prove "the launch hands the wrapper no values on descriptor 8" t_secrets $L '>"$LAUNCH_LOG" 2>&1 ) 8< <(emit_secrets) &' '>"$LAUNCH_LOG" 2>&1 ) 8< /dev/null &'
+prove "R11(a): the lock helper's argv holds the allowlisted values again" t_secret_argv $L \
+  '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL; do' \
+  '  for v in VELO_TASK_PORT VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT VELO_TASK_LOCK_WAIT VELO_TASK_POLL $ALLOW_NAMES; do'
+prove "R11(a): the daemon launch's argv holds the allowlisted values again" t_secret_argv $L \
+  '  names="$names $(inherited_names)"' $'  for k in $(inherited_names); do args[${#args[@]}]="$k=${!k}"; names="$names $k"; done'
+prove "the launch log's tail reaches the error message unredacted" t_launch_log_redacted $L 'st --secrets-fd 8 redact 8< <(emit_secrets)' '/bin/cat'
+prove "the launch log's tail is redacted without the values this body holds" t_launch_log_redacted $L 'st --secrets-fd 8 redact 8< <(emit_secrets)' 'st redact'
+prove "a redaction that fails shows the launch log raw" t_launch_log_redacted $L $'|| printf \'(the log is not shown: redacting it failed)\'' $'|| printf \'%s\' "$text"'
 prove "launch without umask 077" t_modes_env $L '( umask 077; exec 9>&-;' '( exec 9>&-;'
 prove "the lock descriptor reaches the daemon" t_modes_env $L '( umask 077; exec 9>&-;' '( umask 077;'
 prove "launch without VANTH_HOME" t_modes_env \
@@ -2422,7 +2709,18 @@ prove "a failpoint takes an empty destination" t_failpoint_gating $S '(name != "
 
 # ---- adoption: provenance, intent, listener ----
 prove "prov_valid accepts everything" t_provenance_refusals $L $'  local dj live\n  PROV_WHY=""\n' $'  local dj live\n  PROV_WHY=""\n  return 0\n'
+prove "the launch digest covers the allowlist, not the names this environment sets" t_digest_inherited $L '  names=$(inherited_names)' '  names=$ALLOW_NAMES'
 prove "the provenance pid is not compared with daemon.json" t_provenance_refusals $L '[ "$dj" = "$REC_PID" ] || {' 'true || {'
+prove "djson takes a daemon.json it cannot parse for an absent one" t_daemon_json_malformed $L 'djson() { stl json-get "$VH/daemon.json" "$1"; }' 'djson() { stl json-get "$VH/daemon.json" "$1" || true; }'
+prove "djson reads daemon.json with the venv's python, which install-vanth is about to replace" t_install_broken_venv $L 'djson() { stl json-get "$VH/daemon.json" "$1"; }' 'djson() { st json-get "$VH/daemon.json" "$1"; }'
+prove "a daemon.json that cannot be parsed is no evidence for the pid cross-check in restart-daemon" t_daemon_json_malformed $L \
+  $'      dj=$(djson pid) || bad_daemon_json\n      if [ "${1:-}" != any ]' $'      dj=$(djson pid) || dj=\n      if [ "${1:-}" != any ]'
+prove "adoption takes a daemon.json it cannot parse for one that names no pid" t_daemon_json_malformed $L \
+  $'  dj=$(djson pid) || bad_daemon_json\n  [ "$dj" = "$REC_PID" ]' $'  dj=$(djson pid) || dj=\n  [ "$dj" = "$REC_PID" ]'
+prove "venv_in_use takes a daemon.json it cannot parse for no daemon" t_daemon_json_malformed $L \
+  $'  pid=$(djson pid) || bad_daemon_json\n  if [ -n "$pid" ]; then' $'  pid=$(djson pid) || pid=\n  if [ -n "$pid" ]; then'
+prove "doctor goes on with a daemon.json it cannot parse" t_daemon_json_malformed $L \
+  '    pid=$(djson pid) || { bad "daemon: up on port $PORT, but $VH/daemon.json cannot be read as JSON (see above); its pid, the provenance and the listener were not checked"; return "$rc"; }' '    pid=$(djson pid) || pid='
 prove "the provenance start time is not compared" t_provenance_refusals $L '  [ "$live" = "$REC_LSTART" ] || { PROV_WHY=' '  true || { PROV_WHY='
 prove "the provenance digest is not compared" t_provenance_refusals $L '  [ "$REC_DIGEST" = "$(launch_digest)" ] \' '  true \'
 prove "daemon.json started_at is not compared" t_provenance_refusals $L '  within_5s "$(epoch_of_lstart "$REC_LSTART")" "$(epoch_of_iso "$(djson started_at)")" \' '  true \'
@@ -2531,7 +2829,7 @@ prove "install without --require-hashes" t_install_flags $L '    --require-hashe
 prove "install allows sdists" t_install_flags $L '    --require-hashes --only-binary :all: -r "$LOCKFILE"' '    --require-hashes -r "$LOCKFILE"'
 prove "install from the wrong file" t_install_flags $L '-r "$LOCKFILE" ||' '-r "$LIB_DIR/../requirements/vanth.in" ||'
 prove "install without the PyPI pin" t_install_flags $L '--default-index https://pypi.org/simple' '--no-config'
-prove "install runs Vanth's setup command" t_install_flags $L $'  verify_install\n  st sha256 "$LOCKFILE" > "$MARKER"' $'  verify_install; "$VENV/bin/vanth" setup\n  st sha256 "$LOCKFILE" > "$MARKER"'
+prove "install runs Vanth's setup command" t_install_flags $L $'  verify_install\n  still_locked\n  st sha256 "$LOCKFILE" > "$MARKER"' $'  verify_install; "$VENV/bin/vanth" setup\n  still_locked\n  st sha256 "$LOCKFILE" > "$MARKER"'
 prove "uv runs with the caller's PATH" t_install_flags $L '  /usr/bin/env -i "${uvenv[@]}" "$UV" "$@"' '  "$UV" "$@"'
 prove "the trigger-parent reason is not asserted" t_install_asserts $L \
   '|| fail_install "the pinned trigger-parent stop reason is absent from the installed Vanth (R1)"' '|| true'
@@ -2542,8 +2840,25 @@ prove "install ignores the marker" t_install_idempotent $L '    if [ "$(/bin/cat
 prove "a changed lock does not rebuild" t_install_idempotent $L '    if [ "$(/bin/cat "$MARKER")" = "$want" ]; then' '    if true; then'
 prove "install replaces a venv under a running daemon" t_install_refuses_under_daemon $L '  if venv_in_use; then' '  if false; then'
 prove "a failed install removes the venv under a running daemon" t_install_failure_under_daemon $L '  ! venv_in_use || die 6 "install-vanth: $*;' '  true || die 6 "install-vanth: $*;'
-prove "venv_in_use ignores a daemon.json pid that runs from the venv" t_venv_in_use $L $'  pid=$(djson pid)\n  if [ -n "$pid" ]; then' $'  pid=\n  if [ -n "$pid" ]; then'
+prove "venv_in_use ignores a daemon.json pid that runs from the venv" t_venv_in_use $L $'  pid=$(djson pid) || bad_daemon_json\n  if [ -n "$pid" ]; then' $'  pid=\n  if [ -n "$pid" ]; then'
 prove "venv_in_use ignores a recorded process that does not answer" t_venv_in_use $L '  if find_ours_live any; then return 0; fi' '  :'
+prove "the lock helper is taken for alive whatever became of it (install-vanth)" t_install_orphan $L $'= "$LOCK_HOLDER" ]\n}' $'= "$LOCK_HOLDER" ] || true\n}'
+prove "the lock helper is taken for alive whatever became of it (ensure-daemon)" t_ensure_orphan $L $'= "$LOCK_HOLDER" ]\n}' $'= "$LOCK_HOLDER" ] || true\n}'
+prove "the lock helper is taken for alive whatever became of it (verification)" t_install_orphan_verify $L $'= "$LOCK_HOLDER" ]\n}' $'= "$LOCK_HOLDER" ] || true\n}'
+prove "assert_lock_held does not ask whether the lock helper is alive (install-vanth)" t_install_orphan $L $'  holder_alive || die 6 "$LOCK_HOLDER_GONE"\n' ''
+prove "assert_lock_held does not ask whether the lock helper is alive (ensure-daemon)" t_ensure_orphan $L $'  holder_alive || die 6 "$LOCK_HOLDER_GONE"\n' ''
+prove "assert_lock_held does not ask whether the lock helper is alive (verification)" t_install_orphan_verify $L $'  holder_alive || die 6 "$LOCK_HOLDER_GONE"\n' ''
+prove "uv pip install is not watched for the lock helper's death" t_install_orphan $L '  hold_run run_uv pip install --no-config' '  run_uv pip install --no-config'
+prove "uv venv is not watched for the lock helper's death" t_install_orphan $L '  hold_run run_uv venv --no-config' '  run_uv venv --no-config'
+prove "a signal to the install body is not passed on to uv" t_install_signalled $L \
+  $'  trap \'kill -TERM -- "-$job" 2>/dev/null || :; exit 143\' TERM INT HUP' '  :'
+prove "a failed verification removes the venv without asking again whether the lock is held" t_install_orphan_verify $L \
+  $'  still_locked\n  /bin/rm -rf "$VENV"; die 1 "install-vanth failed' $'  /bin/rm -rf "$VENV"; die 1 "install-vanth failed'
+prove "the install marker is written without asking again whether the lock is held" t_install_orphan_verify $L \
+  $'  verify_install\n  still_locked\n  st sha256 "$LOCKFILE" > "$MARKER"' $'  verify_install\n  st sha256 "$LOCKFILE" > "$MARKER"'
+prove "a failed uv pip install is not a failed install" t_install_hash_tamper $L '--require-hashes --only-binary :all: -r "$LOCKFILE" || fail_install "uv pip install"' '--require-hashes --only-binary :all: -r "$LOCKFILE" || true'
+prove "install without --require-hashes accepts a lock whose hash is not its wheel's" t_install_hash_tamper $L '    --require-hashes --only-binary :all: -r "$LOCKFILE"' '    --only-binary :all: -r "$LOCKFILE"'
+FAKE_UV_MUTANT=nohash prove_env "the fake uv does not enforce --require-hashes" t_install_hash_tamper
 
 # ---- the lock, the closure list, the fixtures ----
 H0=$(printf '%064d' 0)
