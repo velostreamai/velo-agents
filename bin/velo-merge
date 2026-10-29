@@ -35,7 +35,9 @@
 # but still require green CI.
 
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die()  { printf '\n\033[31mREFUSING TO MERGE:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
@@ -277,8 +279,7 @@ FILES=$(jq -r '[.files[].path]|join("\n")' <<<"$M")
 # as worker instructions, and the installers that put any of it in place.
 CODE=$(( $(grep -c '^src/' <<<"$FILES" || true) \
         + $(grep -c '^tests/' <<<"$FILES" || true) \
-        + $(grep -cE '^\.agents/(bin|rules|skills|tasks)/' <<<"$FILES" || true) \
-        + $(grep -cE '^\.agents/(install|update)\.sh$' <<<"$FILES" || true) ))
+        + $(grep -cE "$GATE_ORCH_RE" <<<"$FILES" || true) ))   # the repo's own tooling paths (velo-repo-lib.sh)
 
 # Mirrors velo-orch-lib.sh's is_agents_only (as of #2285 Round 2) rather than
 # sourcing it: that file is daemon-support tooling built for velo-orchestrd,
@@ -338,7 +339,7 @@ else
     [[ $FORCE -eq 1 ]] || die "#$PR has ambiguous gate labels: $(tr '\n' ' ' <<<"$GATE_LABELS" | sed 's/ $//') — at most one.
   The label is the gate's verdict, and two of them is no verdict: one of them is stale (a
   label that could not be removed, or one added by hand). Re-record the verdict, which
-  replaces them:  velo-gate $PR --pass | --block"
+  replaces them:  ${GATE_CMD_ENV}velo-gate $PR --pass | --block"
     warn "ambiguous gate labels ($(tr '\n' ' ' <<<"$GATE_LABELS" | sed 's/ $//')) — proceeding under --force"
   fi
   GATE_PASSED=0
@@ -379,7 +380,7 @@ $PLAN_OUT"
     # the first listed is only the one named in the message).
     CUR=$(head -n 1 <<<"$GATE_LABELS"); [[ -n "$CUR" ]] || CUR="gate:none"
     [[ $FORCE -eq 1 ]] || die "#$PR touches $CODE code file(s) and is '$CUR', not gate:passed.
-  Run the gate, then: velo-gate $PR --pass
+  Run the gate, then: ${GATE_CMD_ENV}velo-gate $PR --pass
   Verifying it yourself is not the gate — that is how an ungated PR gets
   described as ready."
   fi
@@ -498,7 +499,7 @@ $PLAN_OUT"
     if [[ -n "$STALE" ]]; then
       [[ $FORCE -eq 1 ]] || die "STALE GATE — head is now $SHORT, but:$STALE
   Commits landed after those gates ran. Re-gate against the current head:
-    velo-gate $PR --running   # then re-run the reviewers
+    ${GATE_CMD_ENV}velo-gate $PR --running   # then re-run the reviewers
   This is the exact case where a PR looked green against code that had
   already been replaced."
     else
@@ -542,7 +543,7 @@ $PLAN_OUT"
       [[ $FORCE -eq 1 ]] || die "#$PR is gate:passed but has NO recorded report for:$MISSING
   A gate whose result never reached the PR is indistinguishable from one that
   never ran. Post it:
-    velo-gate-post $PR <gate-name> <report-file>
+    ${GATE_CMD_ENV}velo-gate-post $PR <gate-name> <report-file>
   Recorded so far: ${RECORDED:-none}"
       warn "missing gate reports:$MISSING — proceeding under --force"
     fi
@@ -567,7 +568,7 @@ echo
 # poll window. The guard belongs here, where the side effect happens, not
 # duplicated in each caller (#2285 Round 2, Integration after PR1) — same
 # reasoning as velo-gate-post's post-once guard, one door down.
-MERGE_DIR="$VELO_STATE/gate/$PR"
+MERGE_DIR="$VELO_STATE/${GATE_SUBDIR}/$PR"
 mkdir -p "$MERGE_DIR"
 MERGE_DONE="$MERGE_DIR/.merged-$SHORT"
 MERGE_LOCK="$MERGE_DIR/.merging-$SHORT.lock"

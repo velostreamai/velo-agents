@@ -14,7 +14,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./velo-orch-lib.sh
-source "$HERE/velo-orch-lib.sh"
+# The lib resolves the repo (VELO_REPO) and says why when it cannot; going on without it would answer "no unhandled
+# attention events" about a state dir that was never named.
+source "$HERE/velo-orch-lib.sh" || exit 1
 
 die() { printf '\nERROR: %s\n\n' "$1" >&2; exit 1; }
 

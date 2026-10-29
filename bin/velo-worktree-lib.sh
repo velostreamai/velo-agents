@@ -18,7 +18,7 @@ wt_branch() {   # <worktree> -> branch name, or "?"
 }
 
 wt_commits() {  # <worktree> -> commits ahead of origin/master
-  git -C "$1" log --oneline origin/master..HEAD 2>/dev/null | wc -l | tr -d ' '
+  git -C "$1" log --oneline ${WT_BASE_REF:-origin/master}..HEAD 2>/dev/null | wc -l | tr -d ' '
 }
 
 wt_dirty() {    # <worktree> -> count of dirty paths
@@ -44,7 +44,7 @@ wt_unpushed() { # <worktree> <branch> -> commits not on the remote branch
 }
 
 wt_diffstat() { # <worktree> -> "files insertions deletions" vs origin/master
-  git -C "$1" diff --shortstat origin/master...HEAD 2>/dev/null | awk '
+  git -C "$1" diff --shortstat ${WT_BASE_REF:-origin/master}...HEAD 2>/dev/null | awk '
     { f=0; i=0; d=0
       for (n=1; n<=NF; n++) {
         if ($n ~ /^file/)      f=$(n-1)

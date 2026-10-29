@@ -19,7 +19,9 @@
 # linked issue that cannot be read is not one with no acceptance bars (see gh_read).
 
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die()  { printf '\n\033[31m%s\033[0m %s\n\n' "ERROR:" "$1" >&2; exit 1; }
 ok()   { printf '\033[32m  ok\033[0m %s\n' "$1"; }
@@ -59,6 +61,7 @@ HEAD=$(jq -r .headRefOid <<<"$META")
 SHORT="${HEAD:0:9}"
 STATE=$(jq -r .state <<<"$META")
 TITLE=$(jq -r .title <<<"$META")
+[[ $REPO_IS_DEFAULT -eq 1 ]] || TITLE="$TITLE  [$REPO]"   # a plan for another repo says whose PR it is
 LABELS=$(jq -r '[.labels[].name]|join(",")' <<<"$META")
 # The gate's verdict is ONE label, read from MANY: a PR can carry several `gate:*` labels at once
 # (a `--remove-label` that failed, or one added by hand in the UI). Two of them are no verdict, and
@@ -79,7 +82,7 @@ esac
 # an opus:high result that never happened. velo-gate-post puts the same
 # declaration on the posted comment.
 CC_BY=""
-[[ -f "$VELO_STATE/gate/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/gate/$PR/check-code.by")
+[[ -f "$VELO_STATE/${GATE_SUBDIR}/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/${GATE_SUBDIR}/$PR/check-code.by")
 SUBST=""; SUBST_SHOW=""
 case "$CC_BY" in
   sonnet)
@@ -105,6 +108,15 @@ ISSUES=$(jq -r '(.body // "")
                 | [scan("\\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\\s+#([0-9]+)"; "i") | .[0] | tonumber]
                 | unique | .[]' <<<"$META") \
   || die "could not read the body of #$PR to find the issues it closes"
+# Outside Velostream a PR names its issue more loosely than a closing keyword ("Part of #17", "see #17"), and the
+# trigger that stands in for that in Velostream (a "[#N]" parent tag on a src/ PR) does not exist: any `#N` in the
+# body that is not part of a longer reference (owner/repo#N) counts as one too.
+CLOSING=$(tr '\n' ' ' <<<"$ISSUES")
+if [[ $REPO_IS_DEFAULT -eq 0 ]]; then
+  REFS=$(jq -r '(.body // "") | [scan("(?<![\\w./#-])#([0-9]+)") | .[0] | tonumber] | unique | .[]' <<<"$META") \
+    || die "could not read the body of #$PR to find the issues it references"
+  ISSUES=$(printf '%s\n%s\n' "$ISSUES" "$REFS" | grep . | sort -un)
+fi
 BARS=0; SPEC_BULLET=""; BARS_ERR=""; BARS_UNREADABLE=""
 # An issue that cannot be READ is not an issue with no acceptance bullets. Counted as 0 it
 # silently dropped check-spec from the plan — the failure the rules below were first written
@@ -170,6 +182,8 @@ count_acceptance_bars() {
   for n in $ISSUES; do
     if bars_of "$n"; then
       [[ "$BARS" -ge 3 ]] && hit="${hit:+$hit, }#$n has $BARS acceptance bars"
+    elif [[ "$GH_ERR" == *"Could not resolve"* && " $CLOSING" != *" $n "* ]]; then
+      :   # a bare "#N" that names nothing in this repo (a Velostream issue, a typo) links nothing; only a closing keyword must resolve
     else
       nbad=$((nbad + 1)); bad="${bad:+$bad, }#$n"; lone="$GH_ERR"; errs="${errs:+$errs; }#$n: $GH_ERR"
     fi
@@ -203,14 +217,13 @@ count_acceptance_bars() {
 # skill IS the instruction text a worker runs on. install/update.sh put any of
 # it in place. Weakening a sidecar constraint or swapping an installed policy is
 # a change to how every run behaves, and scored 0 under a bin|rules-only rule.
-TOUCHES_ORCH=$(( $(grep -cE '^\.agents/(bin|rules|skills|tasks)/' <<<"$FILES" || true) \
-               + $(grep -cE '^\.agents/(install|update)\.sh$' <<<"$FILES" || true) ))
+TOUCHES_ORCH=$(grep -cE "$GATE_ORCH_RE" <<<"$FILES" || true)   # which paths those are depends on the repo (velo-repo-lib.sh)
 
 NEED=()
 build_need() {   # -> NEED; returns 1 (BARS_UNREADABLE / BARS_ERR set) when a linked issue could not be read
   NEED=()
   if [[ "$TOUCHES_ORCH" -gt 0 ]]; then
-    NEED+=("code-review  (orchestration: $TOUCHES_ORCH file(s) under .agents/ — governs every other run)")
+    NEED+=("code-review  (orchestration: $TOUCHES_ORCH file(s) $GATE_ORCH_WHERE — governs every other run)")
     [[ "$TOUCHES_SRC" -gt 0 ]] && NEED+=("check-code   (src/ touched: $TOUCHES_SRC files)")
   elif [[ "$TOUCHES_SRC" -eq 0 && "$TOUCHES_TEST" -eq 0 ]]; then
     NEED+=("none — docs only, no buildable code and no orchestration")
@@ -222,12 +235,17 @@ build_need() {   # -> NEED; returns 1 (BARS_UNREADABLE / BARS_ERR set) when a li
       [[ -n "$SPEC_BULLET" ]] && NEED+=("check-spec   ($SPEC_BULLET)")
     fi
   fi
+  # Outside Velostream most PRs land in the orchestration branch above, and the issue they close still has bars.
+  if [[ $REPO_IS_DEFAULT -eq 0 && "$TOUCHES_ORCH" -gt 0 && -n "$ISSUES" ]]; then
+    count_acceptance_bars || return 1
+    [[ -n "$SPEC_BULLET" ]] && NEED+=("check-spec   ($SPEC_BULLET)")
+  fi
   # A child PR of a tracked parent ("[#2231] ...") ships a pinned brief, and its bars live in
   # the scope the gate is given — not in a closing-keyword issue. "Part B of #N" and
   # "Parent: #N" are not closing keywords, so the issue scan above found nothing and
   # check-spec was silently never planned on #2756/#2758/#2761/#2762. It runs on velo-local
   # ($0), so there is no saving in leaving it out.
-  if [[ "$TOUCHES_SRC" -gt 0 && "$TITLE" =~ ^\[#[0-9]+\] && "${NEED[*]}" != *check-spec* ]]; then
+  if [[ $REPO_IS_DEFAULT -eq 1 && "$TOUCHES_SRC" -gt 0 && "$TITLE" =~ ^\[#[0-9]+\] && "${NEED[*]}" != *check-spec* ]]; then
     NEED+=("check-spec   (parent-tracked PR: the pinned brief's bars are verified; velo-local, free)")
   fi
   return 0
@@ -369,7 +387,7 @@ case "$MODE" in
       [[ -z "$MISSING" ]] \
         || die "refusing to mark passed: head is $SHORT, and a planned gate has no report at head:$MISSING
   Run the leg and post its report. A leg may be waived only with a named approver:
-    velo-gate-finish $PR $SHORT --pass --waive <gate>='<reason>' --approved-by '<who>'"
+    ${GATE_CMD_ENV}velo-gate-finish $PR $SHORT --pass --waive <gate>='<reason>' --approved-by '<who>'"
     fi
     # The old verdict label is removed BEFORE the new one is added, and a removal that fails stops
     # the run: adding beside a label that could not be removed would leave two gate labels, a PR
@@ -395,6 +413,7 @@ case "$MODE" in
        One is stale (a label that could not be removed, or one added by hand). Re-record it, which
        replaces them: velo-gate $PR --pass | --block"
       SHOW_RC=1
+      [[ $REPO_IS_DEFAULT -eq 1 ]] || warn "  for $REPO, whose #$PR that is: ${GATE_CMD_ENV}velo-gate $PR --pass | --block"
     fi
     if ! read_gate_comments; then
       # Not "nothing has been recorded": the read failed, so nothing is known.
@@ -413,7 +432,7 @@ case "$MODE" in
       else
         warn "every gate comment names the current head, but the label is '$CUR'.
        A comment records that a gate RAN; only the label records its VERDICT.
-       Set it once the reviewers report: velo-gate $PR --pass | --block"
+       Set it once the reviewers report: ${GATE_CMD_ENV}velo-gate $PR --pass | --block"
       fi
     fi
     if ! build_need; then

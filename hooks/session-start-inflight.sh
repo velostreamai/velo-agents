@@ -22,7 +22,12 @@
 
 set -uo pipefail
 
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see
+# velo-repo-lib.sh. Fails OPEN like everything else here: a hook that cannot
+# resolve its repo reports nothing rather than obstruct the session start.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${VELO_REPO_LIB:-$HOOK_DIR/../bin/velo-repo-lib.sh}" || exit 0
+repo_init || exit 0
 FOUND=0
 SECTIONS=""
 declare -a PR_NUMS=()
@@ -31,8 +36,8 @@ declare -a PR_NUMS=()
 # Same detection velo-watch's gates() uses: a `codex review` or `claude -p`
 # process whose command line references a per-PR gate directory.
 GATE_LINES=$(ps -eo pid=,command= 2>/dev/null \
-  | grep -E "(codex review|claude -p).*state/gate/[0-9]+/" | grep -v grep \
-  | sed -E 's%^ *([0-9]+) .*state/gate/([0-9]+)/([a-z-]+)[.-].*%  PR #\2 - \3 still running (pid \1)%' \
+  | grep -E "(codex review|claude -p).*$GATE_PATH_RE" | grep -v grep \
+  | sed -E "s%^ *([0-9]+) .*state/$GATE_SUBDIR/([0-9]+)/([a-z-]+)[.-].*%  PR #\2 - \3 still running (pid \1)%" \
   | sort -u)
 if [[ -n "$GATE_LINES" ]]; then
   FOUND=1
@@ -85,7 +90,6 @@ fi
 # to THIS script's own directory: hooks run from ~/.agents/hooks/ (installed by
 # install.sh) per the Velostream .claude/settings.json, so the sibling bin/ next
 # to the hook is the installed tooling, and in a checkout it is that checkout's.
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH_LIB="$HOOK_DIR/../bin/velo-orch-lib.sh"
 ATTENTION_LINES=""
 if [[ -f "$ORCH_LIB" ]]; then
@@ -123,17 +127,17 @@ session that started it is the one that just ended, that --wait call died
 with it, but the detached work above did not stop. Re-arm the watch now so
 this session is woken when it finishes, rather than finding out hours late:
 
-  ~/.agents/bin/velo-watch$WATCH_ARGS
-$( [[ "$NEED_ATTENTION_WATCH" -eq 1 ]] && cat <<'ATTN'
+  ${GATE_CMD_ENV}~/.agents/bin/velo-watch$WATCH_ARGS
+$( [[ "$NEED_ATTENTION_WATCH" -eq 1 ]] && cat <<ATTN
 
 There is also at least one unhandled attention event above. That watch exits
 on a gate/worker/CI change; this one exits the moment ANY attention event (or
 a new one) is still unacked, which is the more direct signal for what is
 listed above:
 
-  ~/.agents/bin/velo-watch --attention
+  ${GATE_CMD_ENV}~/.agents/bin/velo-watch --attention
 
-velo-attention ack <id> once you have handled one, or velo-attention ack
+${GATE_CMD_ENV}velo-attention ack <id> once you have handled one, or velo-attention ack
 --all once you have handled everything currently listed.
 ATTN
 )

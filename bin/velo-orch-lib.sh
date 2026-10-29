@@ -16,10 +16,14 @@
 # Bash 3.2 only (macOS system /bin/bash — no associative arrays, no `${x,,}`,
 # no `mapfile`). Every other .agents/bin/* script targets the same floor.
 
+# The repo these dirs belong to (velo-repo-lib.sh): another repo than the default gets its own orch/, gate/ and records/
+# subdirectory, so its PR and issue numbers never meet Velostream's.
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || return 1
+repo_init || return 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
-ORCH_DIR="${ORCH_DIR:-$VELO_STATE/orch}"
-GATE_ROOT="${GATE_ROOT:-$VELO_STATE/gate}"
-RECORDS_DIR="${RECORDS_DIR:-$VELO_STATE/records}"
+ORCH_DIR="${ORCH_DIR:-$VELO_STATE/orch$REPO_SUB}"
+GATE_ROOT="${GATE_ROOT:-$VELO_STATE/$GATE_SUBDIR}"
+RECORDS_DIR="${RECORDS_DIR:-$VELO_STATE/records$REPO_SUB}"
 ATTENTION_FILE="$ORCH_DIR/attention.jsonl"
 ACKED_FILE="$ORCH_DIR/acked-ids"
 QUEUE_FILE="$ORCH_DIR/queue.jsonl"

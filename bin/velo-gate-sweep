@@ -28,11 +28,13 @@
 # prints an error line and the sweep continues with the next one — the sweep's
 # whole point is that one dead PR must not cost the rest of the view.
 #
-# `gh --repo velostreamai/velostream` is explicit so the command works from any
-# cwd, including a worktree on a branch with no upstream.
+# `gh --repo "$REPO"` is explicit so the command works from any cwd, including a
+# worktree on a branch with no upstream.
 
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 
 [[ $# -ge 1 ]] || { echo "usage: velo-gate-sweep <pr> [<pr>...]" >&2; exit 2; }
@@ -181,7 +183,7 @@ cx_classify() {  # <text-present:0|1> <text> <read-error-text>
 }
 
 for p in "$@"; do
-  d="$VELO_STATE/gate/$p"
+  d="$VELO_STATE/${GATE_SUBDIR}/$p"
   # One gh view: head + state + mergeable. Same read-honesty rule as `gh pr
   # checks` below (#2358 P1 class): a FAILED view read — network down, API 5xx —
   # used to print "not found", which is a different fact. rc!=0 prints the gh

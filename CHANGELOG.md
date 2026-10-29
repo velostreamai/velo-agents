@@ -6,6 +6,40 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — `VELO_REPO`: the tools work on any repo, and the default is byte-for-byte unchanged (velo-agents#17, velostream#2769)
+
+The gate and the worker tools could review and dispatch for exactly one repository: `velostreamai/velostream` was
+written into twelve scripts (the `gh --repo` of every gate and worker tool), the checkout was `~/RustroverProjects/velostream`, a worker's
+worktree was `velostream-<n>` cut from `origin/master`, and the state dirs (`gate/`, `dispatch/`, `records/`, `spec/`,
+`native/`, `orch/`) were keyed by PR or issue number alone. Pointed at velo-agents, `velo-pr-gate 12` would gate
+Velostream's PR 12, and a dispatch would cut a worker for velo-agents' issue out of Velostream's tree. One variable now
+decides: `VELO_REPO=<owner>/<name>` (`VELO_GATE_REPO` is the same, `VELO_REPO` wins), resolved in `bin/velo-repo-lib.sh`,
+the only file in `bin/` and `hooks/` that spells the default. For another repo a dispatch uses `~/RustroverProjects/<name>`
+and `<name>-<n>` cut from the repo's default branch as GitHub names it, and **refuses, naming the path it tried,** when
+that tree is missing, is another repo's clone (origin checked), or GitHub names no default branch — it never falls back to
+Velostream's tree. A gate finds the tree it reviews by name and origin, not by the cwd, and refuses the same way. State
+for another repo is `<dir>/<owner>__<name>/…`, so numbers from two repos never share a directory, lock or record. The
+Velostream-only prerequisites (discovery index, `run-commit.sh`, the CLAUDE.md read-first, STREAMING-COMPLIANCE, the
+`fail_to_pass` sidecar check) are skipped and **said so** — in the dispatch output, and in an `OVERRIDE-DIRECTIVES:`
+paragraph that opens the worker's task and every review brief. `check-spec` is planned for a PR that closes or references
+an issue with acceptance bars, orchestration means the tooling tree (`bin/ rules/ skills/ tasks/ hooks/ launchd/`), a
+printed follow-up command carries `VELO_REPO=<repo> `, and the launchd agent stays Velostream's (`install`, `uninstall` and
+`status` refuse for another repo). `tests/test_repo_env.sh` and `tests/test_repo_env_workers.sh` pin it: a golden recorded
+from the pre-change scripts (292 lines: every gh argv, the state tree, the review brief, every stdout of 20 scenarios)
+equals the default repo's trace today; a stub `gh` proves every call for another repo names it; a static scan proves no
+script but the lib spells the default and every `gh` call and state path is scoped; each check is proved red by a named
+mutant. Two existing suites moved with it: `test-timeouts.sh` exports `VELO_REPO_LIB` so a script a suite copies away from
+`bin/` still finds the lib, and `test_brief_sweep.sh` re-anchors two mutation anchors on the line that now carries
+`${REPO_SUB}` (the proofs still bite). A repo that has Velostream's name and another owner (`acme/velostream`) resolves to the
+same `~/RustroverProjects/velostream` and `velostream-<n>` paths, so every tool that finds a tree by name asks `repo_owns`
+first (the `origin` must be the repo; the default repo is not asked): `velo-status` and `velo-orchestrd` skip another repo's
+worktree, `velo-spec-review` (its tree and any `--worktree`), `velo-dispatch` (the worktree at the issue's path) and `velo-record`
+(its tree and `--worktree`) refuse it, naming the path, and `velo-status` reads the legacy `.agents/tasks` record location for
+Velostream only, as `velo-dispatch` already did. **Prevents:** a gate or a worker acting on the wrong repository's PR or issue with the
+same number, a worker cut from the wrong tree or the wrong base branch, two repos' gate locks and records overwriting one
+another, one owner's tools reading, attesting, counting or resuming another owner's checkout of the same name, and a
+non-Velostream run failing on prerequisites that only Velostream has — or silently skipping them.
+
 ### Fixed — gate findings on velo-task M1 and M3c: no secret in an argv, no install under a lost lock (#2769, velo-agents#18)
 
 The gates on the merged M1 and M3c found twelve things; each has a fix and a test that was seen red through a mutant.

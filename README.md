@@ -37,6 +37,7 @@ and the tests** — never from the worker's self-report.
     velo-attention                 list/ack unhandled events from velo-orchestrd
     velo-orch-lib.sh               helpers shared by velo-orchestrd + velo-attention
     velo-worktree-lib.sh           worktree derivations shared by velo-status + velo-record
+    velo-repo-lib.sh               WHICH repo the tools work on (`VELO_REPO`): the one place that spells the default, plus the tree, worktree, base-branch and state-path rules for any other repo. Sourced by every script that calls `gh`; must sit beside them
     zg                             discovery-search shim — the `zg` the policy tells workers to run
     velo_worker_runner.py          the one worker runner, two provider profiles
     velo_sdk_patches.py            corrections to the ROLLBACK sdk, applied at import
@@ -64,6 +65,10 @@ and the tests** — never from the worker's self-report.
     test_gate_run.sh               velo-gate-run: ATTACK fill under the exhaustive-review preamble, last-marker verdict, retry, --brief-only, one e2e round
     test_gate_finish.sh            velo-gate-finish: post order, gated sha, idempotence, retry, no label over a missing report
     test_gate_sweep.sh             velo-gate-sweep: STALE flag, last-block verdict, per-leg caps, no-gate / gh-failure handling
+    test_repo_env.sh               VELO_REPO, the gate half: the default repo's gh argv, state and review brief are byte-for-byte what they were (a golden recorded from the scripts before the change); for another repo every gh call names it, state paths never collide, a missing worktree is refused by path, `velo-pr-gate <n> --plan` plans that repo's diff; no script outside the lib spells the default; each check is proved red on a mutated copy
+    test_repo_env_workers.sh       VELO_REPO, the worker half: dispatch (that repo's tree and default branch, refusals by path, the Velostream-only prerequisites skipped and said so), record, status, native, the orchestrator, watch, the SessionStart hook; each check is proved red on a mutated copy
+    repo-env-lib.sh                the two VELO_REPO suites' shared harness: a stub gh that logs its argv, a sandbox holding a clone of each repo, the 20-scenario drive (sourced, not a suite)
+    fixtures/repo-env/             default.golden, the default repo's trace recorded before VELO_REPO existed; its README says how to regenerate it
     test_index_exclude.sh          the discovery index can never become committable
     test_spec_review.sh            the --check loop's verdict paths, stubbed reviewer
     test_spec_review_lint.sh       attest refuses what dispatch refuses (brief lint, worker label); dispatch names the model it launched
@@ -159,6 +164,12 @@ Runtime state lives **outside the repo**, under `$VELO_STATE` (default
     .lock/                 one tick at a time (mkdir lock, pid inside)
     orchestrd.log          the daemon's own reasoning trail, rotated at 5MB
 ```
+
+That is the layout for the default repo. For any other repo (`VELO_REPO`, below) every directory above sits one
+level down under `<owner>__<name>` — `gate/velostreamai__velo-agents/<pr>/`, `dispatch/…/<issue>/`,
+`records/…/<issue>.result.jsonl`, `spec/…`, `native/…`, `orch/…` — so PR 12 and issue 78 of two repos never share a
+directory, a lock or a record. The 7-day gate prune of a Velostream run skips those directories (its own `find`
+would read `gate/<owner>__<name>` as idle while its PRs are live); a run for that repo prunes its own PR directories.
 
 This was `/tmp` until four separate defects traced to it: a fixture race
 (#2040), two gates on one PR sharing a brief, a cleanup that leaked a file per
@@ -304,6 +315,45 @@ degrades badly without it:
 
 `gh` must be authenticated (`gh auth status`) before anything works — issue
 state, labels, `updatedAt` drift and PR gating are all API reads.
+
+## Using it on another repository — `VELO_REPO`
+
+Every tool works on `velostreamai/velostream` unless told otherwise. `VELO_REPO=<owner>/<name>` (the older name
+`VELO_GATE_REPO` is the same variable; `VELO_REPO` wins when both are set) points all of them at another GitHub repo:
+
+```bash
+VELO_REPO=velostreamai/velo-agents velo-pr-gate 12 --plan --wait   # the tier and legs for THAT repo's PR 12
+VELO_REPO=velostreamai/velo-agents velo-dispatch 17 brief.md --wait
+```
+
+`bin/velo-repo-lib.sh` is the one definition of which repo; it is the only file in `bin/` and `hooks/` that spells the
+default (`tests/test_repo_env.sh` counts). `velo-dispatch`, `velo-status`, `velo-watch`, `velo-orchestrd`, `velo-attention`,
+`velo-record`, `velo-native`, `velo-spec-review`, `velo-pr-gate`, `velo-gate`, `velo-gate-run`, `velo-gate-post`, `velo-gate-finish`,
+`velo-gate-sweep`, `velo-merge` and the SessionStart hook all read it; a value that is not `<owner>/<name>` stops each
+with `ERROR: VELO_REPO must be <owner>/<name>`. **With nothing set, nothing differs** — the gh calls, the state paths
+and every message are the ones they were; `tests/fixtures/repo-env/default.golden` pins them from the pre-change scripts.
+
+| | Velostream (default) | any other repo |
+|---|---|---|
+| a worker's tree and worktree | `~/RustroverProjects/velostream`, `velostream-<issue>` | `~/RustroverProjects/<name>`, `<name>-<issue>` |
+| cut from, and commits counted against | `origin/master` | the repo's default branch as GitHub names it (`gh repo view`), `origin/<it>` |
+| the tree is missing, is another repo's clone, or GitHub names no default branch | — | refused, naming the path tried; Velostream's tree is **never** used instead |
+| a repo with the same name and another owner (`acme/velostream` beside `velostreamai/velostream`) | — | its paths are Velostream's, so every tree found by name must pass an `origin` check (`repo_owns`) before it is read, written, counted or resumed: `velo-status` and `velo-orchestrd` skip a `<name>-*` worktree of another repo, `velo-spec-review` (its tree and any `--worktree`), `velo-dispatch` (the worktree at the issue's path) and `velo-record` (its tree and `--worktree`) refuse it, naming the path |
+| the tree a gate reads | the worktree `git worktree list` finds for the PR's branch | found by name and `origin` under `~/RustroverProjects/<name>*`, whatever the cwd; refused, listing every path tried, when none is on the branch |
+| state | `gate/<pr>/` … | `gate/<owner>__<name>/<pr>/` … (see the layout above) |
+| discovery index, `run-commit.sh`, the CLAUDE.md read-first, STREAMING-COMPLIANCE | applies | skipped, and said so: dispatch prints it, and the worker's task and every review brief open with an `OVERRIDE-DIRECTIVES:` paragraph |
+| what counts as orchestration (gets `code-review`) | files under `.agents/` | files in the tooling tree: `bin/ rules/ skills/ tasks/ hooks/ launchd/ install.sh update.sh` |
+| when `check-spec` is planned | a closing keyword with 3+ acceptance bars, or a `[#N]` PR touching `src/` | a PR that closes **or references** (`#N`) an issue with 3+ acceptance bars |
+| task sidecars and the `fail_to_pass` check | dispatch injects the sidecar's contract; `velo-pr-gate` validates its tests | dispatch injects a sidecar found in the repo's own tree, else says there is none; the `velo-pr-gate` check is skipped, and said so |
+| the launchd agent | `velo-orchestrd install / uninstall / status` | refused (it is Velostream's, with no `VELO_REPO` in its plist); schedule `VELO_REPO=<repo> velo-orchestrd tick` yourself |
+| a printed follow-up command | `velo-gate 12 --pass` | `VELO_REPO=<repo> velo-gate 12 --pass` — pasted into a bare shell it cannot act on Velostream's PR 12 |
+
+One Velostream shape does not carry over: `velo-merge` waives its "no CI checks reported" refusal only for a diff that is
+entirely under `.agents/`, so a PR to a repo with no CI workflow is refused there (nothing would have verified the build)
+until that repo has one.
+
+`tests/test_repo_env.sh` and `tests/test_repo_env_workers.sh` run the real scripts in a sandbox holding a clone of each
+repo against a stub `gh` that logs its argv, and break the code (a mutant per check) to prove each check goes red.
 
 ## Concurrency and isolation
 

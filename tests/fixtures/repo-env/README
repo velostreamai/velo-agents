@@ -1,0 +1,20 @@
+default.golden - what the tools do with VELO_REPO unset, recorded from the scripts BEFORE VELO_REPO existed.
+
+tests/test_repo_env.sh drives 20 scenarios (gate plan/show/pass/finish/block/running, gate-post, gate-sweep, pr-gate plan and
+--brief-only, dispatch --dry-run, spec-review, record, status, merge, native, orchestrd tick, watch, the SessionStart hook) in a
+sandbox with no repo variable set and compares, line for line, with this file:
+
+  - every gh call (its whole argv, in order),
+  - the files left under the state dir,
+  - the review brief,
+  - every scenario's output, with paths, timestamps, shas and pids masked.
+
+The default repo is velostreamai/velostream and must stay byte-for-byte what it was: a new variable that changes one gh call,
+one state path or one printed hint for the default is a regression in every dispatched worker, not a feature.
+
+It was generated from origin/main at 1deca7e (the commit before the variable). To regenerate it from a checkout of the tools
+you trust (never from the tree under change):
+
+  REPO_ENV_GOLDEN_FROM=/path/to/trusted/checkout bash -c '. tests/repo-env-lib.sh' > tests/fixtures/repo-env/default.golden
+
+A deliberate change to the default's behaviour edits this file in the same commit, and the diff is the review.

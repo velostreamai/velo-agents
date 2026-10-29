@@ -34,3 +34,8 @@ export VELO_TASK_START_WAIT=10
 export VELO_TASK_STOP_WAIT=3
 export VELO_TASK_LOCK_WAIT=30
 export VELO_TASK_POLL=0.05
+
+# Not a timeout, but the same kind of thing: every suite inherits it. A script under test that a suite copies away from
+# bin/ (a mutant, a layout in a scratch dir) has no velo-repo-lib.sh beside it; this is where it finds the real one.
+VELO_REPO_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/velo-repo-lib.sh"
+export VELO_REPO_LIB

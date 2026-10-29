@@ -14,7 +14,9 @@
 # `velo-merge` can detect staleness.
 
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 VELO_STATE="${VELO_STATE:-$HOME/.agents/state}"
 die() { printf '\n\033[31mERROR:\033[0m %s\n\n' "$1" >&2; exit 1; }
 ok()  { printf '\033[32m  ok\033[0m %s\n' "$1"; }
@@ -120,7 +122,7 @@ if [[ -z "$SHA" ]]; then
   # only ever compare timestamps, never identity. Prefer it whenever it
   # exists; the heuristic remains for reports with no gate directory at all
   # (older gates, or a report relayed from somewhere velo-pr-gate never ran).
-  GATED_SHA_FILE="$VELO_STATE/gate/$PR/gated.sha"
+  GATED_SHA_FILE="$VELO_STATE/${GATE_SUBDIR}/$PR/gated.sha"
   if [[ -f "$GATED_SHA_FILE" ]]; then
     SHA=$(tr -d '[:space:]' < "$GATED_SHA_FILE")
     [[ -n "$SHA" ]] && ok "using recorded gate sha from $GATED_SHA_FILE: ${SHA:0:9} (not the live head)"
@@ -152,7 +154,7 @@ if [[ -z "$SHA" ]]; then
     HEAD commit  : $(date -u -r "$HEAD_CT" +%FT%TZ 2>/dev/null || echo "$HEAD_CT")
 
   Pass the sha the gate actually reviewed:
-    velo-gate-post $PR $NAME $FILE --sha <sha>"
+    ${GATE_CMD_ENV}velo-gate-post $PR $NAME $FILE --sha <sha>"
     fi
   fi
   SHA="$HEAD"
@@ -179,7 +181,7 @@ if head -n 8 <<<"$BODY" | grep -qiE "(^|[^a-z-])$NAME[ ]+(leg|gate|review)[ :(,-
 
   Run the leg (check-code defaults to the free tier; check-spec runs on velo-local),
   or waive it with a named approver:
-    velo-gate-finish <pr> <sha> --pass --waive $NAME='<reason>' --approved-by '<who>'"
+    ${GATE_CMD_ENV}velo-gate-finish <pr> <sha> --pass --waive $NAME='<reason>' --approved-by '<who>'"
 fi
 
 HDR="gate: $NAME @ ${SHA:0:9}"
@@ -201,7 +203,7 @@ HDR="gate: $NAME @ ${SHA:0:9}"
 SUBST_NOTE=""
 if [[ "$NAME" == "check-code" ]]; then
   CC_BY=""
-  [[ -f "$VELO_STATE/gate/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/gate/$PR/check-code.by")
+  [[ -f "$VELO_STATE/${GATE_SUBDIR}/$PR/check-code.by" ]] && CC_BY=$(tr -d '[:space:]' < "$VELO_STATE/${GATE_SUBDIR}/$PR/check-code.by")
   if ! grep -qiE '^[[:space:]>*_-]*reviewer substitution' <<<"$BODY"; then
     case "$CC_BY" in
       sonnet)
@@ -241,7 +243,7 @@ fi
 # in. Putting the lock and the done-marker in the function that performs the
 # side effect covers every caller by construction, rather than asking each one
 # to remember to guard itself (#2285 Round 2, Integration after PR1).
-POST_DIR="$VELO_STATE/gate/$PR"
+POST_DIR="$VELO_STATE/${GATE_SUBDIR}/$PR"
 mkdir -p "$POST_DIR"
 POST_KEY="$NAME-${SHA:0:9}"
 POST_DONE="$POST_DIR/.posted-$POST_KEY"
@@ -285,4 +287,4 @@ ok "posted '$NAME' to #$PR @ ${SHA:0:9}"
 echo "   $URL"
 echo
 echo "   Next: record the VERDICT — a comment says a gate RAN, the label says what it FOUND:"
-echo "     velo-gate $PR --pass    # or --block"
+echo "     ${GATE_CMD_ENV}velo-gate $PR --pass    # or --block"

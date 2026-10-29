@@ -35,7 +35,10 @@
 # Bash 3.2 only (macOS system /bin/bash). No associative arrays, no `${x,,}`.
 
 set -uo pipefail
-REPO="velostreamai/velostream"
+# Which repo: VELO_REPO (alias VELO_GATE_REPO), else the default; see velo-repo-lib.sh. The gate tools it runs
+# (velo-gate, velo-gate-post, velo-merge) resolve the repo from the same two variables, so they act on the repo it lists.
+. "${VELO_REPO_LIB:-$(dirname "${BASH_SOURCE[0]}")/velo-repo-lib.sh}" || exit 1
+repo_init || exit 1
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=./velo-orch-lib.sh
@@ -60,7 +63,7 @@ MIN_DISK_GB="${VELO_ORCH_MIN_DISK_GB:-25}"
 # does not trip it — 30m default clears that with a wide margin.
 WEDGE_MINUTES="${VELO_ORCH_WEDGE_MINUTES:-30}"
 WEDGE_GRACE_MINUTES="${VELO_ORCH_WEDGE_GRACE_MINUTES:-10}"
-WORKTREE_GLOB="${VELO_ORCH_WORKTREE_GLOB:-$HOME/RustroverProjects/velostream-*}"
+WORKTREE_GLOB="${VELO_ORCH_WORKTREE_GLOB:-$HOME/RustroverProjects/$REPO_NAME-*}"
 LOG_FILE="${VELO_ORCH_LOG:-$ORCH_DIR/orchestrd.log}"
 LOG_MAX_BYTES="${VELO_ORCH_LOG_MAX_BYTES:-5242880}"
 
@@ -365,6 +368,9 @@ list_active_worktrees() {   # -> one worktree path per line with a live worker p
   local d pid
   for d in $WORKTREE_GLOB; do
     [[ -d "$d" ]] || continue
+    # a worker of another repo under this directory name (the owner differs, the name does not) is not this repo's: it is
+    # neither counted against the cap nor escalated
+    repo_owns "$d" || continue
     pid=$(orch_running_pid_for "$d")
     [[ -n "$pid" ]] && printf '%s\n' "$d"
   done
@@ -497,6 +503,7 @@ step_wedge_and_stop() {
   local d issue
   for d in $WORKTREE_GLOB; do
     [[ -d "$d" ]] || continue
+    repo_owns "$d" || continue
     issue="${d##*-}"
     [[ "$issue" =~ ^[0-9]+$ ]] || issue="$(basename "$d")"
 
@@ -591,6 +598,11 @@ cmd_tick() {
 
 main() {
   local cmd="${1:-tick}"
+  # The launchd agent is Velostream's: one label, and a plist with no VELO_REPO in its environment.
+  case "$cmd" in install|uninstall|status)
+    [[ $REPO_IS_DEFAULT -eq 1 ]] \
+      || { echo "ERROR: $cmd manages Velostream's launchd agent, not $REPO's — run VELO_REPO=$REPO velo-orchestrd tick from your own scheduler" >&2; return 1; } ;;
+  esac
   case "$cmd" in
     tick) cmd_tick ;;
     install) cmd_install ;;
