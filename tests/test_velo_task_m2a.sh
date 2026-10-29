@@ -570,16 +570,18 @@ t_status_verdicts() {
   mkjobs
   rj st-ok 0; run VT status st-ok; need "B1: exit 0 is ok" [ "$RC" = 0 -a "$OUT" = "st-ok ok" ]
   rj st-fail 42; run VT status st-fail; need "B1: exit 42 is failed(42)" [ "$OUT" = "st-fail failed(42)" ]
+  need "...and status exits 0: it succeeded in reporting a verdict (R5: wait mirrors the verdict, status does not)" [ "$RC" = 0 ]
   run VT run st-to --timeout 1 -- /bin/sh -c 'exec /bin/sleep 5'; run VT status st-to; need "a job that outlives its timeout is timeout" [ "$OUT" = "st-to timeout" ]
+  need "...and status exits 0 for it" [ "$RC" = 0 ]
   run VT status --json st-fail; need "--json is one object with the id, job_id, status, exit_code and verdict" \
     [ "$OUT" = "$(printf '{"exit_code":42,"id":"st-fail","job_id":"%s","status":"failed","verdict":"failed(42)"}' "$(cat "$E_HOME/names/st-fail")")" ]
-  j=$(fv __inject '{"name":"inj-a","status":"orphaned"}'); run VT status --job "$j"; need "B18: orphaned is lost" [ "$OUT" = "$j lost" ]
+  j=$(fv __inject '{"name":"inj-a","status":"orphaned"}'); run VT status --job "$j"; need "B18: orphaned is lost, and status exits 0 for a lost verdict" [ "$OUT" = "$j lost" -a "$RC" = 0 ]
   j=$(fv __inject '{"name":"inj-b","status":"mystery"}'); run VT status --job "$j"; need "B18: an unknown status string is lost" [ "$OUT" = "$j lost" ]
   j=$(fv __inject '{"name":"inj-c","status":"failed"}'); run VT status --job "$j"; need "B18: failed with no exit_code is lost" [ "$OUT" = "$j lost" ]
   for s in queued launching running paused retrying stopping; do
     j=$(fv __inject "{\"name\":\"inj-$s\",\"status\":\"$s\"}"); run VT status --job "$j"; need "$s is in-flight" [ "$OUT" = "$j in-flight" ]
   done
-  j=$(fv __inject '{"name":"inj-k","status":"cancelled","stop_actor":"user"}'); run VT status --job "$j"; need "B26: cancelled by the user is killed" [ "$OUT" = "$j killed" ]
+  j=$(fv __inject '{"name":"inj-k","status":"cancelled","stop_actor":"user"}'); run VT status --job "$j"; need "B26: cancelled by the user is killed, and status exits 0 for it" [ "$OUT" = "$j killed" -a "$RC" = 0 ]
   jp=$(fv __inject '{"name":"inj-parent","status":"failed","exit_code":1}')
   j=$(fv __inject '{"name":"inj-child","status":"cancelled","stop_actor":"daemon","stop_reason":"trigger parent reached an incompatible terminal status","trigger_json":{"job_id":"'"$jp"'","status":"completed"}}')
   run VT status --job "$j"; need "B26: cancelled by a trigger parent that exists is upstream-failed(<parent>)" [ "$OUT" = "$j upstream-failed($jp)" ]
@@ -918,6 +920,39 @@ t_status_list() {  # status with no id lists jobs, newest first: the caller's se
   need "--json is one object a line, keys sorted, with the verdict" \
     [ "$OUT" = "$(printf '{"exit_code":3,"id":"ls-a2","job_id":"%s","status":"failed","verdict":"failed(3)"}\n{"exit_code":0,"id":"ls-a1","job_id":"%s","status":"completed","verdict":"ok"}' "$JA2" "$JA1")" ]
 }
+tags_have() {  # <tag>: the JSON on stdin is an object whose top-level "tags" list holds the tag
+  "$PYBIN" -I -c 'import json, sys; d = json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) and sys.argv[1] in (d.get("tags") or []) else 1)' "$1"
+}
+t_vanth_tags_real() {  # R3, R8, VELO_TASK_NETWORK_TESTS=1: the real Vanth emits the tags a session filter reads, and the list order is the one the spec gives
+  local sess=netsess ja n rows want
+  export VELO_TASK_START_WAIT=60 UV_CACHE_DIR="$T/uv-cache" UV_PYTHON_INSTALL_DIR="$T/uv-python"
+  mkhome; run VT install-vanth; need "real install-vanth succeeds" [ "$RC" = 0 ]
+  kill "$E_HOLDER"; wait "$E_HOLDER" 2>/dev/null  # the real vanthd does not set SO_REUSEPORT: the reservation goes right before it binds
+  run VT ensure-daemon; need "the real daemon starts" [ "$RC" = 0 ]
+  for n in net-a net-b net-c net-d; do CLAUDE_SESSION_ID="$sess" run VT run "$n" --timeout 30 -- /usr/bin/true; need "$n starts" [ "$RC" = 0 ]; ja=$OUT; done
+  CLAUDE_SESSION_ID=other run VT run net-o --timeout 30 -- /usr/bin/true; need "a job of another session starts" [ "$RC" = 0 ]
+  ja=$(cat "$E_HOME/names/net-a")
+  waitfor 60 sh -c "[ \"\$(CLAUDE_SESSION_ID=$sess '$R/bin/velo-task' status net-a 2>/dev/null)\" = 'net-a ok' ]" || { echo "FAILED: net-a never reached ok"; exit 1; }
+  run env VANTH_HOME="$E_VH" VANTH_DAEMON_PORT="$E_PORT" "$E_VENV/bin/vanth" --json status "$ja"
+  need "the real vanth --json status carries the session tag in its tags key (the filter reads it there)" tags_have "session:$sess" <<<"$OUT"
+  run VT status --session "$sess" net-a; need "status --session S <id> reports the verdict of a job that carries the tag" [ "$RC" = 0 -a "$OUT" = "net-a ok" ]
+  run VT status --session someone-else net-a; need "...and refuses (exit 2) a job that does not" [ "$RC" = 2 ]
+  sleep 2  # every job has finished or is about to; the list needs no verdict from the daemon, only the rows
+  CLAUDE_SESSION_ID="$sess" run VT status
+  need "a list holds the four jobs of the session" [ "$RC" = 0 -a "$(wc -l <<<"$OUT" | tr -d ' ')" = 4 ]
+  need "...and not the other session's" not grep -q net-o <<<"$OUT"
+  rows=$(awk '{print $2}' <<<"$OUT")
+  want=$("$PYBIN" -I -c 'import sqlite3, sys; print("\n".join(r[0] for r in sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("SELECT job_id FROM jobs WHERE tags_json LIKE ? ORDER BY created_at DESC, job_id DESC", ("%session:" + sys.argv[2] + "%",))))' "$E_VH/jobs.sqlite" "$sess")
+  need "the list is in the order created_at DESC, job_id DESC" [ "$rows" = "$want" ]
+  echo "note: real Vanth stamps created_at to the microsecond, so jobs started back to back are not tied and job_id DESC is the tie-break only; created_at of the four jobs: $("$PYBIN" -I -c 'import sqlite3, sys; print(" ".join(str(r[0]) for r in sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True).execute("SELECT created_at FROM jobs WHERE tags_json LIKE ? ORDER BY created_at DESC, job_id DESC", ("%session:" + sys.argv[2] + "%",))))' "$E_VH/jobs.sqlite" "$sess")"
+  kill "$(daemon_pid)" 2>/dev/null
+}
+t_spec_key() {  # R3, R4, B10: the spec gives the idempotency key the code sends, velo_<s8>_<id>, and nowhere the old velo_<id>
+  local spec="$R/docs/velo-task-spec.md"
+  need "the spec has the key as velo_<s8>_<id>" grep -q 'velo_<s8>_<id>' "$spec"
+  need "...R4 gives the rerun key with it" grep -q 'velo_<s8>_<id>_<epoch>_<pid>_<rand8>' "$spec"
+  need "...and no line gives the key as velo_<id>" not grep -q 'velo_<id>' "$spec"
+}
 t_status_list_offline() {  # R8: a list reads jobs.sqlite read-only and needs no daemon; state that is not safe and a schema it cannot read are refused
   local p before calls out
   mklist
@@ -1021,6 +1056,7 @@ check "R3: status <id> settles that id's records only" t_reconcile_scope
 check "R3: two accepted records for one id settle in the order they were written, whatever order their nonces have" t_reconcile_epoch
 check "R3 R21: a recovery and a run settle one id at once: one line per job, and the newest job is the last line" t_reconcile_race
 check "R17: a temp file a crash left between create and link is swept; one whose writer is still running is not" t_sweep_temps
+check "R3 R4 B10: the spec gives the idempotency key as velo_<s8>_<id>" t_spec_key
 check "an unsafe record, name index or database, or a job id that is not one, stops status and run (exit 6); nothing is skipped" t_reconcile_unsafe
 check "R4: a status that settles the record of a run in flight does not make that run start a second job" t_reconcile_inflight
 check "B1 B18 B26 through status: every verdict, injected rows, restart pending, --issue" t_status_verdicts
@@ -1187,6 +1223,12 @@ prove "R3: the records of one id settle in nonce order, not in the order they we
 prove "M2a: the id lock is not taken, so a settle can land inside another's critical section" t_reconcile_race $S $'    return lock_file(os.path.join(os.path.dirname(os.path.abspath(names)), "lock", "id-" + ident))' $'    return None'
 prove "R17: a temp file a crash left is never swept" t_sweep_temps $S '        pid = temp_writer(name)' '        pid = None'
 prove "R17: a temp file of a writer that is still running is swept too" t_sweep_temps $S '        if pid is None or not writer_gone(pid):' '        if pid is None:'
+prove "R4: the spec gives the plain key without the session part" t_spec_key docs/velo-task-spec.md '`velo_<s8>_<id>` for a plain `run`' '`velo_<id>` for a plain `run`'
+prove "R5: status exits non-zero for a verdict that is not ok (it mirrors the verdict like wait)" t_status_verdicts $S $'    return 3 if verdict == "unknown-job" else 0' $'    return 3 if verdict == "unknown-job" else (0 if verdict in ("ok", "in-flight") else 1)'
+if [ "${VELO_TASK_NETWORK_TESTS:-}" = 1 ]; then
+  prove "R3: the session tag is not sent to Vanth (real Vanth: the tag never returns)" t_vanth_tags_real $L '--cwd "$cwd" --tag velo --tag "session:$session")' '--cwd "$cwd" --tag velo)'
+  prove "R8: the list is oldest first (real Vanth)" t_vanth_tags_real $S 'ORDER BY created_at DESC, job_id DESC"):' 'ORDER BY created_at ASC, job_id DESC"):'
+fi
 prove "R3: a pending record that is not a record is skipped" t_reconcile_unsafe $S '        die(9, "%s is not a pending record" % path)' '        return None'
 prove "R3: a database that cannot be read is read as an unsent start" t_reconcile_unsafe \
   $S "        found = query_ro(db, $RCQ" \
@@ -1357,6 +1399,12 @@ prove_env "the suite runs with the real HOME" stray_real_home_env
 prove_env "the suite runs with Homebrew on PATH" stray_homebrew_path
 proof_drain   # every proof reported before anything else runs: the checks below reap the whole suite tree
 
+if [ "${VELO_TASK_NETWORK_TESTS:-}" = 1 ]; then
+  echo "velo-task M2a: network (the real Vanth from PyPI: its tags and the list order)"
+  check "R3 R8: the real vanth emits the session tag in --json status, the filter accepts and refuses on it, and a list is created_at DESC, job_id DESC" t_vanth_tags_real
+else
+  echo "  (real-Vanth tags test skipped: set VELO_TASK_NETWORK_TESTS=1)"
+fi
 echo "velo-task M2a: isolation"
 check "the real home is untouched: HOME was a temp dir and PATH the system directories throughout" t_real_home_untouched
 check "control: the same comparison passes against an undisturbed stand-in home" t_stand_in_untouched

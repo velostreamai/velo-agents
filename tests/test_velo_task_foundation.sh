@@ -167,6 +167,7 @@ prove() {  # <label> <check fn> <file> <anchor> <replacement> [<file> <anchor> <
   MUT_N=$((MUT_N + 1))
   m="$T/pj$MUT_N/code"   # numbered, never named for the label: a label's words must not satisfy a grep on the path
   rm -rf "$m"; mkdir -p "$m"; cp -R "$REPO/bin" "$REPO/requirements" "$m/"; cp "$REPO/install.sh" "$m/"
+  mkdir -p "$m/docs"; cp "$REPO/docs/velo-task-spec.md" "$m/docs/"   # a proof may mutate the spec text (M2a t_spec_key)
   if ! "$PYBIN" -I - "$m" "$@" <<'PY'
 import sys
 root, args = sys.argv[1], sys.argv[2:]
