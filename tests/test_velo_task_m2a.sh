@@ -95,9 +95,6 @@ lost|{"status":"failed","exit_code":true}
 lost|{"status":"failed","exit_code":1,"policy_state_json":"[1]"}
 lost|{"status":"failed","exit_code":1,"policy_state_json":"{not json"}
 lost|{}
-lost|[]
-lost|null
-lost|"completed"
 lost|{"status":"cancelled"}
 lost|{"status":"cancelled","stop_actor":"tool"}
 lost|{"status":"cancelled","stop_actor":"watchdog"}
@@ -116,6 +113,19 @@ upstream-failed(a)|{"status":"cancelled","stop_actor":"daemon","stop_reason":"tr
 upstream-failed(b)|{"status":"cancelled","stop_actor":"daemon","stop_reason":"trigger parent reached an incompatible terminal status","trigger_json":"{\"job_id\":\"b\",\"status\":\"completed\"}"}
 upstream-failed(job_idx)|{"status":"cancelled","stop_actor":"daemon","stop_reason":"trigger parent reached an incompatible terminal status","trigger":{"job_id":"job_idx"}}
 TABLE
+  # M2a, B18: a status that is not an object is not a status at all. Reading it as an empty row made `status <id>` report the job as "not the
+  # job asked about" (exit 2, a usage error) for a malformed answer from Vanth.
+  for json in '[]' 'null' '"completed"' '7'; do
+    run ST verdict-of --label x --names "$d/names" --db "$d/jobs.sqlite" <<<"$json"
+    need "a status that is not an object ($json) is exit 6" [ "$RC" = 6 ]
+    need "...and prints no verdict" not grep -q '^x ' <<<"$OUT"
+    need "...naming what it got" grep -q 'not a JSON object' <<<"$OUT"
+  done
+  # M2a, B18: a policy column nested deeper than the interpreter's json can read raises RecursionError, which is not a verdict and not a
+  # traceback out of the middle of one: the row cannot be classified, so it is lost, never ok.
+  "$PYBIN" -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO jobs (job_id, name, status, command, policy_state_json) VALUES (?, ?, ?, ?, ?)", ("job_deep", "deep", "failed", "x", "[" * 4000 + "]" * 4000)); c.commit()' "$d/jobs.sqlite"
+  run ST verdict-of --label x --job job_deep --names "$d/names" --db "$d/jobs.sqlite" <<<'{"job_id":"job_deep","status":"failed","exit_code":1}'
+  need "a policy column nested deeper than json can read is lost, not a traceback and not ok" [ "$RC" = 0 -a "$OUT" = "x lost" ]
 }
 t_verdict_cli() {  # what verdict-of does around the mapping: identity checks, output forms, unreadable input, the absent row
   local d j; d=$(mktemp -d "$T/vc.XXXXXX"); mkdir "$d/names"; printf 'job_listed\n' > "$d/names/gate-1"
@@ -132,7 +142,8 @@ t_verdict_cli() {  # what verdict-of does around the mapping: identity checks, o
   run ST verdict-of --session abc --label gate-1 <<<"$j"; need "a job with the session tag: its verdict" [ "$RC" = 0 -a "$OUT" = "gate-1 ok" ]
   run ST verdict-of --session abc2 <<<"$j"; need "a job without the session tag is refused (exit 2)" [ "$RC" = 2 ]
   run ST verdict-of --session abc <<<'{"status":"completed","tags":"session:abc"}'; need "tags that are not a list never satisfy --session (exit 2)" [ "$RC" = 2 ]
-  run ST verdict-of --job job_1 <<<'[1]'; need "a status that is not an object is not the job asked about (exit 2)" [ "$RC" = 2 ]
+  run ST verdict-of --job job_1 <<<'[1]'; need "a status that is not an object is a malformed answer (exit 6, B18), not a usage error" [ "$RC" = 6 ]
+  need "...and it does not name a job id it never got" not grep -q 'job_id None' <<<"$OUT"
   run ST verdict-of --json --label gate-1 --job job_1 <<<"$j"
   need "--json is one compact object with sorted keys" [ "$OUT" = '{"exit_code":0,"id":"gate-1","job_id":"job_1","status":"completed","verdict":"ok"}' ]
   run ST verdict-of --job job_1 <<<"not json"; need "input that is not JSON: exit 6" [ "$RC" = 6 ]
@@ -437,6 +448,70 @@ t_reconcile_scope() {  # R3: status <id> settles that id's records only; another
   need "status of an id with no record of its own reports its verdict and nothing else" [ "$RC" = 0 -a "$OUT" = "sc-3 ok" ]
   need "...the other ids' records are untouched" [ "$(pend)" = 2 -a ! -e "$E_HOME/names/sc-1" -a ! -e "$E_HOME/names/sc-2" ]
 }
+t_reconcile_epoch() {  # R3: two accepted records for one id settle in the order they were written, whatever order their nonces have
+  local jold jnew n1 n2 e1 e2
+  mkjobs
+  mkdir -m 700 -p "$E_HOME/pending" "$E_HOME/names"
+  jold=$(fv __inject '{"name":"ep-1","status":"failed","exit_code":3}')
+  jnew=$(fv __inject '{"name":"ep-1","status":"completed","exit_code":0}')
+  dbx "INSERT INTO local_start_requests (idempotency_key, request_hash, job_id, created_at) VALUES ('${K}_ep-1_old', 'h', '$jold', 't')"
+  dbx "INSERT INTO local_start_requests (idempotency_key, request_hash, job_id, created_at) VALUES ('${K}_ep-1_new', 'h', '$jnew', 't')"
+  n1=$(ST pending-write "$E_HOME/pending" -- --name ep-1 --timeout 30 --idempotency-key "${K}_ep-1_old" --cwd "$E" --tag velo -- /bin/true)
+  n2=$(ST pending-write "$E_HOME/pending" -- --name ep-1 --timeout 30 --idempotency-key "${K}_ep-1_new" --cwd "$E" --tag velo -- /bin/true)
+  e1=$(ST json-get "$E_HOME/pending/$n1" epoch); e2=$(ST json-get "$E_HOME/pending/$n2" epoch)
+  need "premise: the second record was written later, so it settles later" [ "$e2" -gt "$e1" ]
+  mv "$E_HOME/pending/$n1" "$E_HOME/pending/ffffffffffffffff"  # the newer record's nonce sorts FIRST: only the creation order is right
+  mv "$E_HOME/pending/$n2" "$E_HOME/pending/0000000000000001"
+  run VT status ep-1
+  need "the older record's job is the first line and the newer record's the last, whatever the nonces are" \
+    [ "$(cat "$E_HOME/names/ep-1")" = "$(printf '%s\n%s' "$jold" "$jnew")" ]
+  need "...so status reports the newer job's verdict" [ "$RC" = 0 -a "$OUT" = "ep-1 ok" ]
+  need "...and both records are settled" [ "$(pend)" = 0 ]
+}
+t_reconcile_race() {  # R3, R21: a recovery and a run settle one id at once: one line per job, and the newest job is the last line
+  local b b2 jold jA
+  mkjobs
+  mkdir -m 700 -p "$E_HOME/pending" "$E_HOME/names"
+  b="$E/go-race"; b2="$E/go-rec"
+  jold=$(fv __inject '{"name":"rc-1","status":"failed","exit_code":3}')
+  # An accepted record older than the run's, whose key Vanth has not recorded YET: the run's own reconcile therefore leaves it alone,
+  # and the recovery has an older job to settle while the run's job is the newer one. The verdicts differ, so the last line of the
+  # index says which job the id ended on.
+  printf '{"epoch":1,"key":"%s_rc-1_old","name":"rc-1"}\n' "$K" > "$E_HOME/pending/0000000000000001"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="start.returned:wait=$b" CLAUDE_SESSION_ID="$S0" VT run rc-1 --timeout 30 --rerun -- /bin/sh -c "echo r >> '$E/runs'; exit 0" >"$E/o-race" 2>&1; echo $? > "$E/rc-race" ) & RW=$!
+  waitfor 10 test -e "$b.reached" || { echo "FAILED: the run never reached start.returned"; exit 1; }
+  jA=$(dbq "SELECT job_id FROM local_start_requests WHERE idempotency_key LIKE '${K}_rc-1_%' AND job_id != '$jold'")
+  need "premise: the run started a job of its own, newer than the record above" [ -n "$jA" -a "$jA" != "$jold" ]
+  dbx "INSERT INTO local_start_requests (idempotency_key, request_hash, job_id, created_at) VALUES ('${K}_rc-1_old', 'h', '$jold', 't')"
+  ( VELO_TASK_TEST=1 VELO_TASK_FAILPOINT="reconcile.locked:wait=$b2" CLAUDE_SESSION_ID="$S0" VT status rc-1 >"$E/o-rec" 2>&1; echo $? > "$E/rc-rec" ) & SW=$!
+  waitfor 10 test -e "$b2.reached" || { echo "FAILED: the recovery never reached reconcile.locked"; exit 1; }
+  need "premise: the recovery is inside the id's critical section, with the older record still unsettled" [ ! -e "$E_HOME/names/rc-1" ]
+  touch "$b"  # the run settles its own record now
+  waitfor 5 grep -q "$jA" "$E_HOME/names/rc-1" && echo "note: the run settled inside the recovery's critical section (no lock)"
+  touch "$b2"  # the recovery settles
+  wait "$RW" 2>/dev/null; wait "$SW" 2>/dev/null
+  need "the run is exit 0 and printed its own job last" [ "$(cat "$E/rc-race")" = 0 -a "$(tail -n 1 "$E/o-race")" = "$jA" ]
+  need "...reporting the older record as unsent, which it never replayed" grep -q '^pending-unsent rc-1$' "$E/o-race"
+  need "the recovery is exit 0 and reports the newer job: the older job was not left last" \
+    [ "$(cat "$E/rc-rec")" = 0 -a "$(cat "$E/o-rec")" = "rc-1 ok" ]
+  need "...the index lists one line per job, the older first" [ "$(cat "$E_HOME/names/rc-1")" = "$(printf '%s\n%s' "$jold" "$jA")" ]
+  need "...and both records are settled" [ "$(pend)" = 0 ]
+}
+t_sweep_temps() {  # R17: a crash between create and link leaves <dest>.tmp.<pid>.<8 hex>; a reconcile sweeps the ones whose writer is gone
+  local dead
+  mkjobs
+  mkdir -m 700 -p "$E_HOME/pending" "$E_HOME/names"
+  ( exit 0 ) & dead=$!; wait "$dead" 2>/dev/null  # a pid that is certainly not a process any more
+  printf 'x\n' > "$E_HOME/pending/aaaaaaaaaaaaaaaa.tmp.$dead.deadbeef"
+  printf 'x\n' > "$E_HOME/pending/aaaaaaaaaaaaaaaa.tmp.$$.deadbeef"
+  printf 'x\n' > "$E_HOME/names/sweep-1.tmp.$dead.deadbeef"
+  printf 'x\n' > "$E_HOME/pending/README"
+  rj sweep-1 0
+  need "a temp file a crash left in pending/ is swept" [ ! -e "$E_HOME/pending/aaaaaaaaaaaaaaaa.tmp.$dead.deadbeef" ]
+  need "...one in names/ too" [ ! -e "$E_HOME/names/sweep-1.tmp.$dead.deadbeef" ]
+  need "...a temp whose writer is alive is that writer's, and stays" [ -e "$E_HOME/pending/aaaaaaaaaaaaaaaa.tmp.$$.deadbeef" ]
+  need "...and a file that is not a temp is not touched" [ -e "$E_HOME/pending/README" ]
+}
 t_reconcile_unsafe() {  # an unsafe or unreadable record, database or index stops status and run (exit 6) before anything is resolved or started: nothing is skipped
   local d before
   d=$(mktemp -d "$T/ru.XXXXXX"); mkdir -m 700 "$d/ext"; printf 'SENTINEL\n' > "$d/ext/target"
@@ -639,8 +714,10 @@ t_pending_write() {  # R17 step 1: the record is the canonical settings of the r
   need "pending-write exits 0" [ "$RC" = 0 ]; need "...and prints a nonce" rx "$OUT" '^[0-9a-f]{16}$'
   f="$d/p/$OUT"
   need "...the record is private (0600)" [ "$(stat -f %Lp "$f")" = 600 ]
-  need "...holds the canonical settings: sorted keys, no spaces, one line" \
-    [ "$(cat "$f")" = '{"argv":["/bin/echo","a b","c'"'"'d"],"cwd":"/w","env":{},"key":"velo_abc-1","name":"abc-1","tags":["velo","issue:7"],"timeout":30,"trigger":null}' ]
+  need "...holds the canonical settings: sorted keys, no spaces, one line, and the creation epoch" \
+    [ "$(cat "$f")" = '{"argv":["/bin/echo","a b","c'"'"'d"],"cwd":"/w","env":{},"epoch":'"$(ST json-get "$f" epoch)"',"key":"velo_abc-1","name":"abc-1","tags":["velo","issue:7"],"timeout":30,"trigger":null}' ]
+  need "...and the epoch is the nanoseconds it was written at (M2a: two records for one id settle in this order)" \
+    [ "$(ST json-get "$f" epoch)" -ge 1700000000000000000 ]
   need "...and leaves no temp name beside it" [ "$(ls "$d/p" | wc -l | tr -d ' ')" = 1 ]
   run ST pending-write "$d/p" -- --name abc-1 --timeout 30 --idempotency-key velo_abc-1 --cwd /w --tag velo -- /bin/true
   need "a second call writes a second record under another nonce" [ "$RC" = 0 -a "$(ls "$d/p" | wc -l | tr -d ' ')" = 2 ]
@@ -941,6 +1018,9 @@ check "R3: a record Vanth has no key for is reported pending-unsent and never re
 check "R3: the key is matched exactly: one that extends, contains or case-folds it does not settle a record" t_reconcile_exact
 check "R17: a reconcile killed between the index line and the unlink is redone, with no second line" t_reconcile_redo
 check "R3: status <id> settles that id's records only" t_reconcile_scope
+check "R3: two accepted records for one id settle in the order they were written, whatever order their nonces have" t_reconcile_epoch
+check "R3 R21: a recovery and a run settle one id at once: one line per job, and the newest job is the last line" t_reconcile_race
+check "R17: a temp file a crash left between create and link is swept; one whose writer is still running is not" t_sweep_temps
 check "an unsafe record, name index or database, or a job id that is not one, stops status and run (exit 6); nothing is skipped" t_reconcile_unsafe
 check "R4: a status that settles the record of a run in flight does not make that run start a second job" t_reconcile_inflight
 check "B1 B18 B26 through status: every verdict, injected rows, restart pending, --issue" t_status_verdicts
@@ -1023,9 +1103,9 @@ prove "B10: the idempotency key contains a colon" t_run_basic $L '    key="velo_
 prove "R11a: --policy is sent" t_run_basic $L 'out=$(vanth_env "$VANTH" --json start "${args[@]}" -- ' 'out=$(vanth_env "$VANTH" --json start "${args[@]}" --policy "{}" -- '
 prove "R11a: the caller's secret is sent as --env" t_run_basic $L 'out=$(vanth_env "$VANTH" --json start "${args[@]}" -- ' 'out=$(vanth_env "$VANTH" --json start "${args[@]}" --env "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}" -- '
 prove "R11a: vanth_env passes the caller's secret on" t_run_basic $L 'VANTH_DAEMON_PORT="$PORT" "$@"; }' 'VANTH_DAEMON_PORT="$PORT" OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" "$@"; }'
-prove "R17: the pending record is never unlinked" t_run_basic $L '    st remove "$PENDING/$pending"  # R17 (4)' '    : # R17 (4)'
-prove "R3: the job id is never appended to the name index" t_run_basic $L 'if [ "$known" = 1 ]; then st append-index' 'if [ "$known" = 7 ]; then st append-index'
-prove "R3: the job id is appended on every run" t_run_basic $L 'if [ "$known" = 1 ]; then st append-index' 'if [ "$known" != 7 ]; then st append-index'
+prove "R17: the pending record is never unlinked" t_run_basic $S $'    cmd_remove([path])\n    failpoint("pending.unlinked")\n    return 0' $'    failpoint("pending.unlinked")\n    return 0'
+prove "R3: the job id is never appended to the name index" t_run_basic $S '    if not index_has(names, job, ident):  # M2a: under the lock' '    if False:  # M2a: under the lock'
+prove "R3: the job id is appended on every run" t_run_basic $S '    if not index_has(names, job, ident):  # M2a: under the lock' '    if True:  # M2a: under the lock'
 prove "R3: --tag velo is not sent" t_run_basic $L '--cwd "$cwd" --tag velo --tag "session:$session")' '--cwd "$cwd" --tag "session:$session")'
 prove "R3: --issue is not sent as a tag" t_run_basic $L 'if [ "$have_issue" = 1 ]; then args=("${args[@]}" --tag "issue:$issue"); fi' ':'
 prove "R3: --stage is not sent as a tag" t_run_basic $L 'if [ "$have_stage" = 1 ]; then args=("${args[@]}" --tag "stage:$stage"); fi' ':'
@@ -1058,12 +1138,12 @@ prove "R17: the pending record is written after vanth start" t_run_crash \
   $L $'    pending=$(st pending-write "$PENDING" -- "${args[@]}" -- "${cmdline[@]}")  # R17 (1): the settings are durable before anything is sent\n    stl failpoint pending.published\n    rc=0\n' $'    rc=0\n' \
   $L $'    job=$(printf \'%s\\n\' "$out"' $'    pending=$(st pending-write "$PENDING" -- "${args[@]}" -- "${cmdline[@]}")\n    stl failpoint pending.published\n    job=$(printf \'%s\\n\' "$out"'
 prove "R17: the pending record is unlinked before the job id is indexed" t_run_crash \
-  $L $'    if [ "$known" = 1 ]; then st append-index "$NAMES/$id" "$job"; stl failpoint index.appended; fi  # R17 (3)\n    st remove "$PENDING/$pending"  # R17 (4)\n' \
-     $'    st remove "$PENDING/$pending"  # R17 (4)\n    if [ "$known" = 1 ]; then st append-index "$NAMES/$id" "$job"; stl failpoint index.appended; fi  # R17 (3)\n'
+  $S $'    if not index_has(names, job, ident):  # M2a: under the lock, so a concurrent settle cannot slip between the check and the append\n        cmd_append_index([os.path.join(names, ident), job])\n        failpoint("index.appended")\n    cmd_remove([path])\n' \
+     $'    cmd_remove([path])\n    if not index_has(names, job, ident):  # M2a: under the lock, so a concurrent settle cannot slip between the check and the append\n        cmd_append_index([os.path.join(names, ident), job])\n        failpoint("index.appended")\n'
 prove "R21: the pending.published failpoint is gone" t_run_crash $L '    stl failpoint pending.published' '    :'
 prove "R21: the start.returned failpoint is gone" t_run_crash $L '    stl failpoint start.returned' '    :'
-prove "R21: the index.appended failpoint is gone" t_run_crash $L 'stl failpoint index.appended; fi' ':; fi'
-prove "R21: the pending.unlinked failpoint is gone" t_run_crash $L '    stl failpoint pending.unlinked' '    :'
+prove "R21: the index.appended failpoint is gone" t_run_crash $S '        failpoint("index.appended")' '        pass'
+prove "R21: the pending.unlinked failpoint is gone" t_run_crash $S '    failpoint("pending.unlinked")' '    pass'
 prove "R17: remove does not fsync the directory" t_run_fsync_order $S $'    os.unlink(path)\n    _sync_path(os.path.dirname(path), "dir")\n    return 0' $'    os.unlink(path)\n    return 0'
 prove "R17: the pending record is not fsynced before it is published" t_run_fsync_order $S $'    _sync_path(src, "file")\n    trace("link", src, dest)' $'    trace("link", src, dest)'
 prove "R17: the pending directory is not fsynced after the link" t_run_fsync_order $S $'    failpoint("publish.linked", dest)\n    _sync_path(os.path.dirname(dest), "dir")' $'    failpoint("publish.linked", dest)'
@@ -1103,6 +1183,10 @@ prove "R17: reconcile appends the job id without checking that it is listed" t_r
 prove "R17: reconcile unlinks the record before it indexes the job" t_reconcile_redo $S "$RCI"$'\n'"$RCA"$'\n        failpoint("reconcile.indexed")\n        cmd_remove([path])' $'        cmd_remove([path])\n        failpoint("reconcile.indexed")\n'"$RCI"$'\n'"$RCA"
 prove "R21: the reconcile.indexed failpoint is gone" t_reconcile_redo $S $'        failpoint("reconcile.indexed")\n' $'        pass\n'
 prove "R3: reconcile settles the records of every id" t_reconcile_scope $S '        if record is None or record["name"] != ident:' '        if record is None:'
+prove "R3: the records of one id settle in nonce order, not in the order they were written" t_reconcile_epoch $S '    records.sort(key=lambda item: record_order(item[1], item[0]))' '    records.sort(key=lambda item: item[0])'
+prove "M2a: the id lock is not taken, so a settle can land inside another's critical section" t_reconcile_race $S $'    return lock_file(os.path.join(os.path.dirname(os.path.abspath(names)), "lock", "id-" + ident))' $'    return None'
+prove "R17: a temp file a crash left is never swept" t_sweep_temps $S '        pid = temp_writer(name)' '        pid = None'
+prove "R17: a temp file of a writer that is still running is swept too" t_sweep_temps $S '        if pid is None or not writer_gone(pid):' '        if pid is None:'
 prove "R3: a pending record that is not a record is skipped" t_reconcile_unsafe $S '        die(9, "%s is not a pending record" % path)' '        return None'
 prove "R3: a database that cannot be read is read as an unsent start" t_reconcile_unsafe \
   $S "        found = query_ro(db, $RCQ" \

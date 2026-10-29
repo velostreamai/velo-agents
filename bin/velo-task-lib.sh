@@ -701,9 +701,8 @@ cmd_run() {
       if [ "$n" -ge 5 ]; then die 5 "--rerun: Vanth returned an already indexed job for $n keys in a row; nothing new was started"; fi
       continue
     fi
-    if [ "$known" = 1 ]; then st append-index "$NAMES/$id" "$job"; stl failpoint index.appended; fi  # R17 (3)
-    st remove "$PENDING/$pending"  # R17 (4)
-    stl failpoint pending.unlinked
+    rc=0; st index-settle "$PENDING" "$NAMES" "$id" "$pending" "$job" || rc=$?  # R17 (3), (4), M2a: under the id's lock, so the check of the index, the append and the unlink are one step that no other settle can interleave
+    [ "$rc" = 0 ] || die "$rc" "the job of '$id' could not be indexed (see above)"
     printf '%s\n' "$job"
     return 0
   done

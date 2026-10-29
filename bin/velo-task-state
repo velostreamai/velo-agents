@@ -25,7 +25,8 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   remove <file>                            R17 step 4: unlink a regular file of yours (already gone is fine), then fsync its directory
   index-last <names-dir> <id>              the last job id in <names-dir>/<id> (R3); exit 1 when there is no such index
   index-has <names-dir> <job_id> [<id>]    exit 0 when a name-index file (just <id>'s, when given) lists the job id, else 1
-  reconcile <pending-dir> <names-dir> <db> <id>   R3, R17: settle <id>'s pending records against Vanth's local_start_requests (read-only, the key matched exactly): key present = index the job id (unless listed), unlink the record; key absent = leave it, print `pending-unsent <id>` on stderr, exit 3
+  reconcile <pending-dir> <names-dir> <db> <id>   R3, R17: settle <id>'s pending records against Vanth's local_start_requests (read-only, the key matched exactly): key present = index the job id (unless listed), unlink the record; key absent = leave it, print `pending-unsent <id>` on stderr, exit 3. The records settle oldest first (the epoch in each record), under the lock of <id>, and a temp file no writer can still link is swept from both directories
+  index-settle <pending-dir> <names-dir> <id> <nonce> <job_id>   R17 step 3 and 4, M2a: under the lock of <id>, check the name index again (a reconcile may have indexed the job already), append the job id unless it is listed, then unlink <nonce>
   failpoint <name>                         test-only crash/barrier point (see below)
   test-capability                          exit 0 when the test capability holds (see below), else 2
 
@@ -63,10 +64,11 @@ import time
 from urllib.parse import quote
 
 # A failpoint name is registered when its call site exists; a typo must not pass silently. The last four are the steps of
-# `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked (reconcile.indexed: the same, in reconcile).
+# `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked (reconcile.indexed: the same, in reconcile;
+# reconcile.locked: after reconcile has taken the lock of the id and before it settles anything, so a test can hold a settle inside its critical section).
 FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready", "launch.recorded",
               "ensure.adopting", "restart.validated", "install.lock.held", "install.verified", "pending.published", "start.returned", "index.appended",
-              "pending.unlinked", "reconcile.indexed"}
+              "pending.unlinked", "reconcile.indexed", "reconcile.locked"}
 TEST_MARKER = ".velo-task-test-root"
 # Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
 # exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly
@@ -95,6 +97,7 @@ SECRET_SHAPES = [re.compile(p) for p in (
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{6,}", r"AKIA[0-9A-Z]{8,}")]
 JOB_ID = re.compile(r"[A-Za-z0-9_-]+")  # used with fullmatch: `$` would also accept a trailing newline
 PENDING_NONCE = re.compile(r"[0-9a-f]{16}")  # the name pending-write gives a record; a temp file beside it, or anything else, is not one
+TEMP_NAME = re.compile(r".+\.tmp\.([0-9]+)\.[0-9a-f]{8}")  # what write_new calls its temp, with the pid of the writer it belongs to (R17)
 # R1: the one in-flight predicate (every component uses this set, the Stop guard included), and the reason Vanth 1.14.0 gives a job it
 # cancels because its trigger parent ended in another status than the awaited one (install-vanth asserts the installed package holds it).
 IN_FLIGHT = frozenset(("queued", "launching", "running", "paused", "retrying", "stopping"))
@@ -256,19 +259,11 @@ def _sync_path(path, kind):
         os.close(fd)
 
 
-def cmd_lock(args):
-    timeout, child_fd = None, None
-    while args[:1] in (["--timeout"], ["--child-fd"]):
-        if len(args) < 2:
-            usage("lock: %s needs a value" % args[0])
-        if args[0] == "--timeout":
-            timeout = float(args[1])
-        else:
-            child_fd = int(args[1])
-        args = args[2:]
-    if len(args) < 3 or args[1] != "--":
-        usage("lock: expected <path> -- cmd...")
-    path, cmd = os.path.abspath(args[0]), args[2:]
+def lock_file(path, timeout=None):
+    """The one way a lock is taken (R17, M1): an exclusive flock on <path>, waiting at most <timeout> seconds for it, and then a check that
+    the name still has the very file that was locked. Returns (fd, dirfd); the lock is held until fd is closed, and dirfd keeps the directory
+    it was opened through. The directory and the file are opened through descriptors and never by a path that could have been swapped for a
+    symlink. A caller that lives only to do one locked pass keeps the pair open and lets the kernel release it at exit."""
     parent, name = os.path.split(path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     # The directory and the file are opened through descriptors and never by a path that could have been swapped for a symlink.
@@ -295,6 +290,33 @@ def cmd_lock(args):
     named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
     if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino):
         die(9, "%s was replaced while the lock was being taken; the lock is not on the file the name now has" % path)
+    return fd, dirfd
+
+
+def id_lock(names, ident):
+    """M2a, R3: the lock of one id, beside the state dir's other locks and never among the records or the index files. The check of the name
+    index, the append to it and the unlink of a pending record are one critical section per id, so two processes settling one id cannot
+    interleave: no job is listed twice, and a job appended by one of them can never be overtaken by an older one appended by the other. The
+    helper that takes it is one shot, so the pair stays open and the kernel releases the lock when it exits."""
+    return lock_file(os.path.join(os.path.dirname(os.path.abspath(names)), "lock", "id-" + ident))
+
+
+def cmd_lock(args):
+    timeout, child_fd = None, None
+    while args[:1] in (["--timeout"], ["--child-fd"]):
+        if len(args) < 2:
+            usage("lock: %s needs a value" % args[0])
+        if args[0] == "--timeout":
+            timeout = float(args[1])
+        else:
+            child_fd = int(args[1])
+        args = args[2:]
+    if len(args) < 3 or args[1] != "--":
+        usage("lock: expected <path> -- cmd...")
+    path, cmd = os.path.abspath(args[0]), args[2:]
+    name = os.path.basename(path)
+    fd, dirfd = lock_file(path, timeout)
+    locked = os.fstat(fd)
     pass_fds = ()
     if child_fd is not None:
         # The command's view of the lock: another open file description of the very file locked, holding no flock of its own, so
@@ -429,6 +451,49 @@ def write_new(dest, data):
     finally:
         os.close(fd)
     return publish_file(tmp, dest)
+
+
+def temp_writer(name):
+    """The pid of the writer of a temp file write_new leaves behind when it dies between create and link (<dest>.tmp.<pid>.<8 hex>), or
+    None when the name is not one of those. Anything else beside the records and the index files is not ours to sweep."""
+    match = TEMP_NAME.fullmatch(name)
+    if match is None:
+        return None
+    pid = int(match.group(1))
+    return pid if pid > 0 else None
+
+
+def writer_gone(pid):
+    """Whether no process holds this pid, so a temp file of its writer's can no longer be linked by anyone. A pid of another user is alive:
+    we cannot see it, and we never unlink what might still be in use."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False  # not ours to judge: PermissionError and anything else mean "assume alive"
+    return False
+
+
+def sweep_temps(directory):
+    """M2a, R17: a crash between the create and the link of a record or of an index file leaves <dest>.tmp.<pid>.<8 hex> behind, which is
+    not a record and would otherwise sit in the state dir for good. Unlink every one whose writer is gone; a temp whose writer is still
+    alive is that writer's, mid-publish, and is left alone. Exit 9 when a temp cannot be unlinked: the state dir is then not what this
+    code wrote, and nothing else here is read as a record."""
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        pid = temp_writer(name)
+        if pid is None or not writer_gone(pid):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            die(9, "%s cannot be swept: %s" % (path, exc.strerror))
+        _sync_path(directory, "dir")
 
 
 def write_record(dest, pid, lstart, digest, incarnation):
@@ -759,7 +824,9 @@ def verdict_of(row, known_job=lambda job_id: False):
         if status in ("failed", "orphaned") and _restart_pending(row):
             return "in-flight"  # a policy relaunch is coming: the status is not final
         trigger = _json_field(row, "trigger_json", "trigger") if status == "cancelled" else None
-    except ValueError:
+    except (ValueError, RecursionError):
+        # M2a, B18: a policy or trigger column that is not JSON, or one nested deeper than json can read (RecursionError), is a status this
+        # cannot classify: `lost`, never `ok`, and never a traceback out of the middle of a verdict.
         return "lost"
     if status == "completed":
         return "ok"
@@ -877,9 +944,12 @@ def cmd_verdict_of(args):
     else:
         try:
             row = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-        except ValueError as exc:  # not JSON, or not UTF-8
+        except (ValueError, RecursionError) as exc:  # not JSON, not UTF-8, or nested deeper than this interpreter can read
             die(6, "verdict-of: the status is not JSON: %s" % exc)
-        row = row if isinstance(row, dict) else {}
+        if not isinstance(row, dict):
+            # M2a, B18: `[]`, `null` or a string is not a status object, so there is nothing to report a verdict from. Reading it as an
+            # empty row made `status <id>` claim the job was not the job asked about (exit 2): a usage error for a malformed answer.
+            die(6, "verdict-of: the status is not a JSON object (%s)" % type(row).__name__)
         for key, want in (("job_id", job), ("name", opts.get("name"))):
             if want is not None and row.get(key) != want:
                 die(2, "verdict-of: the status is for %s %r, not %r; refusing to report it for the job asked about" % (key, row.get(key), want))
@@ -924,12 +994,36 @@ def cmd_pending_write(args):
     if len(args) < 3 or args[1] != "--":
         usage("pending-write: expected <dir> -- <vanth start args...>")
     directory = os.path.abspath(args[0])
-    data = (json.dumps(parse_start(args[2:]), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    settings = parse_start(args[2:])
+    settings["epoch"] = time.time_ns()  # M2a, R3: when this record was created, so two records for one id settle in the order they were written
+    data = (json.dumps(settings, sort_keys=True, separators=(",", ":")) + "\n").encode()
     os.close(open_dir_nofollow(directory))  # a symlink in place of the directory, or one that is not yours, is refused (exit 9)
     nonce = os.urandom(8).hex()
     if not write_new(os.path.join(directory, nonce), data):
         die(3, "pending-write: %s already exists" % nonce)
     print(nonce)
+    return 0
+
+
+def cmd_index_settle(args):
+    """R17 (3), (4), M2a: the settle of the run that published <nonce>, under the lock of its id. <job> is the job id Vanth returned for it.
+    The index is checked again here, because a reconcile that recovered this run's record may have indexed the job already. The check, the
+    append and the unlink are one critical section with reconcile's: nothing can be appended between them, and no other process can settle
+    this id in the middle of them. The two steps keep their names (index.appended, pending.unlinked), so a crash lands where it always did."""
+    if len(args) != 5:
+        usage("index-settle: expected <pending-dir> <names-dir> <id> <nonce> <job>")
+    pending, names, ident, nonce, job = args
+    if ident in ("", ".", "..") or "/" in ident or PENDING_NONCE.fullmatch(nonce) is None:
+        die(9, "index-settle: %r is not an id and %r is not a nonce" % (ident, nonce))
+    if not JOB_ID.fullmatch(job) or job.startswith("-"):
+        die(9, "index-settle: %r is not a job id" % job)
+    id_lock(names, ident)
+    path = os.path.join(pending, nonce)
+    if not index_has(names, job, ident):  # M2a: under the lock, so a concurrent settle cannot slip between the check and the append
+        cmd_append_index([os.path.join(names, ident), job])
+        failpoint("index.appended")
+    cmd_remove([path])
+    failpoint("pending.unlinked")
     return 0
 
 
@@ -981,6 +1075,14 @@ def read_pending(path):
     return record
 
 
+def record_order(record, nonce):
+    """M2a, R3: the order in which one id's records settle, oldest first. A record carries the epoch it was written with (pending-write), and
+    the newest record's job must be the last line of the name index. A record with no usable epoch (written before the field existed, or with
+    something that is not a number in it) sorts first, and the nonce keeps the order total - the order those records settled in before."""
+    epoch = record.get("epoch") if record else None
+    return (epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else 0, nonce)
+
+
 def cmd_reconcile(args):
     """R3, R17: settle the pending records named <id> against Vanth's own acceptance record, so a run that died after `vanth start` returned
     does not lose its job. The record's key is looked up in local_start_requests, read-only and matched exactly (never through `vanth list`,
@@ -995,9 +1097,16 @@ def cmd_reconcile(args):
         nonces = sorted(name for name in os.listdir(pending) if PENDING_NONCE.fullmatch(name))
     except FileNotFoundError:
         return 0
-    for nonce in nonces:
+    sweep_temps(pending)  # M2a, R17: a temp no writer can still link is swept before anything here is read as a record
+    sweep_temps(names)
+    id_lock(names, ident)  # M2a, R3: every record of this id is settled under one lock, taken by this pass and by the run's own settle
+    failpoint("reconcile.locked")
+    # The records are read once, then settled oldest first: the epoch the record was written with (M2a, R3) orders the pass, so the last
+    # line of the name index is the job of the newest record, whatever order the random nonces happen to have.
+    records = [(nonce, read_pending(os.path.join(pending, nonce))) for nonce in nonces]
+    records.sort(key=lambda item: record_order(item[1], item[0]))
+    for nonce, record in records:
         path = os.path.join(pending, nonce)
-        record = read_pending(path)
         if record is None or record["name"] != ident:  # None: settled by another reconcile since the listing
             continue
         found = query_ro(db, "SELECT job_id FROM local_start_requests WHERE idempotency_key = ?", (record["key"],))
@@ -1052,7 +1161,8 @@ COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish
             "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
             "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
             "verdict-of": cmd_verdict_of, "pending-write": cmd_pending_write, "remove": cmd_remove,
-            "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile, "session-token": cmd_session_token,
+            "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile, "index-settle": cmd_index_settle,
+            "session-token": cmd_session_token,
             "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 
