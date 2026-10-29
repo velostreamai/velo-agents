@@ -12,12 +12,14 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   launch-exec <intent> <digest> <incarnation> <program> [name...]   publish the intent for THIS process, then exec <program> with only the named variables
   retire <path>                            durably rename path to <path>.retired.<epoch> (never replaces)
   append-index <file> <job_id>             append one line (O_APPEND) to a regular file of yours, never through a symlink; fsync file, fsync dir if created
+  append-line <file> <text>                the same writer for one prose line (the R8 override audit log): one line, no control character
   fp <status> <exit_code> <stop_actor> <stop_reason> <end>   first 16 hex of SHA-256 of the row
   sha256 [file]                            hex SHA-256 of a file, or of stdin
   json-get <file|-> <key>                  top-level JSON value as text (string raw, true/false, number); empty when absent
   modes-check <home> [file...]             exit 8 and print the first path that group or other can access
   redact                                   stdin -> stdout with secrets replaced by ***
   jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
+  job-info <db> <job_id> [<names-dir>]     one jobs.sqlite row asked about by its job_id: `verdict <v>` (R1, verdict_of alone) then, per session:<id> tag, `session <id>`; exit 3 when there is no such row
   verdict-of [--names D] [--db P] [--job J] [--name N] [--issue I] [--session S] [--label L] [--json] [--absent]   R1: the verdict of the status object (or jobs.sqlite row) on stdin, as `<label> <verdict>`; exit 2 when it is not the job asked about, 6 when it is not JSON; --absent: Vanth has no row for J (lost(pruned) when the name index lists J, else unknown-job, exit 3)
   verdict-of --list --db P --names D [--session S] [--issue I] [--json]   every job of jobs.sqlite that carries those tags, newest first, as `<name> <job_id> <verdict>` (--json: one object each)
   session-token <file>                     the session token of a state dir with no CLAUDE_SESSION_ID: 16 hex characters, made on first use (never replaced), printed
@@ -29,10 +31,10 @@ Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper fo
   failpoint <name>                         test-only crash/barrier point (see below)
   test-capability                          exit 0 when the test capability holds (see below), else 2
 
-Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job; reconcile: a record Vanth has no key for), 4 jobs-ro: database
+Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job; job-info: no such row; reconcile: a record Vanth has no key for), 4 jobs-ro: database
 locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 6 verdict-of: the input is not JSON, 8 modes-check: loose
 mode found, 9 unsafe state (a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire,
-append-index, pending-write, remove, index-last, index-has, reconcile, session-token; for check-state also a home whose mode is not 0700), 75 lock or
+append-index, append-line, pending-write, remove, index-last, index-has, reconcile, session-token; for check-state also a home whose mode is not 0700), 75 lock or
 failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from `lock` is the
 command's own.
 
@@ -529,35 +531,78 @@ def cmd_launch_exec(args):
     os.execve(program, [program], env)
 
 
-def cmd_append_index(args):
-    if len(args) != 2:
-        usage("append-index: expected <file> <job_id>")
-    path, job_id = args
+def append_line(path, text, who):
+    """One line appended to a control file of yours (the name index, the override audit log): O_APPEND under O_NOFOLLOW, fsync file,
+    fsync its directory when it was created. The one writer both append-index and append-line use, so the safety of an append is
+    written once."""
     path = os.path.abspath(path)
-    if not JOB_ID.fullmatch(job_id):
-        die(2, "append-index: job_id must match ^[A-Za-z0-9_-]+$")
     created = False
     try:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
         created = True
-    except FileExistsError:  # the index is a control file: opened without following a symlink, and only a regular file of yours is appended to
+    except FileExistsError:  # the file is a control file: opened without following a symlink, and only a regular file of yours is appended to
         try:
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
         except OSError as exc:
-            die(9, "append-index: %s cannot be opened: %s" % (path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
+            die(9, "%s: %s cannot be opened: %s" % (who, path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
         problem = node_problem(path, os.fstat(fd), "file")
         if problem:
             os.close(fd)
-            die(9, "append-index: %s" % problem)
+            die(9, "%s: %s" % (who, problem))
     try:
-        line = (job_id + "\n").encode()
+        line = (text + "\n").encode("utf-8", "surrogateescape")
         if os.write(fd, line) != len(line):  # one write(2) under O_APPEND: concurrent lines never tear
-            die(1, "append-index: short write to %s" % path)
+            die(1, "%s: short write to %s" % (who, path))
         _sync_fd(fd, "file", path)
     finally:
         os.close(fd)
     if created:
         _sync_path(os.path.dirname(path), "dir")
+    return 0
+
+
+def cmd_append_index(args):
+    if len(args) != 2:
+        usage("append-index: expected <file> <job_id>")
+    path, job_id = args
+    if not JOB_ID.fullmatch(job_id):
+        die(2, "append-index: job_id must match ^[A-Za-z0-9_-]+$")
+    return append_line(path, job_id, "append-index")
+
+
+def cmd_append_line(args):
+    """One prose line (the R8 override audit log) appended by the same writer as the name index. The line is one line and holds no
+    control character, so an operator's reason cannot add a line or a field to the log."""
+    if len(args) != 2:
+        usage("append-line: expected <file> <text>")
+    text = args[1]
+    if not text or any(ord(c) < 0x20 or ord(c) == 0x7f for c in text):
+        usage("append-line: the text must be one non-empty line with no control character")
+    return append_line(args[0], text, "append-line")
+
+
+def cmd_job_info(args):
+    """One row of jobs.sqlite asked about by ITS job_id: `verdict <v>` (R1, verdict_of alone, so a caller never reads a status into a
+    verdict of its own) then one `session <id>` line per session:<id> tag the row carries (R9, the owner ack speaks for). --names is
+    where a trigger parent is looked up, exactly as the list does. Exit 3 when jobs.sqlite has no such row."""
+    if len(args) not in (2, 3):
+        usage("job-info: expected <db> <job_id> [<names-dir>]")
+    db, job_id = args[0], args[1]
+    names = args[2] if len(args) == 3 else None
+    known = lambda parent: bool(names and index_has(names, parent)) or job_row_exists(db, parent)
+    rows = query_ro(db, "SELECT job_id, name, status, exit_code, stop_actor, stop_reason, trigger_json, policy_state_json, tags_json "
+                        "FROM jobs WHERE job_id = ?", (job_id,))
+    if not rows:
+        die(3, "job-info: %s is not a row of jobs.sqlite" % job_id)
+    row = rows[0]
+    print("verdict %s" % verdict_of(row, known))
+    try:
+        tags = _json_field(row, "tags_json")
+    except ValueError:  # surfaced, never read as "this job belongs to no session": that would let any session speak for it
+        die(1, "job-info: the tags_json of %s is not JSON" % job_id)
+    for tag in tags if isinstance(tags, list) else ():
+        if isinstance(tag, str) and tag.startswith("session:"):
+            print("session %s" % _tok(tag[len("session:"):]))
     return 0
 
 
@@ -1050,10 +1095,10 @@ def cmd_test_capability(args):
 COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish, "retire": cmd_retire,
             "write-record": cmd_write_record, "rec-read": cmd_rec_read, "check-state": cmd_check_state,
             "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
-            "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
+            "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro, "job-info": cmd_job_info,
             "verdict-of": cmd_verdict_of, "pending-write": cmd_pending_write, "remove": cmd_remove,
             "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile, "session-token": cmd_session_token,
-            "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
+            "append-line": cmd_append_line, "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
 
 
 def adopt_secrets(argv):

@@ -37,6 +37,9 @@
 #   names/<id>          the name index (R3): the job_ids run started under <id>, one per line, append-only
 #   pending/<nonce>     a start about to be sent to Vanth (R17): its canonical settings, deleted once its job_id is indexed
 #   session             the owner token run tags jobs with (session:<id>) when $CLAUDE_SESSION_ID is unset: made on first use, one per state dir
+#   acks/<job_id>       an acknowledged job (R9): published once, never edited; the Stop guard stops blocking on a lost row that has one
+#   overrides.log       the stop-override audit log (R8): one line per override, time, session, uid and the reason given
+#   override/<session>  a one-shot stop override (R8): the next guard run of that session spends it, then it is gone
 # VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT, VELO_TASK_STOP_WAIT, VELO_TASK_LOCK_WAIT
 # (seconds) and VELO_TASK_POLL (the poll interval while a daemon starts or stops, default 0.2 s). Exit codes: 0 ok, 1 error,
 # 2 usage, 6 daemon refused/down/misconfigured.
@@ -64,6 +67,9 @@ LOCK_FILE="$VELO_TASK_HOME/lock/daemon"
 NAMES="$VELO_TASK_HOME/names"
 PENDING="$VELO_TASK_HOME/pending"
 SESSION_FILE="$VELO_TASK_HOME/session"
+ACKS="$VELO_TASK_HOME/acks"                 # R9: one marker per acknowledged job, named by job_id
+OVERRIDES="$VELO_TASK_HOME/overrides.log"   # R8: the stop-override audit log
+OVERRIDE_DIR="$VELO_TASK_HOME/override"     # R8: override/<session>, the one-shot marker the next guard run spends
 UV_PINNED=/opt/homebrew/bin/uv
 INSTALL_PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 SYS_PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -765,4 +771,196 @@ cmd_status() {
   if [ "$have_session" = 1 ]; then session=$(session_id "$session") || exit "$?"; vargs=("${vargs[@]}" --session "$session"); fi  # any owner unless asked
   if [ "$json" = 1 ]; then vargs=("${vargs[@]}" --json); fi
   if [ "$absent" = 1 ]; then st verdict-of --absent "${vargs[@]}"; else printf '%s\n' "$out" | st verdict-of "${vargs[@]}"; fi
+}
+
+
+# ---- ack, the Stop guard and SessionStart (R8, R9; velo-agents#7) --------------------------------------
+# R8: the Stop hook blocks on the jobs of THIS session that are not finished, read from jobs.sqlite alone through the same verdict
+# (R1) `status --list` prints -- no daemon is asked, so a session whose daemon is down is still told what it left running. Anything
+# that cannot be read (an unsafe state path, a database that is missing, locked past 2000 ms or of another schema) blocks and prints
+# the one way out, `velo-task stop-override`: no block releases itself after N runs. R9: an ack is one published marker,
+# acks/<job_id>, and the only row it closes is `lost`: a job that runs again blocks again whatever its marker says.
+#
+# The guard and SessionStart run the system python (stl): neither needs Vanth's venv, and state that can only be read is state the
+# hooks must still read.
+
+override_take() {  # <session>: spend this session's one-shot override marker; 0 when it was there, 1 when not
+  local f="$OVERRIDE_DIR/$1" claimed
+  [ -e "$f" ] || [ -L "$f" ] || return 1
+  claimed="$OVERRIDE_DIR/.$1.spent.$$"
+  /bin/mv -f "$f" "$claimed" 2>/dev/null || return 1   # R8: a rename, so two guard runs cannot both spend the same override
+  stl remove "$claimed" >/dev/null 2>&1 || true        # the marker is spent whether or not it can be cleaned up
+  return 0
+}
+hook_listing() {  # <session>: its jobs, `<name> <job_id> <verdict>` each; 1 and the reason on stdout when the state cannot be read (R8)
+  local out
+  out=$(stl check-state --owner-only "$VELO_TASK_HOME") || { printf 'state: %s\n' "${out:-the state check failed}"; return 1; }
+  if [ ! -e "$VH/jobs.sqlite" ]; then
+    # R8: no database, but the name index or a pending record says a job exists: unreadable, never "nothing to block"
+    if [ -n "$(/usr/bin/ls -A "$NAMES" 2>/dev/null)$(/usr/bin/ls -A "$PENDING" 2>/dev/null)" ]; then
+      printf 'the state is at %s but %s/jobs.sqlite is missing, while the name index or a pending record is not\n' "$VELO_TASK_HOME" "$VH"
+      return 1
+    fi
+    return 0   # nothing was ever started here
+  fi
+  out=$(stl verdict-of --list --names "$NAMES" --db "$VH/jobs.sqlite" --session "$1" 2>&1) || { printf '%s\n' "$out"; return 1; }
+  [ -z "$out" ] || printf '%s\n' "$out"
+  return 0
+}
+keep_blocking() {  # stdin: `<name> <job_id> <verdict>` rows; stdout: the rows that block (R8): in flight, or lost and not acked (R9)
+  local name job verdict
+  while IFS=' ' read -r name job verdict; do
+    [ -n "${job:-}" ] || continue
+    case "$verdict" in
+      in-flight) printf '%s %s %s\n' "$name" "$job" "$verdict" ;;
+      lost) [ -e "$ACKS/$job" ] || [ -L "$ACKS/$job" ] || printf '%s %s %s\n' "$name" "$job" "$verdict" ;;
+    esac
+  done
+}
+blocking_commands() {  # stdin: blocking rows; stdout: the one command that clears each, copy-pasteable
+  local name job verdict
+  while IFS=' ' read -r name job verdict; do
+    [ -n "${job:-}" ] || continue
+    if [ "$verdict" = in-flight ]; then
+      printf '  %s %s: %s -- wait for it: velo-task wait %s\n' "$name" "$job" "$verdict" "$name"
+    else
+      printf '  %s %s: %s, not acked -- velo-task ack %s\n' "$name" "$job" "$verdict" "$job"
+    fi
+  done
+}
+count_inflight() {  # stdin: listing rows; stdout: how many are in flight
+  local name job verdict n=0
+  while IFS=' ' read -r name job verdict; do
+    [ "${verdict:-}" != in-flight ] || n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+hook_stop_guard() {  # the Claude Code Stop hook body (R8): 0 lets the session stop, 2 blocks and says why
+  local me rows fail="" spent=1
+  [ -d "$VELO_TASK_HOME" ] || return 0   # R8: no state directory at all, so no job was ever started here
+  me=$(session_id) || return "$?"        # the same session resolution run tags with, never a second one read from the hook payload
+  override_take "$me" && spent=0         # R8: the next guard run spends the marker, whether or not it had anything to block
+  if rows=$(hook_listing "$me"); then
+    rows=$(keep_blocking <<<"$rows")
+  else
+    fail="$rows"; rows=""
+  fi
+  if [ "$spent" = 0 ]; then
+    printf 'velo-task stop-override: the one-shot marker of this session is spent, so this run lets the session end (R8)\n'
+    [ -z "$fail" ] || printf '  (the job state could not be read: %s)\n' "$fail"
+  else
+    if [ -z "$fail" ] && [ -z "$rows" ]; then return 0; fi
+    if [ -n "$fail" ]; then
+      printf 'the Stop guard cannot read the job state, so it blocks (R8): %s\n' "$fail"
+    else
+      printf 'unfinished jobs of session %s:\n' "$me"
+      blocking_commands <<<"$rows"
+    fi
+    printf 'to end this session anyway: velo-task stop-override --reason <text>\n'
+    return 2
+  fi
+  return 0
+}
+hook_session_start() {  # the Claude Code SessionStart hook body (R8, R9): prints, never blocks, whatever the state says
+  local me rows blocking all others
+  if [ ! -d "$VELO_TASK_HOME" ]; then
+    printf 'velo-task: no job state at %s, so nothing of this session is in flight\nother sessions: 0 in flight\n' "$VELO_TASK_HOME"
+    return 0
+  fi
+  me=$(session_id) || { printf 'velo-task: this session could not be resolved, so no job list is shown\nother sessions: 0 in flight\n'; return 0; }
+  if ! rows=$(hook_listing "$me"); then
+    printf 'velo-task: the job state cannot be read, so no job list is shown: %s\n' "$rows"
+    printf 'other sessions: unknown in flight (run `velo-task doctor`)\n'
+    return 0
+  fi
+  blocking=$(keep_blocking <<<"$rows")
+  if [ -n "$blocking" ]; then
+    printf 'velo-task: unfinished jobs of session %s (they block its Stop hook):\n' "$me"
+    blocking_commands <<<"$blocking"
+  else
+    printf 'velo-task: no job of session %s is in flight or lost unacked\n' "$me"
+  fi
+  all=$(stl verdict-of --list --names "$NAMES" --db "$VH/jobs.sqlite" 2>&1) || all=""
+  if [ -z "$all" ] && [ -n "$rows" ]; then
+    printf 'other sessions: unknown in flight (the job list could not be read)\n'
+  else
+    others=$(( $(count_inflight <<<"$all") - $(count_inflight <<<"$rows") ))
+    printf 'other sessions: %s in flight\n' "$others"
+  fi
+  return 0
+}
+cmd_ack() {
+  local job="" any=0 out rc=0 why me verdict="" owners="" tmp=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --any-session) any=1; shift ;;
+      -*) die 2 "unknown option '$1'" ;;
+      *) [ -z "$job" ] || die 2 "ack takes one job_id"; job="$1"; shift ;;
+    esac
+  done
+  [ -n "$job" ] || die 2 "usage: velo-task ack <job_id> [--any-session]"
+  check_arg job "$job"
+  [ -z "${CLAUDE_SESSION_ID:-}" ] || check_arg session "$CLAUDE_SESSION_ID"   # as in run and status: refused whether or not it is used
+  prep_env
+  [ -d "$VELO_TASK_HOME" ] || die 6 "state: $VELO_TASK_HOME does not exist, so no job was ever started here"
+  why=$(stl check-state --owner-only "$VELO_TASK_HOME") || die 6 "state: ${why:-the state check failed}; nothing was acknowledged"
+  if [ -e "$ACKS/$job" ] || [ -L "$ACKS/$job" ]; then printf '%s acked (already: %s)\n' "$job" "$ACKS/$job"; return 0; fi  # idempotent, and no row is read to say so
+  [ -e "$VH/jobs.sqlite" ] || die 1 "$VH/jobs.sqlite does not exist, so there is no job '$job' to acknowledge (has anything been run here?)"
+  out=$(stl job-info "$VH/jobs.sqlite" "$job" "$NAMES" 2>&1) || rc=$?
+  case "$rc" in
+    0) ;;
+    3) die 1 "job '$job' is not a row of $VH/jobs.sqlite: nothing was acknowledged" ;;
+    *) die 6 "the job row of '$job' could not be read (helper exit $rc, see above); nothing was acknowledged" ;;
+  esac
+  while IFS=' ' read -r key value; do
+    case "$key" in
+      verdict) verdict="$value" ;;
+      session) owners="${owners:+$owners }$value" ;;   # the R9 owner tag(s); the helper quotes one it cannot print as a word
+    esac
+  done <<<"$out"
+  # R9: an ack closes a job that has stopped. One that is still running is refused (exit 2): waiting is what closes it.
+  [ "$verdict" != in-flight ] || die 2 "job '$job' is $verdict: ack closes a stopped job, never a running one; wait for it with \`velo-task wait <id>\`"
+  me=$(session_id) || exit "$?"
+  if [ "$any" = 0 ] && [ -n "$owners" ]; then
+    case " $owners " in
+      *" $me "*) ;;
+      *) die 2 "job '$job' belongs to another session ($owners): an acknowledgment of another session's job is published with --any-session" ;;
+    esac
+  fi
+  /bin/mkdir -p -m 700 "$ACKS"
+  tmp="$ACKS/.ack.$$.$RANDOM"
+  ( umask 077; printf 'session=%s\nat=%s\nverdict=%s\n' "$me" "$(/bin/date -u +%FT%TZ)" "$verdict" > "$tmp" ) ||
+    die 1 "the acknowledgment could not be written in $ACKS"
+  rc=0; stl publish "$ACKS/$job" "$tmp" || rc=$?
+  case "$rc" in
+    0) printf '%s acked (%s)\n' "$job" "$verdict" ;;
+    3) printf '%s acked (already)\n' "$job" ;;   # two acks raced: the marker is there, which is what both wanted
+    *) die 1 "the acknowledgment of '$job' could not be published (helper exit $rc, see above)" ;;
+  esac
+}
+cmd_stop_override() {
+  local reason="" what="" line="" me="" tmp=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --reason) [ "$#" -ge 2 ] || die 2 "--reason needs a value"; reason="$2"; shift 2 ;;
+      -*) die 2 "unknown option '$1'" ;;
+      *) die 2 "stop-override takes --reason <text>, not '$1'" ;;
+    esac
+  done
+  [ -n "$reason" ] || die 2 "usage: velo-task stop-override --reason <text>"
+  case "$reason" in *$'\n'*|*$'\r'*) die 2 "the reason must be one line: a line break would add a line to the audit log" ;; esac
+  prep_env
+  [ -d "$VELO_TASK_HOME" ] || die 6 "state: $VELO_TASK_HOME does not exist, so there is no session here to end"
+  what=$(stl check-state --owner-only "$VELO_TASK_HOME") || die 6 "state: ${what:-the state check failed}; nothing was written"
+  me=$(session_id) || exit "$?"
+  line="$(/bin/date -u +%FT%TZ) session=$me uid=$(/usr/bin/id -u) reason=$reason"
+  # R8: the audit line first -- an override that cannot be audited is not one -- then the one-shot marker.
+  stl append-line "$OVERRIDES" "$line" || die 1 "the override could not be logged in $OVERRIDES (see above); nothing was written"
+  /bin/mkdir -p -m 700 "$OVERRIDE_DIR"
+  tmp="$OVERRIDE_DIR/.marker.$$.$RANDOM"
+  ( umask 077; printf '%s\n' "$line" > "$tmp" ) || die 1 "the override marker could not be written in $OVERRIDE_DIR"
+  st remove "$OVERRIDE_DIR/$me" >/dev/null 2>&1 || true   # two overrides leave one marker, so a session cannot bank two (R8)
+  local rc=0; stl publish "$OVERRIDE_DIR/$me" "$tmp" || rc=$?
+  [ "$rc" = 0 ] || die 1 "the override marker of this session could not be published (helper exit $rc, see above)"
+  printf 'stop-override: %s\n' "$line"
 }
