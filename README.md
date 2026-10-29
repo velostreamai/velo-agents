@@ -255,12 +255,38 @@ is skipped the same way, which is why `--check` looks for it):
           { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\"" }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/session-start-inflight.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/session-start-inflight.sh\"" },
+          { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/velo-task-session-start.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/velo-task-session-start.sh\"" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/velo-task-stop-guard.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/velo-task-stop-guard.sh\"" }
+        ]
+      }
     ]
   }
 }
 ```
 
-`session-start-inflight.sh` registers the same way under `SessionStart`. The two `deny-*` hooks are guardrails against
+`session-start-inflight.sh` registers the same way under `SessionStart`. Installing a hook registers nothing, so the guarded
+line is what makes a machine without it skip it.
+
+`velo-task-stop-guard.sh` (Stop) blocks a session that still has **its own** `velo-task` jobs unfinished: one tagged
+`session:<me>` (the same session id `run` tags with) that is in flight, or `lost` and not acknowledged. It prints the one command
+that clears each row — `velo-task wait <id>` for one that is running, `velo-task ack <job_id>` for one that stopped without a
+verdict. Another session's jobs never block, and nothing releases a block after N runs. When the job state cannot be read (a
+state path that is not yours, `jobs.sqlite` missing while the name index or a pending record is there, locked past 2000 ms, or of
+another schema) it blocks, and prints the one way out: `velo-task stop-override --reason <text>`, which audits the line in
+`<state>/overrides.log` and lets that session end once. `velo-task-session-start.sh` (SessionStart) prints the same list, then one
+non-blocking line, `other sessions: N in flight`. Both read the Vanth jobs database read-only through the state helper and never
+ask the daemon, and both are fail-open when the hook is not installed. The two `deny-*` hooks are guardrails against
 the orchestrating model's own mistakes (docs/velo-task-spec.md R10, R15(i)), not isolation:
 
 | hook | denies | allows | known false negatives |
