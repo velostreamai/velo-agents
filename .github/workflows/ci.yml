@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tooling
+        run: |
+          command -v jq >/dev/null || { [ "$(uname)" = Darwin ] && brew install jq || sudo apt-get install -y jq; }
+          python3 --version
+          bash --version | head -1
+      - name: tests/run.sh
+        run: bash tests/run.sh
