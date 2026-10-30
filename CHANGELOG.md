@@ -18,9 +18,13 @@ committed fixtures, and against the real checkout too where it exists, with a vi
 orchestrator's dispatch; GNU `stat -f` answered with a filesystem report that `velo-gate-post` and `velo-task-lib.sh` read as a mtime and a mode);
 `/usr/sbin/lsof` as the only lsof; `#!/bin/zsh` on a host without zsh. The Mac's own awk and bash: the hook proofs need the one-true-awk's
 limits and B14 needs a bash 3.2, so Linux now gets `original-awk` as `/usr/bin/awk` and a 3.2.57 built from source (`VELO_TEST_BASH32`).
-Two defects were in the suites themselves: `test_oai_backend.sh` made its commits with `git -c user.*`, so on a host with no global git
-identity the salvage commit failed and the read-only "never committed" check passed without proving anything, and `test_gate_routing.sh`
-grepped a `CLAUDE.md` that this repository does not have, so "no stale claim" could never fail. macOS lacks GNU `timeout`, which the
+Four defects were in the suites themselves: `test_oai_backend.sh` made its commits with `git -c user.*`, so on a host with no global git
+identity the salvage commit failed and the read-only "never committed" check passed without proving anything; `test_gate_routing.sh`
+grepped a `CLAUDE.md` that this repository does not have, so "no stale claim" could never fail; `test_gate_no_silent_skip.sh` called
+`post` two checks before it defined it (`post: command not found`, an empty answer), so "a NOT RUN that names a sub-check is not refused"
+passed without ever running `velo-gate-post`; and `test_orchestrd.sh` read the real free disk of the host while `velo-orchestrd`
+pauses every dispatch under 25 GB, which a hosted ubuntu runner (about 10 GB free) is. It now pins `df` and has a scenario for the pause
+itself, both ways, each proved red on a mutated daemon. macOS lacks GNU `timeout`, which the
 SessionStart hook and `velo-dispatch` call and `test_repo_env*.sh` pin; `.github/ci/macos.sh` installs it. No test was deleted, skipped
 or narrowed and no assertion weakened: where a proof was blind on Linux (a port holder whose reuse rules differ, an awk that does not abort
 on a lone byte, a Python whose default encoding is already UTF-8) it was made to bite there or given an equivalent that does, and the new
