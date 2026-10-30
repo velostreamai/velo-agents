@@ -6,6 +6,32 @@ for adding a row here, and the reason each gate exists at all.
 
 Newest first.
 
+### Added — CI runs the whole suite on ubuntu and macOS, in four shards each, and the suites no longer need the developer's machine (velo-agents#29)
+
+`tests/run.sh` had only ever run on one Mac, so what it proved was "passes on the machine it was written on". Its first run on
+GitHub-hosted runners (`ci.yml`, 73 suites one after another) failed 9 suites on macOS after 28 minutes and 12 on ubuntu after 16,
+and each failure was the suite leaning on something only that Mac has, never a flake. Read from the machine: `test_status.sh` (worktrees
+under `$HOME`), `test_llm_bench.sh`, `test_gate_routing.sh` and `test_ast_grep_tool.py` (a private Velostream checkout: they now run against
+committed fixtures, and against the real checkout too where it exists, with a visible note when it does not), `test_velo_task.sh`
+(`~/.claude.json`). Written for BSD: `stat -f`, `df -g`, `find -perm +077`, `sed -i ''` and `date -j` in `velo-task-lib.sh`,
+`velo-repo-lib.sh`, `velo-gate-post`, `velo-orchestrd` and their suites (GNU `df -g` printed usage, which was read as 0 GB free and paused the
+orchestrator's dispatch; GNU `stat -f` answered with a filesystem report that `velo-gate-post` and `velo-task-lib.sh` read as a mtime and a mode);
+`/usr/sbin/lsof` as the only lsof; `#!/bin/zsh` on a host without zsh. The Mac's own awk and bash: the hook proofs need the one-true-awk's
+limits and B14 needs a bash 3.2, so Linux now gets `original-awk` as `/usr/bin/awk` and a 3.2.57 built from source (`VELO_TEST_BASH32`).
+Two defects were in the suites themselves: `test_oai_backend.sh` made its commits with `git -c user.*`, so on a host with no global git
+identity the salvage commit failed and the read-only "never committed" check passed without proving anything, and `test_gate_routing.sh`
+grepped a `CLAUDE.md` that this repository does not have, so "no stale claim" could never fail. macOS lacks GNU `timeout`, which the
+SessionStart hook and `velo-dispatch` call and `test_repo_env*.sh` pin; `.github/ci/macos.sh` installs it. No test was deleted, skipped
+or narrowed and no assertion weakened: where a proof was blind on Linux (a port holder whose reuse rules differ, an awk that does not abort
+on a lone byte, a Python whose default encoding is already UTF-8) it was made to bite there or given an equivalent that does, and the new
+branches (no lsof, the Linux port holder) have proofs of their own.
+
+Speed: the suites take 16-28 minutes in sequence. `run.sh --shard I/N` runs the I-th of N slices; `tests/shard-plan.sh` makes the
+slices longest-processing-time-first from `tests/suite-weights.txt` (refusing a plan that could drop or repeat a suite), and
+`tests/test_run_sh_shards.sh` proves that every suite is in exactly one slice, that the slices balance, that a bad request is refused, and that
+`ci.yml` runs every slice (each check seen red on a mutated copy). Each shard is a runner of its own that shares nothing with the others, which
+is the one form of parallelism that cannot make a suite interfere with another. An aggregate job named `tests` is red unless every shard on every OS is green.
+
 ### Added — `VELO_REPO`: the tools work on any repo, and the default is byte-for-byte unchanged (velo-agents#17, velostream#2769)
 
 The gate and the worker tools could review and dispatch for exactly one repository: `velostreamai/velostream` was
