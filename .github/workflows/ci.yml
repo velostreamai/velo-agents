@@ -28,5 +28,11 @@ jobs:
           command -v jq >/dev/null || { [ "$(uname)" = Darwin ] && brew install jq || sudo apt-get install -y jq; }
           python3 --version
           bash --version | head -1
+      - name: Worker SDK (pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sdk-venv"
+          "$RUNNER_TEMP/sdk-venv/bin/pip" install --quiet "git+https://github.com/velostreamai/velo-agent-sdk@530492642d54b2429a057c7cc8f2c120f5b4833c"
       - name: tests/run.sh
+        env:
+          VELO_TEST_PYTHON: ${{ runner.temp }}/sdk-venv/bin/python
         run: bash tests/run.sh
