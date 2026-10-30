@@ -12,27 +12,70 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# tests/run.sh runs 73+ suites one after another and takes 17-29 minutes on one runner. Each shard below is a runner of its own - a
+# clean checkout that shares nothing with the others - running one weight-balanced slice of the suites (`run.sh --shard I/N`,
+# planned by tests/shard-plan.sh from tests/suite-weights.txt; tests/test_run_sh_shards.sh holds the slices to "every suite
+# exactly once"). What each OS needs that the stock image lacks is installed by .github/ci/*.sh, which says why.
 jobs:
-  tests:
-    name: tests (${{ matrix.os }})
+  shards:
+    name: tests (${{ matrix.os }} ${{ matrix.shard }}/${{ matrix.shards }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3, 4]
+        shards: [4]   # how many slices there are: the length of `shard`, which tests/test_run_sh_shards.sh holds it to
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Tooling
-        run: |
-          command -v jq >/dev/null || { [ "$(uname)" = Darwin ] && brew install jq || sudo apt-get install -y jq; }
-          python3 --version
-          bash --version | head -1
-      - name: Worker SDK (pinned)
-        run: |
-          python3 -m venv "$RUNNER_TEMP/sdk-venv"
-          "$RUNNER_TEMP/sdk-venv/bin/pip" install --quiet "git+https://github.com/velostreamai/velo-agent-sdk@530492642d54b2429a057c7cc8f2c120f5b4833c"
-      - name: tests/run.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: System tools (Linux)
+        if: runner.os == 'Linux'
+        run: bash .github/ci/ubuntu.sh
+      - name: System tools (macOS)
+        if: runner.os == 'macOS'
+        run: bash .github/ci/macos.sh
+      # macOS's /bin/bash is 3.2.57, the shell bar B14 pins; a Linux runner builds the same release (once: the build is cached).
+      - name: bash 3.2 (restore)
+        if: runner.os == 'Linux'
+        id: bash32
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/bash32
+          key: bash32-3.2.57-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/ci/build-bash32.sh') }}
+      - name: bash 3.2 (build)
+        if: runner.os == 'Linux' && steps.bash32.outputs.cache-hit != 'true'
+        run: bash .github/ci/build-bash32.sh "$RUNNER_TEMP/bash32"
+      - name: bash 3.2 (save)
+        if: runner.os == 'Linux' && steps.bash32.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/bash32
+          key: ${{ steps.bash32.outputs.cache-primary-key }}
+      - name: Python tools and worker venvs
+        run: bash .github/ci/python-tools.sh "$RUNNER_TEMP/ci"
+      - name: tests/run.sh --shard ${{ matrix.shard }}/${{ matrix.shards }}
         env:
-          VELO_TEST_PYTHON: ${{ runner.temp }}/sdk-venv/bin/python
-        run: bash tests/run.sh
+          VELO_TEST_PYTHON: ${{ runner.temp }}/ci/sdk-venv/bin/python
+          VELO_OAI_PY: ${{ runner.temp }}/ci/oai-venv/bin/python
+          VELO_TEST_BASH32: ${{ runner.os == 'Linux' && format('{0}/bash32/bin/bash', runner.temp) || '' }}
+        run: |
+          export PATH="$RUNNER_TEMP/ci/bin:$PATH"
+          bash tests/run.sh --shard "${{ matrix.shard }}/${{ matrix.shards }}"
+
+  # One check that is red unless every shard on every OS is green, so a slice that never ran cannot read as a pass.
+  tests:
+    name: tests
+    needs: shards
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every shard passed
+        env:
+          RESULT: ${{ needs.shards.result }}
+        run: |
+          echo "shards: $RESULT"
+          [ "$RESULT" = success ]

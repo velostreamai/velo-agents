@@ -1,0 +1,83 @@
+# What each suite costs, in seconds on the slowest CI runner (macos-latest, 3 cores), heaviest first.
+#
+# tests/shard-plan.sh reads this to split the suites of tests/run.sh into balanced slices for `run.sh --shard I/N`. The numbers
+# only balance the slices: they never decide whether a suite runs, and a weight that is out of date makes one runner slower, not a
+# suite pass or fail. Every suite run.sh calls needs a line here and every line needs a suite (tests/test_run_sh_shards.sh holds
+# the two files to each other); a new suite takes its own time from the "[Ns hh:mm:ssZ-hh:mm:ssZ] <suite>" line a run prints.
+#
+# Refresh: after a CI run, take each suite's N from those lines in the slowest runner's logs (the run prints them for every suite),
+# round up, keep the minimum at 1.
+413 test_gate_run.sh
+314 test_velo_task.sh
+237 test_native_workers.sh
+163 test_repo_env.sh
+159 test_repo_env_workers.sh
+128 test_velo_task_hooks.sh
+63 test_gate_check_code_mode.sh
+39 test_zg_hidden.sh
+33 test_orchestrd.sh
+30 test_brief_sweep.sh
+29 test_merge_aggregate.sh
+19 test_gate_comments.sh
+17 test_velo_task_bash32.sh
+15 test_gate_finish.sh
+12 test_run_sh_shards.sh
+9 test_run_sh_summary.sh
+8 test_gate_substitution.sh
+8 test_pr_gate_launch.sh
+6 test_gate_sweep.sh
+6 test_watch_attention.sh
+5 test_fence_parity.py
+5 test_status.sh
+3 test_context_compaction.py
+3 test_gate_no_silent_skip.sh
+3 test_gate_post_once.sh
+3 test_llm_bench.sh
+3 test_merge_once.sh
+3 test_record.sh
+3 test_runner_path.sh
+2 test_brief_fields.sh
+2 test_context_and_budget.py
+2 test_dispatch_wait.sh
+2 test_oai_backend.sh
+1 test_agent_log.py
+1 test_ast_grep_tool.py
+1 test_attention.sh
+1 test_billed_invariant.sh
+1 test_brief_ste.sh
+1 test_check_code_skill.sh
+1 test_ci_rollup_latest.sh
+1 test_dispatch_preflight.sh
+1 test_empty_final_retry.py
+1 test_fail_to_pass.sh
+1 test_gate_health.sh
+1 test_gate_post_sha.sh
+1 test_gate_routing.sh
+1 test_gate_template_guard.sh
+1 test_history_routing.sh
+1 test_index_exclude.sh
+1 test_install_check.sh
+1 test_leaked_tool_calls.py
+1 test_llama_server_run.sh
+1 test_local_backend.sh
+1 test_merge_gates.sh
+1 test_no_progress_nudge.py
+1 test_policy_single_source.sh
+1 test_pr_gate_wait.sh
+1 test_require_wait_hook.sh
+1 test_routing.sh
+1 test_runner_accounting.py
+1 test_salvage.py
+1 test_sdk_patches.py
+1 test_second_opinion.sh
+1 test_session_start_attention.sh
+1 test_skill_inlining.py
+1 test_spec_review.sh
+1 test_spec_review_lint.sh
+1 test_spec_review_worker.sh
+1 test_tool_contract.py
+1 test_tool_input_log.py
+1 test_transient_retry.py
+1 test_verdict_of.sh
+1 test_worker_env.py
+1 test_zg_tool.py
