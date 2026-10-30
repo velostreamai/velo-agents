@@ -46,14 +46,19 @@ b14_kind() {  # <file>: what its first line says it is: bash (exactly #!/bin/bas
   esac
 }
 
+# The shell B14 runs scripts under. /bin/bash is bash 3.2.57 on macOS, and the spec pins 3.2; a host whose /bin/bash is newer (every
+# Linux) builds a 3.2 of its own and names it in VELO_TEST_BASH32 (.github/ci/build-bash32.sh does that for CI). B14_BASH is the
+# suites' own override, for the proof that a bash 5 turns the premise red. With neither set the premise check says what to do.
+BASH32_DEFAULT="${VELO_TEST_BASH32:-/bin/bash}"
+
 bash32_version() {  # the version of the shell B14 runs scripts under
-  "${B14_BASH:-/bin/bash}" -c 'echo "$BASH_VERSION"'
+  "${B14_BASH:-$BASH32_DEFAULT}" -c 'echo "$BASH_VERSION"'
 }
 
 bash32_run() {  # <script> [args...]: the script under that shell, with nothing inherited from the caller's environment
   local home rc
   home=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/b32run.XXXXXX") || return 1
-  /usr/bin/env -i HOME="$home" VELO_TASK_HOME="$home/vt" PATH=/usr/bin:/bin:/usr/sbin:/sbin "${B14_BASH:-/bin/bash}" "$@"
+  /usr/bin/env -i HOME="$home" VELO_TASK_HOME="$home/vt" PATH=/usr/bin:/bin:/usr/sbin:/sbin "${B14_BASH:-$BASH32_DEFAULT}" "$@"
   rc=$?
   rm -rf "$home"
   return "$rc"

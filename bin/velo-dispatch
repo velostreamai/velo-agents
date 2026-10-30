@@ -1071,7 +1071,7 @@ ok "brief satisfies the spec checklist"
 velo_brief_ste_warn "$BRIEF"
 
 # ---- 5. disk ----------------------------------------------------------------
-AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
+AVAIL=$(free_disk_gb)
 [[ "$AVAIL" -ge "$MIN_DISK_GB" ]] || die "only ${AVAIL}GB free; each worktree target/ is ~20GB.
   A full disk kills workers with errors that look like compile bugs.
   Free space (rm -rf <merged-worktree>/target) then retry."

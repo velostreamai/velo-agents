@@ -10,15 +10,28 @@ unset VELO_TASK_HOME VELO_TASK_PORT CLAUDE_SESSION_ID
 # Test-mode timeouts (stubs answer at once; a broken run is bounded): see test-timeouts.sh.
 . "$HERE/test-timeouts.sh"
 REAL_HOME="$HOME"
+# stat spells its format with -f on BSD and -c on GNU, and GNU stat accepts -f too (as "filesystem status") and answers with a
+# report that is not what was asked for. So GNU is tried first: BSD stat rejects -c cleanly and falls through to its own spelling.
+mode_of() { /usr/bin/stat -c %a "$1" 2>/dev/null || /usr/bin/stat -f %Lp "$1"; }   # <path>: its permission bits in octal, as 600
+# sed -i takes its backup suffix as a separate argument on BSD (-i '') and attached on GNU (-i.bak); only the attached form means the
+# same on both, and the copy it leaves is removed.
+sedi() {  # <sed arguments...> <file>: edit the file in place
+  local f="${!#}"
+  sed -i.sedi-bak "$@" && rm -f "$f.sedi-bak"
+}
 snap_home() {  # what velo-task or Vanth could write under the real home, as mtime and size; the real state dir must not gain a velo-task dir
   local p
   for p in "$REAL_HOME/.agents/state" "$REAL_HOME/.agents/state/velo-task" "$REAL_HOME/.agents/state/vanth" "$REAL_HOME/.config"; do
-    if [ -e "$p" ]; then /usr/bin/stat -f '%N %m %z' "$p"; else echo "$p absent"; fi
+    if [ -e "$p" ]; then /usr/bin/stat -c '%n %Y %s' "$p" 2>/dev/null || /usr/bin/stat -f '%N %m %z' "$p"; else echo "$p absent"; fi
   done
 }
 # ~/.claude.json is compared by what matters, not by mtime: a live Claude session rewrites it all the time, so an mtime
 # comparison would fail on activity that is not ours. What velo-task or Vanth would add is a vanth or velo-task entry.
-claude_json_marks() { /usr/bin/grep -c -i -e vanth -e velo-task "$REAL_HOME/.claude.json" 2>/dev/null; true; }
+# A host with no ~/.claude.json (a CI runner, a fresh account) has no entries: 0, never an empty string the -le below cannot read.
+claude_json_marks() {
+  [ -f "$REAL_HOME/.claude.json" ] || { echo 0; return 0; }
+  /usr/bin/grep -c -i -e vanth -e velo-task "$REAL_HOME/.claude.json" 2>/dev/null; true
+}
 HOME_BEFORE=$(snap_home); MARKS_BEFORE=$(claude_json_marks)
 # macOS mktemp given no template ignores TMPDIR (run.sh points it into the worktree): build the template from TMPDIR.
 TMP_ROOT="${TMPDIR:-/tmp}"; TMP_ROOT="${TMP_ROOT%/}"
@@ -73,6 +86,13 @@ reap() {  # stop what this suite started: fake daemons run in their own process 
 cleanup() { reap; chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT; trap 'exit 130' INT TERM
 PYBIN=$(pick_python) || { echo "no usable python3 outside the temp root (looked for: $PYTHON_CANDIDATES)" >&2; exit 1; }
+# lsof is in /usr/sbin on macOS and /usr/bin on Linux, where it is not installed by default. Found by absolute path, as the library does.
+LSOF=""; for p in /usr/sbin/lsof /usr/bin/lsof; do [ -x "$p" ] && { LSOF="$p"; break; }; done
+[ -n "$LSOF" ] || { echo "no lsof (looked for /usr/sbin/lsof /usr/bin/lsof): the loopback checks cannot run without it" >&2; exit 1; }
+loose_files() {  # <dir>...: the regular files under them that are open to group or other. find spells "any of these bits" -perm +077 on BSD
+  # and -perm /077 on GNU, and each rejects the other's; six single-bit tests joined by -o mean the same on both.
+  find "$@" -type f \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \)
+}
 FAILED=0
 pass() { printf '  ok   %s\n' "$1"; }
 flunk() { printf '  FAIL %s\n' "$1"; FAILED=1; }
@@ -107,6 +127,7 @@ PROOF_RES="$T/proof-results"; mkdir -p "$PROOF_RES"
 proof_queue=""; proof_running=0
 proof_job() {  # <n> <check fn> <label> [<code root>]: the check must go RED; the verdict is written to a file for the parent
   local n="$1" fn="$2" label="$3" root="${4:-}" out rc
+  IN_PROOF=1   # a check may allow a mutant more time than the real code needs (t_launch_requires_own_pid); this job is a background subshell, so the parent never sees it
   T="$T/pj$n"; PIDS="$T/pids"; : > "$PIDS"
   if [ -n "$root" ]; then out=$(trap reap EXIT; R="$root" "$fn" 2>&1); else out=$(trap reap EXIT; "$fn" 2>&1); fi; rc=$?
   if [ "$rc" = 0 ]; then printf 'FAIL\nMUTATION-PROOF %s: %s stayed GREEN with the mutation\n' "$label" "$fn"
@@ -224,7 +245,7 @@ EOF
 }
 mkcode() {  # <dest>: a copy of the code under test whose pinned uv is the fake one: the real path is a constant of the library, there is no override to set
   rm -rf "$1"; mkdir -p "$1"; cp -R "$R/bin" "$R/requirements" "$1/"
-  sed -i '' "s#^UV_PINNED=.*#UV_PINNED=$E/uvbin/uv#" "$1/bin/velo-task-lib.sh"
+  sedi "s#^UV_PINNED=.*#UV_PINNED=$E/uvbin/uv#" "$1/bin/velo-task-lib.sh"
 }
 installv() { mkcode "$E/code"; run "$E/code/bin/velo-task" install-vanth; }   # install through the fake uv
 daemon_pid() { ST json-get "$E_VH/daemon.json" pid 2>/dev/null; }
@@ -244,11 +265,17 @@ decoy() {  # <argv0 label> -> pid of an unrelated live process whose command lin
   echo "$p"
 }
 lstart_of() { LC_ALL=C TZ=UTC /bin/ps -o lstart= -p "$1" | sed -e 's/  */ /g; s/^ //; s/ $//'; }   # ps's UTC rendering, squeezed
+# The two functions below turn ps's rendering of a start time into a number and back. BSD date reads and writes it with -j -f / -r, GNU date
+# with -d / @: neither spelling is accepted by the other, so python (the suite's own, by absolute path) does it, in UTC, in English.
 shift_lstart() {  # <lstart> <seconds>: the same clock moved by seconds, in the same rendering
-  local e; e=$(LC_ALL=C date -j -u -f '%a %b %d %H:%M:%S %Y' "$1" +%s) || return 1
-  LC_ALL=C TZ=UTC date -j -u -r "$(( e + $2 ))" '+%a %b %e %H:%M:%S %Y' | sed -e 's/  */ /g'
+  "$PYBIN" -I -c 'import calendar, sys, time
+t = time.gmtime(calendar.timegm(time.strptime(sys.argv[1], "%a %b %d %H:%M:%S %Y")) + int(sys.argv[2]))
+print(time.strftime("%a %b ", t) + str(t.tm_mday) + time.strftime(" %H:%M:%S %Y", t))' "$1" "$2"
 }
-iso_start() { LC_ALL=C date -j -u -f '%a %b %d %H:%M:%S %Y' "$(lstart_of "$1")" +%Y-%m-%dT%H:%M:%SZ; }
+iso_start() {
+  "$PYBIN" -I -c 'import sys, time
+print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.strptime(sys.argv[1], "%a %b %d %H:%M:%S %Y")))' "$(lstart_of "$1")"
+}
 write_json() {  # <pid> <started_at>: a daemon.json as Vanth writes it, private like Vanth's own (a loose one would be refused for its mode, not for what the test means)
   mkdir -p -m 700 "$E_VH"
   ( umask 077; printf '{"url":"http://127.0.0.1:%s","pid":%s,"started_at":"%s"}\n' "$E_PORT" "$1" "$2" > "$E_VH/daemon.json" )
@@ -258,7 +285,12 @@ write_prov() {  # <pid> <lstart> [digest]: a provenance record in the format vel
   printf 'pid=%s\nlstart=%s\ndigest=%s\n' "$1" "$2" "${3-$D64}" > "$E_HOME/daemon.provenance"
 }
 snap_state() {  # <dir>: names, sizes, mtimes and modes of everything under it, for a before/after comparison
-  ( cd "$1" && find . -print0 | LC_ALL=C sort -z | xargs -0 /usr/bin/stat -f '%N %z %Fm %Lp' )   # %Fm: modification time to the nanosecond
+  # %Fm / %.9Y: modification time to the nanosecond (BSD / GNU spelling; the GNU one is probed once, on a path that always exists)
+  if /usr/bin/stat -c %a . >/dev/null 2>&1; then
+    ( cd "$1" && find . -print0 | LC_ALL=C sort -z | xargs -0 /usr/bin/stat -c '%n %s %.9Y %a' )
+  else
+    ( cd "$1" && find . -print0 | LC_ALL=C sort -z | xargs -0 /usr/bin/stat -f '%N %z %Fm %Lp' )
+  fi
 }
 t_real_home_untouched() {  # finding 15: nothing this suite ran touched the real home (snapshotted before HOME was switched)
   need "the real ~/.agents/state and ~/.config are as they were (mtime, size), and no velo-task or vanth dir appeared" [ "$(snap_home)" = "$HOME_BEFORE" ]
@@ -478,7 +510,10 @@ t_json_get() {  # the helper replaces jq: process identity and provenance are re
   need "booleans are printed as the words jq prints" [ "$(ST json-get "$d/j" up)/$(ST json-get "$d/j" down)" = true/false ]
   need "a nested value is compact JSON" [ "$(ST json-get "$d/j" nested)" = '{"a":[1,2]}' ]
   need "non-ASCII comes out as UTF-8" [ "$(ST json-get "$d/j" accent)" = "$(printf 'caf\xc3\xa9')" ]
-  need "...whatever the caller's locale (a Latin-1 locale must not change the bytes)" [ "$(LC_ALL=en_US.ISO8859-1 ST json-get "$d/j" accent)" = "$(printf 'caf\xc3\xa9')" ]
+  # PYTHONIOENCODING makes the Latin-1 caller explicit: whether LC_ALL alone changes Python's stdout depends on the host (the locale
+  # may not be installed; Python 3.15 defaults to UTF-8 whatever the locale says), and a mutant that left the locale in charge
+  # would then print the right bytes by luck.
+  need "...whatever the caller's locale (a Latin-1 locale must not change the bytes)" [ "$(LC_ALL=en_US.ISO8859-1 PYTHONIOENCODING=latin-1 ST json-get "$d/j" accent)" = "$(printf 'caf\xc3\xa9')" ]
   run ST json-get "$d/j" absent; need "a missing key: exit 0" [ "$RC" = 0 ]; need "...printing nothing" [ -z "$OUT" ]
   run ST json-get "$d/j" nothing; need "a null value: exit 0" [ "$RC" = 0 ]; need "...printing nothing" [ -z "$OUT" ]
   run ST json-get "$d/none.json" pid; need "a missing file (a daemon that has not started): exit 0" [ "$RC" = 0 ]; need "...printing nothing" [ -z "$OUT" ]
@@ -594,7 +629,7 @@ t_override() {  # the one-shot Stop override: a valid private file of yours, pub
   local h; mkhome; h=$E_HOME
   run ST override-take "$h"; need "nothing pending: take is exit 3" [ "$RC" = 3 ]
   run ST override-write "$h" 'closing the laptop'; need "write succeeds" [ "$RC" = 0 ]
-  need "...a private regular file" [ -f "$h/stop-override" -a "$(stat -f %Lp "$h/stop-override")" = 600 ]
+  need "...a private regular file" [ -f "$h/stop-override" -a "$(mode_of "$h/stop-override")" = 600 ]
   need "...holding one time, uid and reason line" grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z uid=[0-9]+ reason=closing the laptop$' "$h/stop-override"
   need "...and no temp file is left" [ "$(ls -A "$h" | grep -c 'stop-override\.')" = 0 ]
   run ST override-write "$h" again; need "a second write while a valid one is pending is refused (exit 1)" [ "$RC" = 1 ]
@@ -741,7 +776,7 @@ t_secret_argv() {  # the allowlisted value goes by name, never through an argv o
   local k=sk-live-AAAA1111BBBB2222 s want
   mkhome; mkvenv; printf 'OPENROUTER_API_KEY\n' > "$E_HOME/vanth.env.allow"
   s="$E/spy"; mkdir -p "$s"; cp -R "$R/bin" "$R/requirements" "$s/"; render env-spy.sh "$E/env-spy"
-  sed -i '' "s#/usr/bin/env#$E/env-spy#g" "$s/bin/velo-task-lib.sh"   # a copy of the library whose every env is the spy, which logs the argv it is given and runs the real env with it
+  sedi "s#/usr/bin/env#$E/env-spy#g" "$s/bin/velo-task-lib.sh"   # a copy of the library whose every env is the spy, which logs the argv it is given and runs the real env with it
   need "precondition: the copied library runs its envs through the spy" [ "$(grep -c "$E/env-spy" "$s/bin/velo-task-lib.sh")" -ge 3 ]
   OPENROUTER_API_KEY=$k run "$s/bin/velo-task" ensure-daemon
   need "ensure-daemon through the spy succeeds (exit 0)" [ "$RC" = 0 ]
@@ -758,7 +793,7 @@ t_launch_log_not_shown() {  # the launch log can hold what a daemon echoes, so t
   need "...the message names the launch log" grep -qF "see $E_HOME/daemon.launch.log" <<<"$OUT"
   need "control: the log holds the daemon's words, value included (it is private, 0600)" grep -qF "MY_PASSPHRASE=$k" "$E_HOME/daemon.launch.log"
   need "the value is nowhere in the message" not grep -qF "$k" <<<"$OUT"
-  need "the launch log is private" [ "$(stat -f %Lp "$E_HOME/daemon.launch.log")" = 600 ]
+  need "the launch log is private" [ "$(mode_of "$E_HOME/daemon.launch.log")" = 600 ]
 }
 t_digest_inherited() {  # the launch digest covers the allowlisted names this environment SETS, which are what the daemon gets: it is adopted only by an environment that would launch it the same
   local pa want
@@ -781,13 +816,13 @@ t_digest_inherited() {  # the launch digest covers the allowlisted names this en
 }
 t_modes_env() {  # B22
   local f; mkhome; mkvenv; run VT ensure-daemon; need "clean launch succeeds" [ "$RC" = 0 ]
-  need "VANTH_HOME is 0700" [ "$(stat -f %Lp "$E_VH")" = 700 ]
-  for f in jobs.sqlite daemon.json token logs/daemon.log events/e.jsonl; do need "$f is 0600" [ "$(stat -f %Lp "$E_VH/$f")" = 600 ]; done
+  need "VANTH_HOME is 0700" [ "$(mode_of "$E_VH")" = 700 ]
+  for f in jobs.sqlite daemon.json token logs/daemon.log events/e.jsonl; do need "$f is 0600" [ "$(mode_of "$E_VH/$f")" = 600 ]; done
   need "VANTH_HOME, the port and retention=0 reach the daemon through the launch" \
     grep -qx "launch pid=$(daemon_pid) umask=0077 home=$E_VH port=$E_PORT retention=0" "$E_CALLS"
   need "the provenance records the daemon's pid" [ "$(prov pid)" = "$(daemon_pid)" ]
   need "...its start time" [ -n "$(prov lstart)" ]; need "...and the launch digest" grep -Eq '^digest=[0-9a-f]{64}$' "$E_HOME/daemon.provenance"
-  need "...and is private" [ "$(stat -f %Lp "$E_HOME/daemon.provenance")" = 600 ]
+  need "...and is private" [ "$(mode_of "$E_HOME/daemon.provenance")" = 600 ]
 }
 t_provenance_refusals() {  # B22: one scenario per validity condition, the others held true so each is individually provable
   local p dp um good
@@ -1004,7 +1039,9 @@ t_port_collision() {  # the daemon cannot bind because a foreign process holds t
 t_launch_requires_own_pid() {  # the daemon that answers must be the one that was launched; another one answering is not a ready launch
   local other; mkhome; mkvenv
   other=$(decoy vanthd); printf '%s\n' "$other" > "$E/forge-json"   # the fake writes a daemon.json naming this process and never listens
-  VELO_TASK_START_WAIT=2 run VT ensure-daemon
+  # The real code waits out its whole allowance (2 s), because the daemon that answers is never the one it launched. The mutant is ready at the first answer,
+  # so a proof gives the launch 20 s to produce one: on a slow host the mutant would otherwise run out the clock like the real code and look correct.
+  VELO_TASK_START_WAIT=$([ -z "${IN_PROOF:-}" ] && echo 2 || echo 20) run VT ensure-daemon
   need "a launch while daemon.json names another live process never counts as ready (exit 6)" [ "$RC" = 6 ]
   need "...saying the daemon did not become ready" grep -q 'did not become ready' <<<"$OUT"
   need "no provenance was published for the launched pid" [ ! -e "$E_HOME/daemon.provenance" ]
@@ -1028,6 +1065,16 @@ t_loopback() {  # the daemon's real listener decides, not what daemon.json says
   run VT ensure-daemon
   need "a daemon with valid provenance that listens wide is not adopted (exit 6)" [ "$RC" = 6 ]
   need "...naming the rule" grep -q "only 127.0.0.1:$E_PORT is allowed" <<<"$OUT"; need "...and it was not signalled" alive "$p2"
+  # Where lsof is not installed (a Linux host without it) the listener cannot be seen, and a daemon nobody can check is refused, not
+  # trusted: this daemon listens on 127.0.0.1 only, and is refused all the same, by the tool's absence.
+  mkhome; mkvenv; mkcode "$E/nolsof"
+  sedi 's#^for p in /usr/sbin/lsof /usr/bin/lsof; do#for p in /no/such/dir/lsof; do#' "$E/nolsof/bin/velo-task-lib.sh"
+  run "$E/nolsof/bin/velo-task" ensure-daemon
+  need "with no lsof a launch is refused (exit 6)" [ "$RC" = 6 ]
+  need "...saying there is no lsof" grep -q 'there is no lsof' <<<"$OUT"
+  p=$(sed -n 's/^launch pid=\([0-9]*\) .*/\1/p' "$E_CALLS")
+  need "...the daemon it launched was stopped" not alive "$p"
+  need "...no provenance was published" [ ! -e "$E_HOME/daemon.provenance" ]
 }
 can_bind() {  # <host> <port> <server|daemon>: whether a process can bind host:port as an ordinary server (SO_REUSEADDR) or as the fake vanthd (SO_REUSEADDR and SO_REUSEPORT); on stderr, why not
   "$PYBIN" -I -c 'import socket, sys
@@ -1050,8 +1097,12 @@ t_port_reservation() {  # the port reserved for a daemon that listens on every i
   need "...nor on 127.0.0.1 (exit 1)" [ "$RC" = 1 ]; need "...because the port is in use" grep -q 'Address already in use' <<<"$OUT"
   run can_bind 0.0.0.0 "$E_PORT" daemon; need "control: the fake vanthd, which sets SO_REUSEPORT, binds 0.0.0.0 beside the reservation (exit 0)" [ "$RC" = 0 ]
   run can_bind 127.0.0.1 "$E_PORT" daemon; need "...and 127.0.0.1 (exit 0)" [ "$RC" = 0 ]
-  held=$(/usr/sbin/lsof -nP -a -p "$E_HOLDER" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p' | tr '\n' ' ')
-  OUT="the reservation listens on: $held"; need "the reservation listens on 127.0.0.1 only" [ "$held" = "127.0.0.1:$E_PORT " ]
+  held=$("$LSOF" -nP -a -p "$E_HOLDER" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p' | tr '\n' ' ')
+  # BSD: the reservation listens on loopback, which is what makes a foreign SO_REUSEADDR server refuse the port, and nowhere else.
+  # Linux: it holds the port without listening at all, because a listener there would take its share of the daemon's connections.
+  if [ "$(uname)" = Linux ]; then want=""; else want="127.0.0.1:$E_PORT "; fi
+  OUT="the reservation listens on: ${held:-nothing}"
+  need "the reservation listens on 127.0.0.1 only (on Linux: it holds the port and listens nowhere)" [ "$held" = "$want" ]
 }
 t_before_install() {
   mkhome; run VT ensure-daemon; need "ensure-daemon before install-vanth exits 6" [ "$RC" = 6 ]
@@ -1141,7 +1192,7 @@ t_install_broken_venv() {  # a venv whose python does not run (a build that died
 }
 t_install_hash_tamper() {  # B23, offline: the fake uv refuses, as uv does under --require-hashes, a lock with a hash that is not the wheel's
   mkhome; mkuv ok; mkcode "$E/code"
-  sed -i '' 's/--hash=sha256:f072f4d8/--hash=sha256:e072f4d8/' "$E/code/requirements/vanth.lock"
+  sedi 's/--hash=sha256:f072f4d8/--hash=sha256:e072f4d8/' "$E/code/requirements/vanth.lock"
   need "precondition: one hash in the copied lock is changed, in that copy only" [ "$(grep -c 'sha256:e072f4d8' "$E/code/requirements/vanth.lock")/$(grep -c 'sha256:f072f4d8' "$R/requirements/vanth.lock")" = 1/1 ]
   run "$E/code/bin/velo-task" install-vanth
   need "a lock with one hash that is not its wheel's fails install-vanth (exit 1)" [ "$RC" = 1 ]
@@ -1351,7 +1402,7 @@ t_session() {
   mkjobs; unset CLAUDE_SESSION_ID
   run VT run gate-1 --timeout 30 -- /usr/bin/true; need "without CLAUDE_SESSION_ID run still works" [ "$RC" = 0 ]
   t=$(cat "$E_HOME/session"); need "...with a token the state dir keeps" grep -qE '^[0-9a-f]{16}$' <<<"$t"
-  need "...private" [ "$(stat -f %Lp "$E_HOME/session")" = 600 ]
+  need "...private" [ "$(mode_of "$E_HOME/session")" = 600 ]
   need "...and the jobs are tagged with it" [ "$(sql 'SELECT tags_json FROM jobs WHERE name = ?' gate-1)" = "[\"velo\", \"session:$t\"]" ]
   run VT run gate-1 --timeout 30 -- /usr/bin/true; need "the same token again is the same job" [ "$RC" = 0 ]
   rm "$E_HOME/session"; ln -s "$E/target" "$E_HOME/session"; printf 'abcdef\n' > "$E/target"
@@ -1493,12 +1544,12 @@ t_network() {  # the real Vanth from PyPI and a real vanthd on a random port in 
   need "...and equals the checked-in closure list" \
     [ "$(/opt/homebrew/bin/uv pip freeze --no-config --python "$E_VENV/bin/python" | norm_freeze)" = "$(norm_freeze < "$HERE/fixtures/vanth-closure.txt")" ]
   m="$T/net-tamper"; rm -rf "$m"; mkdir -p "$m"; cp -R "$R/bin" "$R/requirements" "$m/"
-  sed -i '' -E "s/--hash=sha256:[0-9a-f]+/--hash=sha256:$(printf '%064d' 0)/" "$m/requirements/vanth.lock"
+  sedi -E "s/--hash=sha256:[0-9a-f]+/--hash=sha256:$(printf '%064d' 0)/" "$m/requirements/vanth.lock"
   mkhome; run "$m/bin/velo-task" install-vanth
   need "a lock whose hashes do not match the wheels fails the install" [ "$RC" != 0 ]; need "...and leaves no venv" [ ! -e "$E_VENV" ]
   echo "note: tampered hashes: exit $RC; $(tail -n 1 <<<"$OUT" | cut -c1-150)"
   rm -rf "$m"; mkdir -p "$m"; cp -R "$R/bin" "$R/requirements" "$m/"
-  sed -i '' 's/^vanth==1\.14\.0 /vanth==1.13.0 /' "$m/requirements/vanth.lock"
+  sedi 's/^vanth==1\.14\.0 /vanth==1.13.0 /' "$m/requirements/vanth.lock"
   mkhome; run "$m/bin/velo-task" install-vanth
   need "a different Vanth version than the locked hashes fails the install" [ "$RC" != 0 ]; need "...and leaves no venv" [ ! -e "$E_VENV" ]
   echo "note: wrong version: exit $RC; $(tail -n 1 <<<"$OUT" | cut -c1-150)"
@@ -1513,11 +1564,11 @@ t_network() {  # the real Vanth from PyPI and a real vanthd on a random port in 
   kill "$E_HOLDER"; wait "$E_HOLDER" 2>/dev/null
   run VT ensure-daemon; need "the real daemon starts" [ "$RC" = 0 ]; need "...as started" grep -q started <<<"$OUT"; echo "note: $OUT"
   p=$(daemon_pid)
-  need "VANTH_HOME is 0700" [ "$(stat -f %Lp "$E_VH")" = 700 ]
-  for f in daemon.json token jobs.sqlite; do need "$f is 0600" [ "$(stat -f %Lp "$E_VH/$f")" = 600 ]; done
-  need "no file under logs/ or events/ is group- or world-accessible" [ -z "$(find "$E_VH/logs" "$E_VH/events" -type f -perm +077)" ]
+  need "VANTH_HOME is 0700" [ "$(mode_of "$E_VH")" = 700 ]
+  for f in daemon.json token jobs.sqlite; do need "$f is 0600" [ "$(mode_of "$E_VH/$f")" = 600 ]; done
+  need "no file under logs/ or events/ is group- or world-accessible" [ -z "$(loose_files "$E_VH/logs" "$E_VH/events")" ]
   need "the daemon listens on 127.0.0.1 only (lsof)" \
-    [ "$(/usr/sbin/lsof -nP -a -p "$p" -iTCP -sTCP:LISTEN -Fn | grep '^n' | sort -u)" = "n127.0.0.1:$E_PORT" ]
+    [ "$("$LSOF" -nP -a -p "$p" -iTCP -sTCP:LISTEN -Fn | grep '^n' | sort -u)" = "n127.0.0.1:$E_PORT" ]
   run VT ensure-daemon; need "the running daemon is adopted" [ "$RC" = 0 ]; need "...as adopted" grep -q adopted <<<"$OUT"
   export CLAUDE_SESSION_ID=net-sess
   run VT run net-ok --timeout 30 -- /bin/sh -c 'exit 0'; need "a real run prints a job id" [ "$RC" = 0 -a "${OUT#job_}" != "$OUT" ]
@@ -1633,14 +1684,21 @@ prove "start time rendered in the caller's locale and zone" t_locale_fresh_shell
 prove "adoption does not check the listener" t_loopback $L '    check_loopback "$pid" || die 6 "$LOOPBACK_WHY; refusing to adopt it. Run: velo-task restart-daemon"' '    :'
 prove "the loopback check always passes" t_loopback $L '  [ "$got" = "n127.0.0.1:$PORT " ] && return 0' '  return 0'
 prove "the loopback check looks at the port only" t_loopback $L '  [ "$got" = "n127.0.0.1:$PORT " ] && return 0' $'  case "$got" in *":$PORT "*) return 0 ;; esac'
-PORT_HOLDER_MUTANT=loopback-only prove_env "the port reservation holds loopback only, so a foreign server can take the wildcard address" t_port_reservation
+PORT_HOLDER_MUTANT=release prove_env "the port reservation is given back, so a foreign server can take the port" t_port_reservation
+PORT_HOLDER_MUTANT=release prove_env "the loopback test's port reservation is given back" t_loopback
 PORT_HOLDER_MUTANT=listen-wild prove_env "the wildcard side of the port reservation listens too" t_port_reservation
-PORT_HOLDER_MUTANT=loopback-only prove_env "the loopback test reserves its port on loopback only" t_loopback
+# loopback-only is a failure of the BSD port rules: there a wildcard bind is allowed beside a loopback holder. Linux counts overlapping
+# addresses as one, so a loopback holder alone refuses the wildcard bind and this mutant changes nothing (checked: the foreign wildcard
+# bind is refused with the wildcard half of the reservation left out). The `release` proofs above are the ones that bite on both.
+if [ "$(uname)" != Linux ]; then
+  PORT_HOLDER_MUTANT=loopback-only prove_env "the port reservation holds loopback only, so a foreign server can take the wildcard address" t_port_reservation
+  PORT_HOLDER_MUTANT=loopback-only prove_env "the loopback test reserves its port on loopback only" t_loopback
+fi
 prove "restart-daemon signals the pid daemon.json names when no record exists" t_restart_refuses_unproven $L \
   $'  elif probe_up; then\n    die 6 "a daemon answers on port $PORT but no velo-task record proves' \
   $'  elif probe_up; then\n    signal_validated TERM "$(djson pid)" "$(ps_lstart "$(djson pid)")"; /bin/sleep 1\n    die 6 "a daemon answers on port $PORT but no velo-task record proves'
 prove "ps is looked up on the caller's PATH" t_no_path_tools $L 'LC_ALL=C TZ=UTC /bin/ps -o lstart= -p "$1"' 'LC_ALL=C TZ=UTC ps -o lstart= -p "$1"'
-prove "lsof is looked up on the caller's PATH" t_no_path_tools $L '/usr/sbin/lsof -nP' 'lsof -nP'
+prove "lsof is looked up on the caller's PATH" t_no_path_tools $L '"$LSOF" -nP' 'lsof -nP'
 VELO_TASK_START_WAIT=3 prove "env is looked up on the caller's PATH" t_no_path_tools $L 'vanth_env() { /usr/bin/env -i' 'vanth_env() { env -i'   # a shim env never answers the probe: the mutant waits out the start window, 3 s
 prove "awk is looked up on the caller's PATH" t_no_path_tools $L 'norm_names() { /usr/bin/awk' 'norm_names() { awk' $L 'SYS_PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'SYS_PATH="$PATH"'
 prove "install without the PyPI pin" t_install_flags $L '--default-index https://pypi.org/simple' '--no-config'
@@ -1754,9 +1812,10 @@ prove "restart-daemon does not check the modes" t_modes_refuse $L $'need_home; n
 prove "restart-daemon skips the allowlist check" t_allowlist_lists $L $'need_home; need_install; need_allowlist; need_modes\n  pid=$(prov_get pid)' $'need_home; need_install; need_modes\n  pid=$(prov_get pid)'
 prove "the mode check is skipped after a launch" t_modes_after_launch $L $'  need_modes\n  printf \'daemon up pid=%s port=%s (started)' $'  printf \'daemon up pid=%s port=%s (started)'
 prove "the launch log is not part of the mode check" t_modes_refuse $L '  [ ! -e "$LAUNCH_LOG" ] || set -- "$LAUNCH_LOG"' '  :'
-prove "a failed mode check is treated as private" t_modes_refuse $L '-perm +077 -print 2>&1 |' '-perm +077 -print 2>/dev/null |'
+prove "a failed mode check is treated as private" t_modes_refuse $L '-print 2>&1 |' '-print 2>/dev/null |'
 prove "a launch is not checked for its listener" t_loopback $L '  check_loopback "$pid" || abandon_launch "$pid" "$LOOPBACK_WHY"' '  true'
 prove "adoption does not check the listener" t_loopback $L '    check_loopback "$pid" || die 6 "$LOOPBACK_WHY; refusing to adopt it' '    true || die 6 "$LOOPBACK_WHY; refusing to adopt it'
+prove "a host with no lsof is not told so" t_loopback $L '[ -n "$LSOF" ] || { LOOPBACK_WHY="there is no lsof (looked for /usr/sbin/lsof /usr/bin/lsof), so what pid $1 listens on cannot be checked"; return 1; }' ':'
 prove "the provenance pid is not compared with daemon.json" t_provenance_refusals $L '  [ "$(djson pid)" = "$pid" ] || { PROV_WHY="daemon.json pid' '  true || { PROV_WHY="daemon.json pid'
 prove "the provenance start time is not compared" t_provenance_refusals $L '  [ -n "$live" ] && [ "$live" = "$(prov_get lstart)" ] ||' '  [ -n "$live" ] ||'
 prove "the provenance digest is not compared" t_provenance_refusals $L '  [ "$(prov_get digest)" = "$(launch_spec | sha_of)" ] \' '  true \'

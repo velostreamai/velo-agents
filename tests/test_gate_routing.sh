@@ -18,6 +18,11 @@ BIN="$(cd "$HERE/.." && pwd)/bin"
 ROOT="$(cd "$HERE/.." && pwd)"
 # CLAUDE.md is the Velostream repo's, which tells orchestrator sessions how to gate.
 VELOREPO="${VELO_BENCH_REPO:-$HOME/RustroverProjects/velostream}"
+# That repo is private, so a host without a checkout of it (CI) cannot read the real file. The paragraph this suite checks is kept
+# as a snapshot in tests/fixtures/velostream/CLAUDE.md and read in its place. Where the real file IS there it is read as before, and
+# the snapshot is held to it (below), so a snapshot that has drifted is caught on the one machine that can see the real file.
+SNAP_CLAUDE="$HERE/fixtures/velostream/CLAUDE.md"
+if [[ -f "$VELOREPO/CLAUDE.md" ]]; then VCLAUDE="$VELOREPO/CLAUDE.md"; else VCLAUDE="$SNAP_CLAUDE"; fi
 GATE="$BIN/velo-pr-gate"
 FAILED=0
 ok()   { printf '  ok   %s\n' "$1"; }
@@ -73,7 +78,14 @@ else
 fi
 
 # CLAUDE.md, which is what every orchestrator session reads.
-if grep -q '`check-code` → opus' "$VELOREPO/CLAUDE.md"; then
+if [[ "$VCLAUDE" == "$SNAP_CLAUDE" ]]; then
+  ok "no Velostream checkout at $VELOREPO: CLAUDE.md is read from the committed snapshot"
+elif grep -qxF -- "$(grep -v '^<!--' "$SNAP_CLAUDE")" "$VCLAUDE"; then
+  ok "the committed snapshot of CLAUDE.md is the real file's line, verbatim"
+else
+  fail "tests/fixtures/velostream/CLAUDE.md has drifted from $VCLAUDE — copy the real 'Gating a PR' line over it"
+fi
+if grep -q '`check-code` → opus' "$VCLAUDE"; then
   ok "CLAUDE.md says check-code -> opus"
 else
   fail "CLAUDE.md disagrees with the script — the drift this suite exists to catch"
@@ -83,7 +95,7 @@ fi
 # Matched on the old WORDING, not on proximity. `check-code.*velo-local` looked
 # right and was a false positive: the corrected line names check-code and then
 # check-spec → velo-local, so any cross-line match fires on the fix itself.
-if grep -qE '`check-code`( / `check-spec`)? → velo-local' "$ROOT/CLAUDE.md"; then
+if grep -qE '`check-code`( / `check-spec`)? → velo-local' "$VCLAUDE"; then
   fail "CLAUDE.md still routes check-code to velo-local"
 else
   ok "no stale 'check-code -> velo-local' claim in CLAUDE.md"
@@ -175,7 +187,7 @@ if grep -q 'check-code-agent-prompt.md' "$GATE"; then
 else
   fail "the sonnet route has no prompt file"
 fi
-for DOC in "$VELOREPO/CLAUDE.md" "$ROOT/README.md"; do
+for DOC in "$VCLAUDE" "$ROOT/README.md"; do
   if grep -q 'check-code-by' "$DOC"; then
     ok "$(basename "$DOC") documents --check-code-by"
   else

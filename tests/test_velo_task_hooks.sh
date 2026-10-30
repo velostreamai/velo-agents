@@ -295,6 +295,19 @@ t_utf8() {  # a multibyte character inside quotes must not blind the scanner, wh
   deny  $V 'echo "é"; vanth prune' LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
   deny  $V "echo 'ü ö'; vanth prune" LC_ALL=en_US.UTF-8
   allow $V 'echo "日本語 — vanth prune"' LC_ALL=en_US.UTF-8
+  # Those three cases go red only on an awk that aborts on a lone byte of a multibyte character in a UTF-8 locale: the awk macOS ships
+  # does (towc: multibyte conversion failure); mawk, gawk and the bwk awk of 2023 do not, so a scanner that dropped its LC_ALL=C would
+  # still pass them there. What they stand for is checked directly, on every awk: the scanner's awk starts in the C locale whatever
+  # locale the caller has. A copy of the hooks runs the scanner through an awk that records the locale it was started in.
+  local d out; d=$(/usr/bin/mktemp -d "$T/utf8.XXXXXX") || return 1
+  cp -R "$R/hooks" "$d/hooks"
+  printf '#!/bin/bash\nprintf "%%s\\n" "${LC_ALL-unset}" >> "%s/awk-locale"\nexec /usr/bin/awk "$@"\n' "$d" > "$d/awk-spy"; chmod +x "$d/awk-spy"
+  sed "s#/usr/bin/awk#$d/awk-spy#g" "$R/hooks/guard-lib.sh" > "$d/hooks/guard-lib.sh"
+  [ "$(grep -c "$d/awk-spy" "$d/hooks/guard-lib.sh")" -ge 1 ] || bad "precondition: the copied scanner runs its awk through the spy"
+  out=$(jq -cn --arg c 'echo "é"; vanth prune' '{tool_name:"Bash",tool_input:{command:$c}}' | env LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 "$d/hooks/$V" 2>&1 >/dev/null); RC=$?
+  [ "$RC" = 2 ] || bad "the spied hook should still DENY (exit 2) but exited $RC: $out"
+  [ -s "$d/awk-locale" ] || bad "the spy awk never ran, so the locale the scanner's awk starts in was not observed"
+  [ "$(sort -u "$d/awk-locale" 2>/dev/null)" = C ] || bad "the scanner's awk started in the caller's locale, not in C: $(sort -u "$d/awk-locale" 2>/dev/null | tr '\n' ' ')"
   [ "$BAD" = 0 ]
 }
 

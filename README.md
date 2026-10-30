@@ -52,7 +52,10 @@ and the tests** — never from the worker's self-report.
     velo-task-lib.sh               the functions behind velo-task, sourced by it and by the two velo-task hooks, never a subcommand: the pinned install, the private daemon launch, run/status/wait/cancel, the in-flight query
     velo-task-state                the stdlib-python helper behind velo-task: json-get (no jq), jobs-ro (read-only SQLite on Vanth's jobs.sqlite), verdict-of (the closed verdict set), launch (exec with only the named variables), override-write/take
   tests/
-    run.sh                         every suite — run when touching .agents/
+    run.sh                         every suite — run when touching .agents/; `run.sh --shard I/N` runs the I-th of N balanced slices (what CI does)
+    shard-plan.sh                  which suites slice I of N holds: longest-processing-time-first over suite-weights.txt; refuses a plan that could drop or repeat a suite
+    suite-weights.txt              what each suite costs on the slowest CI runner (seconds); it balances the slices and never decides whether a suite runs
+    test_run_sh_shards.sh          the slices hold every suite exactly once, are balanced, a bad request is refused, and ci.yml runs every slice
     test_runner_accounting.py      usage / leak / cost-provenance invariants
     test_record.sh                 STOP detection, outcome ladder, record writing
     test_dispatch_preflight.sh     brief-vs-reality refusals, driving the real script
@@ -1748,6 +1751,16 @@ be the rule in the script"*, which is precisely what it exists to catch — and
 worked. Nobody ran it.
 
 If you changed anything under `.agents/`, this suite is the gate.
+
+**CI runs it too** (`.github/workflows/ci.yml`, on ubuntu and macOS), as 4 shards per OS: each shard is a runner of its own running
+one balanced slice of the suites (`tests/run.sh --shard 2/4`), so a run takes the longest slice and not the sum of all the suites.
+`tests/shard-plan.sh` makes the slices from `tests/suite-weights.txt`, and `tests/test_run_sh_shards.sh` fails if a suite could
+fall in no slice or two, or if the workflow runs fewer slices than the plan has. A new suite needs a line in the weights file.
+What a runner needs that its stock image lacks is installed by `.github/ci/` (zsh, lsof and the one-true-awk on Linux; GNU `timeout`
+on macOS; bash 3.2 built from source on Linux, because macOS's `/bin/bash` is the 3.2 that bar B14 pins; the pinned SDK venvs). The
+suites that used to need the developer's machine - a Velostream checkout (`test_llm_bench.sh`, `test_gate_routing.sh`,
+`test_ast_grep_tool.py`) or the worktrees under `$HOME` (`test_status.sh`) - use the committed fixtures under `tests/fixtures/` when
+it is absent and say so, and read the real thing where it is present, as before.
 
 Two suites need more than the repo to run, and **skip loudly** rather than
 passing quietly when they cannot:

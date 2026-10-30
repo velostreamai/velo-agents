@@ -47,8 +47,10 @@ sys.modules.setdefault("agents", _stub)
 m = types.ModuleType("plain")
 exec(compile(src.replace("@function_tool", ""), "velo_oai_tools", "exec"), m.__dict__)
 import os
-# The fixture path is a Velostream source directory: use the Velostream checkout.
-repo = pathlib.Path(os.environ.get("VELO_BENCH_REPO") or os.path.expanduser("~/RustroverProjects/velostream"))
+# The fixture is a small Rust tree in the shape of a Velostream source directory, committed beside this test: what is under test
+# is the ast_grep wrapper, not Velostream, and Velostream is a private repo that a CI runner cannot clone. VELO_BENCH_REPO
+# points the same checks at a real checkout instead.
+repo = pathlib.Path(os.environ.get("VELO_BENCH_REPO") or (pathlib.Path(__file__).resolve().parent / "fixtures" / "ast-grep"))
 m.set_cwd(str(repo))
 P = "src/velostream/sql/execution/processors"
 

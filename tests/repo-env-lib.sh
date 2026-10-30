@@ -89,7 +89,7 @@ exec /usr/bin/git "$@"
 STUB
 cat > "$T/stub/df" <<'STUB'
 #!/bin/bash
-printf 'Filesystem 1G-blocks Used Available Capacity Mounted on\n/dev/stub 1000 100 900 10%% /\n'
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 1048576000 104857600 943718400 10%% /\n'
 STUB
 cat > "$T/stub/launchctl" <<'STUB'
 #!/bin/bash

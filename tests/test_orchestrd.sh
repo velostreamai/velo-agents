@@ -132,6 +132,15 @@ DISPATCHEOF
 chmod +x "$T/bin/velo-dispatch"
 export VELO_DISPATCH_BIN="$T/bin/velo-dispatch"
 
+# step_dispatch asks `df -Pk` how much is free where $HOME is, and pauses under VELO_ORCH_MIN_DISK_GB (25). What it does with a dispatch
+# is under test here, not the disk of the host that runs the suite (a hosted runner has about 10 GB free), so df is a stub: 900 GiB
+# free unless a scenario sets DF_FREE_GIB (section 18 does, both ways).
+cat > "$T/bin/df" <<'STUBEOF'
+#!/bin/bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 1048576000 0 %s 0%% /\n' "$(( ${DF_FREE_GIB:-900} * 1048576 ))"
+STUBEOF
+chmod +x "$T/bin/df"
+
 export FIX CALLS_LOG
 export PATH="$T/bin:$BIN:$PATH"
 
@@ -891,6 +900,71 @@ dispatch_proof "an entry that cannot be dispatched is escalated" \
 dispatch_proof "an issue that is not a number is a bad entry, not a read to try" \
   '  if ! [[ "$issue" =~ ^[0-9]+$ ]]; then bad="no numeric issue"' '  if [[ -z "$issue" ]]; then bad="no numeric issue"' \
   four-bad-entries-four-events
+
+echo
+echo "== 18. a host short of disk pauses dispatch and says so once a day; one with room dispatches =="
+# Every section above runs against the stub df at 900 GiB, so none of it depends on the host's disk. Here the stub says 10, and 900 again as the control:
+# a daemon that read the real disk instead of asking df would fail one of the two on any host (a roomy one fails the 10, a tight one the 900).
+LD_FAILS=""
+lowdisk_scenario() {   # <GiB the stub df reports free>: one entry queued, two ticks of the daemon under test (ORCHD_UNDER_TEST, default the real one)
+  reset_state
+  mkdir -p "$STATE/orch" "$T/worktrees"
+  export VELO_ORCH_WORKTREE_GLOB="$T/worktrees/velostream-*"
+  list_prs gate:running; list_prs gate:passed
+  jq -cn '{labels:[{name:"worker:deepseek"}]}' > "$FIX/issue_1818.json"
+  queue_one 1818 deepseek
+  DF_FREE_GIB="$1" run_tick >/dev/null 2>&1
+  DF_FREE_GIB="$1" run_tick >/dev/null 2>&1
+}
+check_lowdisk() {   # <short|roomy> -> LD_FAILS: the checks that did not hold
+  LD_FAILS=""
+  local dlog="$STATE/orch/orchestrd.log" n ev
+  n=$(count_events low-disk)
+  if [[ "$1" == short ]]; then
+    grep -q 1818 "$STATE/orch/queue.jsonl" 2>/dev/null     || LD_FAILS="$LD_FAILS entry-stays-queued"
+    ! grep -q "FAKE-DISPATCH 1818" "$dlog" 2>/dev/null     || LD_FAILS="$LD_FAILS nothing-dispatched"
+    [[ "${n:-0}" == 1 ]]                                   || LD_FAILS="$LD_FAILS escalated-once-across-two-ticks"
+    ev=$(jq -r 'select(.kind == "low-disk") | .evidence' "$STATE/orch/attention.jsonl" 2>/dev/null)
+    grep -q 'only 10GB free (< 25GB)' <<<"$ev"             || LD_FAILS="$LD_FAILS says-how-much-is-free"
+  else
+    grep -q "FAKE-DISPATCH 1818" "$dlog" 2>/dev/null       || LD_FAILS="$LD_FAILS dispatched-with-room"
+    ! grep -q 1818 "$STATE/orch/queue.jsonl" 2>/dev/null   || LD_FAILS="$LD_FAILS entry-leaves-the-queue"
+    [[ "${n:-0}" == 0 ]]                                   || LD_FAILS="$LD_FAILS no-escalation-with-room"
+  fi
+}
+lowdisk_scenario 10;  check_lowdisk short; SHORT_FAILS="$LD_FAILS"
+lowdisk_scenario 900; check_lowdisk roomy
+if [[ -z "$SHORT_FAILS$LD_FAILS" ]]; then
+  ok "10 GB free (< 25): the entry stays queued, nothing is dispatched, and two ticks escalate low-disk once, saying how much is free"
+  ok "900 GB free: the entry is dispatched and nothing is escalated"
+else
+  fail "low disk:$SHORT_FAILS$LD_FAILS"
+fi
+lowdisk_proof() {   # <what is pinned> <anchor> <replacement> <short|roomy> <GiB the stub reports> <the checks that must go red...>
+  local what="$1" anchor="$2" repl="$3" kind="$4" gib="$5" missing="" c
+  shift 5
+  if mutant_orchd "$anchor" "$repl"; then
+    ORCHD_UNDER_TEST="$T/mut/velo-orchestrd" lowdisk_scenario "$gib"
+    check_lowdisk "$kind"
+    for c in "$@"; do [[ " $LD_FAILS " == *" $c "* ]] || missing="$missing $c"; done
+    if [[ -z "$missing" ]]; then
+      ok "MUTATION-PROOF $what: red with it reverted ($LD_FAILS )"
+    else
+      fail "MUTATION-PROOF $what: the mutant stayed green for$missing (red: $LD_FAILS )"
+    fi
+  else
+    fail "MUTATION-PROOF $what: could not build the mutant (anchor missing — did step_dispatch change shape?)"
+  fi
+}
+lowdisk_proof "a short disk pauses dispatch" \
+  '  if [[ -z "$disk" || "$disk" -lt "$MIN_DISK_GB" ]]; then' '  if [[ -z "$disk" ]]; then' short 10 \
+  entry-stays-queued nothing-dispatched escalated-once-across-two-ticks says-how-much-is-free
+lowdisk_proof "a disk with room is not paused" \
+  '  if [[ -z "$disk" || "$disk" -lt "$MIN_DISK_GB" ]]; then' '  if true; then' roomy 900 \
+  dispatched-with-room entry-leaves-the-queue no-escalation-with-room
+lowdisk_proof "a short disk is escalated once a day, not once a tick" \
+  'attention_append "low-disk:orch:$day" "low-disk"' 'attention_append "low-disk:orch:$day-$$" "low-disk"' short 10 \
+  escalated-once-across-two-ticks
 
 echo
 [[ $RC -eq 0 ]] && echo "all velo-orchestrd checks passed" || echo "FAILURES"

@@ -30,10 +30,12 @@ ALLOW="$VELO_TASK_HOME/vanth.env.allow"
 PROV="$VELO_TASK_HOME/daemon.provenance"
 LAUNCH_LOG="$VELO_TASK_HOME/daemon.launch.log"
 SESSION_FILE="$VELO_TASK_HOME/session"
-UV_PINNED=/opt/homebrew/bin/uv
+UV_PINNED=/opt/homebrew/bin/uv; [ -x "$UV_PINNED" ] || ! [ -x /usr/local/bin/uv ] || UV_PINNED=/usr/local/bin/uv  # Homebrew on Apple silicon; else the Homebrew prefix of an Intel Mac, or a system-wide install on Linux
 SYS_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 PYSYS=""
 for p in /opt/homebrew/bin/python3 /usr/bin/python3; do [ -x "$p" ] && { PYSYS="$p"; break; }; done
+LSOF=""
+for p in /usr/sbin/lsof /usr/bin/lsof; do [ -x "$p" ] && { LSOF="$p"; break; }; done  # macOS keeps lsof in /usr/sbin, Linux in /usr/bin; never found through PATH
 # Jobs inherit the daemon's environment: a fixed PATH, HOME, Vanth's own variables, allowlisted names.
 JOB_PATH="$HOME/.agents/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 NAME_RE='^[A-Z][A-Z0-9_]*$'
@@ -94,7 +96,9 @@ inherited_names() {  # the allowlisted names this environment sets, one a line: 
 
 need_home() {  # the state root is private (0700) before anything is kept in it
   /bin/mkdir -p -m 700 "$VELO_TASK_HOME"
-  [ "$(/usr/bin/stat -f %Lp "$VELO_TASK_HOME")" = 700 ] || die 6 "$VELO_TASK_HOME must have mode 700; refusing"
+  # The mode is `stat -c %a` on GNU and `stat -f %Lp` on BSD; GNU first, because BSD stat rejects -c cleanly while GNU stat
+  # accepts -f (it means "filesystem status") and would answer with a report that is not a mode.
+  [ "$(/usr/bin/stat -c %a "$VELO_TASK_HOME" 2>/dev/null || /usr/bin/stat -f %Lp "$VELO_TASK_HOME")" = 700 ] || die 6 "$VELO_TASK_HOME must have mode 700; refusing"
 }
 need_install() {
   [ -f "$MARKER" ] && [ -x "$PY" ] && [ -x "$VANTHD" ] && [ -x "$VANTH" ] || die 6 "Vanth is not installed in $VENV; run: velo-task install-vanth"
@@ -135,7 +139,9 @@ modes_problem() {  # succeeds, saying what, when anything under Vanth's home or 
   local bad
   [ -e "$VH" ] || return 1
   [ ! -e "$LAUNCH_LOG" ] || set -- "$LAUNCH_LOG"
-  bad=$(/usr/bin/find "$VH" "$@" -perm +077 -print 2>&1 | /usr/bin/head -n 1) || true  # a directory find cannot read is reported on stderr: an error, never a pass
+  # Any group or other bit: -perm +077 on BSD find, -perm /077 on GNU find, and neither is accepted by the other. Six single-bit tests
+  # joined by -o mean the same on both.
+  bad=$(/usr/bin/find "$VH" "$@" \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \) -print 2>&1 | /usr/bin/head -n 1) || true  # a directory find cannot read is reported on stderr: an error, never a pass
   [ -n "$bad" ] || return 1
   MODES_WHY="$bad (open to group or other, or unreadable)"
 }
@@ -144,7 +150,8 @@ need_modes() {
 }
 check_loopback() {  # <pid>: the daemon's listening sockets are 127.0.0.1:$PORT and nothing else
   local got
-  got=$(/usr/sbin/lsof -nP -a -p "$1" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | /usr/bin/grep '^n' | LC_ALL=C /usr/bin/sort -u | /usr/bin/tr '\n' ' ') || true
+  [ -n "$LSOF" ] || { LOOPBACK_WHY="there is no lsof (looked for /usr/sbin/lsof /usr/bin/lsof), so what pid $1 listens on cannot be checked"; return 1; }
+  got=$("$LSOF" -nP -a -p "$1" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | /usr/bin/grep '^n' | LC_ALL=C /usr/bin/sort -u | /usr/bin/tr '\n' ' ') || true
   [ "$got" = "n127.0.0.1:$PORT " ] && return 0
   LOOPBACK_WHY="pid $1 listens on '${got:-nothing}' but only 127.0.0.1:$PORT is allowed"
   return 1

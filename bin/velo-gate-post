@@ -142,7 +142,9 @@ if [[ -z "$SHA" ]]; then
   # closed, and the fix is one flag.
   if [[ "$FILE" != "-" && -f "$FILE" ]]; then
     HEAD_CT=$(git log -1 --format=%ct "$HEAD" 2>/dev/null || echo 0)
-    FILE_MT=$(stat -f %m "$FILE" 2>/dev/null || stat -c %Y "$FILE" 2>/dev/null || echo 0)
+    # GNU stat first: `stat -f` is valid there too (it means "filesystem status"), so trying the BSD spelling first printed a
+    # filesystem report and still exited non-zero, and both outputs landed in FILE_MT. BSD stat has no -c and fails cleanly.
+    FILE_MT=$(stat -c %Y "$FILE" 2>/dev/null || stat -f %m "$FILE" 2>/dev/null || echo 0)
     if [[ "$HEAD_CT" -gt 0 && "$FILE_MT" -gt 0 && "$FILE_MT" -lt "$HEAD_CT" ]]; then
       die "refusing to stamp this report against HEAD (${HEAD:0:9}).
 
@@ -150,8 +152,8 @@ if [[ -z "$SHA" ]]; then
   earlier one and stamping HEAD would claim coverage it does not have. A gate
   result is only valid for the commit it ran against.
 
-    report mtime : $(date -u -r "$FILE_MT" +%FT%TZ 2>/dev/null || echo "$FILE_MT")
-    HEAD commit  : $(date -u -r "$HEAD_CT" +%FT%TZ 2>/dev/null || echo "$HEAD_CT")
+    report mtime : $(date -u -r "$FILE_MT" +%FT%TZ 2>/dev/null || date -u -d "@$FILE_MT" +%FT%TZ 2>/dev/null || echo "$FILE_MT")
+    HEAD commit  : $(date -u -r "$HEAD_CT" +%FT%TZ 2>/dev/null || date -u -d "@$HEAD_CT" +%FT%TZ 2>/dev/null || echo "$HEAD_CT")
 
   Pass the sha the gate actually reviewed:
     ${GATE_CMD_ENV}velo-gate-post $PR $NAME $FILE --sha <sha>"

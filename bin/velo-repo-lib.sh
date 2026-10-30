@@ -115,3 +115,9 @@ repo_base_branch() {
 # repo_scoped <path> — <path> with REPO_SUB put before its last component: records/7.result.jsonl becomes
 # records/<owner>__<name>/7.result.jsonl. <path> itself for the default repo.
 repo_scoped() { printf '%s' "${1%/*}$REPO_SUB/${1##*/}"; }
+
+# free_disk_gb — whole GiB available on the volume that holds $HOME, or nothing when df cannot say. Sourced here only
+# because this is the one library every tool already loads; it has nothing to do with which repo. `df -Pk` is POSIX (1024-byte
+# blocks, one line a filesystem), so BSD and GNU df print the same table; `df -g` is BSD only and prints a usage error, and no
+# table, on GNU, which read as "0GB free" and paused every dispatch.
+free_disk_gb() { df -Pk "$HOME" | awk 'NR==2 {print int($4 / 1048576)}'; }

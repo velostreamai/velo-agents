@@ -1,7 +1,10 @@
 #!/bin/bash
 # Run the .agents tooling tests (#1992).
 #
-#   ./tests/run.sh
+#   ./tests/run.sh               every suite, one after another
+#   ./tests/run.sh --shard I/N   only the I-th of N weight-balanced slices of the suites (1 <= I <= N), so CI can spread them
+#                                over N runners; the slices partition the suites (tests/shard-plan.sh, held to that by
+#                                tests/test_run_sh_shards.sh), so running all N of them runs every suite exactly once
 #
 # These exist because `velo-gate` classifies an .agents/-only diff as
 # "tooling-only, no gate required", so this code gets no review and no CI by
@@ -15,6 +18,22 @@
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The slice is planned before anything is created, so a bad request leaves nothing behind. It is an argument and not an
+# environment variable on purpose: every suite inherits the environment, and the two that run run.sh itself (on stubs) must see
+# a whole run unless they ask for a slice.
+SHARD=""
+SHARD_SUITES=""
+ALL_SUITES=""
+case "${1:-}" in
+  "") ;;
+  --shard)
+    SHARD="${2:-}"
+    [[ -n $SHARD && $# -eq 2 ]] || { echo "usage: run.sh [--shard I/N]" >&2; exit 2; }
+    SHARD_SUITES=$("$HERE/shard-plan.sh" "$SHARD" "$HERE/run.sh") || exit 1
+    ALL_SUITES=$("$HERE/shard-plan.sh" --all "$HERE/run.sh") || exit 1
+    ;;
+  *) echo "usage: run.sh [--shard I/N]" >&2; exit 2 ;;
+esac
 # Test mode: production waits shortened for stubs, inherited by every suite.
 . "$HERE/test-timeouts.sh"
 # A private agent-state dir per run. Several agents run this suite at once on one
@@ -53,6 +72,13 @@ TIMES=()
 utc() { date -u +%H:%M:%SZ; }
 RUN_START=$(date -u +%FT%TZ)
 echo "run.sh started $RUN_START"
+SHARD_PLANNED=0
+RAN=0
+if [[ -n $SHARD ]]; then
+  SHARD_PLANNED=$(grep -c . <<<"$SHARD_SUITES")
+  echo "shard $SHARD: $SHARD_PLANNED suites; every other suite belongs to another shard"
+  sed 's/^/  /' <<<"$SHARD_SUITES"
+fi
 # Each suite runs in its own process group (set -m gives a background job its own
 # pgid). Anything still in that group once the suite has exited is a leaked fake
 # or poll loop: it is named, killed, and the suite fails. A leaked loop from one
@@ -61,6 +87,17 @@ CUR=""
 trap '[[ -n $CUR ]] && kill -- -"$CUR" 2>/dev/null; exit 130' INT TERM
 trap 'rm -rf "$RUN_TMP"' EXIT
 suite() {  # <name> <command...>
+  # A sharded run starts only the suites of its slice; the rest are some other runner's. A suite the plan has never heard of
+  # (a call that does not start its line, where tests/shard-plan.sh cannot see it) would belong to NO runner and silently never
+  # run, so it fails here instead.
+  if [[ -n $SHARD && $'\n'"$SHARD_SUITES"$'\n' != *$'\n'"$1"$'\n'* ]]; then
+    if [[ $'\n'"$ALL_SUITES"$'\n' != *$'\n'"$1"$'\n'* ]]; then
+      echo "  FAIL $1 is called where tests/shard-plan.sh cannot see it (a suite call must start its line), so no shard would run it"
+      RC=1; FAILED+=("$1")
+    fi
+    return 0
+  fi
+  RAN=$((RAN + 1))
   local name=$1 t0=$SECONDS w0 rc left; w0=$(utc); shift
   set -m; "$@" & CUR=$!; set +m
   wait "$CUR"; rc=$?
@@ -220,13 +257,20 @@ suite test_agent_log.py "$PY" "$HERE/test_agent_log.py"
 suite test_ast_grep_tool.py python3 "$HERE/test_ast_grep_tool.py"
 suite test_history_routing.sh bash "$HERE/test_history_routing.sh"
 suite test_run_sh_summary.sh bash "$HERE/test_run_sh_summary.sh"
+suite test_run_sh_shards.sh bash "$HERE/test_run_sh_shards.sh"
 
 echo
 echo "slowest suites (total ${SECONDS}s, $RUN_START to $(date -u +%FT%TZ)):"
 printf '%s\n' "${TIMES[@]}" | sort -rn | head -5 | sed -E 's/^([0-9]+) /  \1s  /'
+# The plan and the calls above are read from the same file; if they disagree (a suite called where the plan could not see it) the
+# slice did not run what it said it would, and a runner that quietly ran fewer tests must not report success.
+if [[ -n $SHARD && $RAN -ne $SHARD_PLANNED ]]; then
+  echo "shard $SHARD planned $SHARD_PLANNED suites and ran $RAN"
+  RC=1
+fi
 if [[ $RC -eq 0 ]]; then
-  echo "✅ .agents tests passed"
+  echo "✅ .agents tests passed${SHARD:+ (shard $SHARD: $RAN suites)}"
 else
-  echo "❌ .agents tests FAILED (${#FAILED[@]}): ${FAILED[*]}"
+  echo "❌ .agents tests FAILED (${#FAILED[@]}): ${FAILED[*]}${SHARD:+ (shard $SHARD)}"
 fi
 exit $RC

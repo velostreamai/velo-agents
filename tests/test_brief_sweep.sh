@@ -173,11 +173,11 @@ case "$ARGS" in
   *) echo "stub gh: unexpected call: $*" >&2; exit 1 ;;
 esac
 STUB
-# velo-dispatch refuses under 40GB free (`df -g $HOME`, column 4 of line 2) and a dry run ends
-# right after that check: say there is plenty, so the printout is reached on any host.
+# velo-dispatch refuses under 40GB free (`df -Pk $HOME`, column 4 of line 2, in KiB) and a dry run ends
+# right after that check: say there is plenty (900 GiB), so the printout is reached on any host.
 cat > "$TMPD/stub/df" <<'STUB'
 #!/bin/bash
-printf 'Filesystem 1G-blocks Used Available Capacity Mounted on\n/dev/stub 1000 100 900 10%% /\n'
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 1048576000 104857600 943718400 10%% /\n'
 STUB
 chmod +x "$TMPD/stub/gh" "$TMPD/stub/df"
 SKILL="$TMPD/check-code.md"; echo "# fixture skill" > "$SKILL"

@@ -631,7 +631,7 @@ if [[ -n "$PARENTS" ]]; then
 fi
 
 # ---- disk -------------------------------------------------------------------
-AVAIL=$(df -g "$HOME" | awk 'NR==2 {print $4}')
+AVAIL=$(free_disk_gb)
 echo
 if [[ "$AVAIL" -lt 40 ]]; then
   echo "${RED}disk: ${AVAIL}GB free${OFF} — under 40GB. Workers die with errors that look"

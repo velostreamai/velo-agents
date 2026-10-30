@@ -24,10 +24,14 @@ bad()  { echo "  FAIL  $1"; RC=1; }
 has()  { if grep -qE -- "$2" <<<"$3"; then ok "$1"; else bad "$1 (no match for /$2/)"; fi; }
 
 PY=$(command -v python3)
+# The runner imports the openai-agents SDK, which plain python3 usually does not have. The summariser section runs under the SDK's venv, the way
+# run.sh runs test_context_compaction.py: VELO_OAI_PY (CI provisions it), else the owner's venv, else python3 (and the section skips, saying so).
+OAI_PY="${VELO_OAI_PY:-$HOME/.venvs/velo-openai-agents/bin/python}"
+[[ -x "$OAI_PY" ]] || OAI_PY="$PY"
 
 echo
 echo "the argument summariser — same contract as velostream#2074"
-OUT=$("$PY" - "$RUNNER" <<'PYEOF'
+OUT=$("$OAI_PY" - "$RUNNER" <<'PYEOF'
 import importlib.util, pathlib, sys, json
 spec = importlib.util.spec_from_file_location("r", pathlib.Path(sys.argv[1]))
 m = importlib.util.module_from_spec(spec)
@@ -46,7 +50,9 @@ print("JUNK",   repr(s("not json")), repr(s(None)), repr(s({})))
 PYEOF
 )
 if grep -q '^SKIP' <<<"$OUT"; then
-  echo "  SKIP  openai-agents not installed ($(grep '^SKIP' <<<"$OUT"))"
+  # A caller that NAMES the SDK's interpreter (CI does) has said it is there: a section skipped under it is a section that did not run.
+  if [[ -n "${VELO_OAI_PY:-}" ]]; then bad "VELO_OAI_PY=$VELO_OAI_PY cannot import the openai-agents SDK ($(grep '^SKIP' <<<"$OUT")), so the summariser section did not run"
+  else echo "  SKIP  openai-agents not installed ($(grep '^SKIP' <<<"$OUT"))"; fi
 else
   has "bulk content elided with its size" 'ELIDE .*content=\[4096 chars\]' "$OUT"
   has "the bulk body itself is absent"    'ELIDE .*x\.rs' "$OUT"
@@ -131,7 +137,9 @@ has "tool results are in the transcript"      '"type": "tool_result"' "$SRC"
 # The real behaviour, not just its wiring: dirty tree + failure => commit.
 STD=$(mktemp -d)/r; mkdir -p "$STD"
 git init -q "$STD"
-git -C "$STD" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+# The identity lives in the repo, as tests/test_salvage.py does it: salvage commits with whatever identity git finds, and a host with no global one (a CI runner) would fail the commit
+git -C "$STD" config user.email t@t; git -C "$STD" config user.name t
+git -C "$STD" commit -q --allow-empty -m base
 echo "work a worker produced" > "$STD/unsaved.txt"
 "$PY" - "$BIN" "$STD" >/dev/null 2>&1 <<'PYEOF'
 import sys
@@ -151,7 +159,9 @@ else bad "salvage left the tree dirty"; fi
 # is reviewing is the failure READ_ONLY_DECLARATION exists to prevent.
 RTD=$(mktemp -d)/r; mkdir -p "$RTD"
 git init -q "$RTD"
-git -C "$RTD" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+# Same here, and more so: with no identity the commit salvage must NOT make would fail anyway, and "never committed" would pass without proving anything
+git -C "$RTD" config user.email t@t; git -C "$RTD" config user.name t
+git -C "$RTD" commit -q --allow-empty -m base
 echo "a review should not commit this" > "$RTD/stray.txt"
 "$PY" - "$BIN" "$RTD" >/dev/null 2>&1 <<'PYEOF'
 import sys
