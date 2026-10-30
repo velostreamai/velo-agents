@@ -55,6 +55,8 @@ gate_comment() { printf 'gate: %s @ %s\n\n## report\n**Verdict:** approve\n' "$1
 waiver() { printf 'gate-waived: %s @ %s\nApproved by: %s\nReason: docs-only\n' "$1" "$2" "$3"; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 run_gate() { rm -f "$STUB_EDITS"; OUT=$(bash "$BIN/velo-gate" "$PR" "$1" 2>&1); RC=$?; printf '%s\n' "$OUT" > "$TMPD/gate.out"; }
+# Defined here, above every use: a call before the definition is "post: command not found", an empty $OUT, and a "not refused" that proves nothing.
+post() { printf '%s\n' "$1" > "$TMPD/report.md"; bash "$BIN/velo-gate-post" 999999999 "$2" "$TMPD/report.md" --sha deadbeef 2>&1 || true; }
 
 SRC_FILES='[{"path":"src/velostream/a.rs"},{"path":"tests/unit/a_test.rs"}]'
 
@@ -202,7 +204,6 @@ if [[ $RC -eq 0 ]]; then ok "a tooling-only PR needs only its code-review"
 else fail "a tooling-only PR was refused (rc=$RC): $(tr '\n' ' ' <"$TMPD/gate.out" | cut -c1-300)"; fi
 
 # --- 1. velo-gate-post refuses a leg that did not run ------------------------------------------
-post() { printf '%s\n' "$1" > "$TMPD/report.md"; bash "$BIN/velo-gate-post" 999999999 "$2" "$TMPD/report.md" --sha deadbeef 2>&1 || true; }
 for body in 'check-code leg NOT RUN (declared); covered by Codex.' \
             'NOT RUN: check-code was skipped to save tokens' \
             'The check-code gate was skipped.'; do
