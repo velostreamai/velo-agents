@@ -18,8 +18,10 @@ committed fixtures, and against the real checkout too where it exists, with a vi
 orchestrator's dispatch; GNU `stat -f` answered with a filesystem report that `velo-gate-post` and `velo-task-lib.sh` read as a mtime and a mode);
 `/usr/sbin/lsof` as the only lsof; `#!/bin/zsh` on a host without zsh. The Mac's own awk and bash: the hook proofs need the one-true-awk's
 limits and B14 needs a bash 3.2, so Linux now gets `original-awk` as `/usr/bin/awk` and a 3.2.57 built from source (`VELO_TEST_BASH32`).
-Four defects were in the suites themselves: `test_oai_backend.sh` made its commits with `git -c user.*`, so on a host with no global git
-identity the salvage commit failed and the read-only "never committed" check passed without proving anything; `test_gate_routing.sh`
+Five defects were in the suites themselves: `test_oai_backend.sh` made its commits with `git -c user.*`, so on a host with no global git
+identity the salvage commit failed and the read-only "never committed" check passed without proving anything, and it ran its
+argument-summariser section under whatever `python3` was on PATH, which has no SDK, so the section skipped (it now runs under the SDK
+venv, and a `VELO_OAI_PY` that cannot import the SDK fails instead of skipping); `test_gate_routing.sh`
 grepped a `CLAUDE.md` that this repository does not have, so "no stale claim" could never fail; `test_gate_no_silent_skip.sh` called
 `post` two checks before it defined it (`post: command not found`, an empty answer), so "a NOT RUN that names a sub-check is not refused"
 passed without ever running `velo-gate-post`; and `test_orchestrd.sh` read the real free disk of the host while `velo-orchestrd`
