@@ -6,7 +6,7 @@ velo-task's own python from this fixture's.
 Only what velo-task relies on, but with real behaviour where velo-task now checks it: it LISTENS (127.0.0.1, or
 0.0.0.0 when @E@/bind-all exists), so the loopback check sees a real socket; it exits when it cannot bind. It records its
 launch (pid, umask, home, port, retention), the NAMES of its environment, a hash of OPENROUTER_API_KEY (never a value) and whether
-descriptor 9 (the one velo-task's locked body holds on its lock) reached it, to @E@/calls, secures its home like Vanth, writes
+descriptor 9 (none is handed down) reached it, to @E@/calls, secures its home like Vanth, writes
 daemon.json once it is listening, and exits on SIGTERM.
 
 Switches (files under @E@): fail-launch (exit 1 at once), echo-key (exit 1 at once, its message holding NAME=value for the variable
@@ -44,6 +44,14 @@ if os.path.exists(E + "/echo-key"):
     sys.stderr.write("fake vanthd: refusing to start (%s=%s)\n" % (echoed, os.environ.get(echoed, "unset")))
     sys.exit(1)
 port = int(os.environ.get("VANTH_DAEMON_PORT", "0"))
+os.makedirs(HOME_DIR, exist_ok=True)
+import fcntl  # Vanth's DaemonLock: one daemon per home, the OS lock held for its life; a second one exits at once
+LOCK = open(HOME_DIR + "/daemon.lock", "a")
+try:
+    fcntl.flock(LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.stderr.write("fake vanthd: another daemon holds the home lock\n")
+    sys.exit(1)
 
 os.makedirs(HOME_DIR + "/logs", exist_ok=True)
 os.makedirs(HOME_DIR + "/events", exist_ok=True)
@@ -54,7 +62,7 @@ seed = E + "/seed.sqlite"
 if os.path.exists(seed):
     shutil.copyfile(seed, HOME_DIR + "/jobs.sqlite")
     os.chmod(HOME_DIR + "/jobs.sqlite", 0o600)
-else:
+elif not os.path.exists(HOME_DIR + "/jobs.sqlite"):
     open(HOME_DIR + "/jobs.sqlite", "w").close()
 if os.path.exists(E + "/loose-file"):
     os.chmod(HOME_DIR + "/logs/daemon.log", 0o644)

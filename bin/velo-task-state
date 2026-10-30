@@ -1,106 +1,33 @@
 #!/usr/bin/env python3
-"""velo-task-state: the durable-state helper behind velo-task (stdlib only, Python >= 3.9).
+"""velo-task-state: what bash 3.2 cannot do for velo-task and Vanth does not do for it (stdlib only, Python >= 3.9).
 
-Bash 3.2 has no fsync, flock, SHA-256 or JSON, so velo-task calls this helper for them.
+  json-get <file|-> <key>                    top-level JSON value as text (string raw, true/false, number); empty when absent
+  jobs-ro [--cols a,b] <db> <sql> [param...] read-only SQLite on Vanth's jobs.sqlite: a JSON array, or with --cols one line a row (JSON-quoted if not one word)
+  verdict-of [--db P] [--job J] [--name N] [--label L]   the verdict of the status object on stdin, `<label> <verdict>`; 2: not that job, 6: not an object
+  launch <program> [name...]                 exec <program> with ONLY the named variables of this environment
+  override-write <home> <reason>             the one-shot Stop override (temp + fsync + rename; a stale entry is replaced), logged in overrides.log
+  override-take <home>                       consume a VALID override (private regular file of yours, `<time> uid=<n> reason=<text>`): 0, else 3
+  session-read <home>                        the token the state dir keeps, only if dir and file are private, ours, no link, token-shaped
+  inflight <db> <session> [--others]         the session's in-flight jobs (verdict_of rule; tags_json must be an array of strings), or --others: a count
 
-  lock [--timeout S] [--child-fd N] <path> -- cmd...   run cmd holding an exclusive flock on <path>; the directory and the file are opened without following symlinks and must be yours; --child-fd hands cmd descriptor N on the same file (it holds no lock)
-  lock-held --fd N <path>                  exit 0 when descriptor N is the file <path> still names and some process holds the flock on it, else 1 saying why
-  publish <dest> <srcfile>                 fsync srcfile, link it to dest (never replaces), fsync dest's dir, unlink srcfile, fsync its dir
-  write-record <dest> <pid> <lstart> <digest> <incarnation>   a daemon.intent / daemon.provenance record: O_EXCL temp, then publish
-  rec-read <path>                          print a record, not following symlinks: exit 1 when absent, 9 (problem on stdout) when unsafe
-  check-state [--owner-only] <home>        exit 9 and print the first state path that is a symlink, the wrong type or not yours, or the home itself unless its mode is exactly 0700 (--owner-only, which doctor passes because it only reads: unless group and other have no access)
-  launch-exec <intent> <digest> <incarnation> <program> [name...]   publish the intent for THIS process, then exec <program> with only the named variables
-  retire <path>                            durably rename path to <path>.retired.<epoch> (never replaces)
-  append-index <file> <job_id>             append one line (O_APPEND) to a regular file of yours, never through a symlink; fsync file, fsync dir if created
-  fp <status> <exit_code> <stop_actor> <stop_reason> <end>   first 16 hex of SHA-256 of the row
-  sha256 [file]                            hex SHA-256 of a file, or of stdin
-  json-get <file|-> <key>                  top-level JSON value as text (string raw, true/false, number); empty when absent
-  modes-check <home> [file...]             exit 8 and print the first path that group or other can access
-  redact                                   stdin -> stdout with secrets replaced by ***
-  jobs-ro <db> <sql>                       read-only SQLite; stdout = JSON array of row objects
-  verdict-of [--names D] [--db P] [--job J] [--name N] [--issue I] [--session S] [--label L] [--json] [--absent]   R1: the verdict of the status object (or jobs.sqlite row) on stdin, as `<label> <verdict>`; exit 2 when it is not the job asked about, 6 when it is not JSON; --absent: Vanth has no row for J (lost(pruned) when the name index lists J, else unknown-job, exit 3)
-  verdict-of --list --db P --names D [--session S] [--issue I] [--json]   every job of jobs.sqlite that carries those tags, newest first, as `<name> <job_id> <verdict>` (--json: one object each)
-  session-token <file>                     the session token of a state dir with no CLAUDE_SESSION_ID: 16 hex characters, made on first use (never replaced), printed
-  pending-write <dir> -- <vanth start args...>   R17 step 1: publish <dir>/<nonce> with the canonical settings of the request about to be sent; print the nonce
-  remove <file>                            R17 step 4: unlink a regular file of yours (already gone is fine), then fsync its directory
-  index-last <names-dir> <id>              the last job id in <names-dir>/<id> (R3); exit 1 when there is no such index
-  index-has <names-dir> <job_id> [<id>]    exit 0 when a name-index file (just <id>'s, when given) lists the job id, else 1
-  reconcile <pending-dir> <names-dir> <db> <id>   R3, R17: settle <id>'s pending records against Vanth's local_start_requests (read-only, the key matched exactly): key present = index the job id (unless listed), unlink the record; key absent = leave it, print `pending-unsent <id>` on stderr, exit 3
-  failpoint <name>                         test-only crash/barrier point (see below)
-  test-capability                          exit 0 when the test capability holds (see below), else 2
-
-Exit codes: 0 ok, 1 error, 2 usage or refused test seam, 3 publish: dest exists (verdict-of: unknown-job; reconcile: a record Vanth has no key for), 4 jobs-ro: database
-locked for more than 2000 ms, 5 jobs-ro: schema mismatch, 6 verdict-of: the input is not JSON, 8 modes-check: loose
-mode found, 9 unsafe state (a symlink, the wrong type or another owner: lock, rec-read, check-state, publish, retire,
-append-index, pending-write, remove, index-last, index-has, reconcile, session-token; for check-state also a home whose mode is not 0700), 75 lock or
-failpoint wait timed out, 137 failpoint exit. lock-held: 0 held, 1 not held or unsafe. Any other code from `lock` is the
-command's own.
-
-Test seams (spec R21): VELO_TASK_FAILPOINT=<name>[@<dest-name>][:exit|:wait=<barrier-file>], VELO_TASK_FSYNC_TRACE=<file>
-and, for velo-task itself, VELO_TASK_UV and VELO_TASK_RERUN_NONCE (the --rerun key suffix) are honoured only when
-VELO_TASK_TEST=1, VELO_TASK_TEST_ROOT_NONCE is set and the nearest .velo-task-test-root above VELO_TASK_HOME holds that
-nonce; otherwise any set value is refused (exit 2) on every invocation. `wait` creates <barrier-file>.reached, then
-polls for <barrier-file>. publish.linked@<dest-name> fires only for the publish whose destination file is named <dest-name>.
-The trace file gets one line per durable step: fsync file|dir <path>, link <src> <dest>, unlink <path>,
-rename <src> <dest>.
-
-Secrets: --secrets-fd N, in front of any subcommand, reads NAME=value records (each ends in a NUL) from descriptor N until it ends,
-then runs this helper again with them added to its environment, which only the same user can read; a value handed over so is in no
-argv, which ps shows to everyone. With no record there is no second run.
+Exit codes: 0 ok, 1 error, 2 usage, 3 override-take: none, 4 jobs-ro: locked more than 2 s, 5 jobs-ro: schema mismatch, 6 verdict-of: not an object.
 """
-import errno
-import fcntl
-import hashlib
 import json
 import os
 import re
 import signal
 import sqlite3
 import stat
-import subprocess
 import sys
 import time
 from urllib.parse import quote
 
-# A failpoint name is registered when its call site exists; a typo must not pass silently. The last four are the steps of
-# `run` (R17): the pending record published, vanth start returned, the job id indexed, the pending record unlinked (reconcile.indexed: the same, in reconcile).
-FAILPOINTS = {"daemon.lock.held", "publish.linked", "launch.started", "launch.wrapper", "launch.intent", "launch.ready", "launch.recorded",
-              "ensure.adopting", "restart.validated", "install.lock.held", "install.verified", "pending.published", "start.returned", "index.appended",
-              "pending.unlinked", "reconcile.indexed"}
-TEST_MARKER = ".velo-task-test-root"
-# Everything velo-task opens by path under VELO_TASK_HOME, as (path below the home, kind). check-state refuses any that
-# exists as a symlink, as the wrong kind of node, or owned by another user, and the home itself unless its mode is exactly
-# STATE_ROOT_MODE: in a home that others can reach, anything could be planted between a check and an open. A path that does not
-# exist yet is fine.
-STATE_PATHS = (("", "dir"), ("lock", "dir"), ("lock/daemon", "file"), ("venv", "dir"), ("venv/.velo-task-installed", "file"),
-               ("vanth", "dir"), ("vanth/daemon.json", "file"), ("vanth.env.allow", "file"), ("daemon.intent", "file"),
-               ("daemon.provenance", "file"), ("daemon.launch.log", "file"), ("names", "dir"), ("pending", "dir"), ("session", "file"))
-STATE_ROOT_MODE = 0o700
-LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC"}  # the rendering every start time is compared in (the lib's ps_lstart does the same)
-RECORD_UUID = re.compile(r"[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
-SECRET_ENV_NAME = re.compile(rb"[A-Z][A-Z0-9_]*")  # the shape of an allowlisted name (the lib's NAME_RE)
-# sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API;
-# the module only exports them as names from Python 3.11, and this helper must run on the system 3.9 as well.
+# sqlite3 action codes (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) are fixed by SQLite's C API; the module only exports them from 3.11.
 SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION = 20, 21, 31
-# Columns the spec reads from Vanth's database (R1, R8); install-vanth and every read check them.
-SCHEMA = {
-    "jobs": ("job_id", "name", "status", "exit_code", "stop_actor", "stop_reason",
-             "trigger_json", "created_at", "ended_at", "policy_state_json", "tags_json"),
-    "local_start_requests": ("idempotency_key", "job_id"),
-}
-SECRET_NAME = re.compile(r"token|secret|key|password|credential|auth", re.I)
-AUTH_HEADER = re.compile(r"(authorization[\"']?\s*:)[^\r\n]*", re.I)
-SECRET_SHAPES = [re.compile(p) for p in (
-    r"ghp_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}",
-    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{6,}", r"AKIA[0-9A-Z]{8,}")]
-JOB_ID = re.compile(r"[A-Za-z0-9_-]+")  # used with fullmatch: `$` would also accept a trailing newline
-PENDING_NONCE = re.compile(r"[0-9a-f]{16}")  # the name pending-write gives a record; a temp file beside it, or anything else, is not one
-# R1: the one in-flight predicate (every component uses this set, the Stop guard included), and the reason Vanth 1.14.0 gives a job it
-# cancels because its trigger parent ended in another status than the awaited one (install-vanth asserts the installed package holds it).
+# Columns velo-task reads from Vanth's database; install-vanth and every read check them.
+JOB_COLUMNS = ("job_id", "name", "status", "exit_code", "stop_actor", "stop_reason", "created_at", "policy_state_json", "tags_json")
+# The one in-flight predicate (every component uses it, the Stop guard included): Vanth's non-terminal statuses.
 IN_FLIGHT = frozenset(("queued", "launching", "running", "paused", "retrying", "stopping"))
-TRIGGER_REASON = "trigger parent reached an incompatible terminal status"
-# The only `vanth start` flags velo-task sends besides --tag: --policy, --secret-env, --env and the wake options are not among them (R1, R11a).
-START_FLAGS = {"--name": "name", "--timeout": "timeout", "--idempotency-key": "key", "--cwd": "cwd"}
 
 
 def die(code, msg):
@@ -109,478 +36,12 @@ def die(code, msg):
 
 
 def usage(msg):
-    die(2, msg + "\n" + __doc__.split("\n\n")[2])
-
-
-def node_problem(path, info, kind):
-    """Why a state node (info is its lstat or fstat) is not safe to use, or None. A symlink is never accepted, the node must
-    be the kind the caller expects ("dir" or "file", a regular file), and it must belong to the current user."""
-    if stat.S_ISLNK(info.st_mode):
-        return "%s is a symlink" % path
-    if kind == "dir" and not stat.S_ISDIR(info.st_mode):
-        return "%s is not a directory" % path
-    if kind == "file" and not stat.S_ISREG(info.st_mode):
-        return "%s is not a regular file" % path
-    if info.st_uid != os.getuid():
-        return "%s is owned by uid %d, not by you (uid %d)" % (path, info.st_uid, os.getuid())
-    return None
-
-
-def open_dir_nofollow(path):
-    """A descriptor for the directory at path, opened without following a symlink at its last component, after checking it
-    is a directory of the current user. Everything below it is then opened relative to this descriptor."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as exc:
-        die(9, "%s cannot be opened as a real directory: %s" % (path, "it is a symlink" if os.path.islink(path) else exc.strerror))
-    problem = node_problem(path, os.fstat(fd), "dir")
-    if problem:
-        die(9, problem)
-    return fd
-
-
-def process_lstart(pid):
-    """ps's start time for pid, rendered LC_ALL=C TZ=UTC with whitespace squeezed: what the records store and the lib compares."""
-    out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], env=LSTART_ENV, capture_output=True, text=True, check=False)
-    text = " ".join(out.stdout.split())
-    if not text:
-        die(1, "cannot read the start time of pid %d (ps exit %d)" % (pid, out.returncode))
-    return text
-
-
-def test_capability_problem():
-    """None when the test capability (R21) holds, else why not. The capability is a directory that contains
-    VELO_TASK_HOME and holds TEST_MARKER with VELO_TASK_TEST_ROOT_NONCE as its content: a test creates both, so
-    nothing the environment alone controls (TMPDIR, the working directory, a broad temp root) can grant it."""
-    if os.environ.get("VELO_TASK_TEST") != "1":
-        return "VELO_TASK_TEST is not 1"
-    nonce = os.environ.get("VELO_TASK_TEST_ROOT_NONCE", "")
-    if not nonce:
-        return "VELO_TASK_TEST_ROOT_NONCE is not set"
-    home = os.environ.get("VELO_TASK_HOME", "")
-    if not home:
-        return "VELO_TASK_HOME is not set"
-    here = os.path.realpath(home)
-    while True:
-        marker = os.path.join(here, TEST_MARKER)
-        if os.path.isfile(marker):
-            with open(marker, encoding="utf-8") as fh:
-                held = fh.read().strip()
-            return None if held == nonce else "%s does not hold VELO_TASK_TEST_ROOT_NONCE" % marker
-        parent = os.path.dirname(here)
-        if parent == here:
-            return "no %s above VELO_TASK_HOME (%s)" % (TEST_MARKER, home)
-        here = parent
-
-
-def require_test_capability(name):
-    problem = test_capability_problem()
-    if problem:
-        die(2, "%s is set but refused: it is honoured only for tests (%s)" % (name, problem))
-
-
-_TRACE_PATH = None
-
-
-def load_trace():
-    global _TRACE_PATH
-    path = os.environ.get("VELO_TASK_FSYNC_TRACE", "")
-    if path:
-        require_test_capability("VELO_TASK_FSYNC_TRACE")
-        _TRACE_PATH = os.path.abspath(path)
-
-
-def trace(*fields):
-    """Append one line per durable step to VELO_TASK_FSYNC_TRACE (test capability only), so a test can assert the order."""
-    if _TRACE_PATH is None:
-        return
-    fd = os.open(_TRACE_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        os.write(fd, (" ".join(fields) + "\n").encode())
-    finally:
-        os.close(fd)
-
-
-def failpoint_spec():
-    """(name, action, barrier, dest-name) of the armed failpoint, or None. Only publish.linked takes a dest-name
-    (publish.linked@daemon.provenance fires for that publish alone, not for the intent's that precedes it)."""
-    raw = os.environ.get("VELO_TASK_FAILPOINT", "")
-    if not raw:
-        return None
-    require_test_capability("VELO_TASK_FAILPOINT")
-    point, _, action = raw.partition(":")
-    name, _, target = point.partition("@")
-    if name not in FAILPOINTS:
-        die(2, "unknown failpoint %r" % name)
-    if "@" in point and (name != "publish.linked" or not target):
-        die(2, "failpoint %r: only publish.linked takes a non-empty @<dest-name>" % point)
-    if action in ("", "exit"):
-        return name, "exit", None, target
-    if action.startswith("wait=") and len(action) > 5:
-        return name, "wait", action[5:], target
-    die(2, "unknown failpoint action %r" % action)
-
-
-def failpoint(name, dest=None):
-    spec = failpoint_spec()
-    if not spec or spec[0] != name or (spec[3] and spec[3] != os.path.basename(dest or "")):
-        return
-    if spec[1] == "exit":
-        sys.stderr.write("velo-task-state: failpoint %s: exit\n" % name)
-        sys.stderr.flush()
-        os._exit(137)
-    open(spec[2] + ".reached", "w").close()
-    deadline = time.monotonic() + float(os.environ.get("VELO_TASK_FAILPOINT_WAIT_MAX", "60"))
-    while not os.path.exists(spec[2]):
-        if time.monotonic() > deadline:
-            die(75, "failpoint %s: barrier %s never appeared" % (name, spec[2]))
-        time.sleep(0.02)
-
-
-def _sync_fd(fd, kind, path):
-    """fsync an open descriptor (kind is "file" or "dir", path names it) and record it in the trace. The trace line and the
-    sync are one call, so a change that drops the sync drops the line, and a test on the trace sees it."""
-    trace("fsync", kind, path)
-    # macOS fsync does not flush the drive cache; F_FULLFSYNC does.
-    if hasattr(fcntl, "F_FULLFSYNC"):
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
-
-
-def _sync_path(path, kind):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        _sync_fd(fd, kind, path)
-    finally:
-        os.close(fd)
-
-
-def cmd_lock(args):
-    timeout, child_fd = None, None
-    while args[:1] in (["--timeout"], ["--child-fd"]):
-        if len(args) < 2:
-            usage("lock: %s needs a value" % args[0])
-        if args[0] == "--timeout":
-            timeout = float(args[1])
-        else:
-            child_fd = int(args[1])
-        args = args[2:]
-    if len(args) < 3 or args[1] != "--":
-        usage("lock: expected <path> -- cmd...")
-    path, cmd = os.path.abspath(args[0]), args[2:]
-    parent, name = os.path.split(path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    # The directory and the file are opened through descriptors and never by a path that could have been swapped for a symlink.
-    dirfd = open_dir_nofollow(parent)
-    try:
-        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)  # non-inheritable: the command never holds the lock
-    except OSError as exc:
-        die(9, "lock file %s cannot be opened: %s" % (path, "it is a symlink" if os.path.islink(path) else exc.strerror))
-    problem = node_problem(path, os.fstat(fd), "file")
-    if problem:
-        die(9, problem)
-    deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError as exc:
-            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                raise
-            if deadline is not None and time.monotonic() >= deadline:
-                die(75, "lock %s: not acquired within %ss" % (path, timeout))
-            time.sleep(0.02)
-    locked = os.fstat(fd)
-    named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-    if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino):
-        die(9, "%s was replaced while the lock was being taken; the lock is not on the file the name now has" % path)
-    pass_fds = ()
-    if child_fd is not None:
-        # The command's view of the lock: another open file description of the very file locked, holding no flock of its own, so
-        # it can ask lock-held whether the lock is still held and still on this name, and can never keep the lock alive.
-        view = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
-        seen = os.fstat(view)
-        if (seen.st_dev, seen.st_ino) != (locked.st_dev, locked.st_ino):
-            die(9, "%s was replaced while the lock was being taken" % path)
-        if fd == child_fd:  # the lock itself must never sit on the number the command is given
-            fd = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, child_fd + 1)
-            os.close(child_fd)
-        if view != child_fd:
-            os.dup2(view, child_fd, inheritable=True)
-            os.close(view)
-        pass_fds = (child_fd,)
-    try:
-        proc = subprocess.Popen(cmd, pass_fds=pass_fds)
-    except OSError as exc:
-        die(127, "lock: cannot run %s: %s" % (cmd[0], exc.strerror))
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, lambda s, _frame: proc.send_signal(s))
-    rc = proc.wait()
-    return rc if rc >= 0 else 128 - rc
-
-
-def cmd_lock_held(args):
-    """The question a locked body asks (lock --child-fd handed it descriptor N): is that descriptor still the file <path> names,
-    and does some other open file description hold the flock on it? The path is only looked at (lstat), never opened."""
-    if len(args) != 3 or args[0] != "--fd":
-        usage("lock-held: expected --fd N <path>")
-    fd, path = int(args[1]), os.path.abspath(args[2])
-
-    def not_held(why):
-        sys.stderr.write("velo-task-state: lock-held: %s\n" % why)
-        return 1
-    try:
-        mine = os.fstat(fd)
-    except OSError:
-        return not_held("descriptor %d is not open: this process was not started by `lock --child-fd %d`" % (fd, fd))
-    problem = node_problem("descriptor %d" % fd, mine, "file")
-    if problem:
-        return not_held(problem)
-    try:
-        named = os.lstat(path)  # never creates the lock file
-    except FileNotFoundError:
-        return not_held("%s does not exist" % path)
-    if stat.S_ISLNK(named.st_mode):
-        return not_held("%s is a symlink: it is no longer the file the lock was taken on" % path)
-    if (named.st_dev, named.st_ino) != (mine.st_dev, mine.st_ino):
-        return not_held("%s is no longer the file the lock was taken on" % path)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-            return 0
-        raise
-    fcntl.flock(fd, fcntl.LOCK_UN)  # the probe took it, so nobody held it: give it back
-    return not_held("nobody holds the lock on %s" % path)
-
-
-def publish_file(src, dest):
-    """The one durable no-clobber publish (R17), used by `publish` and so by every provenance and intent writer.
-    Order: fsync the temp, link it to dest (never replacing), fsync dest's directory so the new name is durable,
-    unlink the temp, fsync the temp's directory. A crash between link and unlink leaves both names, never neither.
-    Returns False, with the temp removed, when dest already exists. The temp must be a regular file of the current user and
-    is linked as itself: a symlink is never followed, on the way in or onto an existing dest."""
-    src, dest = os.path.abspath(src), os.path.abspath(dest)
-    problem = node_problem(src, os.lstat(src), "file")
-    if problem:
-        die(9, "publish: %s" % problem)
-    _sync_path(src, "file")
-    trace("link", src, dest)
-    try:
-        os.link(src, dest, follow_symlinks=False)
-    except FileExistsError:
-        trace("unlink", src)
-        os.unlink(src)
-        _sync_path(os.path.dirname(src), "dir")
-        return False
-    failpoint("publish.linked", dest)
-    _sync_path(os.path.dirname(dest), "dir")
-    trace("unlink", src)
-    os.unlink(src)
-    _sync_path(os.path.dirname(src), "dir")
-    return True
-
-
-def cmd_publish(args):
-    if len(args) != 2:
-        usage("publish: expected <dest> <srcfile>")
-    dest, src = args
-    if not publish_file(src, dest):
-        die(3, "publish: %s already exists (temp removed)" % dest)
-    return 0
-
-
-def cmd_retire(args):
-    """Move a record out of the way for good: rename to <path>.retired.<epoch> (a numeric suffix if that name is taken),
-    then fsync the directory so the retirement survives a crash."""
-    if len(args) != 1:
-        usage("retire: expected <path>")
-    path = os.path.abspath(args[0])
-    try:
-        problem = node_problem(path, os.lstat(path), "file")
-    except FileNotFoundError:
-        die(1, "retire: %s does not exist" % path)
-    if problem:
-        die(9, "retire: %s" % problem)
-    base = "%s.retired.%d" % (path, int(time.time()))
-    target, n = base, 0
-    while os.path.lexists(target):
-        n += 1
-        target = "%s.%d" % (base, n)
-    trace("rename", path, target)
-    os.rename(path, target)
-    _sync_path(os.path.dirname(path), "dir")
-    return 0
-
-
-def write_new(dest, data):
-    """Create dest holding data, durably and without replacing anything. The temp is created O_EXCL and O_NOFOLLOW, so nothing already
-    there (or planted there) is ever written through; it is then published like every record (publish_file). False when dest exists."""
-    dest = os.path.abspath(dest)
-    tmp = "%s.tmp.%d.%s" % (dest, os.getpid(), os.urandom(4).hex())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        if os.write(fd, data) != len(data):
-            die(1, "short write to %s" % tmp)
-    except BaseException:  # die() is SystemExit: whatever stops the write, the temp does not stay behind
-        os.unlink(tmp)
-        raise
-    finally:
-        os.close(fd)
-    return publish_file(tmp, dest)
-
-
-def write_record(dest, pid, lstart, digest, incarnation):
-    """The one writer of daemon.intent and daemon.provenance (write_new). Exit 3 when dest exists: a record is retired before it
-    is replaced, never overwritten."""
-    fields = {"pid": (pid, r"[0-9]+"), "lstart": (lstart, r"[^\n]+"), "digest": (digest, r"[0-9a-f]{64}"),
-              "incarnation": (incarnation, RECORD_UUID.pattern)}
-    for name, (value, pattern) in fields.items():
-        if not re.fullmatch(pattern, str(value)):
-            usage("write-record: %s %r is not a valid value" % (name, value))
-    dest = os.path.abspath(dest)
-    data = ("pid=%s\nlstart=%s\ndigest=%s\nincarnation=%s\n" % (pid, lstart, digest, incarnation)).encode()
-    if not write_new(dest, data):
-        die(3, "write-record: %s already exists (temp removed)" % dest)
-
-
-def cmd_write_record(args):
-    if len(args) != 5:
-        usage("write-record: expected <dest> <pid> <lstart> <digest> <incarnation>")
-    write_record(*args)
-    return 0
-
-
-def cmd_rec_read(args):
-    """Print a record. Exit 1 when it does not exist. Exit 9, with the reason on STDOUT, when it is a symlink, not a regular
-    file or not the current user's: the caller reads one stream and never mistakes an unsafe record for an absent one."""
-    if len(args) != 1:
-        usage("rec-read: expected <path>")
-    path = os.path.abspath(args[0])
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
-    except FileNotFoundError:
-        return 1
-    except OSError as exc:
-        print("%s is a symlink" % path if exc.errno == errno.ELOOP else "%s cannot be opened: %s" % (path, exc.strerror))
-        return 9
-    problem = node_problem(path, os.fstat(fd), "file")  # before fdopen, which would refuse a directory with an exception of its own
-    if problem:
-        os.close(fd)
-        print(problem)
-        return 9
-    with os.fdopen(fd, "rb") as fh:
-        data = fh.read()
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
-    return 0
-
-
-def cmd_check_state(args):
-    """Exit 9 and print the first path under <home> (STATE_PATHS) that exists as a symlink, as the wrong kind of node, or owned
-    by someone else, and the home itself unless its mode is exactly 0700. With --owner-only, which doctor passes because it only
-    reads, the home must instead give group and other no access (so a home nobody can write to is fine). Nothing is opened,
-    followed, created or changed: a lstat per path."""
-    owner_only = args[:1] == ["--owner-only"]
-    if owner_only:
-        args = args[1:]
-    if len(args) != 1:
-        usage("check-state: expected [--owner-only] <home>")
-    home = os.path.abspath(args[0])
-    for rel, kind in STATE_PATHS:
-        path = os.path.join(home, rel) if rel else home
-        try:
-            info = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        problem = node_problem(path, info, kind)
-        if not problem and not rel:  # the home itself
-            mode = stat.S_IMODE(info.st_mode)
-            if owner_only and mode & 0o077:
-                problem = "%s has mode %o, group and other must have no access" % (path, mode)
-            elif not owner_only and mode != STATE_ROOT_MODE:
-                problem = "%s has mode %o, must be %o" % (path, mode, STATE_ROOT_MODE)
-        if problem:
-            print(problem)
-            return 9
-    return 0
-
-
-def cmd_launch_exec(args):
-    """The process that becomes vanthd. velo-task starts `launch-exec <intent> <digest> <incarnation> <vanthd> <names>`; it
-    publishes daemon.intent for its OWN pid and start time, durably and in the order of every record, and only then execs
-    vanthd, which keeps the pid and the start time. A hard kill before the exec leaves no daemon at all; a hard kill after it
-    leaves a daemon whose intent is already in place. vanthd gets exactly the named variables and nothing else this process
-    holds, the test seams among them."""
-    if len(args) < 4:
-        usage("launch-exec: expected <intent> <digest> <incarnation> <program> [name...]")
-    intent, digest, incarnation, program, names = args[0], args[1], args[2], args[3], args[4:]
-    missing = [n for n in names if n not in os.environ]
-    if missing:
-        die(1, "launch-exec: not set in the environment: %s" % " ".join(missing))
-    env = {n: os.environ[n] for n in names}
-    failpoint("launch.wrapper")
-    pid = os.getpid()
-    write_record(intent, pid, process_lstart(pid), digest, incarnation)
-    failpoint("launch.intent")
-    for sig in (signal.SIGPIPE, signal.SIGXFSZ):  # Python ignores these; vanthd gets the dispositions a plain exec would have given it
-        signal.signal(sig, signal.SIG_DFL)
-    os.execve(program, [program], env)
-
-
-def cmd_append_index(args):
-    if len(args) != 2:
-        usage("append-index: expected <file> <job_id>")
-    path, job_id = args
-    path = os.path.abspath(path)
-    if not JOB_ID.fullmatch(job_id):
-        die(2, "append-index: job_id must match ^[A-Za-z0-9_-]+$")
-    created = False
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
-    except FileExistsError:  # the index is a control file: opened without following a symlink, and only a regular file of yours is appended to
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO planted here must not hang the open
-        except OSError as exc:
-            die(9, "append-index: %s cannot be opened: %s" % (path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
-        problem = node_problem(path, os.fstat(fd), "file")
-        if problem:
-            os.close(fd)
-            die(9, "append-index: %s" % problem)
-    try:
-        line = (job_id + "\n").encode()
-        if os.write(fd, line) != len(line):  # one write(2) under O_APPEND: concurrent lines never tear
-            die(1, "append-index: short write to %s" % path)
-        _sync_fd(fd, "file", path)
-    finally:
-        os.close(fd)
-    if created:
-        _sync_path(os.path.dirname(path), "dir")
-    return 0
-
-
-def cmd_fp(args):
-    if len(args) != 5:
-        usage("fp: expected <status> <exit_code> <stop_actor> <stop_reason> <end>")
-    row = "|".join(args).encode("utf-8", "surrogateescape")
-    print(hashlib.sha256(row).hexdigest()[:16])
-    return 0
-
-
-def cmd_sha256(args):
-    if len(args) > 1:
-        usage("sha256: expected [file]")
-    data = open(args[0], "rb").read() if args else sys.stdin.buffer.read()
-    print(hashlib.sha256(data).hexdigest())
-    return 0
+    die(2, msg + "\n" + __doc__.split("\n\n")[1])
 
 
 def cmd_json_get(args):
-    """Print one top-level value of a JSON object, the way `jq -r` would: strings raw, booleans as true/false, numbers as
-    written, nested values as compact JSON, nothing for a missing or null key. A missing file has no value (the caller
-    decides whether that matters); a file or stdin that is not a JSON object is an error."""
+    """Print one top-level value of a JSON object the way `jq -r` would: strings raw, booleans true/false, numbers as written, nested
+    values as compact JSON, nothing for a missing or null key. A missing file has no value; anything that is not a JSON object is an error."""
     if len(args) != 2:
         usage("json-get: expected <file|-> <key>")
     src, key = args
@@ -598,168 +59,88 @@ def cmd_json_get(args):
     value = doc.get(key)
     if value is None:
         return 0
-    sys.stdout.reconfigure(encoding="utf-8")  # the text is the same whatever locale the caller runs under
+    sys.stdout.reconfigure(encoding="utf-8")
     if isinstance(value, bool):
         print("true" if value else "false")
     elif isinstance(value, str):
         print(value)
-    elif isinstance(value, (int, float)):
-        print(json.dumps(value))
     else:
         print(json.dumps(value, separators=(",", ":")))
     return 0
 
 
-def _mode_problem(path):
-    """Why path is not private (no group or other access), or None. Symlinks are refused: their own mode says nothing."""
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(info.st_mode):
-        return "%s is a symlink; its mode cannot be checked" % path
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & 0o077:
-        return "%s has mode %o, must be %s" % (path, mode, "700" if stat.S_ISDIR(info.st_mode) else "600")
-    return None
-
-
-def _walk_modes(root):
-    """Every directory and file below root, not following symlinks; an unreadable directory is an error, not a pass."""
-    def fail(exc):
-        raise exc
-    for dirpath, dirnames, filenames in os.walk(root, onerror=fail):
-        yield dirpath
-        for name in dirnames + filenames:
-            yield os.path.join(dirpath, name)
-
-
-def cmd_modes_check(args):
-    """Vanth's state must be private (R11(c)): the home 0700; jobs.sqlite*, token, daemon.json and the launch log 0600;
-    logs/ and events/ with everything below them. Prints the first offender and exits 8; exits 0 when all is private."""
-    if not args:
-        usage("modes-check: expected <home> [file...]")
-    home, extras = os.path.abspath(args[0]), args[1:]
-    paths = [home]
-    if os.path.isdir(home):
-        paths += [os.path.join(home, n) for n in sorted(os.listdir(home))
-                  if n.startswith("jobs.sqlite") or n in ("token", "daemon.json")]
-        for sub in ("logs", "events"):
-            if os.path.isdir(os.path.join(home, sub)) and not os.path.islink(os.path.join(home, sub)):
-                paths += list(_walk_modes(os.path.join(home, sub)))
-            else:
-                paths.append(os.path.join(home, sub))
-    paths += [os.path.abspath(p) for p in extras]
-    for path in paths:
-        problem = _mode_problem(path)
-        if problem:
-            print(problem)
-            return 8
-    return 0
-
-
-def _allowlist_names():
-    if not os.environ.get("VELO_TASK_HOME"):
-        die(1, "redact: VELO_TASK_HOME is not set, so the allowlist cannot be located")
-    path = os.path.join(os.environ["VELO_TASK_HOME"], "vanth.env.allow")
-    if not os.path.lexists(path):
-        return set()
-    names = set()
-    for line in open(path, encoding="utf-8").read().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            names.add(line)
-    return names
-
-
-def cmd_redact(args):
-    if args:
-        usage("redact: takes no arguments")
-    text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
-    allowed = _allowlist_names()
-    values = {v for k, v in os.environ.items() if v and (k in allowed or SECRET_NAME.search(k))}
-    for value in sorted(values, key=len, reverse=True):
-        text = text.replace(value, "***")
-    text = AUTH_HEADER.sub(r"\1 ***", text)
-    for shape in SECRET_SHAPES:
-        text = shape.sub("***", text)
-    out = text.encode("utf-8", "surrogateescape")  # nothing is written before every step has succeeded
-    sys.stdout.buffer.write(out)
-    sys.stdout.buffer.flush()
-    return 0
-
-
 def read_only_authorizer(action, arg1, arg2, db_name, source):
-    """Allow only what a plain SELECT needs and deny the rest: ATTACH and DETACH (which can create a file), DDL, DML,
-    PRAGMA (so none can be written), transactions, and load_extension."""
+    """Allow only what a plain SELECT needs: no ATTACH (which can create a file), DDL, DML, PRAGMA, transaction or load_extension."""
     if action == SQLITE_FUNCTION and str(arg2).lower() == "load_extension":
         return sqlite3.SQLITE_DENY
-    if action in (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION):
-        return sqlite3.SQLITE_OK
-    return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK if action in (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) else sqlite3.SQLITE_DENY
 
 
 def query_ro(db, sql, params=()):
-    """The rows (as dicts) of one SELECT on a Vanth database, read-only (R8); dies with the exit codes in the header."""
+    """The rows (as dicts) of one SELECT on a Vanth database, read-only: mode=ro, query_only, and an authorizer that denies all but SELECT."""
     try:
-        # Three layers keep this read-only (R8): mode=ro opens the file read-only, query_only refuses writes on the
-        # connection (attached databases included), and the authorizer, installed after the pragmas this function itself
-        # needs, denies everything but SELECT. timeout=2.0 is the 2000 ms busy timeout.
         con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db)), uri=True, timeout=2.0)
         con.execute("PRAGMA query_only=ON")
-        missing = ["%s.%s" % (t, c) for t, cols in SCHEMA.items()
-                   for c in cols if c not in {r[1] for r in con.execute("PRAGMA table_info(%s)" % t)}]
+        have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+        missing = [c for c in JOB_COLUMNS if c not in have]
         if missing:
-            die(5, "jobs-ro: schema mismatch, missing: %s" % ", ".join(missing))
+            die(5, "jobs-ro: schema mismatch, missing jobs.%s" % ", jobs.".join(missing))
         con.row_factory = sqlite3.Row
         con.set_authorizer(read_only_authorizer)
-        rows = [dict(r) for r in con.execute(sql, params)]
+        return [dict(r) for r in con.execute(sql, params)]
     except sqlite3.OperationalError as exc:
-        if "locked" in str(exc):
-            die(4, "jobs-ro: %s (waited 2000 ms)" % exc)
+        die(4 if "locked" in str(exc) else 1, "jobs-ro: %s" % exc)
+    except sqlite3.DatabaseError as exc:
         die(1, "jobs-ro: %s" % exc)
-    except sqlite3.DatabaseError as exc:  # not authorized, malformed database
-        die(1, "jobs-ro: %s" % exc)
-    return rows
+
+
+def tok(text):
+    """A field of a line: as it is when it is one printable word with no double quote, else JSON-quoted, so a name any tool may set cannot add a line."""
+    text = str(text)
+    return text if re.fullmatch(r"[\x21\x23-\x7e]+", text) else json.dumps(text)
 
 
 def cmd_jobs_ro(args):
-    if len(args) != 2:
-        usage("jobs-ro: expected <db> <sql>")
-    sys.stdout.write(json.dumps(query_ro(*args), separators=(",", ":"), default=str) + "\n")
+    cols = None
+    if args[:1] == ["--cols"] and len(args) > 1:
+        cols, args = args[1].split(","), args[2:]
+    if len(args) < 2:
+        usage("jobs-ro: expected [--cols a,b] <db> <sql> [param...]")
+    rows = query_ro(args[0], args[1], tuple(args[2:]))
+    if cols is None:
+        sys.stdout.write(json.dumps(rows, separators=(",", ":"), default=str) + "\n")
+    else:
+        for row in rows:
+            print(" ".join(tok(row.get(c, "")) for c in cols))
     return 0
 
 
-def _json_field(row, *names):
-    """The first of names present in row, parsed: a JSON column of a jobs.sqlite row is text, the same field of a status object is
-    already a value. None when absent or empty; text that is not JSON raises ValueError."""
-    value = next((row[name] for name in names if name in row), None)
+def json_field(row, name):
+    """A JSON column of a jobs.sqlite row is text, the same field of a status object is already a value; None when absent or empty."""
+    value = row.get(name)
     return (json.loads(value) if value.strip() else None) if isinstance(value, str) else value
 
 
-def _restart_pending(row):
-    """Whether a restart policy has a relaunch pending (policy_state_json: restart_after, or pending_restart_after while it is being
-    claimed). ValueError when the state is not an object."""
-    state = _json_field(row, "policy_state_json")
+def restart_pending(row):
+    """Whether a restart policy has a relaunch pending (restart_after, or pending_restart_after while it is being claimed)."""
+    state = json_field(row, "policy_state_json")
     if state is not None and not isinstance(state, dict):
         raise ValueError("policy_state_json is not an object")
     return bool(state and (state.get("restart_after") or state.get("pending_restart_after")))
 
 
-def verdict_of(row, known_job=lambda job_id: False):
-    """R1, the one place a verdict is computed: a `vanth --json status` object or a jobs.sqlite row in; one of ok, failed(n), timeout,
-    killed, lost, upstream-failed(<parent>), in-flight out. Total: whatever it cannot classify is `lost`, never `ok`. known_job(parent)
-    says whether a trigger parent is a row of jobs.sqlite or an entry of the name index."""
+def verdict_of(row):
+    """The one place a verdict is computed: a `vanth --json status` object or a jobs.sqlite row in; ok, failed(n), timeout, killed, lost or
+    in-flight out. Total: whatever it cannot classify is `lost`, never `ok`."""
     if not isinstance(row, dict) or not isinstance(row.get("status"), str):
         return "lost"
     status = row["status"]
     if status in IN_FLIGHT:
         return "in-flight"
     try:
-        if status in ("failed", "orphaned") and _restart_pending(row):
+        if status in ("failed", "orphaned") and restart_pending(row):
             return "in-flight"  # a policy relaunch is coming: the status is not final
-        trigger = _json_field(row, "trigger_json", "trigger") if status == "cancelled" else None
-    except ValueError:
+    except (ValueError, RecursionError):  # a policy column that is not JSON, or nested deeper than json can read
         return "lost"
     if status == "completed":
         return "ok"
@@ -768,330 +149,171 @@ def verdict_of(row, known_job=lambda job_id: False):
     if status == "failed":
         code = row.get("exit_code")
         return "failed(%d)" % code if isinstance(code, int) and not isinstance(code, bool) else "lost"
-    if status == "cancelled":
-        actor, parent = row.get("stop_actor"), trigger.get("job_id") if isinstance(trigger, dict) else None
-        if actor == "user":
-            return "killed"
-        if (actor == "daemon" and row.get("stop_reason") == TRIGGER_REASON and isinstance(parent, str)
-                and JOB_ID.fullmatch(parent) and known_job(parent)):
-            return "upstream-failed(%s)" % parent
+    if status == "cancelled" and row.get("stop_actor") == "user":
+        return "killed"
     return "lost"  # orphaned, any other cancelled, a status outside both sets
 
 
-def read_state_file(path):
-    """The bytes of one control file (a name index, a pending record). Opened without following a symlink (and a FIFO is never waited on):
-    it must be a regular file of yours. None when it does not exist; exit 9 when it is unsafe."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        die(9, "%s cannot be opened: %s" % (path, "it is a symlink" if exc.errno == errno.ELOOP else exc.strerror))
-    problem = node_problem(path, os.fstat(fd), "file")
-    if problem:
-        os.close(fd)
-        die(9, problem)
-    with os.fdopen(fd, "rb") as fh:
-        return fh.read()
-
-
-def read_index(path):
-    """The job ids in one name-index file (R3), in order. None when it does not exist; exit 9 when it is unsafe or holds a line that is
-    not a job id."""
-    data = read_state_file(path)
-    if data is None:
-        return None
-    ids = [line for line in data.decode("utf-8", "surrogateescape").split("\n") if line]
-    for line in ids:
-        if not JOB_ID.fullmatch(line) or line.startswith("-"):  # a leading dash would reach `vanth status` as an option
-            die(9, "%s holds a line that is not a job id: %r" % (path, line))
-    return ids
-
-
-def index_has(directory, job_id, only=None):
-    """Whether a name-index file in directory (just the one called `only`, when given) lists job_id."""
-    try:
-        names = [only] if only else sorted(os.listdir(directory))
-    except FileNotFoundError:
-        return False
-    return any(job_id in (read_index(os.path.join(directory, name)) or ()) for name in names)
-
-
-def job_row_exists(db, job_id):
-    return bool(query_ro(db, "SELECT 1 AS present FROM jobs WHERE job_id = ?", (job_id,)))
-
-
-def job_json(label, row, verdict, job=None):
-    """The --json object of one job, the same for the status of one job and for every row of a list."""
-    return json.dumps({"id": label, "job_id": row.get("job_id", job), "status": row.get("status"), "exit_code": row.get("exit_code"),
-                       "verdict": verdict}, sort_keys=True, separators=(",", ":"))
-
-
-def _tok(text):
-    """A field of a list line: as it is when it is one printable word with no double quote, else JSON-quoted, so a name any tool may set
-    cannot add a line or a field, and a field that starts with a double quote is always JSON."""
-    text = str(text)
-    return text if re.fullmatch(r"[\x21\x23-\x7e]+", text) else json.dumps(text)
-
-
-def list_jobs(db, known, opts, as_json):
-    """Every job of jobs.sqlite (read-only, R8) that carries the tags asked for (--session S, --issue I), newest first: `<name> <job_id> <verdict>`."""
-    if not db:
-        usage("verdict-of: --list needs --db")
-    want = ["%s:%s" % (key, opts[key]) for key in ("session", "issue") if key in opts]
-    for row in query_ro(db, "SELECT job_id, name, status, exit_code, stop_actor, stop_reason, trigger_json, policy_state_json, tags_json "
-                            "FROM jobs ORDER BY created_at DESC, job_id DESC"):
-        try:
-            tags = _json_field(row, "tags_json")
-        except ValueError:  # tags that are not JSON: the job belongs to no session
-            tags = None
-        if all(tag in (tags if isinstance(tags, list) else ()) for tag in want):
-            verdict = verdict_of(row, known)
-            print(job_json(row["name"], row, verdict) if as_json else "%s %s %s" % (_tok(row["name"] or "-"), _tok(row["job_id"]), verdict))
-    return 0
-
-
 def cmd_verdict_of(args):
-    """The verdict (R1) of the Vanth status object, or jobs.sqlite row, on stdin: `<label> <verdict>`, or one JSON object with --json.
-    --names and --db say where a trigger parent is looked up (the name index, the database). --job, --name, --issue and --session are what
-    the caller resolved: a status for another job, under another name or without the issue or session tag is refused (exit 2), never
-    reported as the job asked about. --absent: Vanth has no row for --job (lost(pruned) when the name index lists it, else unknown-job,
-    exit 3). Not JSON: exit 6. --list: no stdin, every job of --db (list_jobs)."""
-    opts, flags, i = {}, set(), 0
+    opts, i = {}, 0
     while i < len(args):
-        if args[i] in ("--json", "--absent", "--list"):
-            flags.add(args[i])
-            i += 1
-        elif args[i] in ("--names", "--db", "--job", "--name", "--issue", "--session", "--label") and i + 1 < len(args):
-            opts[args[i][2:]] = args[i + 1]
-            i += 2
+        if args[i] in ("--db", "--job", "--name", "--label") and i + 1 < len(args):
+            opts[args[i][2:]], i = args[i + 1], i + 2
         else:
             usage("verdict-of: unexpected argument %r" % args[i])
-    names, db, job = opts.get("names"), opts.get("db"), opts.get("job")
-    known = lambda parent: bool(names and index_has(names, parent)) or bool(db and job_row_exists(db, parent))
-    if "--list" in flags:
-        return list_jobs(db, known, opts, "--json" in flags)
-    if "--absent" in flags:
-        row = {}
-        verdict = "lost(pruned)" if job and names and index_has(names, job) else "unknown-job"
-    else:
-        try:
-            row = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-        except ValueError as exc:  # not JSON, or not UTF-8
-            die(6, "verdict-of: the status is not JSON: %s" % exc)
-        row = row if isinstance(row, dict) else {}
-        for key, want in (("job_id", job), ("name", opts.get("name"))):
-            if want is not None and row.get(key) != want:
-                die(2, "verdict-of: the status is for %s %r, not %r; refusing to report it for the job asked about" % (key, row.get(key), want))
-        for key in ("issue", "session"):
-            if key in opts and "%s:%s" % (key, opts[key]) not in (row["tags"] if isinstance(row.get("tags"), list) else []):
-                die(2, "verdict-of: the job does not carry the tag %s:%s" % (key, opts[key]))
-        if db and job and "policy_state_json" not in row and row.get("status") in ("failed", "orphaned"):
-            found = query_ro(db, "SELECT policy_state_json FROM jobs WHERE job_id = ?", (job,))  # `vanth status` omits it: a restart may be pending (R1)
-            row["policy_state_json"] = found[0]["policy_state_json"] if found else None
-        verdict = verdict_of(row, known)
-    label = opts.get("label") or job or "-"
-    if "--json" in flags:
-        print(job_json(label, row, verdict, job))
-    else:
-        print("%s %s" % (label, verdict))
-    return 3 if verdict == "unknown-job" else 0
-
-
-def parse_start(args):
-    """The canonical settings of a `vanth start` request (R3): what Vanth's request-equality covers, read from the very argv that is
-    sent, so the record cannot differ from the request. A flag velo-task does not send (--policy, --secret-env, --env, a wake option) is
-    refused. env and trigger are part of the record (R3) and empty until a caller sends them."""
-    settings = {"argv": [], "cwd": None, "env": {}, "key": None, "name": None, "tags": [], "timeout": None, "trigger": None}
-    i = 0
-    while i < len(args) and args[i] != "--":
-        flag = args[i]
-        if (flag != "--tag" and flag not in START_FLAGS) or i + 1 == len(args):
-            die(2, "pending-write: %r is not a flag velo-task sends, or it has no value" % flag)
-        if flag == "--tag":
-            settings["tags"].append(args[i + 1])
-        else:
-            settings[START_FLAGS[flag]] = int(args[i + 1]) if flag == "--timeout" else args[i + 1]
-        i += 2
-    settings["argv"] = args[i + 1:]
-    missing = [name for name in ("argv", "cwd", "key", "name", "timeout") if not settings[name]]
-    if missing:
-        die(2, "pending-write: the request has no %s" % ", ".join(missing))
-    return settings
-
-
-def cmd_pending_write(args):
-    if len(args) < 3 or args[1] != "--":
-        usage("pending-write: expected <dir> -- <vanth start args...>")
-    directory = os.path.abspath(args[0])
-    data = (json.dumps(parse_start(args[2:]), sort_keys=True, separators=(",", ":")) + "\n").encode()
-    os.close(open_dir_nofollow(directory))  # a symlink in place of the directory, or one that is not yours, is refused (exit 9)
-    nonce = os.urandom(8).hex()
-    if not write_new(os.path.join(directory, nonce), data):
-        die(3, "pending-write: %s already exists" % nonce)
-    print(nonce)
-    return 0
-
-
-def cmd_remove(args):
-    if len(args) != 1:
-        usage("remove: expected <file>")
-    path = os.path.abspath(args[0])
     try:
-        problem = node_problem(path, os.lstat(path), "file")
-    except FileNotFoundError:
-        return 0  # a step of run that reconcile may already have done
-    if problem:
-        die(9, "remove: %s" % problem)
-    trace("unlink", path)
-    os.unlink(path)
-    _sync_path(os.path.dirname(path), "dir")
+        row = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (ValueError, RecursionError) as exc:  # not JSON, not UTF-8, or nested deeper than this interpreter can read
+        die(6, "verdict-of: the status is not JSON: %s" % exc)
+    if not isinstance(row, dict):
+        die(6, "verdict-of: the status is not a JSON object (%s)" % type(row).__name__)
+    for key, field in (("job", "job_id"), ("name", "name")):  # a status for another job or name is never reported as the job asked about
+        if key in opts and row.get(field) != opts[key]:
+            die(2, "verdict-of: the status is for %s %r, not %r; refusing to report it for the job asked about" % (field, row.get(field), opts[key]))
+    job = opts.get("job")
+    if opts.get("db") and job and "policy_state_json" not in row and row.get("status") in ("failed", "orphaned"):
+        found = query_ro(opts["db"], "SELECT policy_state_json FROM jobs WHERE job_id = ?", (job,))  # `vanth status` omits it: a restart may be pending
+        row["policy_state_json"] = found[0]["policy_state_json"] if found else None
+    verdict = verdict_of(row)
+    label = opts.get("label") or job or "-"
+    print("%s %s" % (label, verdict))
     return 0
 
 
-def cmd_index_last(args):
-    if len(args) != 2:
-        usage("index-last: expected <names-dir> <id>")
-    if args[1] in ("", ".", "..") or "/" in args[1]:
-        usage("index-last: %r is not an id" % args[1])
-    ids = read_index(os.path.join(*args))
-    if not ids:
-        return 1
-    print(ids[-1])
-    return 0
+def cmd_launch(args):
+    """The process that becomes vanthd gets exactly the named variables of this environment and nothing else: the allowlisted secrets
+    reach it by name, so no value is ever in an argv, which ps shows to everyone."""
+    if not args:
+        usage("launch: expected <program> [name...]")
+    program, names = args[0], args[1:]
+    missing = [n for n in names if n not in os.environ]
+    if missing:
+        die(1, "launch: not set in the environment: %s" % " ".join(missing))
+    for sig in (signal.SIGPIPE, signal.SIGXFSZ):  # Python ignores these; vanthd gets the dispositions a plain exec would have given it
+        signal.signal(sig, signal.SIG_DFL)
+    os.execve(program, [program], {n: os.environ[n] for n in names})
 
 
-def cmd_index_has(args):
-    if len(args) not in (2, 3) or (len(args) == 3 and (args[2] in ("", ".", "..") or "/" in args[2])):
-        usage("index-has: expected <names-dir> <job_id> [<id>]")
-    return 0 if index_has(*args) else 1
+OVERRIDE_LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ uid=(\d+) reason=\S.*\n\Z")
 
 
-def read_pending(path):
-    """The settings in one pending record (R17), read like a name index. None when it is gone; exit 9 when it is unsafe or not a record."""
-    data = read_state_file(path)
-    if data is None:
+def read_private(path, limit):
+    """The text of a regular file of ours that group and other cannot touch, opened without following a link, at most `limit` bytes; else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # absent, or a symlink: not ours
+    except OSError:
         return None
     try:
-        record = json.loads(data.decode("utf-8"))
-    except ValueError:  # not JSON, or not UTF-8
-        record = None
-    if not isinstance(record, dict) or not all(isinstance(record.get(field), str) for field in ("key", "name")):
-        die(9, "%s is not a pending record" % path)
-    return record
-
-
-def cmd_reconcile(args):
-    """R3, R17: settle the pending records named <id> against Vanth's own acceptance record, so a run that died after `vanth start` returned
-    does not lose its job. The record's key is looked up in local_start_requests, read-only and matched exactly (never through `vanth list`,
-    which caps at 1,000 rows and matches names by substring). Present: the start was accepted, so the job id goes to <names-dir>/<id> unless
-    it is already listed, and then the record is unlinked; a crash between the two is redone from what is on disk. Absent: the outcome is
-    indeterminate, so the record stays, nothing is sent, and `pending-unsent <id>` is printed on stderr (exit 3)."""
-    if len(args) != 4 or args[3] in ("", ".", "..") or "/" in args[3]:
-        usage("reconcile: expected <pending-dir> <names-dir> <db> <id>")
-    pending, names, db, ident = args
-    unsent = False
-    try:
-        nonces = sorted(name for name in os.listdir(pending) if PENDING_NONCE.fullmatch(name))
-    except FileNotFoundError:
-        return 0
-    for nonce in nonces:
-        path = os.path.join(pending, nonce)
-        record = read_pending(path)
-        if record is None or record["name"] != ident:  # None: settled by another reconcile since the listing
-            continue
-        found = query_ro(db, "SELECT job_id FROM local_start_requests WHERE idempotency_key = ?", (record["key"],))
-        if not found:
-            unsent = True
-            continue
-        job = found[0]["job_id"]
-        if not isinstance(job, str) or not JOB_ID.fullmatch(job) or job.startswith("-"):
-            die(9, "Vanth's job id for %s is not a job id: %r" % (record["key"], job))
-        if not index_has(names, job, ident):
-            cmd_append_index([os.path.join(names, ident), job])
-        failpoint("reconcile.indexed")
-        cmd_remove([path])
-    if unsent:
-        sys.stderr.write("pending-unsent %s\n" % ident)
-    return 3 if unsent else 0
-
-
-def cmd_session_token(args):
-    """The session token of a state dir whose caller has no CLAUDE_SESSION_ID: 16 hex characters, made on first use and never replaced."""
-    if len(args) != 1:
-        usage("session-token: expected <file>")
-    path = os.path.abspath(args[0])
-    write_new(path, (os.urandom(8).hex() + "\n").encode())  # False when the token exists already, the normal case
-    ids = read_index(path)  # the safe reader of a one-line control file: not a symlink, not a FIFO, yours
-    if not ids:
-        die(9, "%s holds no token" % path)
-    print(ids[0])
-    return 0
-
-
-def cmd_failpoint(args):
-    if len(args) != 1:
-        usage("failpoint: expected <name>")
-    if args[0] not in FAILPOINTS:
-        die(2, "unknown failpoint %r" % args[0])
-    failpoint(args[0])
-    return 0
-
-
-def cmd_test_capability(args):
-    if args:
-        usage("test-capability: takes no arguments")
-    problem = test_capability_problem()
-    if problem:
-        die(2, "the test capability is not granted: %s" % problem)
-    return 0
-
-
-COMMANDS = {"lock": cmd_lock, "lock-held": cmd_lock_held, "publish": cmd_publish, "retire": cmd_retire,
-            "write-record": cmd_write_record, "rec-read": cmd_rec_read, "check-state": cmd_check_state,
-            "launch-exec": cmd_launch_exec, "append-index": cmd_append_index, "fp": cmd_fp, "sha256": cmd_sha256, "json-get": cmd_json_get,
-            "modes-check": cmd_modes_check, "redact": cmd_redact, "jobs-ro": cmd_jobs_ro,
-            "verdict-of": cmd_verdict_of, "pending-write": cmd_pending_write, "remove": cmd_remove,
-            "index-last": cmd_index_last, "index-has": cmd_index_has, "reconcile": cmd_reconcile, "session-token": cmd_session_token,
-            "failpoint": cmd_failpoint, "test-capability": cmd_test_capability}
-
-
-def adopt_secrets(argv):
-    """`--secrets-fd N <subcommand> ...`: read the NAME=value records on descriptor N (NUL-terminated, to its end), so that no secret
-    value is ever in an argv. With no record, return the arguments after the option. Otherwise run this helper again, from its first
-    instruction and without the option, with the values added to its environment: a process's environment at exec is what ps -E
-    shows, and what the daemon this helper launches is built from. It does not return."""
-    if len(argv) < 3 or not argv[1].isdigit():
-        usage("--secrets-fd: expected N <subcommand> [args...]")
-    fd, rest, raw = int(argv[1]), argv[2:], b""
-    try:
-        while True:
-            part = os.read(fd, 65536)
-            if not part:
-                break
-            raw += part
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > limit:
+            return None
+        return os.read(fd, limit + 1).decode("utf-8", "replace")
+    finally:
         os.close(fd)
-    except OSError as exc:
-        die(1, "--secrets-fd %d: %s" % (fd, exc.strerror))
-    records = [r for r in raw.split(b"\0") if r]
-    if not records:
-        return rest
-    env = dict(os.environb)
-    for record in records:
-        name, equals, value = record.partition(b"=")
-        if not equals or not SECRET_ENV_NAME.fullmatch(name):
-            die(2, "--secrets-fd: every record must be NAME=value, a name of capitals, digits and underscores")
-        env[name] = value
-    if not sys.executable:
-        die(1, "--secrets-fd: this interpreter has no path to run again")
-    os.execve(sys.executable, [sys.executable] + (["-I"] if sys.flags.isolated else []) + [sys.argv[0]] + rest, env)
+
+
+def valid_override(path):
+    """A pending override holds one `<time> uid=<n> reason=<text>` line of ours."""
+    match = OVERRIDE_LINE.match(read_private(path, 4096) or "")
+    return bool(match) and int(match.group(1)) == os.getuid()
+
+
+def append_log(home, text):
+    log = os.open(os.path.join(home, "overrides.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(log, "a") as fh:
+        fh.write(text)
+
+
+def cmd_override_write(args):
+    """Publish <home>/stop-override atomically (private temp, fsync, rename). A stale entry that is not a valid override (a symlink, an
+    empty or partial file) is replaced; a valid one already pending is an error."""
+    if len(args) != 2 or not args[1].strip() or "\n" in args[1] or "\0" in args[1]:
+        usage("override-write: expected <home> <one-line reason>")
+    home, reason = args
+    path = os.path.join(home, "stop-override")
+    if valid_override(path):
+        die(1, "override-write: a stop-override is already pending")
+    line = "%s uid=%d reason=%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.getuid(), reason)
+    tmp = "%s.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.rename(tmp, path)  # replaces a stale file or symlink itself, never what it points at
+        except IsADirectoryError:
+            os.rmdir(path)  # an empty stale directory; a full one fails loudly
+            os.rename(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+    append_log(home, "set " + line)
+    return 0
+
+
+def cmd_override_take(args):
+    """Consume a VALID override (exit 0); anything else is left alone and is exit 3."""
+    if len(args) != 1:
+        usage("override-take: expected <home>")
+    path = os.path.join(args[0], "stop-override")
+    if not valid_override(path):
+        return 3
+    os.unlink(path)
+    append_log(args[0], "used %s uid=%d\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.getuid()))
+    return 0
+
+
+def job_tags(row):
+    """The tags of a jobs.sqlite row: tags_json must parse to an array of strings, else this fails (the Stop guard then blocks)."""
+    try:
+        tags = json.loads(row.get("tags_json") or "")
+    except (ValueError, RecursionError, TypeError) as exc:
+        raise ValueError("job %s: tags_json is not JSON (%s)" % (row.get("job_id"), exc))
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        raise ValueError("job %s: tags_json is not an array of strings" % row.get("job_id"))
+    return tags
+
+
+def cmd_session_read(args):
+    """session-read <home>: the session token this state dir keeps, only if the dir and the file are private and ours, the file is no link,
+    and its content is exactly 16 lowercase hex digits (what velo-task generates)."""
+    if len(args) != 1:
+        usage("session-read: expected <home>")
+    home = os.stat(args[0])
+    if not stat.S_ISDIR(home.st_mode) or home.st_uid != os.getuid() or home.st_mode & 0o077:
+        die(1, "session-read: %s is not a private directory of yours" % args[0])
+    token = read_private(os.path.join(args[0], "session"), 64)
+    if token is None or not re.fullmatch(r"[0-9a-f]{16}", token):
+        die(1, "session-read: the session file is not a private, generated token of yours")
+    print(token)
+    return 0
+
+
+def cmd_inflight(args):
+    """inflight <db> <session> [--others]: this session's jobs whose verdict is in-flight, as `name job_id status` lines (--others: how many
+    in-flight jobs do NOT carry the session's tag). The same verdict_of that status uses, so a failed job with a restart pending counts."""
+    if len(args) not in (2, 3) or (len(args) == 3 and args[2] != "--others"):
+        usage("inflight: expected <db> <session> [--others]")
+    mine, others = [], 0
+    for row in query_ro(args[0], "SELECT * FROM jobs ORDER BY created_at, job_id"):
+        if verdict_of(row) != "in-flight":
+            continue
+        if "session:" + args[1] in job_tags(row):
+            mine.append(row)
+        else:
+            others += 1
+    print(others) if len(args) == 3 else [print(tok(r["name"]), tok(r["job_id"]), r["status"]) for r in mine]
+    return 0
+
+
+COMMANDS = {"json-get": cmd_json_get, "jobs-ro": cmd_jobs_ro, "verdict-of": cmd_verdict_of, "launch": cmd_launch,
+            "override-write": cmd_override_write, "override-take": cmd_override_take, "inflight": cmd_inflight, "session-read": cmd_session_read}
 
 
 def main(argv):
-    if argv[:1] == ["--secrets-fd"]:
-        argv = adopt_secrets(argv)
-    failpoint_spec()  # a stray VELO_TASK_FAILPOINT or VELO_TASK_FSYNC_TRACE is refused by every subcommand, not just the ones that use it
-    load_trace()
     if not argv or argv[0] in ("-h", "--help", "help"):
         sys.stdout.write(__doc__)
         return 0

@@ -1,29 +1,15 @@
 #!/bin/bash
-# velo-task - detached-work coordination on a pinned, hash-locked Vanth (docs/velo-task-spec.md).
-#
-# M1 (foundation) is the install and daemon lifecycle, M2a adds run and status:
-#   velo-task install-vanth    build the pinned venv from requirements/vanth.lock (R11, R12)
-#   velo-task ensure-daemon    adopt the daemon velo-task launched, or launch one (R6, R11, R18)
-#   velo-task restart-daemon   SIGTERM the validated daemon pid, then a clean launch (R7, R18)
-#   velo-task doctor           read-only report on install, allowlist, modes, provenance, schema
-#   velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd...   start a job, print its job_id (R2-R4, R17)
-#   velo-task status [--json] [--issue N] [--session S] <id> | --job <job_id>   print `<id> <verdict>` (R1, R3): ok, failed(n), timeout,
-#                              killed, lost, upstream-failed(<parent>) or in-flight; exit 6 and `velo-task restart-daemon` when the daemon is down;
-#                              exit 3 for a job Vanth does not know, or an id whose start Vanth never received (pending-unsent: re-run it)
-#   velo-task status [--session <id>|me | --all] [--issue N] [--json]   list jobs, newest first, as `<id> <job_id> <verdict>` (default: this session's; no daemon needed)
-# A job belongs to a session: $CLAUDE_SESSION_ID, else the token in <state>/session (one per state dir, made on first use); `run` tags it session:<id>.
-# Every other subcommand exits 2 ("not implemented yet").
-#
-# Layout (VELO_TASK_HOME defaults to ${VELO_STATE:-~/.agents/state}/velo-task; tests override it):
-#   venv/               pinned Vanth install      vanth/              VANTH_HOME = AGENT_BG_HOME
-#   vanth.env.allow     secret NAMES the daemon may inherit (one per line)
-#   daemon.provenance   pid, start time, launch digest, incarnation of the daemon WE launched
-#   daemon.intent       the same, written the moment a launch has a pid, retired once the daemon is proved ready
-#   lock/daemon         per-home lock (install, ensure, restart)   daemon.launch.log   vanthd stdout/stderr
-# VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT,
-# VELO_TASK_STOP_WAIT, VELO_TASK_LOCK_WAIT (seconds), VELO_TASK_POLL (poll interval). Exit codes: 0 ok,
-# 1 error, 2 usage, 6 daemon refused/down/misconfigured. The functions live in velo-task-lib.sh, which
-# this file sources; nothing in the library is a subcommand.
+# velo-task - detached-work coordination on a pinned, hash-locked Vanth (docs/velo-task-spec.md). Vanth is the only state.
+#   velo-task install-vanth    build the pinned venv from requirements/vanth.lock
+#   velo-task ensure-daemon    adopt the daemon velo-task launched, or launch one (private, allowlisted environment)
+#   velo-task restart-daemon   SIGTERM the validated daemon pid, then a clean launch
+#   velo-task run <id> --timeout S [--issue N] [--stage ST] [--rerun] -- cmd...   start a job, print its job_id
+#   velo-task status <id> | --job <job_id>   print `<id> <verdict>`: ok, failed(n), timeout, killed, lost or in-flight
+#   velo-task wait <id>... [--any|--all] [--timeout S]   one `<id> <verdict>` line per id; exit 0 iff ok, 3 on timeout, 2 unknown id
+#   velo-task cancel <id> | --job <job_id>   vanth stop, then the verdict (killed)
+#   velo-task stop-override --reason <text>   let the current session end once although jobs are in flight (audited)
+# <id> is the job's name in Vanth; the newest job of that exact name is meant. Exit codes: 0 ok, 1 error, 2 usage/unknown id, 3 wait timeout, 4 cancel of a finished job,
+# 5 idempotency conflict, 6 daemon refused/down. The functions live in velo-task-lib.sh; nothing in the library is a subcommand.
 set -euo pipefail
 
 SELF_SRC="${BASH_SOURCE[0]}"
@@ -34,11 +20,10 @@ SELF="$(cd "$SELF_DIR" && pwd)/${SELF_SRC##*/}"
 usage() { /usr/bin/sed -n '2,/^set -euo/p' "$SELF" | /usr/bin/sed '$d; s/^# \{0,1\}//'; }
 sub="${1:-}"; [ "$#" -eq 0 ] || shift
 case "$sub" in
-  install-vanth|ensure-daemon|restart-daemon|doctor)
+  install-vanth|ensure-daemon|restart-daemon)
     [ "$#" -eq 0 ] || die 2 "$sub takes no arguments"
     "cmd_${sub//-/_}" ;;
-  run|status) "cmd_$sub" "$@" ;;
+  run|status|wait|cancel|stop-override) "cmd_${sub//-/_}" "$@" ;;
   -h|--help|help|'') usage ;;
-  _*) die 2 "unknown subcommand '$sub'" ;;
-  *) die 2 "'$sub' is not implemented yet (available: install-vanth, ensure-daemon, restart-daemon, doctor, run, status)" ;;
+  *) die 2 "unknown subcommand '$sub' (available: install-vanth, ensure-daemon, restart-daemon, run, status, wait, cancel, stop-override)" ;;
 esac
