@@ -95,6 +95,7 @@ inherited_names() {  # the allowlisted names this environment sets, one a line: 
 }
 
 need_home() {  # the state root is private (0700) before anything is kept in it
+  [ ! -L "$VELO_TASK_HOME" ] || die 6 "$VELO_TASK_HOME is a symlink; refusing"
   /bin/mkdir -p -m 700 "$VELO_TASK_HOME"
   # The mode is `stat -c %a` on GNU and `stat -f %Lp` on BSD; GNU first, because BSD stat rejects -c cleanly while GNU stat
   # accepts -f (it means "filesystem status") and would answer with a report that is not a mode.
@@ -137,7 +138,8 @@ prov_live() {  # the provenance names a process that runs with the recorded star
 }
 modes_problem() {  # succeeds, saying what, when anything under Vanth's home or the launch log is open to group or other (they must be 0700/0600)
   local bad
-  [ -e "$VH" ] || return 1
+  [ -e "$VH" ] || [ -L "$VH" ] || return 1
+  [ ! -L "$VH" ] || { MODES_WHY="$VH is a symlink"; return 0; }
   [ ! -e "$LAUNCH_LOG" ] || set -- "$LAUNCH_LOG"
   # Any group or other bit: -perm +077 on BSD find, -perm /077 on GNU find, and neither is accepted by the other. Six single-bit tests
   # joined by -o mean the same on both.
@@ -251,7 +253,7 @@ verify_install() {
   [ "$locked" = "$installed" ] || fail_install "installed distributions differ from the lock: $(/usr/bin/diff <(echo "$locked") <(echo "$installed") | /usr/bin/tr '\n' ' ')"
   "$PY" -I -c 'import vanth' || fail_install "vanth is not importable"
   tmp=$(/usr/bin/mktemp -d "$VENV/schema.XXXXXX")  # inside the venv: fail_install removes it with the venv
-  "$PY" -I -c 'import sqlite3, sys; from vanth.migrations import migrate; db = sqlite3.connect(sys.argv[1] + "/jobs.sqlite"); migrate(db, sys.argv[1]); db.close()' "$tmp" \
+  ( umask 077; "$PY" -I -c 'import sqlite3, sys; from vanth.migrations import migrate; db = sqlite3.connect(sys.argv[1] + "/jobs.sqlite"); migrate(db, sys.argv[1]); db.close()' "$tmp" ) \
     || fail_install "the installed Vanth could not create its schema"
   st jobs-ro "$tmp/jobs.sqlite" 'SELECT 1 AS ok' >/dev/null || fail_install "the installed Vanth schema lacks columns velo-task reads"
   /bin/rm -rf "$tmp"
@@ -351,11 +353,11 @@ resolve() {  # <id> | --job <job_id>: sets JOB (and LABEL) from Vanth's own data
   local db="$VH/jobs.sqlite" rc=0 found=""
   if [ "$1" = --job ]; then
     check_arg job "$2"; LABEL="$2"
-    [ ! -e "$db" ] || found=$(st jobs-ro --cols job_id "$db" 'SELECT job_id FROM jobs WHERE job_id = ?' "$2") || rc=$?
+    [ ! -e "$db" ] && [ ! -L "$db" ] || found=$(st jobs-ro --cols job_id "$db" 'SELECT job_id FROM jobs WHERE job_id = ?' "$2") || rc=$?
   else
     check_arg id "$1"; LABEL="$1"
     # The exact name, newest first: a read of the database, so there is no 1,000-row `vanth list` cap and no substring match.
-    [ ! -e "$db" ] || found=$(st jobs-ro --cols job_id "$db" 'SELECT job_id FROM jobs WHERE name = ? ORDER BY created_at DESC, job_id DESC LIMIT 1' "$1") || rc=$?
+    [ ! -e "$db" ] && [ ! -L "$db" ] || found=$(st jobs-ro --cols job_id "$db" 'SELECT job_id FROM jobs WHERE name = ? ORDER BY created_at DESC, job_id DESC LIMIT 1' "$1") || rc=$?
   fi
   [ "$rc" -eq 0 ] || die 6 "jobs.sqlite cannot be read (helper exit $rc, see above); nothing was resolved"
   [ -n "$found" ] || die 2 "unknown id '${2:-$1}': Vanth has no job by that name; address a job by its id with --job <job_id>"

@@ -38,6 +38,7 @@ velo-task stop-override --reason <text>         let the session end once with jo
   DYLD_*, ...), passed by name so no value is in an argv; it listens on 127.0.0.1 only; a daemon is adopted only if a 3-field record
   (pid, start time, launch digest) written after it was proven ready matches. Anything else is exit 6 with the recovery command.
 - **R9** Exit codes: 0 ok, 1 error, 2 usage/unknown id (or a job Vanth no longer knows: no verdict line), 3 wait timeout, 4 `cancel` of a job that already finished (its real verdict goes to stderr, `already-terminal`), 5 idempotency conflict, 6 daemon refused/down/misconfigured.
+- **R11** Every path the guard, hooks and helpers trust is absent or a private, real object of ours: a Vanth home or state dir that is a link, a file or dangling is a problem (guard blocks, SessionStart says so); only a genuinely absent one allows. `jobs.sqlite` must be a regular file, ours, mode 0600, in a private real directory, or no row is read.
 - **R10** Two PreToolUse deny hooks (hooks/deny-vanth-cleanup.sh, hooks/deny-pgrep-wait-loop.sh; tests/test_velo_task_hooks.sh): no
   `vanth prune|restore`, no `until/while pgrep` wait loop. Kept as they were (bars B13, B29 hook half); all scripts run under bash 3.2 (B14).
 
