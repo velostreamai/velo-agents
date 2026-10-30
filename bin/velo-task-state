@@ -76,10 +76,26 @@ def read_only_authorizer(action, arg1, arg2, db_name, source):
     return sqlite3.SQLITE_OK if action in (SQLITE_READ, SQLITE_SELECT, SQLITE_FUNCTION) else sqlite3.SQLITE_DENY
 
 
+def private_dir(path):
+    """A real directory (not a link) of ours that group and other cannot enter."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
 def query_ro(db, sql, params=()):
     """The rows (as dicts) of one SELECT on a Vanth database, read-only: mode=ro, query_only, and an authorizer that denies all but SELECT."""
+    path = os.path.abspath(db)
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db)), uri=True, timeout=2.0)
+        info = os.lstat(path)  # lstat: a symlink to a decoy database is not Vanth's database
+    except OSError as err:
+        die(1, "jobs-ro: %s: %s" % (db, err.strerror))
+    if not private_dir(os.path.dirname(path)) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        die(1, "jobs-ro: %s is not a private regular file of yours in a private directory" % db)
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % quote(path), uri=True, timeout=2.0)
         con.execute("PRAGMA query_only=ON")
         have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
         missing = [c for c in JOB_COLUMNS if c not in have]
@@ -230,6 +246,8 @@ def cmd_override_write(args):
     if len(args) != 2 or not args[1].strip() or "\n" in args[1] or "\0" in args[1]:
         usage("override-write: expected <home> <one-line reason>")
     home, reason = args
+    if not private_dir(home):
+        die(1, "override-write: %s is not a private directory of yours" % home)
     path = os.path.join(home, "stop-override")
     if valid_override(path):
         die(1, "override-write: a stop-override is already pending")
@@ -259,7 +277,7 @@ def cmd_override_take(args):
     if len(args) != 1:
         usage("override-take: expected <home>")
     path = os.path.join(args[0], "stop-override")
-    if not valid_override(path):
+    if not private_dir(args[0]) or not valid_override(path):
         return 3
     os.unlink(path)
     append_log(args[0], "used %s uid=%d\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.getuid()))
@@ -282,8 +300,7 @@ def cmd_session_read(args):
     and its content is exactly 16 lowercase hex digits (what velo-task generates)."""
     if len(args) != 1:
         usage("session-read: expected <home>")
-    home = os.stat(args[0])
-    if not stat.S_ISDIR(home.st_mode) or home.st_uid != os.getuid() or home.st_mode & 0o077:
+    if not private_dir(args[0]):
         die(1, "session-read: %s is not a private directory of yours" % args[0])
     token = read_private(os.path.join(args[0], "session"), 64)
     if token is None or not re.fullmatch(r"[0-9a-f]{16}", token):

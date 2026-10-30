@@ -4,7 +4,7 @@
 # home. Advisory, always exit 0: an unreadable database is said so on stdout, never an error that would obstruct the session start.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || exit 0
 STATE="${VELO_TASK_HOME:-${VELO_STATE:-$HOME/.agents/state}/velo-task}"
-[ -d "$STATE/vanth" ] || exit 0
+if [ ! -L "$STATE" ] && [ ! -L "$STATE/vanth" ] && [ ! -e "$STATE/vanth" ] && { [ ! -e "$STATE" ] || [ -d "$STATE" ]; }; then exit 0; fi  # only a genuinely absent home is silent
 [ -r "$HOOK_DIR/../bin/velo-task-lib.sh" ] && . "$HOOK_DIR/../bin/velo-task-lib.sh" 2>/dev/null || exit 0
 session=$(session_id 2>&1) || { echo "velo-task: the session cannot be resolved: $session"; exit 0; }
 rows=$(inflight_of "$session" 2>&1) || { echo "velo-task: Vanth's database cannot be read, so in-flight jobs are unknown: $rows"; exit 0; }

@@ -7,7 +7,7 @@
 # Fail closed: once a Vanth home exists, ANYTHING but a proven "nothing in flight" blocks, with the one way out, `velo-task stop-override
 # --reason <text>`, which lets one Stop through: a missing database, a database that is garbled, locked past 2 s or of another schema, a
 # library that is missing or does not load, a query that does not end in the success sentinel (a library that calls `exit 0` included).
-# Only a missing Vanth HOME allows: nothing was ever started here. Nothing releases a block after N runs. No program is looked up on PATH.
+# Only a Vanth HOME that is genuinely absent (no symlink, dangling or not; no non-directory) allows: nothing was ever started here. Nothing releases a block after N runs. No program is looked up on PATH.
 # Contract: exit 0 lets the session stop, exit 2 blocks with the reason on stderr.
 /bin/cat >/dev/null 2>&1 || true   # the Stop payload is not read: the session is velo-task's own resolution, not something a payload can name
 HINT="to end this session anyway: velo-task stop-override --reason <text>"
@@ -15,7 +15,8 @@ block() { printf 'velo-task Stop guard: %s\n' "$1" >&2; exit 2; }
 [ -n "${VELO_TASK_HOME:-}${VELO_STATE:-}${HOME:-}" ] || block "no HOME, VELO_STATE or VELO_TASK_HOME: the state directory cannot be located
 $HINT"
 STATE="${VELO_TASK_HOME:-${VELO_STATE:-$HOME/.agents/state}/velo-task}"
-[ -d "$STATE/vanth" ] || exit 0
+# "No Vanth home" is only a path that is genuinely absent: a dangling or live symlink, a non-directory, anything else goes on to the checks.
+if [ ! -L "$STATE" ] && [ ! -L "$STATE/vanth" ] && [ ! -e "$STATE/vanth" ] && { [ ! -e "$STATE" ] || [ -d "$STATE" ]; }; then exit 0; fi
 SELF="${BASH_SOURCE[0]}"; DIR="${SELF%/*}"; [ "$DIR" != "$SELF" ] || DIR=.
 LIB="$DIR/../bin/velo-task-lib.sh"
 OK=VELO_GUARD_QUERY_COMPLETE

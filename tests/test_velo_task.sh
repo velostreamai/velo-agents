@@ -194,6 +194,7 @@ if not drop:
                     [("a", "one", "running"), ("b", "two", "failed")])
 con.commit()
 PY
+  chmod 600 "$1"
 }
 mkvenv() {  # a fake installed Vanth: stub vanthd (listens) and vanth (both record to $E_CALLS), install marker
   # bin/python is a wrapper SCRIPT we own, never a symlink to the real interpreter: a stub (or a mutant) that
@@ -505,7 +506,14 @@ t_jobs_ro() {
   run ST jobs-ro "$d/jobs.sqlite" 'PRAGMA query_only=OFF'; need "a PRAGMA is refused" [ "$RC" = 1 ]
   mkdb "$d/bad.sqlite" created_at; run ST jobs-ro "$d/bad.sqlite" 'SELECT 1'
   need "a database without a column velo-task reads is exit 5" [ "$RC" = 5 ]; need "...naming it" grep -q 'jobs.created_at' <<<"$OUT"
-  printf 'not a database, just text\n' > "$d/junk.sqlite"; run ST jobs-ro "$d/junk.sqlite" 'SELECT 1'; need "a file that is not a database is exit 1" [ "$RC" = 1 ]
+  printf 'not a database, just text\n' > "$d/junk.sqlite"; chmod 600 "$d/junk.sqlite"; run ST jobs-ro "$d/junk.sqlite" 'SELECT 1'; need "a file that is not a database is exit 1" [ "$RC" = 1 ]
+  ln -s "$d/jobs.sqlite" "$d/link.sqlite"; run ST jobs-ro "$d/link.sqlite" 'SELECT 1'
+  need "a symlink to a good database is refused (exit 1)" [ "$RC" = 1 ]; need "...saying why" grep -q 'not a private regular file' <<<"$OUT"
+  cp "$d/jobs.sqlite" "$d/open.sqlite"; chmod 644 "$d/open.sqlite"; run ST jobs-ro "$d/open.sqlite" 'SELECT 1'; need "a database open to group or other is refused" [ "$RC" = 1 ]
+  mkdir -m 755 "$d/loose"; cp "$d/jobs.sqlite" "$d/loose/jobs.sqlite"; run ST jobs-ro "$d/loose/jobs.sqlite" 'SELECT 1'; need "a database in a directory open to group or other is refused" [ "$RC" = 1 ]
+  mkdir -m 700 "$d/real"; cp "$d/jobs.sqlite" "$d/real/jobs.sqlite"; ln -s "$d/real" "$d/dirlink"; run ST jobs-ro "$d/dirlink/jobs.sqlite" 'SELECT 1'
+  need "a database reached through a symlinked directory is refused" [ "$RC" = 1 ]
+  run ST jobs-ro "$d/real/jobs.sqlite" 'SELECT 1'; need "control: the same file, private in a private directory, is read" [ "$RC" = 0 ]
   run ST jobs-ro "$d/none.sqlite" 'SELECT 1'; need "a missing database is exit 1 and is not created" [ "$RC" = 1 -a ! -e "$d/none.sqlite" ]
   "$PYBIN" -I -c 'import sqlite3, sys, time; c = sqlite3.connect(sys.argv[1], isolation_level=None); c.execute("BEGIN EXCLUSIVE"); open(sys.argv[2], "w").close(); time.sleep(6)' "$d/jobs.sqlite" "$d/held" &
   waitfor 5 test -e "$d/held" || { echo "FAILED: the lock was never taken"; exit 1; }
@@ -623,6 +631,8 @@ t_override() {  # the one-shot Stop override: a valid private file of yours, pub
   need "write over a directory that is not empty fails loudly (exit 1)" [ "$RC" = 1 ]; need "...leaving no temp file" [ "$(ls -A "$h" | grep -c 'stop-override\.')" = 0 ]
   rm -rf "$h/stop-override"; mkdir "$h/stop-override"
   run ST override-write "$h" 'over an empty directory'; need "write replaces an empty directory" [ "$RC" = 0 -a -f "$h/stop-override" ]; rm -f "$h/stop-override"
+  ln -s "$h" "$E/homelink"; run ST override-write "$E/homelink" 'through a linked home'; need "write into a symlinked state dir is refused (exit 1)" [ "$RC" = 1 ]
+  run ST override-write "$h" 'for take'; run ST override-take "$E/homelink"; need "take through a symlinked state dir is refused (exit 3)" [ "$RC" = 3 ]; rm -f "$h/stop-override"
   run ST override-write "$h" ''; need "an empty reason is a usage error (exit 2)" [ "$RC" = 2 ]
   run ST override-write "$h" $'two\nlines'; need "a reason with a newline is a usage error (exit 2)" [ "$RC" = 2 ]
 }
@@ -1466,6 +1476,36 @@ t_session_file() {  # the fallback session token is read only if it is exactly w
   run ST session-read "$h"; need "control: restored, the token is read again" [ "$RC" = 0 ]
   mkdir "$h/session.d"; rm "$f"; mkdir "$f"; run ST session-read "$h"; need "a directory is refused" [ "$RC" = 1 ]; rmdir "$f"
   run ST session-read "$E/no-such-dir"; need "a missing state dir is refused" [ "$RC" = 1 ]
+  printf '%s' "$tok" > "$f"; chmod 600 "$f"; ln -s "$h" "$E/homelink"; run ST session-read "$E/homelink"; need "a symlinked state dir is refused" [ "$RC" = 1 ]
+}
+t_vanth_paths() {  # every path the guard and the hooks trust: absent allows, anything else that is not a private real object blocks
+  local d p
+  mkjobs; tag_row p-run running "$SID" >/dev/null; p=$E_VH/jobs.sqlite
+  cp "$p" "$E/decoy.sqlite"; chmod 600 "$E/decoy.sqlite"
+  sql 'DELETE FROM jobs' >/dev/null; cp "$p" "$E/empty.sqlite"; chmod 600 "$E/empty.sqlite"   # a decoy with no rows
+  tag_row p-run running "$SID" >/dev/null
+  guard; need "(setup) the real database holds an in-flight job: blocks" [ "$RC" = 2 ]
+  rm "$p"; ln -s "$E/empty.sqlite" "$p"; guard; need "jobs.sqlite as a symlink to a decoy with no rows blocks, it does not allow" [ "$RC" = 2 ]
+  sstart; need "SessionStart says the database cannot be read" grep -q 'cannot be read' <<<"$OUT"
+  run VT status p-run; need "status resolves nothing through it (exit 6)" [ "$RC" = 6 ]
+  rm "$p"; ln -s "$E/nowhere.sqlite" "$p"; run VT status p-run; need "a dangling jobs.sqlite is an error for status (exit 6), not 'unknown id'" [ "$RC" = 6 ]
+  rm "$p"; cp "$E/empty.sqlite" "$p"; chmod 644 "$p"; guard; need "a jobs.sqlite open to group or other blocks" [ "$RC" = 2 ]; run VT status p-run; need "...and status will not read it (exit 6)" [ "$RC" = 6 ]; rm "$p"; cp "$E/decoy.sqlite" "$p"; chmod 600 "$p"
+  guard; need "control: private again, the in-flight job blocks by name" [ "$RC" = 2 ]
+  mv "$E_VH" "$E/vh.real"; ln -s /nonexistent/vanth-home "$E_VH"
+  guard; need "a dangling symlink where the Vanth home should be blocks" [ "$RC" = 2 ]
+  sstart; need "SessionStart is not silent about it" [ -n "$OUT" ]
+  rm "$E_VH"; : > "$E_VH"; guard; need "a regular file where the Vanth home should be blocks" [ "$RC" = 2 ]
+  sstart; need "SessionStart is not silent about a file either" [ -n "$OUT" ]
+  rm "$E_VH"; ln -s "$E/vh.real" "$E_VH"; guard; need "a symlink to the real Vanth home blocks" [ "$RC" = 2 ]
+  run VT ensure-daemon; need "ensure-daemon refuses a symlinked Vanth home (exit 6)" [ "$RC" = 6 ]; need "...saying the home is a symlink" grep -q 'is a symlink' <<<"$OUT"
+  rm "$E_VH"; mv "$E/vh.real" "$E_VH"; guard; need "control: restored, the guard blocks on the job" [ "$RC" = 2 ]; need "...naming it" grep -q p-run <<<"$OUT"
+  d=$E/state-link; ln -s /nonexistent/state "$d"; VELO_TASK_HOME=$d guard; need "a dangling symlink as the state dir blocks" [ "$RC" = 2 ]
+  mkdir "$E/emptystate"; rm "$d"; ln -s "$E/emptystate" "$d"; VELO_TASK_HOME=$d guard; need "a symlink to a directory with no Vanth home blocks too" [ "$RC" = 2 ]
+  sstart_at() { VELO_TASK_HOME=$d run /bin/bash "$R/hooks/velo-task-session-start.sh" </dev/null; }
+  sstart_at; need "SessionStart is not silent about a symlinked state dir" [ -n "$OUT" ]
+  : > "$E/statefile"; VELO_TASK_HOME=$E/statefile guard; need "a regular file as the state dir blocks" [ "$RC" = 2 ]
+  VELO_TASK_HOME=$E/absent-state guard; need "control: a state dir that is genuinely absent allows" [ "$RC" = 0 ]
+  ln -s "$E_HOME" "$E/homelink"; VELO_TASK_HOME=$E/homelink run VT ensure-daemon; need "need_home refuses a symlinked state root (exit 6)" [ "$RC" = 6 ]; need "...saying the root is a symlink" grep -q 'is a symlink' <<<"$OUT"
 }
 t_session_start() {
   mkjobs; tag_row s-run running "$SID" >/dev/null; tag_row s-oth running other-1 >/dev/null; tag_row s-oth2 queued other-2 >/dev/null; tag_row s-done completed "$SID" >/dev/null
@@ -1603,6 +1643,7 @@ check "B-S: the Stop guard blocks this session's in-flight jobs and fails closed
 check "the stop-override is one Stop, audited" t_stop_override
 check "the guard reads tags_json as JSON and fails closed on anything else" t_tags_json
 check "the fallback session token is read only if private, ours, not a link and token-shaped" t_session_file
+check "every path the guard and hooks trust: absent allows, a link, a file or a loose mode blocks" t_vanth_paths
 check "SessionStart lists this session's jobs and counts the others" t_session_start
 echo "velo-task: mutation proofs (each check must go red on a mutated copy)"
 V=bin/velo-task; L=bin/velo-task-lib.sh; S=bin/velo-task-state; H=hooks/velo-task-stop-guard.sh; HS=hooks/velo-task-session-start.sh
@@ -1613,7 +1654,6 @@ prove "json-get reads a malformed file as empty" t_json_get $S '    doc = json.l
 prove "json-get lets a non-object through" t_json_get $S '    if not isinstance(doc, dict):' '    if False:'
 prove "json-get fails on a missing file" t_json_get $S $'        except FileNotFoundError:\n            return 0' $'        except FileNotFoundError:\n            raise'
 prove "json-get writes in the caller's locale encoding" t_json_get $S '    sys.stdout.reconfigure(encoding="utf-8")' '    pass'
-prove "jobs-ro opens the database with create rights" t_jobs_ro $S '?mode=ro' '?mode=rwc'
 prove "jobs-ro waits 0 ms" t_jobs_ro $S 'uri=True, timeout=2.0' 'uri=True, timeout=0.0'
 prove "jobs-ro skips the schema check" t_jobs_ro $S '        if missing:' '        if False:'
 prove "jobs-ro installs no authorizer" t_jobs_ro $S '        con.set_authorizer(read_only_authorizer)' '        pass'
@@ -1799,7 +1839,7 @@ prove "Stop guard: no success marker required" t_stop_guard $H $'[ "${out##*$\'\
 prove "Stop guard: stopping does not block" t_stop_guard $S '"retrying", "stopping"))' '"retrying"))'
 prove "Stop guard: a lost job blocks" t_stop_guard $S 'return "lost"  # orphaned, any other cancelled, a status outside both sets' 'return "in-flight"'
 prove "Stop guard: a restart pending does not block" t_stop_guard $S 'if status in ("failed", "orphaned") and restart_pending(row):' 'if False:'
-prove "Stop guard: no Vanth home allows, a home does not" t_stop_guard $H '[ -d "$STATE/vanth" ] || exit 0' 'exit 0'
+prove "Stop guard: no Vanth home allows, a home does not" t_stop_guard $H '[ ! -e "$STATE/vanth" ] && {' 'true && {'
 prove "Stop guard: a missing database is no jobs" t_stop_guard $L $'  st inflight "$VH/jobs.sqlite" "$1"\n}' $'  [ -e "$VH/jobs.sqlite" ] || return 0; st inflight "$VH/jobs.sqlite" "$1"\n}'
 prove "Stop guard: no HOME allows" t_stop_guard $H '[ -n "${VELO_TASK_HOME:-}${VELO_STATE:-}${HOME:-}" ] || block' 'true || block'
 prove "Stop guard: a tool is looked up on PATH" t_stop_guard $H "/usr/bin/grep '^ROW '" "grep '^ROW '"
@@ -1808,7 +1848,7 @@ prove "SessionStart: counts this session's jobs as others" t_session_start $S 'o
 prove "override: write replaces a valid pending one" t_override $S $'    if valid_override(path):\n        die(1,' $'    if False:\n        die(1,'
 prove "override: write cannot replace a stale entry" t_override $S 'os.rename(tmp, path)  # replaces' 'os.link(tmp, path)  # replaces'
 prove "override: take accepts any file" t_override $S 'or info.st_mode & 0o077 or info.st_size > limit:' 'or False:'
-prove "override: take accepts an open mode" t_override $S ' or info.st_mode & 0o077' ''
+prove "override: take accepts an open mode" t_override $S ' or info.st_mode & 0o077 or info.st_size > limit' ' or info.st_size > limit'
 prove "override: take accepts any content" t_override $S 'return bool(match) and int(match.group(1)) == os.getuid()' 'return True'
 prove "override: take accepts another uid" t_override $S ' and int(match.group(1)) == os.getuid()' ''
 prove "override: take accepts a non-regular entry" t_override $S 'if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or' 'if info.st_uid != os.getuid() or'
@@ -1825,16 +1865,35 @@ prove "tags: a parse failure is no tags" t_tags_json $S $'    except (ValueError
 prove "tags: a non-array is no tags" t_tags_json $S $'    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):\n        raise' $'    if not isinstance(tags, list):\n        return []\n    if False:\n        raise'
 prove "tags: non-string elements are ignored" t_tags_json $S 'or not all(isinstance(t, str) for t in tags):' 'or False:'
 prove "session file: read as plain text" t_session_file $L '    s=$(st session-read "$VELO_TASK_HOME") ||' '    s=$(/bin/cat "$SESSION_FILE") ||'
-prove "session file: the state dir may be open" t_session_file $S 'if not stat.S_ISDIR(home.st_mode) or home.st_uid != os.getuid() or home.st_mode & 0o077:' 'if not stat.S_ISDIR(home.st_mode):'
+prove "session file: the state dir may be open" t_session_file $S $'if not private_dir(args[0]):\n        die(1, "session-read' $'if False:\n        die(1, "session-read'
 
 prove "tags: any session tag matches" t_stop_guard $S 'if "session:" + args[1] in job_tags(row):' 'if any(t.startswith("session:") for t in job_tags(row)):'
 prove "tags: a session id that is a prefix matches" t_stop_guard $S 'if "session:" + args[1] in job_tags(row):' 'if any(t.startswith("session:" + args[1]) for t in job_tags(row)):'
 
 prove "session file: a link is followed" t_session_file $S 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK' 'os.O_RDONLY | os.O_NONBLOCK'
-prove "session file: any mode" t_session_file $S ' or info.st_mode & 0o077' ''
+prove "session file: any mode" t_session_file $S ' or info.st_mode & 0o077 or info.st_size > limit' ' or info.st_size > limit'
 prove "session file: any content" t_session_file $S 'if token is None or not re.fullmatch(r"[0-9a-f]{16}", token):' 'if token is None:'
 prove "session file: a trailing newline is accepted" t_session_file $S 'not re.fullmatch(r"[0-9a-f]{16}", token):' 'not re.fullmatch(r"[0-9a-f]{16}\n?", token):'
 
+
+# ---- review round 3: every Vanth path ----
+prove "jobs-ro follows a symlink" t_jobs_ro $S 'info = os.lstat(path)  # lstat' 'info = os.stat(path)  # lstat'
+prove "jobs-ro: the directory may be open" t_jobs_ro $S 'if not private_dir(os.path.dirname(path)) or not stat.S_ISREG' 'if not stat.S_ISREG'
+prove "jobs-ro: the file may be open" t_jobs_ro $S $'info.st_uid != os.getuid() or info.st_mode & 0o077:\n        die(1, "jobs-ro' $'info.st_uid != os.getuid():\n        die(1, "jobs-ro'
+prove "jobs-ro: a symlink is no object" t_vanth_paths $S 'info = os.lstat(path)  # lstat' 'info = os.stat(path)  # lstat'
+prove "jobs-ro: any mode (guard)" t_vanth_paths $S $'info.st_uid != os.getuid() or info.st_mode & 0o077:\n        die(1, "jobs-ro' $'info.st_uid != os.getuid():\n        die(1, "jobs-ro'
+prove "private_dir follows a link" t_override $S $'        info = os.lstat(path)\n    except OSError:\n        return False\n    return stat.S_ISDIR' $'        info = os.stat(path)\n    except OSError:\n        return False\n    return stat.S_ISDIR'
+prove "private_dir follows a link (session)" t_session_file $S $'        info = os.lstat(path)\n    except OSError:\n        return False\n    return stat.S_ISDIR' $'        info = os.stat(path)\n    except OSError:\n        return False\n    return stat.S_ISDIR'
+prove "Stop guard: a dangling Vanth home is no home" t_vanth_paths $H '&& [ ! -L "$STATE/vanth" ]' ''
+prove "Stop guard: a non-directory Vanth home is no home" t_vanth_paths $H '[ ! -e "$STATE/vanth" ] && {' '[ ! -d "$STATE/vanth" ] && {'
+prove "Stop guard: a symlinked state dir is no problem" t_vanth_paths $H 'if [ ! -L "$STATE" ] && ' 'if '
+prove "Stop guard: a state dir that is a file is no problem" t_vanth_paths $H '{ [ ! -e "$STATE" ] || [ -d "$STATE" ]; }; then exit 0' 'true; then exit 0'
+prove "SessionStart: a dangling Vanth home is silent" t_vanth_paths $HS '&& [ ! -L "$STATE/vanth" ]' ''
+prove "SessionStart: a symlinked state dir is silent" t_vanth_paths $HS 'if [ ! -L "$STATE" ] && ' 'if '
+prove "resolve: a dangling jobs.sqlite is an unknown id" t_vanth_paths $L $'[ ! -e "$db" ] && [ ! -L "$db" ] || found=$(st jobs-ro --cols job_id "$db" \'SELECT job_id FROM jobs WHERE name' $'[ ! -e "$db" ] || found=$(st jobs-ro --cols job_id "$db" \'SELECT job_id FROM jobs WHERE name'
+prove "modes: a symlinked Vanth home is fine" t_vanth_paths $L '  [ ! -L "$VH" ] || { MODES_WHY="$VH is a symlink"; return 0; }' ''
+prove "need_home: a symlinked state root is fine" t_vanth_paths $L '  [ ! -L "$VELO_TASK_HOME" ] || die 6 "$VELO_TASK_HOME is a symlink; refusing"' ''
+prove "install: the schema probe database is open to others" t_install_flags $L '  ( umask 077; "$PY" -I -c' '  ( "$PY" -I -c'
 proof_drain   # every proof reported before anything else runs: the checks below reap the whole suite tree
 if [ "${VELO_TASK_NETWORK_TESTS:-}" = 1 ]; then
   echo "velo-task: the real Vanth (VELO_TASK_NETWORK_TESTS=1)"
