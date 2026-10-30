@@ -1430,6 +1430,43 @@ t_stop_override() {  # one Stop, audited, and the block is back
   ln -s "$E/target" "$E_HOME/stop-override"; run VT stop-override --reason 'over a stale link'; need "stop-override works over a stale symlink" [ "$RC" = 0 ]
   guard; need "...and releases once" [ "$RC" = 0 ]
 }
+t_tags_json() {  # the guard reads tags_json as JSON: an array of strings, exact membership; anything else fails and so blocks
+  local t
+  mkjobs
+  inject "{\"name\":\"t-esc\",\"status\":\"running\",\"tags_json\":\"[\\\"velo\\\",\\\"session\\\\u003a$SID\\\"]\"}" >/dev/null
+  need "(setup) the tag is the JSON escape of session:$SID" [ "$(sql 'SELECT count(*) FROM jobs WHERE tags_json LIKE ?' '%u003a%')" = 1 ]
+  guard; need "a tag written with a JSON escape still tags the session: blocks" [ "$RC" = 2 ]; need "...naming the job" grep -q 't-esc' <<<"$OUT"
+  sql 'DELETE FROM jobs' >/dev/null
+  for t in 'not json' '{"a":"session:'"$SID"'"}' '["velo",3]' '"session:'"$SID"'"' '' 'null'; do
+    inject "{\"name\":\"t-bad\",\"status\":\"running\",\"tags_json\":$("$PYBIN" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$t")}" >/dev/null
+    guard; need "tags_json '$t' on an in-flight job: the helper fails, the guard blocks" [ "$RC" = 2 ]
+    sql 'DELETE FROM jobs' >/dev/null
+  done
+  inject '{"name":"t-fin","status":"completed","exit_code":0,"tags_json":"not json"}' >/dev/null
+  guard; need "malformed tags on a job that is not in flight do not matter" [ "$RC" = 0 ]
+  inject '{"name":"t-note","status":"running","tags_json":["velo","note: \"session:'"$SID"'\""]}' >/dev/null
+  guard; need "a tag that merely contains the session text is not the session's tag" [ "$RC" = 0 ]
+  sstart; need "SessionStart counts it as another session's" grep -qx 'other sessions: 1 in flight' <<<"$OUT"
+}
+t_session_file() {  # the fallback session token is read only if it is exactly what velo-task made
+  local h f tok=0123456789abcdef
+  mkjobs; unset CLAUDE_SESSION_ID; h=$E_HOME; f=$h/session
+  run VT run gate-1 --timeout 30 -- /usr/bin/true; need "(setup) a token is made on first use" [ "$RC" = 0 ]
+  run ST session-read "$h"; need "the generated token is read" [ "$RC" = 0 ] && [ "${#OUT}" = 16 ]
+  need "...as the file holds it" [ "$OUT" = "$(cat "$f")" ]
+  tag_row s-mine running "$(cat "$f")" >/dev/null; guard; need "the guard blocks on the job of that token" [ "$RC" = 2 ]; sql 'DELETE FROM jobs' >/dev/null
+  cp "$f" "$E/good-token"
+  chmod 644 "$f"; run ST session-read "$h"; need "a token file open to group or other is refused" [ "$RC" = 1 ]; guard; need "...and the guard blocks" [ "$RC" = 2 ]
+  run VT run gate-2 --timeout 30 -- /usr/bin/true; need "...and velo-task refuses to use it (exit 6)" [ "$RC" = 6 ]; chmod 600 "$f"
+  printf '%s\n' "$tok" > "$f"; run ST session-read "$h"; need "a token with a trailing newline is not the generated format" [ "$RC" = 1 ]
+  printf 'ABCDEF0123456789' > "$f"; run ST session-read "$h"; need "an upper-case token is refused" [ "$RC" = 1 ]
+  printf '%s' "$tok" > "$f"; run ST session-read "$h"; need "control: another well-formed private token is read" [ "$RC" = 0 -a "$OUT" = "$tok" ]
+  rm "$f"; ln -s "$E/good-token" "$f"; run ST session-read "$h"; need "a symlink to a well-formed token is refused" [ "$RC" = 1 ]; guard; need "...and the guard blocks" [ "$RC" = 2 ]
+  rm "$f"; cp "$E/good-token" "$f"; chmod 600 "$f"; chmod 755 "$h"; run ST session-read "$h"; need "a state dir open to group or other is refused" [ "$RC" = 1 ]; chmod 700 "$h"
+  run ST session-read "$h"; need "control: restored, the token is read again" [ "$RC" = 0 ]
+  mkdir "$h/session.d"; rm "$f"; mkdir "$f"; run ST session-read "$h"; need "a directory is refused" [ "$RC" = 1 ]; rmdir "$f"
+  run ST session-read "$E/no-such-dir"; need "a missing state dir is refused" [ "$RC" = 1 ]
+}
 t_session_start() {
   mkjobs; tag_row s-run running "$SID" >/dev/null; tag_row s-oth running other-1 >/dev/null; tag_row s-oth2 queued other-2 >/dev/null; tag_row s-done completed "$SID" >/dev/null
   sstart; need "SessionStart exits 0" [ "$RC" = 0 ]
@@ -1564,6 +1601,8 @@ check "the session: id from the environment, else a token the state dir keeps" t
 echo "velo-task: hooks"
 check "B-S: the Stop guard blocks this session's in-flight jobs and fails closed" t_stop_guard
 check "the stop-override is one Stop, audited" t_stop_override
+check "the guard reads tags_json as JSON and fails closed on anything else" t_tags_json
+check "the fallback session token is read only if private, ours, not a link and token-shaped" t_session_file
 check "SessionStart lists this session's jobs and counts the others" t_session_start
 echo "velo-task: mutation proofs (each check must go red on a mutated copy)"
 V=bin/velo-task; L=bin/velo-task-lib.sh; S=bin/velo-task-state; H=hooks/velo-task-stop-guard.sh; HS=hooks/velo-task-session-start.sh
@@ -1693,7 +1732,6 @@ prove "wait: --all with a failed job is exit 0" t_wait $L '[ "${done_[$i]#* }" =
 prove "wait: a timeout is exit 1" t_wait $L 'die 3 "wait timed out' 'die 1 "wait timed out'
 prove "wait: --any waits for all" t_wait $L 'if [ "$mode" = any ] && [ "$first" -ge 0 ]; then' 'if false; then'
 prove "cancel: the job is not stopped" t_cancel $L 'out=$(vanth_env "$VANTH" --json stop "$JOB" --signal terminate --kill-after 5 2>&1) || rc=$?' 'out=""'
-prove "session: the token file may be a symlink" t_session $L '  [ -f "$SESSION_FILE" ] && [ ! -L "$SESSION_FILE" ] || die 6' '  true || die 6'
 # ---- hooks ----
 prove "Stop guard: the override is not consumed" t_stop_override $S '    os.unlink(path)' '    pass'
 prove "SessionStart: lists nothing" t_session_start $HS 'if [ -n "$rows" ]; then' 'if false; then'
@@ -1758,8 +1796,6 @@ prove "the helper is not isolated from the caller's user site" t_hostile_env $L 
 prove "Stop guard: always allows" t_stop_guard $H 'deny "this session still has jobs in flight' 'exit 0; deny "this session still has jobs in flight'
 prove "Stop guard: fails open when the query fails" t_stop_guard $H $'|| deny "Vanth\'s database cannot be read, or the check did not complete: $out"' '|| true' $H $'[ "${out##*$\'\\n\'}" = "$OK" ] || deny "the check did not complete (no success marker): $out"' 'true'
 prove "Stop guard: no success marker required" t_stop_guard $H $'[ "${out##*$\'\\n\'}" = "$OK" ] || deny "the check did not complete (no success marker): $out"' 'true'
-prove "Stop guard: any session blocks" t_stop_guard $S $'if \'"session:%s"\' % args[1] in (row.get("tags_json") or ""):' 'if True:'
-prove "Stop guard: a session id that is a prefix matches" t_stop_guard $S $'\'"session:%s"\' % args[1]' $'\'"session:%s\' % args[1]'
 prove "Stop guard: stopping does not block" t_stop_guard $S '"retrying", "stopping"))' '"retrying"))'
 prove "Stop guard: a lost job blocks" t_stop_guard $S 'return "lost"  # orphaned, any other cancelled, a status outside both sets' 'return "in-flight"'
 prove "Stop guard: a restart pending does not block" t_stop_guard $S 'if status in ("failed", "orphaned") and restart_pending(row):' 'if False:'
@@ -1771,7 +1807,7 @@ prove "Stop guard: the override is always on" t_stop_override $H '. "$1" && st o
 prove "SessionStart: counts this session's jobs as others" t_session_start $S 'others += 1' 'others += 2'
 prove "override: write replaces a valid pending one" t_override $S $'    if valid_override(path):\n        die(1,' $'    if False:\n        die(1,'
 prove "override: write cannot replace a stale entry" t_override $S 'os.rename(tmp, path)  # replaces' 'os.link(tmp, path)  # replaces'
-prove "override: take accepts any file" t_override $S 'or info.st_mode & 0o077 or info.st_size > 4096:' 'or False:'
+prove "override: take accepts any file" t_override $S 'or info.st_mode & 0o077 or info.st_size > limit:' 'or False:'
 prove "override: take accepts an open mode" t_override $S ' or info.st_mode & 0o077' ''
 prove "override: take accepts any content" t_override $S 'return bool(match) and int(match.group(1)) == os.getuid()' 'return True'
 prove "override: take accepts another uid" t_override $S ' and int(match.group(1)) == os.getuid()' ''
@@ -1782,6 +1818,23 @@ prove "cancel: a finished job is stopped anyway" t_cancel $L $'  if [ "$VERDICT"
 prove "cancel: a finished job is exit 0" t_cancel $L 'die 4 "already-terminal' 'die 0 "already-terminal'
 prove "cancel: a finished job prints its verdict as a result" t_cancel $L $'  printf \'%s\\n\' "$VERDICT_LINE" >&2\n  die 4' $'  printf \'%s\\n\' "$VERDICT_LINE"\n  die 4'
 prove "cancel: a finished job is reported killed" t_cancel $L 'if [ "$VERDICT" = killed ]; then printf' 'if true; then printf'
+
+# ---- review round 2: tags as JSON, session token provenance ----
+prove "tags: matched as raw text" t_tags_json $S 'if "session:" + args[1] in job_tags(row):' $'if \'"session:%s"\' % args[1] in (row.get("tags_json") or ""):'
+prove "tags: a parse failure is no tags" t_tags_json $S $'    except (ValueError, RecursionError, TypeError) as exc:\n        raise ValueError("job %s: tags_json is not JSON (%s)" % (row.get("job_id"), exc))' $'    except (ValueError, RecursionError, TypeError):\n        return []'
+prove "tags: a non-array is no tags" t_tags_json $S $'    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):\n        raise' $'    if not isinstance(tags, list):\n        return []\n    if False:\n        raise'
+prove "tags: non-string elements are ignored" t_tags_json $S 'or not all(isinstance(t, str) for t in tags):' 'or False:'
+prove "session file: read as plain text" t_session_file $L '    s=$(st session-read "$VELO_TASK_HOME") ||' '    s=$(/bin/cat "$SESSION_FILE") ||'
+prove "session file: the state dir may be open" t_session_file $S 'if not stat.S_ISDIR(home.st_mode) or home.st_uid != os.getuid() or home.st_mode & 0o077:' 'if not stat.S_ISDIR(home.st_mode):'
+
+prove "tags: any session tag matches" t_stop_guard $S 'if "session:" + args[1] in job_tags(row):' 'if any(t.startswith("session:") for t in job_tags(row)):'
+prove "tags: a session id that is a prefix matches" t_stop_guard $S 'if "session:" + args[1] in job_tags(row):' 'if any(t.startswith("session:" + args[1]) for t in job_tags(row)):'
+
+prove "session file: a link is followed" t_session_file $S 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK' 'os.O_RDONLY | os.O_NONBLOCK'
+prove "session file: any mode" t_session_file $S ' or info.st_mode & 0o077' ''
+prove "session file: any content" t_session_file $S 'if token is None or not re.fullmatch(r"[0-9a-f]{16}", token):' 'if token is None:'
+prove "session file: a trailing newline is accepted" t_session_file $S 'not re.fullmatch(r"[0-9a-f]{16}", token):' 'not re.fullmatch(r"[0-9a-f]{16}\n?", token):'
+
 proof_drain   # every proof reported before anything else runs: the checks below reap the whole suite tree
 if [ "${VELO_TASK_NETWORK_TESTS:-}" = 1 ]; then
   echo "velo-task: the real Vanth (VELO_TASK_NETWORK_TESTS=1)"

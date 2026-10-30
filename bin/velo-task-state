@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """velo-task-state: what bash 3.2 cannot do for velo-task and Vanth does not do for it (stdlib only, Python >= 3.9).
 
-  json-get <file|-> <key>                  top-level JSON value as text (string raw, true/false, number); empty when absent
-  jobs-ro [--cols a,b] <db> <sql> [param...]   read-only SQLite on Vanth's jobs.sqlite; stdout = JSON array of rows, or with --cols one
-                                           line a row (the columns, space separated; a value that is not one printable word is JSON-quoted)
-  verdict-of [--db P] [--job J] [--name N] [--label L]   the verdict of the Vanth status object on stdin, as `<label> <verdict>`;
-                                           exit 2 when it is not the job asked about, 6 when it is not a JSON object
-  launch <program> [name...]               exec <program> with ONLY the named variables of this environment (secrets reach vanthd by name)
-  override-write <home> <reason>           the one-shot Stop override: <home>/stop-override (temp + fsync + rename; a stale entry is replaced), one line in overrides.log
-  override-take <home>                     consume it: exit 0 when it was a VALID override (regular, yours, private, `<time> uid=<n> reason=<text>`), else 3
-  inflight <db> <session> [--others]       the session's in-flight jobs (the verdict_of rule), or with --others how many belong to other sessions
+  json-get <file|-> <key>                    top-level JSON value as text (string raw, true/false, number); empty when absent
+  jobs-ro [--cols a,b] <db> <sql> [param...] read-only SQLite on Vanth's jobs.sqlite: a JSON array, or with --cols one line a row (JSON-quoted if not one word)
+  verdict-of [--db P] [--job J] [--name N] [--label L]   the verdict of the status object on stdin, `<label> <verdict>`; 2: not that job, 6: not an object
+  launch <program> [name...]                 exec <program> with ONLY the named variables of this environment
+  override-write <home> <reason>             the one-shot Stop override (temp + fsync + rename; a stale entry is replaced), logged in overrides.log
+  override-take <home>                       consume a VALID override (private regular file of yours, `<time> uid=<n> reason=<text>`): 0, else 3
+  session-read <home>                        the token the state dir keeps, only if dir and file are private, ours, no link, token-shaped
+  inflight <db> <session> [--others]         the session's in-flight jobs (verdict_of rule; tags_json must be an array of strings), or --others: a count
 
-Exit codes: 0 ok, 1 error, 2 usage, 3 override-take: none, 4 jobs-ro: database locked for more than 2000 ms, 5 jobs-ro: schema mismatch,
-6 verdict-of: not a JSON object.
+Exit codes: 0 ok, 1 error, 2 usage, 3 override-take: none, 4 jobs-ro: locked more than 2 s, 5 jobs-ro: schema mismatch, 6 verdict-of: not an object.
 """
 import json
 import os
@@ -199,20 +197,25 @@ def cmd_launch(args):
 OVERRIDE_LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ uid=(\d+) reason=\S.*\n\Z")
 
 
-def valid_override(path):
-    """A pending override is a regular file of ours, private, holding one `<time> uid=<n> reason=<text>` line; anything else is not one."""
+def read_private(path, limit):
+    """The text of a regular file of ours that group and other cannot touch, opened without following a link, at most `limit` bytes; else None."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:  # absent, or a symlink
-        return False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # absent, or a symlink: not ours
+    except OSError:
+        return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 4096:
-            return False
-        match = OVERRIDE_LINE.match(os.read(fd, 4097).decode("utf-8", "replace"))
-        return bool(match) and int(match.group(1)) == os.getuid()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > limit:
+            return None
+        return os.read(fd, limit + 1).decode("utf-8", "replace")
     finally:
         os.close(fd)
+
+
+def valid_override(path):
+    """A pending override holds one `<time> uid=<n> reason=<text>` line of ours."""
+    match = OVERRIDE_LINE.match(read_private(path, 4096) or "")
+    return bool(match) and int(match.group(1)) == os.getuid()
 
 
 def append_log(home, text):
@@ -263,6 +266,32 @@ def cmd_override_take(args):
     return 0
 
 
+def job_tags(row):
+    """The tags of a jobs.sqlite row: tags_json must parse to an array of strings, else this fails (the Stop guard then blocks)."""
+    try:
+        tags = json.loads(row.get("tags_json") or "")
+    except (ValueError, RecursionError, TypeError) as exc:
+        raise ValueError("job %s: tags_json is not JSON (%s)" % (row.get("job_id"), exc))
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        raise ValueError("job %s: tags_json is not an array of strings" % row.get("job_id"))
+    return tags
+
+
+def cmd_session_read(args):
+    """session-read <home>: the session token this state dir keeps, only if the dir and the file are private and ours, the file is no link,
+    and its content is exactly 16 lowercase hex digits (what velo-task generates)."""
+    if len(args) != 1:
+        usage("session-read: expected <home>")
+    home = os.stat(args[0])
+    if not stat.S_ISDIR(home.st_mode) or home.st_uid != os.getuid() or home.st_mode & 0o077:
+        die(1, "session-read: %s is not a private directory of yours" % args[0])
+    token = read_private(os.path.join(args[0], "session"), 64)
+    if token is None or not re.fullmatch(r"[0-9a-f]{16}", token):
+        die(1, "session-read: the session file is not a private, generated token of yours")
+    print(token)
+    return 0
+
+
 def cmd_inflight(args):
     """inflight <db> <session> [--others]: this session's jobs whose verdict is in-flight, as `name job_id status` lines (--others: how many
     in-flight jobs do NOT carry the session's tag). The same verdict_of that status uses, so a failed job with a restart pending counts."""
@@ -272,7 +301,7 @@ def cmd_inflight(args):
     for row in query_ro(args[0], "SELECT * FROM jobs ORDER BY created_at, job_id"):
         if verdict_of(row) != "in-flight":
             continue
-        if '"session:%s"' % args[1] in (row.get("tags_json") or ""):
+        if "session:" + args[1] in job_tags(row):
             mine.append(row)
         else:
             others += 1
@@ -281,7 +310,7 @@ def cmd_inflight(args):
 
 
 COMMANDS = {"json-get": cmd_json_get, "jobs-ro": cmd_jobs_ro, "verdict-of": cmd_verdict_of, "launch": cmd_launch,
-            "override-write": cmd_override_write, "override-take": cmd_override_take, "inflight": cmd_inflight}
+            "override-write": cmd_override_write, "override-take": cmd_override_take, "inflight": cmd_inflight, "session-read": cmd_session_read}
 
 
 def main(argv):

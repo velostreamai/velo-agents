@@ -293,8 +293,7 @@ session_id() {  # $CLAUDE_SESSION_ID, else the token this state dir keeps (made 
       ( umask 077; /bin/mkdir -p -m 700 "$VELO_TASK_HOME"; /usr/bin/od -An -N8 -tx1 /dev/urandom | /usr/bin/tr -d ' \n' > "$SESSION_FILE.$$"
         /bin/mv -n "$SESSION_FILE.$$" "$SESSION_FILE"; /bin/rm -f "$SESSION_FILE.$$" )
     fi
-    [ -f "$SESSION_FILE" ] && [ ! -L "$SESSION_FILE" ] || die 6 "$SESSION_FILE is not a regular file; refusing to read a session from it"
-    s=$(/bin/cat "$SESSION_FILE")
+    s=$(st session-read "$VELO_TASK_HOME") || die 6 "$SESSION_FILE is not a private, generated session token of yours; refusing to use it (see above)"
   fi
   check_arg session "$s"; printf '%s' "$s"
 }

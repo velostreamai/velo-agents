@@ -23,7 +23,7 @@ velo-task stop-override --reason <text>         let the session end once with jo
 - **R1** `run` refuses without `--timeout` (exit 2) and refuses an `<id>` outside `[a-z0-9][a-z0-9_-]{2,63}` (exit 2), before the daemon is touched.
 - **R2** The idempotency key is `velo_<first 8 hex of sha256(session)>_<id>`: the same id from the same session is one job (Vanth replays
   it; no second execution); another session gets its own. `--rerun` appends `_<epoch>_<pid>_<rand8>` for a second job.
-- **R3** Tags: `velo`, `session:<sid>`, `issue:N`, `stage:ST`. The session is `$CLAUDE_SESSION_ID`, else a token the state dir keeps.
+- **R3** Tags: `velo`, `session:<sid>`, `issue:N`, `stage:ST`. The session is `$CLAUDE_SESSION_ID`, else a token the state dir keeps, read only if the dir and file are private, ours, not a link and exactly 16 hex digits (else exit 6 / the guard blocks). Tags are read as JSON: `tags_json` must be an array of strings and `session:<sid>` an exact member, else the guard blocks.
 - **R4** `<id>` is the job's name. It resolves with ONE read-only query,
   `SELECT job_id FROM jobs WHERE name = ? ORDER BY created_at DESC, job_id DESC LIMIT 1`: the exact name, the newest job. `--job J`
   addresses a job directly. An unknown id is exit 2. No `vanth list` (it caps at 1,000 rows and matches substrings).
