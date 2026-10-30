@@ -32,10 +32,10 @@ MUT_PATHS="bin tests/bash32-sweep.sh tests/fixtures/velo-task/bash4-seeded.sh te
 t_premise() {  # B14's premise: scripts run under bash 3.2.x. On anything newer the rest of this suite proves nothing
   . "$R/tests/bash32-sweep.sh"
   local v
-  v=$(bash32_version) || { echo "FAILED: ${B14_BASH:-/bin/bash} would not report a version"; return 1; }
+  v=$(bash32_version) || { echo "FAILED: ${B14_BASH:-$BASH32_DEFAULT} would not report a version"; return 1; }
   case $v in
-    3.2.*) echo "note: ${B14_BASH:-/bin/bash} is bash $v" ;;
-    *) echo "FAILED: ${B14_BASH:-/bin/bash} is bash '$v', not 3.2.x, so a script that passes here may still fail on the 3.2 the spec pins"; return 1 ;;
+    3.2.*) echo "note: ${B14_BASH:-$BASH32_DEFAULT} is bash $v" ;;
+    *) echo "FAILED: ${B14_BASH:-$BASH32_DEFAULT} is bash '$v', not 3.2.x, so a script that passes here may still fail on the 3.2 the spec pins (on a host whose /bin/bash is newer, point VELO_TEST_BASH32 at a bash 3.2: .github/ci/build-bash32.sh builds one)"; return 1 ;;
   esac
 }
 
@@ -52,7 +52,7 @@ t_sweep_real() {  # B14 on the real scripts: the fixed glob, nothing excluded by
       *) bad "$name: the first line is '$(/usr/bin/head -n 1 "$f")', neither #!/bin/bash nor a python shebang. B14 cannot vouch for a script it does not know how to run: make it #!/bin/bash, or teach b14_kind and say why"; continue ;;
     esac
     swept="$swept $name"
-    out=$("${B14_BASH:-/bin/bash}" -n "$f" 2>&1) || bad "$name does not parse under bash 3.2: $out"
+    out=$("${B14_BASH:-$BASH32_DEFAULT}" -n "$f" 2>&1) || bad "$name does not parse under bash 3.2: $out"
     hits=$(bash4_hits "$f"); rc=$?
     case $rc in
       0) bad "$name uses a bash-4 construct: $(printf '%s' "$hits" | /usr/bin/head -3 | tr '\n' ' ')" ;;

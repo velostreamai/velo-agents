@@ -76,7 +76,8 @@ log()  { mkdir -p "$ORCH_DIR"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$L
 rotate_log_if_needed() {
   [[ -f "$LOG_FILE" ]] || return 0
   local sz
-  sz=$(stat -f %z "$LOG_FILE" 2>/dev/null || stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  # GNU stat first: `stat -f` is valid on GNU too (filesystem status), so the BSD spelling first would print a report and fail.
+  sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
   [[ "$sz" -gt "$LOG_MAX_BYTES" ]] || return 0
   mv -f "$LOG_FILE" "$LOG_FILE.1"
 }
@@ -378,8 +379,6 @@ list_active_worktrees() {   # -> one worktree path per line with a live worker p
 
 wip_count() { list_active_worktrees | grep -c . ; }
 
-free_disk_gb() { df -g "$HOME" 2>/dev/null | awk 'NR==2{print $4}'; }
-
 queue_pop_head() {
   local rest; rest=$(tail -n +2 "$QUEUE_FILE" 2>/dev/null)
   if [[ -n "$rest" ]]; then printf '%s\n' "$rest" > "$QUEUE_FILE"; else : > "$QUEUE_FILE"; fi
@@ -401,7 +400,7 @@ step_dispatch() {
     return 0
   fi
 
-  local disk; disk=$(free_disk_gb)
+  local disk; disk=$(free_disk_gb 2>/dev/null)
   if [[ -z "$disk" || "$disk" -lt "$MIN_DISK_GB" ]]; then
     local day; day=$(date -u +%Y-%m-%d)
     if attention_append "low-disk:orch:$day" "low-disk" "" "" "$day" \
