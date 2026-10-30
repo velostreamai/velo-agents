@@ -112,12 +112,22 @@ check "live deepseek names velo-deepseek" "$(cmd_worker '--model deepseek/deepse
 check "a re-pinned deepseek model still names velo-deepseek" \
       "$(cmd_worker '--model deepseek/deepseek-v4.1-flash')"                                 "velo-deepseek"
 
-# And the whole command must still run. It reads real worktrees, so assert only
-# that it succeeds and prints its header — not on the rows, which vary.
+# And the whole command must still run. Assert only that it succeeds and prints its header.
 # gh stubbed to fail at once: the real one made this check 8s of live GitHub
 # calls, and velo-status already degrades to "(gh unavailable)" without it.
+#
+# velo-status walks the worktrees under $HOME/RustroverProjects and, when it finds none, says so and stops BEFORE the open-PR
+# section — so on a host with no Velostream worktrees (a CI runner, a fresh account) every check below saw an empty PR list.
+# The checks read a sandbox HOME instead: one worktree, with one runner log in the shape velo-dispatch writes, so the worker
+# column has a row whose name the check on raw filenames below can actually catch. The result no longer depends on what
+# worktrees the host happens to have.
+SBH="$TMPD/home"; SBS="$TMPD/state"
+mkdir -p "$SBH/RustroverProjects/velostream-101" "$SBS/dispatch/101"
+git -C "$SBH/RustroverProjects/velostream-101" init -q \
+  && git -C "$SBH/RustroverProjects/velostream-101" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+: > "$SBS/dispatch/101/codex-20260908T035158Z.log"
 mkdir -p "$TMPD/stub"; printf '#!/bin/bash\nexit 1\n' > "$TMPD/stub/gh"; chmod +x "$TMPD/stub/gh"
-OUT=$(PATH="$TMPD/stub:$PATH" "$BIN/velo-status" 2>&1)
+OUT=$(HOME="$SBH" VELO_STATE="$SBS" PATH="$TMPD/stub:$PATH" "$BIN/velo-status" 2>&1)
 if grep -q 'ISSUE.*WORKER.*STATE' <<<"$OUT"; then
   echo "  PASS  velo-status runs and prints its table"
 else
@@ -177,7 +187,7 @@ exit 0
 EOF
 chmod +x "$TMPD/stubpr/gh"
 run_status() {   # <directory holding velo-status> -> $OPEN_OUT
-  OPEN_OUT=$(STUB_OPEN_PRS="$OPEN_PRS" PATH="$TMPD/stubpr:$PATH" "$1/velo-status" 2>&1)
+  OPEN_OUT=$(HOME="$SBH" VELO_STATE="$SBS" STUB_OPEN_PRS="$OPEN_PRS" PATH="$TMPD/stubpr:$PATH" "$1/velo-status" 2>&1)
 }
 pr_line() { grep -E "^  #$1 " <<<"$OPEN_OUT" | head -n 1; }   # <pr number>
 run_status "$BIN"
