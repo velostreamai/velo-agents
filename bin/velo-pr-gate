@@ -477,7 +477,7 @@ WRAPPER="$HOME/.agents/bin/velo-openrouter-agent"
 LOCAL_MODEL="${VELO_LOCAL_MODEL:-$VELO_LOCAL_MODEL_DEFAULT}"
 [[ -n "${VELO_LOCAL_BASE_URL:-}" ]] || die "velo-local.conf resolved no endpoint (backend '${VELO_LOCAL_BACKEND:-}') — run: velo-local use lmstudio|llama|sushi"
 LMSTUDIO_URL="${VELO_LMSTUDIO_URL:-$VELO_LOCAL_BASE_URL}"
-POLICY=/Users/neilavery/.agents/rules/velo-impl.md
+POLICY="${VELO_IMPL_POLICY:-$HOME/.agents/rules/velo-impl.md}"
 
 # Every pid this script launches, in launch order — --wait blocks on all of
 # them (see the end of the script). Tracked as they are launched rather than

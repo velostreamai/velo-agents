@@ -801,7 +801,7 @@ really create. A mismatch **refuses**:
 ```
 NOT READY: brief WORKTREE does not match the worktree this dispatch will use.
   brief says : /tmp/completely-wrong
-  will use   : /Users/neilavery/RustroverProjects/velostream-1898
+  will use   : $HOME/RustroverProjects/velostream-1898
 ```
 
 This exists because nothing used to compare them, and the failure is silent and
