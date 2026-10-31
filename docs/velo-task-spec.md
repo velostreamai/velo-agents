@@ -29,6 +29,10 @@ velo-task stop-override --reason <text>         let the session end once with jo
   addresses a job directly. An unknown id is exit 2. No `vanth list` (it caps at 1,000 rows and matches substrings).
 - **R5** `status`, `wait` and `cancel` ask Vanth (`vanth --json status`), never a log or a process list, and map the answer to the
   closed set below. Anything unclassifiable is `lost`, never `ok`; a status that is not a JSON object (or nests deeper than json reads) is exit 6.
+  The one answer that is not final is the daemon's own `failed to reach daemon` - its `/doctor` check losing a race with its `/health` check,
+  which it does on ~1-2% of concurrent calls. That one call, and only that one, is re-run: at most 10 re-runs (11 calls in all),
+  `VELO_TASK_RETRY_SLEEP` (default 0.2s) apart, and a success, an `unknown job` or any other error is returned at once. If the 11th call
+  loses the race too, the exit is 6 as before and the message says `after 11 attempts`.
 - **R6** Stop guard (Claude Code Stop hook): reads `jobs.sqlite` read-only and BLOCKS while any `session:<me>` job is queued, launching,
   running, paused, retrying or stopping, printing `velo-task wait <id>` per job. Other sessions never block; a lost job is not a blocker.
   Fails closed (the query runs in a child and must end in a success marker) on a missing, unreadable, locked (>2 s) or wrong-schema database and on a missing or
@@ -58,6 +62,6 @@ velo-task stop-override --reason <text>         let the session end once with jo
 ## Bars (each has a mutation-proved test in tests/test_velo_task.sh)
 
 B1/B18/B26 verdicts, RecursionError, restart pending | B3/B11 argument validation | B4/B5/B6/B15 wait | B10, B-R3 same id, one job |
-B-R1 exact-name resolution (1,100 newer jobs) | B-R2 `--rerun` and newest-wins | B-S Stop guard matrix | SessionStart |
+B-R1 exact-name resolution (1,100 newer jobs) | B-R2 `--rerun` and newest-wins | B-RT1..B-RT4 the transient daemon-down re-try (10 re-runs, and only it) | B-S Stop guard matrix | SessionStart |
 B21 secrets (allowlist, no value in argv, launch log not shown) | B22 privacy and provenance (0700/0600, loopback, record) |
 B23 supply chain (hash-locked wheels, closure list, install flags). Opt-in `VELO_TASK_NETWORK_TESTS=1` runs the real Vanth.
