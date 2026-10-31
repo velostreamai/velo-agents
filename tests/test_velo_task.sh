@@ -1153,6 +1153,7 @@ t_hostile_env() {  # nothing velo-task starts reads the caller's PYTHONPATH, BAS
   need "...naming it" grep -q 'VELO_TASK_START_WAIT must be a whole number' <<<"$OUT"; need "...and the command substitution inside it never ran" [ ! -e "$s" ]
   VELO_TASK_POLL='0.1 -x' hostile cmd_ensure_daemon; need "a poll interval that is not a number is refused (exit 2)" [ "$RC" = 2 ]
   need "...nothing was launched by either" [ "$(launches)" = 0 ]
+  VELO_TASK_RETRY_SLEEP='0.1 -x' hostile cmd_ensure_daemon; need "a re-try pause that is not a number is refused (exit 2)" [ "$RC" = 2 ]
   hostile cmd_ensure_daemon; need "ensure-daemon starts the daemon with the hostile variables set (exit 0)" [ "$RC" = 0 ]; need "...as started" grep -q '(started)' <<<"$OUT"
   need "...and none of them fired" quiet
   hostile cmd_ensure_daemon; need "ensure-daemon adopts it (exit 0)" [ "$RC" = 0 ]; need "...as adopted" grep -q '(adopted)' <<<"$OUT"; need "...and none of them fired" quiet
@@ -1380,12 +1381,18 @@ t_status_transient_retry() {  # B-RT1..B-RT4: the daemon loses ~1% of concurrent
   need "B-RT3: a plain daemon error: exit 1" [ "$RC" = 1 ]
   need "...and no re-try: one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
   rm "$E/status-fail"
+  printf '3\n' > "$E/status-transient-error"; t0=$(now)   # VELO_TASK_RETRY_SLEEP unset: the default pause is the one that runs
+  run /usr/bin/env -u VELO_TASK_RETRY_SLEEP "$R/bin/velo-task" status r-ok
+  t1=$(now)
+  need "B-RT1: with no VELO_TASK_RETRY_SLEEP the default pause re-tries to the answer" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  need "...and the default is 0.2s: three re-runs take at least 0.6s" between 0.6 "$t0" "$t1" 30
+  rm "$E/status-transient-error"
   before=$(grep -c "$calls" "$E_CALLS"); t0=$(now)   # a 5s pause in the environment: one that is never taken proves the first call is not delayed
   VELO_TASK_RETRY_SLEEP=5 run VT status r-ok
   t1=$(now)
   need "B-RT4: a first call that answers: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
   need "...exactly one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
-  need "...and no pause at all" between 0 "$t0" "$t1" 2
+  need "...and no pause at all" between 0 "$t0" "$t1" 3
 }
 t_wait() {  # B4, B5, B15, B6
   local j n
@@ -1860,6 +1867,7 @@ prove "resolve: the oldest job" t_run_rerun $L 'ORDER BY created_at DESC, job_id
 prove "resolve: an unknown id goes on" t_resolve_exact $L '  [ -n "$found" ] || die 2 "unknown id' '  [ -n "$found" ] || JOB=job_nope; [ -n "$found" ] || die 0 "unknown id'
 prove "status: a daemon that cannot be reached is exit 1" t_status_daemon $L '*"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict' '*"failed to reach daemon"*) die 1 "daemon-down: $out; no verdict'
 prove "B-RT1: no re-try at all" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 1 ] || break'
+prove "B-RT1: the default pause is nothing" t_status_transient_retry $L '/bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"' '/bin/sleep "${VELO_TASK_RETRY_SLEEP:-0}"'
 prove "B-RT2: five calls instead of eleven" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 5 ] || break'
 prove "B-RT3: every error is re-tried, not just the daemon-down" t_status_transient_retry $L 'case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac' 'case "$RETRY_OUT" in *"vanth status"*) ;; *) break ;; esac'
 prove "B-RT4: a pause even when the first call answers" t_status_transient_retry $L 'RETRY_OUT=""; RETRY_ATTEMPTS=0' 'RETRY_OUT=""; RETRY_ATTEMPTS=0; /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"'
