@@ -1,9 +1,9 @@
 #!/bin/bash
 # Grade a #2737 replay arm with the REFERENCE tests from merged PR #2738 (1640fc412), overlaid on the arm's tree.
 set -u
-ARM="$1"; WT=/Users/neilavery/RustroverProjects/velostream-replay-2737-$ARM
+ARM="$1"; WT="$HOME/RustroverProjects/velostream-replay-2737-$ARM"
 OUT=$HOME/.agents/state/scratch/replay-2737
-REPO=/Users/neilavery/RustroverProjects/velostream
+REPO="${VELO_REPO_DIR:-$HOME/RustroverProjects/velostream}"
 for f in tests/unit/server/processors/rows_window_lateness_wiring_test.rs tests/unit/sql/execution/primed_query_builder_test.rs; do
   git -C "$REPO" show 1640fc412:$f > "$WT/$f"
 done
