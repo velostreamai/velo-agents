@@ -364,15 +364,17 @@ resolve() {  # <id> | --job <job_id>: sets JOB (and LABEL) from Vanth's own data
   [ -n "$found" ] || die 2 "unknown id '${2:-$1}': Vanth has no job by that name; address a job by its id with --job <job_id>"
   JOB="$found"
 }
-retry_transient_daemon() {  # <command...>: run it; when the answer is Vanth's `failed to reach daemon` - a race the daemon loses on ~1% of concurrent calls, its /doctor check and its /health check disagreeing - run the same call again, at most 10 re-runs (11 calls in all), VELO_TASK_RETRY_SLEEP apart
+retry_transient_daemon() {  # <command...>: run it; when it exits non-zero and its output is Vanth's `failed to reach daemon` - a race the daemon loses on ~1% of concurrent calls, its /doctor check and its /health check disagreeing - run the same call again, at most 10 re-runs (11 calls in all), VELO_TASK_RETRY_SLEEP apart
   # Sets RETRY_OUT (the last call's combined output, unchanged) and RETRY_ATTEMPTS (how many calls were made) and returns the last call's exit status, so a
-  # caller keeps its own messages and its own exit code. Success, or any other error, is returned at once: this is the ONLY re-try in velo-task.
+  # caller keeps its own messages and its own exit code. A zero exit is returned at once whatever its output says (a job's command field can hold that text),
+  # and so is any other error: this is the ONLY re-try in velo-task.
   local rc=0
   RETRY_OUT=""; RETRY_ATTEMPTS=0
   while :; do
     rc=0
     RETRY_OUT=$("$@" 2>&1) || rc=$?
     RETRY_ATTEMPTS=$((RETRY_ATTEMPTS + 1))
+    [ "$rc" -ne 0 ] || break   # only a non-zero exit is diagnosed: a zero status is the answer
     case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac
     [ "$RETRY_ATTEMPTS" -lt 11 ] || break
     /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"
