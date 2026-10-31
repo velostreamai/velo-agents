@@ -13,7 +13,8 @@ The behaviour velo-task depends on follows Vanth 1.14.0 as probed against the re
   --json list [--all] [--name N] [--limit N]   newest first, capped at 1000, --name a substring match
   __inject <json>              (test only) a row as given; __bulk <n> <name-prefix> (test only) n completed rows
 Every call is appended to @E@/calls as `vanth <args>`, followed by `env=<the names in its environment>`. Switches (files under @E@):
-start-transport-error, start-fail, status-transport-error, status-fail, status-garbage, status-unknown.
+start-transport-error, start-fail, status-transport-error, status-fail, status-garbage, status-unknown, status-transient-error (a count: that many
+`status <job>` calls answer the daemon's transient `failed to reach daemon`, then the real answer).
 """
 import datetime
 import hashlib
@@ -38,6 +39,21 @@ with open(E + "/calls", "a") as calls:
 def fail(text, code=1):
     sys.stderr.write(text + "\n")
     sys.exit(code)
+
+
+def transient_status_failures():
+    """@E@/status-transient-error holds how many of the next `status <job>` calls answer the daemon's transient refusal; the file counts down."""
+    path = E + "/status-transient-error"
+    try:
+        with open(path) as fh:
+            left = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if left <= 0:
+        return False
+    with open(path, "w") as fh:
+        fh.write("%d\n" % (left - 1))
+    return True
 
 
 def db():
@@ -80,6 +96,9 @@ def cmd_status(args):
             return 1
     if os.path.exists(E + "/status-transport-error"):
         fail("vanth status: failed to reach daemon: connection refused")
+    if transient_status_failures():
+        fail("vanth status: failed to reach daemon: a service is already responding at http://127.0.0.1:%s, but Vanth cannot use it"
+             % os.environ.get("VANTH_DAEMON_PORT", ""))
     if os.path.exists(E + "/status-fail"):
         fail("vanth status: daemon error: boom")
     if os.path.exists(E + "/status-unknown"):

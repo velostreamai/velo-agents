@@ -1153,6 +1153,7 @@ t_hostile_env() {  # nothing velo-task starts reads the caller's PYTHONPATH, BAS
   need "...naming it" grep -q 'VELO_TASK_START_WAIT must be a whole number' <<<"$OUT"; need "...and the command substitution inside it never ran" [ ! -e "$s" ]
   VELO_TASK_POLL='0.1 -x' hostile cmd_ensure_daemon; need "a poll interval that is not a number is refused (exit 2)" [ "$RC" = 2 ]
   need "...nothing was launched by either" [ "$(launches)" = 0 ]
+  VELO_TASK_RETRY_SLEEP='0.1 -x' hostile cmd_ensure_daemon; need "a re-try pause that is not a number is refused (exit 2)" [ "$RC" = 2 ]
   hostile cmd_ensure_daemon; need "ensure-daemon starts the daemon with the hostile variables set (exit 0)" [ "$RC" = 0 ]; need "...as started" grep -q '(started)' <<<"$OUT"
   need "...and none of them fired" quiet
   hostile cmd_ensure_daemon; need "ensure-daemon adopts it (exit 0)" [ "$RC" = 0 ]; need "...as adopted" grep -q '(adopted)' <<<"$OUT"; need "...and none of them fired" quiet
@@ -1353,6 +1354,117 @@ t_status_daemon() {
   kill "$(daemon_pid)"; waitfor 5 not alive "$(daemon_pid)"; : > "$E/fail-launch"
   run VT status gate-1; need "a daemon that is down and cannot start: exit 6" [ "$RC" = 6 ]; need "...the restart hint" grep -q 'velo-task restart-daemon' <<<"$OUT"
   rm "$E/fail-launch"; run VT status gate-1; need "control: a daemon that can start is started, and the verdict read" [ "$OUT" = "gate-1 ok" ]
+}
+t_status_transient_retry() {  # B-RT1..B-RT4: the daemon loses ~1% of concurrent status calls to `failed to reach daemon`; that answer, and only that one, is re-tried, at most 10 times
+  local before t0 t1 t2 t3 calls='^vanth --json status job'
+  mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
+  printf '3\n' > "$E/status-transient-error"
+  before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT1: three transient refusals then the answer: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  need "...after exactly 4 calls" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 4 ]
+  rm "$E/status-transient-error"
+  : > "$E/status-transport-error"; before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT2: a daemon that never answers: exit 6, as today" [ "$RC" = 6 ]
+  need "...after exactly 11 calls (one, then ten re-runs)" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 11 ]
+  need "...saying after 11 attempts" grep -q 'after 11 attempts' <<<"$OUT"
+  need "...and keeping the restart hint" grep -q 'velo-task restart-daemon' <<<"$OUT"
+  rm "$E/status-transport-error"
+  : > "$E/status-unknown"; before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT3: another error (unknown job): exit 2" [ "$RC" = 2 ]
+  need "...and no re-try: one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+  rm "$E/status-unknown"
+  : > "$E/status-fail"; before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT3: a plain daemon error: exit 1" [ "$RC" = 1 ]
+  need "...and no re-try: one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+  rm "$E/status-fail"
+  # A timed run also pays its own overhead (python helpers, the calls), which on a loaded runner can exceed the whole default pause, so a
+  # wall-clock floor on one run cannot tell the default from 0. Ten re-runs with the default must cost at least a second more than the
+  # same ten re-runs with the pause at 0: the default pause is 0.2s a re-run, two seconds in all, and the overhead is the same in both.
+  printf '10\n' > "$E/status-transient-error"; before=$(grep -c "$calls" "$E_CALLS"); t0=$(now)   # VELO_TASK_RETRY_SLEEP unset: the default pause is the one that runs
+  run /usr/bin/env -u VELO_TASK_RETRY_SLEEP "$R/bin/velo-task" status r-ok
+  t1=$(now)
+  need "B-RT1: with no VELO_TASK_RETRY_SLEEP the default pause re-tries to the answer" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  need "...after exactly 11 calls (ten re-runs)" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 11 ]
+  printf '10\n' > "$E/status-transient-error"; before=$(grep -c "$calls" "$E_CALLS"); t2=$(now)
+  run /usr/bin/env VELO_TASK_RETRY_SLEEP=0 "$R/bin/velo-task" status r-ok
+  t3=$(now)
+  need "...and with the pause at 0 the same ten re-runs answer, after exactly 11 calls" [ "$RC" = 0 -a "$OUT" = "r-ok ok" -a "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 11 ]
+  need "...and the default is 0.2s: ten re-runs cost at least 1.0s more than the same ten with a pause of 0" "$PYBIN" -c "import sys; sys.exit(0 if ($t1 - $t0) - ($t3 - $t2) >= 1.0 else 1)"
+  rm "$E/status-transient-error"
+  before=$(grep -c "$calls" "$E_CALLS"); t0=$(now)   # a 5s pause in the environment: one that is never taken proves the first call is not delayed
+  VELO_TASK_RETRY_SLEEP=5 run VT status r-ok
+  t1=$(now)
+  need "B-RT4: a first call that answers: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  need "...exactly one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+  need "...and no pause at all" between 0 "$t0" "$t1" 3
+}
+t_status_success_not_retried() {  # B-RT5: a status that exits 0 is the answer, whatever its output says: its command field can hold the transient text, and it is answered at once, by one call
+  local before calls='^vanth --json status job'
+  mkjobs; inject '{"name":"r-cmd","status":"completed","exit_code":0,"command":"echo vanth: failed to reach daemon"}' >/dev/null
+  before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-cmd
+  need "B-RT5: a status that exits 0 whose command field holds the transient text: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-cmd ok" ]
+  need "...after exactly 1 call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+}
+t_retry_sleep_validation() {  # B-RT6: VELO_TASK_RETRY_SLEEP is a whole number of seconds, or digits, one dot, digits; any other value is refused when the library loads (exit 2)
+  local v
+  mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
+  for v in '1.2.3' '.' '1..2' '..' '.5' '5.'; do
+    VELO_TASK_RETRY_SLEEP="$v" run VT status r-ok
+    need "B-RT6: a re-try pause of '$v' is refused (exit 2)" [ "$RC" = 2 ]
+    need "...naming the setting" grep -q 'VELO_TASK_RETRY_SLEEP must be a number of seconds' <<<"$OUT"
+  done
+  for v in '0' '0.2' '1'; do
+    VELO_TASK_RETRY_SLEEP="$v" run VT status r-ok
+    need "B-RT6: a re-try pause of '$v' is accepted: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  done
+}
+t_poll_validation() {  # B-RT7: VELO_TASK_POLL is a whole number of seconds, or digits, one dot, digits; any other value is refused when the library loads (exit 2). The accepted values reach /bin/sleep: the wait runs to its own timeout
+  local v
+  mkjobs; inject '{"name":"r-run","status":"running"}' >/dev/null
+  for v in '1.2.3' '.' '1..2' '..' '.5' '5.'; do
+    VELO_TASK_POLL="$v" run VT wait r-run --timeout 1
+    need "B-RT7: a poll interval of '$v' is refused (exit 2)" [ "$RC" = 2 ]
+    need "...naming the setting" grep -q 'VELO_TASK_POLL must be a number of seconds' <<<"$OUT"
+  done
+  for v in '0.5' '1' '0'; do
+    VELO_TASK_POLL="$v" run VT wait r-run --timeout 1
+    need "B-RT7: a poll interval of '$v' is accepted: the wait runs to its timeout (exit 3)" [ "$RC" = 3 ]
+    need "...with no refusal and no sleep usage error" not grep -qE 'must be a number|usage: sleep' <<<"$OUT"
+  done
+}
+t_whole_seconds_validation() {  # B-RT8: VELO_TASK_START_WAIT and VELO_TASK_STOP_WAIT are decimal whole numbers of nine digits at most: 010 (octal to bash arithmetic), 08, 00, 1.5, -1, x and a ten-digit count are refused when the library loads (exit 2)
+  local name v
+  mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
+  run VT status r-ok; need "control: the daemon starts with the default settings (exit 0)" [ "$RC" = 0 ]
+  for name in VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT; do
+    for v in '010' '08' '00' '1.5' '-1' 'x' '1000000000'; do
+      run /usr/bin/env "$name=$v" "$R/bin/velo-task" status r-ok
+      need "B-RT8: $name of '$v' is refused (exit 2)" [ "$RC" = 2 ]
+      need "...naming the setting" grep -q "$name must be a whole number of seconds" <<<"$OUT"
+    done
+    for v in '0' '10' '999999999'; do
+      run /usr/bin/env "$name=$v" "$R/bin/velo-task" status r-ok
+      need "B-RT8: $name of '$v' is accepted: the verdict, exit 0" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+    done
+  done
+}
+t_port_validation() {  # B-RT9: VELO_TASK_PORT is a TCP port, 1 to 65535, written without a leading zero: 0, 010, 00, 65536, 99999, 123456 and x are refused when the library loads (exit 2)
+  local v
+  mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
+  for v in '0' '010' '00' '65536' '99999' '123456' 'x'; do
+    run /usr/bin/env "VELO_TASK_PORT=$v" "$R/bin/velo-task" status r-ok
+    need "B-RT9: a port of '$v' is refused (exit 2)" [ "$RC" = 2 ]
+    need "...naming the setting" grep -q 'VELO_TASK_PORT must be a port number from 1 to 65535' <<<"$OUT"
+  done
+  for v in '1' '48217' '65535'; do
+    run /usr/bin/env "VELO_TASK_PORT=$v" "$R/bin/velo-task" status r-ok
+    need "B-RT9: a port of '$v' is accepted: not refused when the library loads" not grep -q 'VELO_TASK_PORT must be' <<<"$OUT"
+  done
 }
 t_wait() {  # B4, B5, B15, B6
   local j n
@@ -1685,6 +1797,12 @@ check "run: a daemon down is exit 6, a refused start exit 1" t_run_failures
 check "B-R1: an id is an exact name, whatever 1,100 newer jobs contain" t_resolve_exact
 check "B1/B18/B26: verdicts through the whole path" t_status_verdicts
 check "status with the daemon down, broken or garbled" t_status_daemon
+check "B-RT1/B-RT2/B-RT3/B-RT4: one transient daemon-down is re-tried, at most 10 times, and nothing else is" t_status_transient_retry
+check "B-RT5: a status that exits 0 is answered at once, even when its output names the transient diagnostic" t_status_success_not_retried
+check "B-RT6: VELO_TASK_RETRY_SLEEP is a whole number or digits, one dot, digits; any other value is refused (exit 2)" t_retry_sleep_validation
+check "B-RT7: VELO_TASK_POLL is a whole number or digits, one dot, digits; any other value is refused (exit 2)" t_poll_validation
+check "B-RT8: VELO_TASK_START_WAIT and VELO_TASK_STOP_WAIT are decimal whole numbers of nine digits at most (010 is refused)" t_whole_seconds_validation
+check "B-RT9: VELO_TASK_PORT is a port from 1 to 65535 without a leading zero" t_port_validation
 check "B4/B5/B6/B15: wait --all, --any, timeout, unknown ids" t_wait
 check "cancel is vanth stop, then the verdict killed; a finished job is exit 4" t_cancel
 check "a job that vanished after the id resolved is exit 2 with no verdict" t_vanished_job
@@ -1709,9 +1827,9 @@ prove "jobs-ro waits 0 ms" t_jobs_ro $S 'uri=True, timeout=2.0' 'uri=True, timeo
 prove "jobs-ro skips the schema check" t_jobs_ro $S '        if missing:' '        if False:'
 prove "jobs-ro installs no authorizer" t_jobs_ro $S '        con.set_authorizer(read_only_authorizer)' '        pass'
 prove "a wait that is not a number is evaluated by bash arithmetic" t_hostile_env $L \
-  '  case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac' '  :'
+  '  [[ "${!v:-0}" =~ $WHOLE_SECS_RE ]] || die 2 "$v must be a whole number of seconds: ${!v}"' '  :'
 prove "a poll interval that is not a number is passed to sleep" t_hostile_env $L \
-  'case "${VELO_TASK_POLL:-0}" in *[!0-9.]*) die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL" ;; esac' ':'
+  '[[ "${VELO_TASK_POLL:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL"' ':'
 ROW=charset prove "the allowlist accepts any name" t_allowlist_rejects $L '/usr/bin/grep -Eq "$NAME_RE"' '/usr/bin/grep -Eq "."'
 ROW=charset prove "the allowlist accepts lowercase names" t_allowlist_rejects $L "NAME_RE='^[A-Z][A-Z0-9_]*\$'" "NAME_RE='^[A-Za-z][A-Za-z0-9_]*\$'"
 ROW=charset prove "the allowlist accepts a leading digit" t_allowlist_rejects $L "NAME_RE='^[A-Z][A-Z0-9_]*\$'" "NAME_RE='^[A-Z0-9][A-Z0-9_]*\$'"
@@ -1825,6 +1943,16 @@ prove "resolve: LIKE" t_resolve_exact $L $'WHERE name = ? ORDER BY created_at DE
 prove "resolve: the oldest job" t_run_rerun $L 'ORDER BY created_at DESC, job_id DESC LIMIT 1' 'ORDER BY created_at ASC, job_id ASC LIMIT 1'
 prove "resolve: an unknown id goes on" t_resolve_exact $L '  [ -n "$found" ] || die 2 "unknown id' '  [ -n "$found" ] || JOB=job_nope; [ -n "$found" ] || die 0 "unknown id'
 prove "status: a daemon that cannot be reached is exit 1" t_status_daemon $L '*"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict' '*"failed to reach daemon"*) die 1 "daemon-down: $out; no verdict'
+prove "B-RT1: no re-try at all" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 1 ] || break'
+prove "B-RT1: the default pause is nothing" t_status_transient_retry $L '/bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"' '/bin/sleep "${VELO_TASK_RETRY_SLEEP:-0}"'
+prove "B-RT2: five calls instead of eleven" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 5 ] || break'
+prove "B-RT3: every error is re-tried, not just the daemon-down" t_status_transient_retry $L 'case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac' 'case "$RETRY_OUT" in *"vanth status"*) ;; *) break ;; esac'
+prove "B-RT4: a pause even when the first call answers" t_status_transient_retry $L 'RETRY_OUT=""; RETRY_ATTEMPTS=0' 'RETRY_OUT=""; RETRY_ATTEMPTS=0; /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"'
+prove "B-RT5: the non-zero exit is not required, so a zero status is re-tried when its output names the daemon" t_status_success_not_retried $L '[ "$rc" -ne 0 ] || break' ':'
+prove "B-RT6: the old character-class check, which passes 1.2.3, ., 1..2, .., .5 and 5." t_retry_sleep_validation $L '[[ "${VELO_TASK_RETRY_SLEEP:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP"' 'case "${VELO_TASK_RETRY_SLEEP:-0}" in *[!0-9.]*) die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP" ;; esac'
+prove "B-RT7: the old character-class check, which passes 1.2.3, ., 1..2, .., .5 and 5." t_poll_validation $L '[[ "${VELO_TASK_POLL:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL"' 'case "${VELO_TASK_POLL:-0}" in *[!0-9.]*) die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL" ;; esac'
+prove "B-RT8: the old character-class check, which accepts 010, 08, 00, 1.5, -1 and a ten-digit count" t_whole_seconds_validation $L '[[ "${!v:-0}" =~ $WHOLE_SECS_RE ]] || die 2 "$v must be a whole number of seconds: ${!v}"' 'case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac'
+prove "B-RT9: the old character-class check, which accepts 0, 010, 65536 and 99999" t_port_validation $L '[[ "$PORT" =~ $PORT_RE ]] && [ "$PORT" -le 65535 ] || die 2 "VELO_TASK_PORT must be a port number from 1 to 65535: $PORT"' 'case "$PORT" in ""|*[!0-9]*) die 2 "VELO_TASK_PORT must be a number: $PORT" ;; esac'
 prove "wait: a failed winner of --any is exit 0" t_wait $L '[ "${done_[$first]#* }" = ok ]; return' 'true; return'
 prove "wait: --all with a failed job is exit 0" t_wait $L '[ "${done_[$i]#* }" = ok ] || worst=1;' 'true || worst=1;'
 prove "wait: a timeout is exit 1" t_wait $L 'die 3 "wait timed out' 'die 1 "wait timed out'
