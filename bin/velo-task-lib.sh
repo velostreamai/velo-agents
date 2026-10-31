@@ -55,7 +55,8 @@ for v in VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT; do  # evaluated by bash arith
   case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac
 done
 case "${VELO_TASK_POLL:-0}" in *[!0-9.]*) die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL" ;; esac
-case "${VELO_TASK_RETRY_SLEEP:-0}" in *[!0-9.]*) die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP" ;; esac
+RETRY_SLEEP_RE='^[0-9]+$|^[0-9]+\.[0-9]+$'   # a whole number, or digits, one dot, digits: /bin/sleep refuses 1.2.3, ., 1..2, .., .5 and 5.
+[[ "${VELO_TASK_RETRY_SLEEP:-0}" =~ $RETRY_SLEEP_RE ]] || die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP"
 unset v p
 
 ps_lstart() {  # <pid> -> start time (LC_ALL=C TZ=UTC, whatever the caller's locale), empty when no such process

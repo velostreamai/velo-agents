@@ -1402,6 +1402,19 @@ t_status_success_not_retried() {  # B-RT5: a status that exits 0 is the answer, 
   need "B-RT5: a status that exits 0 whose command field holds the transient text: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-cmd ok" ]
   need "...after exactly 1 call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
 }
+t_retry_sleep_validation() {  # B-RT6: VELO_TASK_RETRY_SLEEP is a whole number of seconds, or digits, one dot, digits; any other value is refused when the library loads (exit 2)
+  local v
+  mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
+  for v in '1.2.3' '.' '1..2' '..' '.5' '5.'; do
+    VELO_TASK_RETRY_SLEEP="$v" run VT status r-ok
+    need "B-RT6: a re-try pause of '$v' is refused (exit 2)" [ "$RC" = 2 ]
+    need "...naming the setting" grep -q 'VELO_TASK_RETRY_SLEEP must be a number of seconds' <<<"$OUT"
+  done
+  for v in '0' '0.2' '1'; do
+    VELO_TASK_RETRY_SLEEP="$v" run VT status r-ok
+    need "B-RT6: a re-try pause of '$v' is accepted: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  done
+}
 t_wait() {  # B4, B5, B15, B6
   local j n
   mkjobs
@@ -1735,6 +1748,7 @@ check "B1/B18/B26: verdicts through the whole path" t_status_verdicts
 check "status with the daemon down, broken or garbled" t_status_daemon
 check "B-RT1/B-RT2/B-RT3/B-RT4: one transient daemon-down is re-tried, at most 10 times, and nothing else is" t_status_transient_retry
 check "B-RT5: a status that exits 0 is answered at once, even when its output names the transient diagnostic" t_status_success_not_retried
+check "B-RT6: VELO_TASK_RETRY_SLEEP is a whole number or digits, one dot, digits; any other value is refused (exit 2)" t_retry_sleep_validation
 check "B4/B5/B6/B15: wait --all, --any, timeout, unknown ids" t_wait
 check "cancel is vanth stop, then the verdict killed; a finished job is exit 4" t_cancel
 check "a job that vanished after the id resolved is exit 2 with no verdict" t_vanished_job
@@ -1881,6 +1895,7 @@ prove "B-RT2: five calls instead of eleven" t_status_transient_retry $L '[ "$RET
 prove "B-RT3: every error is re-tried, not just the daemon-down" t_status_transient_retry $L 'case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac' 'case "$RETRY_OUT" in *"vanth status"*) ;; *) break ;; esac'
 prove "B-RT4: a pause even when the first call answers" t_status_transient_retry $L 'RETRY_OUT=""; RETRY_ATTEMPTS=0' 'RETRY_OUT=""; RETRY_ATTEMPTS=0; /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"'
 prove "B-RT5: the non-zero exit is not required, so a zero status is re-tried when its output names the daemon" t_status_success_not_retried $L '[ "$rc" -ne 0 ] || break' ':'
+prove "B-RT6: the old character-class check, which passes 1.2.3, ., 1..2, .., .5 and 5." t_retry_sleep_validation $L '[[ "${VELO_TASK_RETRY_SLEEP:-0}" =~ $RETRY_SLEEP_RE ]] || die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP"' 'case "${VELO_TASK_RETRY_SLEEP:-0}" in *[!0-9.]*) die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP" ;; esac'
 prove "wait: a failed winner of --any is exit 0" t_wait $L '[ "${done_[$first]#* }" = ok ]; return' 'true; return'
 prove "wait: --all with a failed job is exit 0" t_wait $L '[ "${done_[$i]#* }" = ok ] || worst=1;' 'true || worst=1;'
 prove "wait: a timeout is exit 1" t_wait $L 'die 3 "wait timed out' 'die 1 "wait timed out'
