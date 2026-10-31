@@ -1356,7 +1356,7 @@ t_status_daemon() {
   rm "$E/fail-launch"; run VT status gate-1; need "control: a daemon that can start is started, and the verdict read" [ "$OUT" = "gate-1 ok" ]
 }
 t_status_transient_retry() {  # B-RT1..B-RT4: the daemon loses ~1% of concurrent status calls to `failed to reach daemon`; that answer, and only that one, is re-tried, at most 10 times
-  local before t0 t1 calls='^vanth --json status job'
+  local before t0 t1 t2 t3 calls='^vanth --json status job'
   mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
   printf '3\n' > "$E/status-transient-error"
   before=$(grep -c "$calls" "$E_CALLS")
@@ -1381,11 +1381,19 @@ t_status_transient_retry() {  # B-RT1..B-RT4: the daemon loses ~1% of concurrent
   need "B-RT3: a plain daemon error: exit 1" [ "$RC" = 1 ]
   need "...and no re-try: one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
   rm "$E/status-fail"
-  printf '3\n' > "$E/status-transient-error"; t0=$(now)   # VELO_TASK_RETRY_SLEEP unset: the default pause is the one that runs
+  # A timed run also pays its own overhead (python helpers, the calls), which on a loaded runner can exceed the whole default pause, so a
+  # wall-clock floor on one run cannot tell the default from 0. Ten re-runs with the default must cost at least a second more than the
+  # same ten re-runs with the pause at 0: the default pause is 0.2s a re-run, two seconds in all, and the overhead is the same in both.
+  printf '10\n' > "$E/status-transient-error"; before=$(grep -c "$calls" "$E_CALLS"); t0=$(now)   # VELO_TASK_RETRY_SLEEP unset: the default pause is the one that runs
   run /usr/bin/env -u VELO_TASK_RETRY_SLEEP "$R/bin/velo-task" status r-ok
   t1=$(now)
   need "B-RT1: with no VELO_TASK_RETRY_SLEEP the default pause re-tries to the answer" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
-  need "...and the default is 0.2s: three re-runs take at least 0.6s" between 0.6 "$t0" "$t1" 30
+  need "...after exactly 11 calls (ten re-runs)" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 11 ]
+  printf '10\n' > "$E/status-transient-error"; before=$(grep -c "$calls" "$E_CALLS"); t2=$(now)
+  run /usr/bin/env VELO_TASK_RETRY_SLEEP=0 "$R/bin/velo-task" status r-ok
+  t3=$(now)
+  need "...and with the pause at 0 the same ten re-runs answer, after exactly 11 calls" [ "$RC" = 0 -a "$OUT" = "r-ok ok" -a "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 11 ]
+  need "...and the default is 0.2s: ten re-runs cost at least 1.0s more than the same ten with a pause of 0" "$PYBIN" -c "import sys; sys.exit(0 if ($t1 - $t0) - ($t3 - $t2) >= 1.0 else 1)"
   rm "$E/status-transient-error"
   before=$(grep -c "$calls" "$E_CALLS"); t0=$(now)   # a 5s pause in the environment: one that is never taken proves the first call is not delayed
   VELO_TASK_RETRY_SLEEP=5 run VT status r-ok
