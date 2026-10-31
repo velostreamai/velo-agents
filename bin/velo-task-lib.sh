@@ -10,7 +10,7 @@
 #   daemon.provenance pid, start time, launch digest of the daemon velo-task launched     daemon.launch.log vanthd stdout/stderr
 #   session the owner token run tags jobs with when $CLAUDE_SESSION_ID is unset      stop-override, overrides.log the Stop guard's one-shot escape
 # VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT, VELO_TASK_STOP_WAIT (seconds), VELO_TASK_POLL
-# (poll interval). Exit codes: 0 ok, 1 error, 2 usage, 3 wait timeout, 4 cancel: already finished, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
+# (poll interval), VELO_TASK_RETRY_SLEEP (pause between re-tries of one transient `failed to reach daemon`). Exit codes: 0 ok, 1 error, 2 usage, 3 wait timeout, 4 cancel: already finished, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
 
 LIB_SRC="${BASH_SOURCE[0]}"
 LIB_SRC_DIR="${LIB_SRC%/*}"; [ "$LIB_SRC_DIR" != "$LIB_SRC" ] || LIB_SRC_DIR=.
@@ -55,6 +55,7 @@ for v in VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT; do  # evaluated by bash arith
   case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac
 done
 case "${VELO_TASK_POLL:-0}" in *[!0-9.]*) die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL" ;; esac
+case "${VELO_TASK_RETRY_SLEEP:-0}" in *[!0-9.]*) die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP" ;; esac
 unset v p
 
 ps_lstart() {  # <pid> -> start time (LC_ALL=C TZ=UTC, whatever the caller's locale), empty when no such process
@@ -363,14 +364,31 @@ resolve() {  # <id> | --job <job_id>: sets JOB (and LABEL) from Vanth's own data
   [ -n "$found" ] || die 2 "unknown id '${2:-$1}': Vanth has no job by that name; address a job by its id with --job <job_id>"
   JOB="$found"
 }
+retry_transient_daemon() {  # <command...>: run it; when the answer is Vanth's `failed to reach daemon` - a race the daemon loses on ~1% of concurrent calls, its /doctor check and its /health check disagreeing - run the same call again, at most 10 re-runs (11 calls in all), VELO_TASK_RETRY_SLEEP apart
+  # Sets RETRY_OUT (the last call's combined output, unchanged) and RETRY_ATTEMPTS (how many calls were made) and returns the last call's exit status, so a
+  # caller keeps its own messages and its own exit code. Success, or any other error, is returned at once: this is the ONLY re-try in velo-task.
+  local rc=0
+  RETRY_OUT=""; RETRY_ATTEMPTS=0
+  while :; do
+    rc=0
+    RETRY_OUT=$("$@" 2>&1) || rc=$?
+    RETRY_ATTEMPTS=$((RETRY_ATTEMPTS + 1))
+    case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac
+    [ "$RETRY_ATTEMPTS" -lt 11 ] || break
+    /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"
+  done
+  return "$rc"
+}
 read_verdict() {  # <job> <label> [extra verdict-of args]: sets VERDICT_LINE and VERDICT; the daemon is asked, never a log or a process list
-  local job="$1" label="$2" out rc=0 vrc=0
+  local job="$1" label="$2" out rc=0 vrc=0 attempts=attempts
   shift 2
-  out=$(vanth_env "$VANTH" --json status "$job" 2>&1) || rc=$?
+  retry_transient_daemon vanth_env "$VANTH" --json status "$job" || rc=$?
+  out="$RETRY_OUT"
   if [ "$rc" -ne 0 ]; then
+    [ "$RETRY_ATTEMPTS" -ne 1 ] || attempts=attempt
     case "$out" in
       *"unknown job"*) die 2 "job $job is unknown to Vanth (cleaned up after it was resolved?); no verdict" ;;
-      *"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict was read; recover with: velo-task restart-daemon" ;;
+      *"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict was read after $RETRY_ATTEMPTS $attempts; recover with: velo-task restart-daemon" ;;
       *) die 1 "vanth status failed (exit $rc): $out" ;;
     esac
   fi

@@ -1354,6 +1354,39 @@ t_status_daemon() {
   run VT status gate-1; need "a daemon that is down and cannot start: exit 6" [ "$RC" = 6 ]; need "...the restart hint" grep -q 'velo-task restart-daemon' <<<"$OUT"
   rm "$E/fail-launch"; run VT status gate-1; need "control: a daemon that can start is started, and the verdict read" [ "$OUT" = "gate-1 ok" ]
 }
+t_status_transient_retry() {  # B-RT1..B-RT4: the daemon loses ~1% of concurrent status calls to `failed to reach daemon`; that answer, and only that one, is re-tried, at most 10 times
+  local before t0 t1 calls='^vanth --json status job'
+  mkjobs; inject '{"name":"r-ok","status":"completed","exit_code":0}' >/dev/null
+  printf '3\n' > "$E/status-transient-error"
+  before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT1: three transient refusals then the answer: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  need "...after exactly 4 calls" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 4 ]
+  rm "$E/status-transient-error"
+  : > "$E/status-transport-error"; before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT2: a daemon that never answers: exit 6, as today" [ "$RC" = 6 ]
+  need "...after exactly 11 calls (one, then ten re-runs)" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 11 ]
+  need "...saying after 11 attempts" grep -q 'after 11 attempts' <<<"$OUT"
+  need "...and keeping the restart hint" grep -q 'velo-task restart-daemon' <<<"$OUT"
+  rm "$E/status-transport-error"
+  : > "$E/status-unknown"; before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT3: another error (unknown job): exit 2" [ "$RC" = 2 ]
+  need "...and no re-try: one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+  rm "$E/status-unknown"
+  : > "$E/status-fail"; before=$(grep -c "$calls" "$E_CALLS")
+  run VT status r-ok
+  need "B-RT3: a plain daemon error: exit 1" [ "$RC" = 1 ]
+  need "...and no re-try: one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+  rm "$E/status-fail"
+  before=$(grep -c "$calls" "$E_CALLS"); t0=$(now)   # a 5s pause in the environment: one that is never taken proves the first call is not delayed
+  VELO_TASK_RETRY_SLEEP=5 run VT status r-ok
+  t1=$(now)
+  need "B-RT4: a first call that answers: exit 0 with the verdict" [ "$RC" = 0 -a "$OUT" = "r-ok ok" ]
+  need "...exactly one call" [ "$(( $(grep -c "$calls" "$E_CALLS") - before ))" = 1 ]
+  need "...and no pause at all" between 0 "$t0" "$t1" 2
+}
 t_wait() {  # B4, B5, B15, B6
   local j n
   mkjobs
@@ -1685,6 +1718,7 @@ check "run: a daemon down is exit 6, a refused start exit 1" t_run_failures
 check "B-R1: an id is an exact name, whatever 1,100 newer jobs contain" t_resolve_exact
 check "B1/B18/B26: verdicts through the whole path" t_status_verdicts
 check "status with the daemon down, broken or garbled" t_status_daemon
+check "B-RT1/B-RT2/B-RT3/B-RT4: one transient daemon-down is re-tried, at most 10 times, and nothing else is" t_status_transient_retry
 check "B4/B5/B6/B15: wait --all, --any, timeout, unknown ids" t_wait
 check "cancel is vanth stop, then the verdict killed; a finished job is exit 4" t_cancel
 check "a job that vanished after the id resolved is exit 2 with no verdict" t_vanished_job
@@ -1825,6 +1859,10 @@ prove "resolve: LIKE" t_resolve_exact $L $'WHERE name = ? ORDER BY created_at DE
 prove "resolve: the oldest job" t_run_rerun $L 'ORDER BY created_at DESC, job_id DESC LIMIT 1' 'ORDER BY created_at ASC, job_id ASC LIMIT 1'
 prove "resolve: an unknown id goes on" t_resolve_exact $L '  [ -n "$found" ] || die 2 "unknown id' '  [ -n "$found" ] || JOB=job_nope; [ -n "$found" ] || die 0 "unknown id'
 prove "status: a daemon that cannot be reached is exit 1" t_status_daemon $L '*"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict' '*"failed to reach daemon"*) die 1 "daemon-down: $out; no verdict'
+prove "B-RT1: no re-try at all" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 1 ] || break'
+prove "B-RT2: five calls instead of eleven" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 5 ] || break'
+prove "B-RT3: every error is re-tried, not just the daemon-down" t_status_transient_retry $L 'case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac' 'case "$RETRY_OUT" in *"vanth status"*) ;; *) break ;; esac'
+prove "B-RT4: a pause even when the first call answers" t_status_transient_retry $L 'RETRY_OUT=""; RETRY_ATTEMPTS=0' 'RETRY_OUT=""; RETRY_ATTEMPTS=0; /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"'
 prove "wait: a failed winner of --any is exit 0" t_wait $L '[ "${done_[$first]#* }" = ok ]; return' 'true; return'
 prove "wait: --all with a failed job is exit 0" t_wait $L '[ "${done_[$i]#* }" = ok ] || worst=1;' 'true || worst=1;'
 prove "wait: a timeout is exit 1" t_wait $L 'die 3 "wait timed out' 'die 1 "wait timed out'

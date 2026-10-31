@@ -17,6 +17,7 @@
 #   20s         3s     velo-task restart-daemon: a SIGTERMed vanthd must exit
 #   60s         30s    velo-task: the per-home daemon lock
 #   0.2s        0.05s  velo-task: poll interval while a launched vanthd comes up or a SIGTERMed one exits
+#   0.2s        0      velo-task: pause between re-tries of one transient `failed to reach daemon` (x10)
 #
 # A scenario that tests one of these waits sets its own value inline.
 #
@@ -34,6 +35,7 @@ export VELO_TASK_START_WAIT=10
 export VELO_TASK_STOP_WAIT=3
 export VELO_TASK_LOCK_WAIT=30
 export VELO_TASK_POLL=0.05
+export VELO_TASK_RETRY_SLEEP=0
 
 # Not a timeout, but the same kind of thing: every suite inherits it. A script under test that a suite copies away from
 # bin/ (a mutant, a layout in a scratch dir) has no velo-repo-lib.sh beside it; this is where it finds the real one.
