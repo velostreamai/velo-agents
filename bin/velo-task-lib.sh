@@ -50,9 +50,11 @@ die() { local code="$1"; shift; printf 'velo-task: %s\n' "$*" >&2; exit "$code";
 st() { /usr/bin/env -i "${HELPER_ENV[@]}" "$PYSYS" -I "$STATE_SCRIPT" "$@"; }  # the helper sees nothing of the caller's environment (python -I: no PYTHON*, no user site)
 
 case "$VELO_TASK_HOME" in /*) ;; *) die 2 "VELO_TASK_HOME must be an absolute path: $VELO_TASK_HOME" ;; esac
-case "$PORT" in ''|*[!0-9]*) die 2 "VELO_TASK_PORT must be a number: $PORT" ;; esac
-for v in VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT; do  # evaluated by bash arithmetic, which runs command substitutions: a number or refused
-  case "${!v:-0}" in *[!0-9]*) die 2 "$v must be a whole number of seconds: ${!v}" ;; esac
+PORT_RE='^[1-9][0-9]{0,4}$'   # a TCP port, 1 to 65535, written without a leading zero (010 is not 10 here)
+[[ "$PORT" =~ $PORT_RE ]] && [ "$PORT" -le 65535 ] || die 2 "VELO_TASK_PORT must be a port number from 1 to 65535: $PORT"
+WHOLE_SECS_RE='^(0|[1-9][0-9]{0,8})$'   # bash arithmetic reads 010 as octal and rejects 08; at most nine digits, so a longer count is refused before it reaches bash arithmetic
+for v in VELO_TASK_START_WAIT VELO_TASK_STOP_WAIT; do  # evaluated by bash arithmetic, which runs command substitutions: a whole number or refused
+  [[ "${!v:-0}" =~ $WHOLE_SECS_RE ]] || die 2 "$v must be a whole number of seconds: ${!v}"
 done
 SECS_RE='^[0-9]+$|^[0-9]+\.[0-9]+$'   # a whole number of seconds, or digits, one dot, digits: /bin/sleep refuses 1.2.3, ., 1..2, .., .5 and 5.
 [[ "${VELO_TASK_POLL:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL"
