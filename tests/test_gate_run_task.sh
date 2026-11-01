@@ -13,9 +13,12 @@
 #   G2 a verdict that is not `ok` IS the step failure: non-zero exit, the verdict and the
 #      out file's tail shown;
 #   G3 a `velo-task run` that fails is FATAL with its message — no fallback to the direct
-#      call, and the gate is NOT started.
+#      call, and the gate is NOT started;
+#   G4 `in-flight` is not a verdict: the wrapper keeps polling until it has one.
 #
-# The mutants are the brief's three: the direct call, any-verdict-is-ok, and a fallback.
+# The mutants are the brief's three (the direct call, any-verdict-is-ok, a fallback) plus
+# the one G4 adds: break on the first poll, which would read a job that is still running
+# as a finished one.
 # No daemon here: the fake velo-task runs the job synchronously (the wrapper's job shell
 # does the redirecting, so the command runs exactly as the real one would) and records the
 # exit status as the verdict `velo-task status` would print.
@@ -45,6 +48,7 @@ export VELO_TASK_BIN="$FAKE_TASK"
 TASK_CALLS="$TMPD/task-calls.log";      export TASK_CALLS
 TASK_VERDICTS="$TMPD/task-verdicts";    export TASK_VERDICTS
 TASK_FAIL="$TMPD/task-run-fail";        export TASK_FAIL
+TASK_INFLIGHT="$TMPD/task-inflight";    export TASK_INFLIGHT
 GATE_CALLS="$TMPD/gate-calls.log";      export GATE_CALLS
 SCOPE="$TMPD/scope.md"
 SC_FAILS=""
@@ -110,7 +114,8 @@ chmod +x "$FAKE_GATE"
 
 # Fake velo-task: `run` executes the job here and now (no daemon in an automated suite)
 # and remembers its exit status; `status` prints `<id> <verdict>`, the shape cmd_status
-# prints, so the wrapper's poll has a real answer to parse.
+# prints, so the wrapper's poll has a real answer to parse. G4 asks it for that many
+# `in-flight` answers first — a job still running must not be read as a finished one.
 cat > "$FAKE_TASK" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$TASK_CALLS"
@@ -129,6 +134,13 @@ case "$1" in
     ;;
   status)
     id="${2:-}"
+    if [[ -s "$TASK_INFLIGHT" ]]; then
+      n=$(cat "$TASK_INFLIGHT")
+      if [[ "$n" -gt 0 ]]; then
+        printf '%s\n' "$((n - 1))" > "$TASK_INFLIGHT"
+        printf '%s in-flight\n' "$id"; exit 0
+      fi
+    fi
     v=$(cat "$TASK_VERDICTS/$id" 2>/dev/null)
     printf '%s %s\n' "$id" "${v:-in-flight}"
     ;;
@@ -139,7 +151,7 @@ chmod +x "$FAKE_TASK"
 reset() {
   rm -rf "$GATE_DIR" "$STUB_DIR" "$TASK_VERDICTS"
   mkdir -p "$STUB_DIR" "$VELO_STATE/gate"
-  rm -f "$GATE_CALLS" "$TASK_CALLS" "$TASK_FAIL"
+  rm -f "$GATE_CALLS" "$TASK_CALLS" "$TASK_FAIL" "$TASK_INFLIGHT"
   cat > "$SCOPE" <<'EOF'
 # Scope
 
@@ -220,10 +232,25 @@ sc_g3_task_run_failure_is_fatal() {
                                                         sc_check the-direct-gate-was-NOT-started $?
 }
 
+# ── G4: in-flight is not a verdict — the wrapper waits for one ───────────────
+sc_g4_inflight_is_not_a_verdict() {
+  SC_FAILS=""
+  reset
+  printf '2\n' > "$TASK_INFLIGHT"     # the job answers in-flight twice, then ok
+  run_wrapper "$TPR" "$SCOPE"
+  [[ $RC -eq 0 ]];                                      sc_check round-exits-0 $?
+  [[ "$(ncalls "status gate-$TPR" "$TASK_CALLS")" == "3" ]]
+                                                        sc_check polled-until-the-verdict $?
+  [[ "$(ncalls "$SCOPE --exec --wait" "$GATE_CALLS")" == "1" ]]
+                                                        sc_check the-job-was-not-started-twice $?
+  has_out "GATE-RUN-OUTPUT-MARKER";                     sc_check the-gates-output-is-printed $?
+}
+
 run_scenarios \
   "sc_g1_job_command_line::G1 the run step asks velo-task for the job, in the pinned shape" \
   "sc_g2_failed_verdict_is_the_step_failure::G2 a verdict that is not ok IS the step failure, with the out tail" \
-  "sc_g3_task_run_failure_is_fatal::G3 a velo-task run that fails is fatal, and the direct gate is not started"
+  "sc_g3_task_run_failure_is_fatal::G3 a velo-task run that fails is fatal, and the direct gate is not started" \
+  "sc_g4_inflight_is_not_a_verdict::G4 in-flight is not a verdict — the wrapper polls until it has one"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # MUTATION-PROOF — each behaviour goes red when it is removed
@@ -265,6 +292,8 @@ prove_run "a velo-task run that fails is fatal (no fallback to the direct call)"
   '[[ $task_rc -eq 0 ]] || die "velo-task run' 'if [[ $task_rc -ne 0 ]]; then
       "$PR_GATE" "$PR" "$@" 2>&1 | tee "$out"; return "${PIPESTATUS[0]}"; fi
     [[ $task_rc -eq 0 ]] || die "velo-task run'
+prove_run "in-flight is not a verdict" sc_g4_inflight_is_not_a_verdict \
+  '[[ "$verdict" == in-flight ]] || break' 'break'
 
 echo
 [[ $FAILED -eq 0 ]] && echo "all velo-gate-run velo-task-job checks passed" || echo "FAILURES"
