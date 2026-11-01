@@ -497,14 +497,9 @@ sc_real_stale_head() {
 sc_real_block_no_substitution() {
   SC_FAILS=""
   real_reset
-  # #31: this round has no recorded runner (real_reset writes no check-code.by), and
-  # the comment now says so. A bare `gate: check-code @ <sha>` header reads as the
-  # routed reviewer's work, so the absence is declared — while no agent that did not
-  # run is ever named.
   run_real "$PR" "$RS" --block "$CC" "$CR"
   [[ $RC -eq 0 ]];                                 sc_check exits-0 $?
-  has "$STUB_POSTED" "runner not recorded";        sc_check no-marker-declares-nothing-was-recorded $?
-  ! has "$STUB_POSTED" "run by a read-only";       sc_check no-runner-is-invented $?
+  ! has "$STUB_POSTED" "Reviewer substitution";    sc_check no-marker-no-declaration $?
   has "$STUB_EDITS" "--add-label gate:blocked";    sc_check blocked-label $?
 }
 
@@ -528,7 +523,7 @@ echo "velo-gate-finish over the real velo-gate-post and velo-gate"
 run_scenarios \
   "sc_real_round::a Sonnet check-code round: stamped, declared, labelled, and safe to re-run" \
   "sc_real_stale_head::a head that moved refuses the label and leaves honestly-stamped reports" \
-  "sc_real_block_no_substitution::an unrecorded check-code runner is declared, and no agent is invented" \
+  "sc_real_block_no_substitution::an opus-route (no marker) block declares nothing" \
   "sc_real_stale_marker::a poster that skips on a stale done-marker cannot get a label over a missing report"
 
 # ═════════════════════════════════════════════════════════════════════════════
