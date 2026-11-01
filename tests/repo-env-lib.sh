@@ -131,12 +131,26 @@ STUB
 printf '%s\n' "$*" >> "$ZG_LOG"
 exit 0
 STUB
-  chmod +x "$H/.agents/bin/velo-openrouter-agent.stub" "$H/.agents/bin/zg.stub"
+  # What a dispatch starts its supervisor WITH (#31): `velo-task run <id> -- <cmd...>`.
+  # Run it here and now, then print the id — cmd_run prints the job as its last line —
+  # so a dispatch's supervisor, its worker and the record it writes are exercised
+  # without a Vanth daemon in the sandbox.
+  cat > "$H/.agents/bin/velo-task.stub" <<'STUB'
+#!/bin/bash
+[[ "$1" = run ]] || { printf 'velo-task stub: unsupported: %s\n' "$*" >&2; exit 2; }
+jid="$2"; shift 2
+while [[ "$#" -gt 0 && "$1" != "--" ]]; do shift; done
+[[ "$#" -gt 0 ]] && shift
+"$@"
+printf '%s\n' "$jid"
+STUB
+  chmod +x "$H/.agents/bin/velo-openrouter-agent.stub" "$H/.agents/bin/zg.stub" "$H/.agents/bin/velo-task.stub"
 }
-stub_worker() {   # replace the symlinked worker and indexer by the stubs (dispatch launches ~/.agents/bin/<name>)
-  rm -f "$H/.agents/bin/velo-openrouter-agent" "$H/.agents/bin/zg"
+stub_worker() {   # replace the symlinked worker, indexer and task runner by the stubs (dispatch launches ~/.agents/bin/<name>)
+  rm -f "$H/.agents/bin/velo-openrouter-agent" "$H/.agents/bin/zg" "$H/.agents/bin/velo-task"
   mv "$H/.agents/bin/velo-openrouter-agent.stub" "$H/.agents/bin/velo-openrouter-agent"
   mv "$H/.agents/bin/zg.stub" "$H/.agents/bin/zg"
+  mv "$H/.agents/bin/velo-task.stub" "$H/.agents/bin/velo-task"
 }
 mk_tree() {   # <name> <default branch>: a remote of that name, cloned to ~/RustroverProjects/<name>, on feat/gate one commit ahead
   local rem="$SB/remote/velostreamai/$1" tree="$H/RustroverProjects/$1"
