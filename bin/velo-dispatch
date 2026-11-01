@@ -6,10 +6,13 @@
 #   velo-dispatch <issue> <brief-file> [--branch <name>] [--dry-run] [--force]
 #                                      [--resume] [--wait]
 #
-# --wait blocks until the detached supervisor records the worker's exit (a new
-# line in ~/.agents/state/records/<issue>.result.jsonl), then prints the
-# outcome, the branch's commits, and the worker's agent.log STOP/MUTATION-PROOF
-# lines. Exits 0 when the worker landed, non-zero when it failed or stopped.
+# --wait blocks until the supervisor records the worker's exit (a new line in
+# ~/.agents/state/records/<issue>.result.jsonl), then prints the outcome, the
+# branch's commits, and the worker's agent.log STOP/MUTATION-PROOF lines. Exits
+# 0 when the worker landed, non-zero when it failed or stopped.
+# The supervisor is a velo-task job (`velo-task status dispatch-<issue>`), so it
+# is in Vanth's jobs table, in `velo-task status`, and in the session's task
+# list — a bare `nohup ... &` was in none of them.
 # Without --wait the launch returns immediately, exactly as before: a detached
 # run that finishes with nobody watching is how gates and workers went
 # unnoticed for 8 hours.
@@ -105,9 +108,9 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY=1; shift ;;
     --force) FORCE=1; shift ;;
     --resume) RESUME=1; shift ;;
-    # Block until the detached supervisor records the worker's exit, instead of
+    # Block until the supervisor records the worker's exit, instead of
     # returning the moment it is launched. See the wait loop right after the
-    # nohup dispatch below for why a result.jsonl line count is the signal used.
+    # launch below for why a result.jsonl line count is the signal used.
     --wait) WAIT=1; shift ;;
     # Deliberately takes a REASON rather than being a bare flag (#2120). A bare
     # --same-tier would be typed reflexively the second time anyone hit the
@@ -1724,9 +1727,9 @@ fi
 # has already finished. The `|| true` is belt and braces on that promise.
 #
 # --wait's baseline: the line count BEFORE the launch below, taken here rather
-# than after `&` returns, so a worker that finishes in the same second the
-# nohup is issued cannot be missed by a watcher that only starts counting once
-# the launch line has already returned control.
+# than after the launch returns, so a worker that finishes in the same second
+# the launch is issued cannot be missed by a watcher that only starts counting
+# once the launch line has already returned control.
 WAIT_RECORD_FILE=$(repo_scoped "${VELO_STATE:-$HOME/.agents/state}/records/${ISSUE}.result.jsonl")
 # velo-record counts commits against the ref resolved above, not one it would have to ask GitHub for after the run.
 [[ $REPO_IS_DEFAULT -eq 1 ]] || export WT_BASE_REF
@@ -1736,7 +1739,41 @@ WAIT_BASELINE_LINES=0
 # A resumed branch already carries earlier runs' commits; counting from
 # origin/master scored a run that committed nothing as `landed` (#2291).
 START_HEAD=$(git -C "$WT" rev-parse HEAD) || die "cannot resolve HEAD in $WT"
-nohup bash -c '
+# ---- launch: the supervisor, as a velo-task job (#31 part A) -----------------
+#
+# The supervisor is started by `velo-task run`, not with a bare `nohup ... &`.
+#
+# A detached `nohup` supervisor is invisible to everything that answers "what is
+# this session running": `velo-task status` reads Vanth's jobs table, the Stop
+# guard blocks a session end while one of its `session:<me>` jobs is in flight,
+# and the Claude task list is built from the same rows. The worker was in none
+# of them, so a dispatch in flight read as an idle session with nothing running.
+#
+# ONE path. `velo-task run` failing is fatal, and there is deliberately no
+# fallback to the nohup launch: a launch that silently takes the other path is
+# the defect being replaced, not a safety net — a supervisor that never reached
+# Vanth is invisible in exactly the way this change exists to fix.
+#
+# Vanth jobs inherit neither PATH nor HOME, and a job sees only the variables
+# NAMED in vanth.env.allow (docs/velo-task-spec.md R8). So:
+#   - the environment the supervisor needs travels as ARGUMENTS to /usr/bin/env;
+#   - a secret travels as its NAME in vanth.env.allow, never as a value on this
+#     command line (the command line is recorded in Vanth's jobs table);
+#   - the supervisor's "$HOME/.agents/bin/..." paths resolve because HOME is
+#     passed the same way.
+#
+# >>> velo-dispatch-launch
+VELO_TASK_BIN="${VELO_TASK_BIN:-$HOME/.agents/bin/velo-task}"
+# The job id is what `velo-task status` is asked about, and velo-task checks it
+# as a lowercase token. A non-default repo contributes its NAME only: REPO_SUB
+# holds slashes, which no id may contain.
+ID_REPO_PART=""
+[[ $REPO_IS_DEFAULT -eq 1 ]] || ID_REPO_PART="${REPO_NAME}-"
+TASK_ID="dispatch-${ID_REPO_PART}${ISSUE}"
+TASK_TIMEOUT="${VELO_DISPATCH_TASK_TIMEOUT:-14400}"
+TASK_OUT=$("$VELO_TASK_BIN" run "$TASK_ID" --issue "$ISSUE" --stage dispatch --rerun \
+  --timeout "$TASK_TIMEOUT" -- \
+  /usr/bin/env HOME="$HOME" PATH="$PATH" /bin/bash -c '
   LOGF="$1"; RI="$2"; RWT="$3"; RNAME="$4"; RMODEL="$5"
   RBRIEF="$6"; RSTART="$7"; RMT="$8"; RBASE="$9"
   # $10 would parse as $1 followed by a literal 0, silently passing the log path
@@ -1752,24 +1789,37 @@ nohup bash -c '
     --model "$RMODEL" --brief "$RBRIEF" --log "$LOGF" --started "$RSTART" \
     --rc "$rc" --max-turns "$RMT" --base "$RBASE" --start-head "$RSHEAD" >> "$LOGF" 2>&1 || true
 ' _ "$LOG" "$ISSUE" "$WT" "$NAME" "$MODEL_ID" "$BRIEF_AS_WRITTEN" "$STARTED" "$RECORD_MAX_TURNS" "$BASE" \
-  "${INDEX_STATE:-unknown}" "$START_HEAD" "$MODEL_LINE" "${CMD[@]}" > /dev/null 2>&1 &
-PID=$!
+  "${INDEX_STATE:-unknown}" "$START_HEAD" "$MODEL_LINE" "${CMD[@]}" 2>&1); TASK_RC=$?
+[[ $TASK_RC -eq 0 ]] || die "velo-task run $TASK_ID failed (exit $TASK_RC):
+$TASK_OUT
+
+  The worker was NOT launched. Repair the daemon, then re-run this dispatch:
+    velo-task ensure-daemon
+    velo-task status $TASK_ID"
+# cmd_run prints the job id as its last line; any stderr noise stays out of it.
+JOB_ID="${TASK_OUT##*$'\n'}"
+[[ -n "$JOB_ID" ]] || die "velo-task run $TASK_ID started no job and printed no id:
+$TASK_OUT
+
+  The worker was NOT launched."
 
 echo
 echo "── dispatched ─────────────────────────────────────────"
 echo "  #$ISSUE  $TITLE"
-echo "  worker : $NAME   supervisor pid $PID"
+echo "  worker : $NAME"
+echo "  job    : $JOB_ID  (velo-task status $TASK_ID)"
 if [[ -n "$MODEL_LINE" ]]; then echo "  $MODEL_LINE"; fi
 echo "  branch : $BRANCH  (off ${WT_BASE_REF:-origin/master} $BASE)"
 echo "  log    : $LOG"
 echo "  record : .agents/tasks/${ISSUE}.result.jsonl  (appended on exit)"
 echo
-echo "  poll:   tail -3 $LOG"
+echo "  poll:   velo-task status $TASK_ID    (or: tail -3 $LOG)"
 echo "  result: git -C $WT log --oneline ${WT_BASE_REF:-origin/master}..HEAD"
 echo
 echo "  Detached. The supervisor records the outcome when the worker exits,"
 echo "  including on crash or timeout. Still verify from git and the tests,"
 echo "  never from the worker's self-report."
+# <<< velo-dispatch-launch
 
 # ---- --wait: block until the supervisor appends the exit record ------------
 #

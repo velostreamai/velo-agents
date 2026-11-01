@@ -208,13 +208,14 @@ else fail "the dispatched block does not print the model line between worker and
 check "the launch hands the model line to the supervisor, after the start head" \
   "$(grep -cF '"$START_HEAD" "$MODEL_LINE" "${CMD[@]}"' "$BIN/velo-dispatch")" 1
 
-# The supervisor is the nohup script inside velo-dispatch. It is extracted and run for real, with
-# the argument order the launch passes, so the log it writes is the one a launch leaves behind.
+# The supervisor is the script velo-dispatch hands to `velo-task run` (#31). It is
+# extracted and run for real, with the argument order the launch passes, so the log
+# it writes is the one a launch leaves behind.
 NOHUP="$TMPD/nohup-script.sh"
 if ! python3 - "$BIN/velo-dispatch" "$NOHUP" <<'PY'
 import pathlib, sys
 src = pathlib.Path(sys.argv[1]).read_text()
-start = src.index("nohup bash -c '") + len("nohup bash -c '")
+start = src.index("/bin/bash -c '") + len("/bin/bash -c '")
 end = src.index("' _ \"$LOG\"", start)
 pathlib.Path(sys.argv[2]).write_text(src[start:end])
 PY
