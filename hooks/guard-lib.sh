@@ -1,7 +1,7 @@
 #!/bin/bash
 # guard-lib.sh - the command scanner the deny-* PreToolUse hooks share (docs/velo-task-spec.md R10, R15(i)).
-# Sourced by deny-vanth-cleanup.sh and deny-pgrep-wait-loop.sh; never registered, never run. The hooks fail open
-# when it is missing, so the guard is silently off until install.sh has put it beside them.
+# Sourced by deny-vanth-cleanup.sh, deny-pgrep-wait-loop.sh and deny-raw-launch.sh; never registered, never run. The hooks
+# fail open when it is missing, so the guard is silently off until install.sh has put it beside them.
 #
 # A guard that greps the raw command text blocks `git commit -m "never run vanth prune"` and `gh pr create --body ...`.
 # So the command is first reduced to its command-position text: one segment per line, where
