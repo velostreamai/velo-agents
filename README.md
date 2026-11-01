@@ -91,7 +91,7 @@ and the tests** — never from the worker's self-report.
     test_verdict_of.sh             verdict_of: one verdict from every **Verdict:** line, not the first
     test_fence_parity.py           the three code-fence readers (brief lint, ATTACK fill, acceptance-bar counter) read ONE grammar
     test_llm_bench.sh              velo-llm-bench: the prompt is the pinned commit's, byte for byte; every result line says what produced it
-    test_velo_task_hooks.sh        velo-task M3c, B13 + B29 hook half: the two deny-* hooks: every denied form, the look-alikes that must pass, each known false negative pinned, fail-open, the README registration line, install; each check is proved red on a mutated copy
+    test_velo_task_hooks.sh        velo-task M3c, B13 + B29 hook half: the three deny-* hooks: every denied form, the look-alikes that must pass, each known false negative pinned, fail-open, the README registration line, install; each check is proved red on a mutated copy
     test_velo_task_bash32.sh       velo-task M3c, B14: every bin/velo-task* script parses, sweeps clean and runs under /bin/bash 3.2; a seeded declare -A fixture (fixtures/velo-task/bash4-seeded.sh) fails both halves; one seed per construct family
     bash32-sweep.sh                the bash-4 sweep and the 3.2 runner, sourced by those two suites; mutation-lib.sh is their shared mutation-proof harness (sourced, not suites)
     test_velo_task.sh              velo-task v2: the state helper, daemon launch (secrets, privacy, provenance), the pinned install, run/status/wait/cancel against a fake Vanth with real state, the Stop guard and SessionStart; each check is proved red on a mutated copy; VELO_TASK_ONLY="t_a t_b" runs just those, VELO_TASK_NO_PROOFS=1 skips the proofs, VELO_TASK_NETWORK_TESTS=1 adds the real Vanth
@@ -105,7 +105,8 @@ and the tests** — never from the worker's self-report.
     session-start-inflight.sh      SessionStart: lists in-flight gates, workers and PRs and unhandled attention events, so work a previous session launched is not forgotten
     deny-vanth-cleanup.sh          PreToolUse: denies `vanth prune` and `vanth restore` (spec R15(i)); its false negatives are in its header and pinned by its test
     deny-pgrep-wait-loop.sh        PreToolUse: denies a hand-written `until/while pgrep` wait loop and allows `velo-task wait` (spec R10)
-    guard-lib.sh                   the command scanner the two deny-* hooks share (command position only: quoted text, heredocs and comments never match); sourced, never registered
+    deny-raw-launch.sh             PreToolUse: denies a raw launch of a worker (`velo-openrouter-agent`) or of a Codex run (`codex exec`) outside velo-dispatch / velo-gate-run (spec R10); its false negatives are in its header and pinned by its test; register it in settings.json PreToolUse — install.sh copies hooks, it registers nothing
+    guard-lib.sh                   the command scanner the three deny-* hooks share (command position only: quoted text, heredocs and comments never match); sourced, never registered
   launchd/
     ai.velostream.orchestrd.plist  source template for the velo-orchestrd launchd agent
   requirements/
@@ -254,7 +255,8 @@ is skipped the same way, which is why `--check` looks for it):
         "hooks": [
           { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/require-wait.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/require-wait.sh\"" },
           { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/deny-vanth-cleanup.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/deny-vanth-cleanup.sh\"" },
-          { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\"" }
+          { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\"" },
+          { "type": "command", "command": "[ -x \"$HOME/.agents/hooks/deny-raw-launch.sh\" ] || exit 0; exec \"$HOME/.agents/hooks/deny-raw-launch.sh\"" }
         ]
       }
     ]
@@ -262,13 +264,14 @@ is skipped the same way, which is why `--check` looks for it):
 }
 ```
 
-`session-start-inflight.sh` registers the same way under `SessionStart`. The two `deny-*` hooks are guardrails against
+`session-start-inflight.sh` registers the same way under `SessionStart`. The three `deny-*` hooks are guardrails against
 the orchestrating model's own mistakes (docs/velo-task-spec.md), not isolation:
 
 | hook | denies | allows | known false negatives |
 |---|---|---|---|
 | `deny-vanth-cleanup.sh` | `vanth prune` and `vanth restore` as a command: bare, by absolute path, `python -m vanth[.cli]`, behind `env`/`sudo`/`timeout`/`uv run` and the like, in a pipeline, `&&`, `$( )` or a loop | any other `vanth` subcommand, `vanth prune --help`, and the same words inside a quoted string, a heredoc or a comment (`git commit -m "..."`) | a `bash -c` or `eval` string, a variable or alias holding the program, a script file, `find -exec`, `sudo -u neil`, `curl -X POST .../cleanup`, the MCP `job_cleanup` tool, `VANTH_RETENTION_SECONDS`, a redirection in front of the command name (`>out vanth prune`), a quoted command path that contains a space, xargs substitution, the output of a command substitution naming the program, more than 1 KB of text in front of the command in one segment |
 | `deny-pgrep-wait-loop.sh` | a `pgrep` inside a `while` or `until` loop, in its condition or its body | `velo-task wait`, `pgrep` outside a loop, and the same words inside a string, a heredoc or a comment | a `bash -c` or `eval` string, `for` and `watch` polls, `ps` piped to `grep`, `pidof`, `kill -0`, pid and marker files, a redirection in front of the command name (`until >/dev/null pgrep ...`), more than 1 KB of text in front of the command in one segment |
+| `deny-raw-launch.sh` | the worker runner `velo-openrouter-agent`, by name or by any path, and `codex` about to run its `exec` subcommand: bare, behind `env`/`sudo`/`nohup`/`timeout`/`uv run` and the like, in a pipeline, `&&`, `$( )` or a loop | `velo-dispatch <issue> <brief> --wait`, `velo-gate-run <pr> <scope>`, `velo-openrouter-agent --help` (and `-h`, `--version`), every other `codex` subcommand (`codex login`, `codex --version`), and the same words inside a quoted string, a heredoc or a comment (`git commit -m "nohup velo-openrouter-agent"`) | a string handed to bash -c / sh -c / eval, a variable or alias holding the program, a script file that launches it, `find -exec`, a wrapper option that takes a word (`sudo -u neil`), xargs substitution, a codex option this hook does not know takes a word, the other raw entry points (`velo-openrouter-agent-sdk.py`, `velo-openai-agents-runner.py`, the runner copied under another name), a redirection in front of the command name (`>out velo-openrouter-agent --model x`), more than 1 KB of text in front of the command in one segment |
 
 Both read the payload with `jq` and fail open (exit 0) when `jq`, `guard-lib.sh` (the scanner they share, installed beside
 them) or the command is missing. `tests/test_velo_task_hooks.sh` pins every denied form, every look-alike that must pass and
