@@ -457,6 +457,7 @@ run_gate_task() {   # <velo-pr-gate args after the pr number...>
     task_out=$("$task_bin" run "$task_id" --issue "$PR" --stage gate --rerun \
       --timeout "$task_timeout" -- \
       /usr/bin/env HOME="$HOME" PATH="$PATH" OUT="$out" \
+      ${VELO_REPO:+"VELO_REPO=$VELO_REPO"} ${VELO_GATE_REPO:+"VELO_GATE_REPO=$VELO_GATE_REPO"} \
       /bin/bash -c 'exec "$@" > "$OUT" 2>&1' _ "$PR_GATE" "$PR" "$@" 2>&1); task_rc=$?
     [[ $task_rc -eq 0 ]] || die "velo-task run $task_id failed (exit $task_rc):
 $task_out
