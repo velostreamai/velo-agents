@@ -9,12 +9,14 @@
 #   2. velo-pr-gate <pr> <scope> --brief-only      generate the review brief; dispatches NOTHING
 #   3. fill the brief's ## ATTACK from the scope file's own ## ATTACK section
 #   4. velo-pr-gate <pr> <scope> --exec --wait     launch the gates, block until they exit
+#      ... as a velo-task job (#31 part B), so the long step is visible to
+#      `velo-task status`, the Stop guard and the Claude task list.
 #   5. wait for the Codex pid, then write Codex's final message to
 #      $VELO_STATE/gate/<pr>/codex-verdict.md      (default ~/.agents/state)
 #
 # Run it with `run_in_background: true`: it blocks for the whole review, which is
-# minutes. The inner `velo-pr-gate ... --wait` is what the require-wait hook
-# insists on for a launch; this wrapper is the thing that must not hold a session.
+# minutes. The gates run as a velo-task job this wrapper then polls; this wrapper
+# is the thing that must not hold a session.
 # `--wait` does NOT wait for the non-blocking second opinion (#2350): it left the
 # gate lock held until the local model finished, and stalled three gates. Once
 # Codex's verdict is out, this wrapper gives it VELO_SECOND_OPINION_GRACE seconds
@@ -59,8 +61,10 @@
 #
 # Retries: a transient gh failure inside velo-pr-gate ("PR #N not found", "could
 # not read head/base branch for #N") is retried up to 3 times, 5s apart
-# (VELO_GATE_RETRY_DELAY). Anything else — a refusal, a missing worktree, a held
-# gate lock — fails on the first attempt: retrying those would only repeat them.
+# (VELO_GATE_RETRY_DELAY) — the run step re-runs the SAME velo-task job with
+# --rerun. Anything else — a refusal, a missing worktree, a held gate lock — fails
+# on the first attempt: retrying those would only repeat them. The task job and
+# its poll: VELO_GATE_TASK_TIMEOUT (default 7200s), VELO_GATE_POLL (default 15s).
 #
 # Exit 0: the round ran and the verdict file is written (or nothing needed
 # gating). Non-zero: it did not, and the output says why.
@@ -417,6 +421,85 @@ run_gate_step() {   # <label> <velo-pr-gate args after the pr number...>
   done
 }
 
+# ---- the run step, as a velo-task job (#31 part B) ------------------------------
+#
+# The long step — velo-pr-gate --exec --wait, which is tens of minutes of Codex —
+# used to run as a foreground child of this wrapper, invisible to everything that
+# answers "what is this session running": Vanth's jobs table is what `velo-task
+# status` reads, what the Stop guard blocks a session end on, and what the Claude
+# task list is built from. This mirrors the launch in velo-dispatch (#31 part A).
+#
+# ONE path. `velo-task run` failing is fatal and there is deliberately NO fallback
+# to the direct call: a round that quietly takes the old path is the defect this
+# replaces, not a safety net.
+#
+# Vanth jobs inherit neither PATH nor HOME and see only the variables NAMED in
+# vanth.env.allow (docs/velo-task-spec.md R8), so:
+#   - the environment the gate needs travels as ARGUMENTS to /usr/bin/env, the out
+#     file included;
+#   - gh and Codex read their config from HOME, which is why HOME is passed;
+#   - a secret travels as its NAME in vanth.env.allow — OPENROUTER_API_KEY is
+#     already there — never as a value on this command line (Vanth records it).
+#
+# `velo-task wait` is NOT used: it has an open daemon bug on long timeouts, so the
+# verdict is POLLED. `velo-task status` prints `<id> <verdict>`; in-flight is the
+# only verdict that is not yet an answer.
+run_gate_task() {   # <velo-pr-gate args after the pr number...>
+  local out="$GATE_DIR/gate-run.run.out" attempt=0 task_rc=0 task_out="" job_id=""
+  local task_bin="${VELO_TASK_BIN:-$HOME/.agents/bin/velo-task}" id_repo_part=""
+  [[ $REPO_IS_DEFAULT -eq 1 ]] || id_repo_part="${REPO_NAME}-"
+  local task_id="gate-${id_repo_part}${PR}" verdict status_out
+  local task_timeout="${VELO_GATE_TASK_TIMEOUT:-7200}" poll="${VELO_GATE_POLL:-15}"
+  while :; do
+    attempt=$((attempt + 1))
+    # The job writes the gate's combined output to $out — the file `tee` wrote
+    # before, so the empty-range check below and a re-run read what they read.
+    task_out=$("$task_bin" run "$task_id" --issue "$PR" --stage gate --rerun \
+      --timeout "$task_timeout" -- \
+      /usr/bin/env HOME="$HOME" PATH="$PATH" OUT="$out" \
+      /bin/bash -c 'exec "$@" > "$OUT" 2>&1' _ "$PR_GATE" "$PR" "$@" 2>&1); task_rc=$?
+    [[ $task_rc -eq 0 ]] || die "velo-task run $task_id failed (exit $task_rc):
+$task_out
+
+  The gate was NOT started. Repair the daemon, then re-run this round:
+    velo-task ensure-daemon
+    velo-task status $task_id"
+    job_id="${task_out##*$'\n'}"   # cmd_run prints the job id as its last line
+    [[ -n "$job_id" ]] || die "velo-task run $task_id started no job and printed no id:
+$task_out
+
+  The gate was NOT started."
+    while :; do
+      status_out=$("$task_bin" status "$task_id" 2>&1); task_rc=$?
+      [[ $task_rc -eq 0 ]] || die "velo-task status $task_id failed (exit $task_rc):
+$status_out
+
+  The gate job $job_id cannot be asked for its verdict, so this round has none.
+  Its output so far is $out."
+      verdict="${status_out##* }"   # `<id> <verdict>`
+      [[ "$verdict" == in-flight ]] || break
+      sleep "$poll"
+    done
+    if [[ "$verdict" == ok ]]; then
+      cat "$out"   # what `tee` printed live before the job held it
+      return 0
+    fi
+    # Any other verdict IS the step failure: the job ran and the gate did not pass.
+    warn "run: velo-task job $job_id ended '$verdict' (velo-task status $task_id)"
+    [[ -s "$out" ]] && tail -n 40 "$out"
+    if [[ $attempt -le $MAX_RETRIES ]] && is_transient "$out"; then
+      warn "run: transient gh failure (attempt $attempt of $((MAX_RETRIES + 1))), retrying in ${RETRY_DELAY}s"
+      sleep "$RETRY_DELAY"
+      continue
+    fi
+    if is_transient "$out"; then
+      warn "run: still failing after $attempt attempts — giving up"
+    fi
+    STEP_RC=1
+    return 1
+  done
+}
+
 has_text() {   # <file> <fixed string>
   grep -qF -- "$2" "$1"
 }
@@ -518,7 +601,7 @@ trap 'reap_second_opinion 0' EXIT
 
 echo
 echo "── 4/5 gates ──"
-run_gate_step run "$SCOPE" --exec --wait ${PASS[@]+"${PASS[@]}"} \
+run_gate_task "$SCOPE" --exec --wait ${PASS[@]+"${PASS[@]}"} \
   || die "velo-pr-gate failed (exit $STEP_RC) — see its output above. No verdict was extracted."
 if [[ $NEEDS_REVIEW -eq 1 ]] && has_text "$GATE_DIR/gate-run.run.out" "is EMPTY"; then
   ok "the diff range is empty — nothing has landed since the last review, so there is nothing to gate."

@@ -48,6 +48,14 @@ export VELO_SECOND_OPINION=0
 export VELO_CHECK_CODE=sonnet
 GATE_DIR="$VELO_STATE/gate/$TPR"
 STUB_DIR="$TMPD/stub"; export STUB_DIR
+# The run step goes through a velo-task job (#31 part B). A fake velo-task runs the job
+# here and now — the suite has no daemon — and remembers its exit status so `status` can
+# answer `<id> <verdict>` as the wrapper polls for. `run` prints the id last, as cmd_run
+# does. TASK_CALLS is outside STUB_DIR: every reset wipes that.
+TASK_STUB="$TMPD/stub-bin/velo-task"
+export VELO_TASK_BIN="$TASK_STUB"
+TASK_CALLS="$TMPD/task-calls.log"; export TASK_CALLS
+TASK_VERDICTS="$TMPD/task-verdicts"; export TASK_VERDICTS
 STUB="$TMPD/stub-bin/velo-pr-gate"
 # A readiness wait that timed out writes its reason here (the stub gate does too, as
 # $STUB_DIR/../harness-failed): the harness failed, not the thing under test. Outside
@@ -245,6 +253,35 @@ echo "second opinion report"
 EOF
 chmod +x "$TMPD/stub-bin/velo-openrouter-agent"
 
+# Fake velo-task (#31 part B): the run step of the wrapper is a velo-task job, and this
+# stands in for the daemon. `run` executes the job synchronously — the wrapper's job
+# shell redirects the gate's output to the file the wrapper later reads, so the fake runs
+# the command exactly as the real one would — and records the verdict `status` prints.
+# `status` answers `<id> <verdict>`, the shape cmd_status prints.
+cat > "$TASK_STUB" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$TASK_CALLS"
+case "$1" in
+  run)
+    id="$2"; shift 2
+    # cmd_run's shape: flags and their values, then `--`, then the command.
+    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
+    [[ $# -gt 0 ]] && shift
+    "$@"; rc=$?
+    if [[ $rc -eq 0 ]]; then v=ok; else v="failed($rc)"; fi
+    mkdir -p "$TASK_VERDICTS"
+    printf '%s\n' "$v" > "$TASK_VERDICTS/$id"
+    printf '%s\n' "$id"
+    ;;
+  status)
+    id="${2:-}"
+    v=$(cat "$TASK_VERDICTS/$id" 2>/dev/null)
+    printf '%s %s\n' "$id" "${v:-in-flight}"
+    ;;
+esac
+EOF
+chmod +x "$TASK_STUB"
+
 SCOPE="$TMPD/scope.md"
 EXPECTED_ATTACK="$TMPD/expected-attack.md"
 EXPECTED_FILLED="$TMPD/expected-filled.md"
@@ -335,7 +372,8 @@ EOF
 }
 
 reset() {
-  rm -rf "$GATE_DIR" "$STUB_DIR"; mkdir -p "$STUB_DIR" "$VELO_STATE/gate"
+  rm -rf "$GATE_DIR" "$STUB_DIR" "$TASK_VERDICTS"; mkdir -p "$STUB_DIR" "$VELO_STATE/gate"
+  rm -f "$TASK_CALLS"
   cat > "$STUB_DIR/plan.txt" <<EOF
 #$TPR  stub pr
   files: 2 (src=1 tests=0)
@@ -2215,7 +2253,7 @@ prove_run "route passed to every step" sc_args \
 prove_run "prime with --brief-only" sc_args \
   'run_gate_step brief "$SCOPE" --brief-only' 'run_gate_step brief "$SCOPE"'
 prove_run "run with --exec --wait" sc_args \
-  'run_gate_step run "$SCOPE" --exec --wait' 'run_gate_step run "$SCOPE" --wait'
+  'run_gate_task "$SCOPE" --exec --wait' 'run_gate_task "$SCOPE" --wait'
 prove_run "no brief for a spec-only plan" sc_spec_only \
   'if [[ $NEEDS_REVIEW -eq 1 ]]; then
   echo

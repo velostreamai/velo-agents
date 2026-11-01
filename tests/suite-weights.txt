@@ -25,6 +25,7 @@
 17 test_gate_finish.sh
 17 test_velo_task_bash32.sh
 16 test_gate_comments.sh
+15 test_gate_run_task.sh
 9 test_run_sh_summary.sh
 8 test_gate_substitution.sh
 8 test_pr_gate_launch.sh
