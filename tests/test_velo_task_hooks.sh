@@ -1,17 +1,18 @@
 #!/bin/bash
-# velo-task M3c, bars B13 and B29 (hook half) (docs/velo-task-spec.md R10, R15(i)): the two PreToolUse deny hooks.
+# velo-task M3c, bars B13 and B29 (hook half) (docs/velo-task-spec.md R10, R15(i)): the three PreToolUse deny hooks.
 #
 #   hooks/deny-vanth-cleanup.sh     denies `vanth prune` and `vanth restore`, in every command form it claims
 #   hooks/deny-pgrep-wait-loop.sh   denies a hand-written `until/while pgrep` wait loop; `velo-task wait` passes
-#   hooks/guard-lib.sh              the command-position scanner both share
+#   hooks/deny-raw-launch.sh        denies a raw `velo-openrouter-agent` or `codex exec` launch; `velo-dispatch` passes
+#   hooks/guard-lib.sh              the command-position scanner the three share
 #
-# Both are guardrails against the orchestrating model's own mistakes, not isolation (R15(i)), and heuristics over command
+# All three are guardrails against the orchestrating model's own mistakes, not isolation (R15(i)), and heuristics over command
 # TEXT. An evasion the scanner cannot see (a bash -c string, a variable holding the program, a script file) is a known false
 # negative: each is listed below and asserted ALLOWED, so closing a gap turns that line red and says to move it to the denied
 # list. An accepted false positive is asserted DENIED the same way.
 #
 # Checks: t_vanth_denied/_wrappers/_control/_allowed/_false_negatives, t_pgrep_denied/_nesting/_allowed/_false_negatives,
-# t_scanner (quoting, backslashes, heredocs, comments, substitutions), t_noglob, t_utf8, t_messages, t_failopen,
+# t_raw_denied/_allowed/_false_negatives, t_scanner (quoting, backslashes, heredocs, comments, substitutions), t_noglob, t_utf8, t_messages, t_failopen,
 # t_scan_speed (CPU time, see t_scan_clock), t_readme_registration (the registration line in README.md, run as Claude Code
 # would run it), t_hook_files, t_hook_docs (each pinned false negative is in the header and the README), t_install_hooks,
 # t_install_exec_scope, t_install_pycache.
@@ -31,7 +32,7 @@ trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 MUT_PATHS="hooks install.sh README.md"
 . "$HERE/mutation-lib.sh"
 . "$HERE/bash32-sweep.sh"   # the sweep that t_hook_files applies to the code under test
-V=deny-vanth-cleanup.sh; P=deny-pgrep-wait-loop.sh
+V=deny-vanth-cleanup.sh; P=deny-pgrep-wait-loop.sh; W=deny-raw-launch.sh
 
 show() { printf '%s' "$1" | tr '\n' '~' | cut -c1-120; }
 run_hook() {  # <hook> <command> [VAR=value...]: the hook as Claude Code runs it, the PreToolUse JSON on stdin; sets RC and ERR
@@ -221,7 +222,79 @@ t_pgrep_false_negatives() {  # the evasions the hook cannot see, and its accepte
   [ "$BAD" = 0 ]
 }
 
-# ---- the scanner both share: what is text and what is a command ----
+# ---- deny-raw-launch.sh (#31 part C): a raw worker or Codex launch outside velo-dispatch ----
+t_raw_denied() {  # the worker runner and `codex exec` are denied in every command form the hook claims
+  local c
+  for c in \
+    'nohup velo-openrouter-agent --model x --brief b &' 'env X=1 /abs/path/velo-openrouter-agent --model x' \
+    '"$HOME/.agents/bin/velo-openrouter-agent" --model x' './bin/velo-openrouter-agent --model x' \
+    'timeout 900 velo-openrouter-agent --model x' 'sudo velo-openrouter-agent --model x' 'nice -n 10 velo-openrouter-agent --model x' \
+    'R=1 velo-openrouter-agent --model x' 'cd /tmp && velo-openrouter-agent --model x' \
+    'velo-openrouter-agent --model x >/dev/null 2>&1' 'velo-openrouter-agent --model x &' \
+    'echo x | velo-openrouter-agent --model x' 'true || velo-openrouter-agent --model x' 'velo-openrouter-agent --model x; echo done' \
+    'if true; then velo-openrouter-agent --model x; fi' 'x=$(velo-openrouter-agent --model x)' $'echo hi\nvelo-openrouter-agent --model x' \
+    'velo-openrouter-agent' 'velo-openrouter-agent --model x' \
+    'codex exec "do the thing"' 'codex exec --dangerously-bypass-approvals-and-sandbox "brief"' \
+    'codex -c a=b exec "do the thing"' 'codex -ca=b exec "do the thing"' 'codex --config a=b exec "do the thing"' \
+    'codex --config=a=b exec "do the thing"' '/opt/homebrew/bin/codex exec "do the thing"' \
+    'codex -m gpt-5 exec "do the thing"' 'codex -mgpt-5 exec "do the thing"' 'codex --model gpt-5 exec "do the thing"' \
+    'codex --model=gpt-5 exec "do the thing"' 'codex -s danger-full-access exec "do the thing"' \
+    'codex --sandbox=read-only exec "do the thing"' 'codex -a never exec "do the thing"' 'codex -C /tmp exec "do the thing"' \
+    'codex -p work exec "do the thing"' 'codex --profile work exec "do the thing"' 'codex -i shot.png exec "do the thing"' \
+    'codex -o out.txt exec "do the thing"' 'codex --enable web_search exec "do the thing"' 'codex --disable foo exec "do the thing"' \
+    'codex --full-auto exec "do the thing"' 'codex --oss exec "do the thing"' \
+    'codex exec -- "brief"' 'codex exec -- --help' \
+    'nohup codex exec "the brief" &' 'sudo env FOO=1 nohup codex exec "the brief"' \
+    'codex exec "$(cat brief.txt)"' 'git log; codex exec "the brief"'
+  do deny $W "$c"; done
+  [ "$BAD" = 0 ]
+}
+t_raw_allowed() {  # the entry points, the look-alikes, and the words in text
+  local c
+  for c in \
+    'velo-dispatch 12 brief --wait' 'velo-dispatch 12 brief --wait &' 'velo-gate-run 42 full' 'velo-pr-gate 42 full' \
+    'velo-openrouter-agent --help' 'velo-openrouter-agent -h' 'velo-openrouter-agent --version' \
+    '/abs/path/velo-openrouter-agent --help' 'nohup velo-openrouter-agent --help &' \
+    'codex login' 'codex --version' 'codex --help' 'codex mcp' 'codex' 'codex -c a=b --help' 'codex exec --help' \
+    'velo-openrouter-agent-status' 'my-velo-openrouter-agent --model x' 'ls velo-openrouter-agent.txt' \
+    'echo codex exec' 'printf "%s\n" nohup velo-openrouter-agent' 'grep -rn "codex exec" docs/' \
+    '# nohup velo-openrouter-agent --model x' 'codex-exec' \
+    'git commit -m "nohup velo-openrouter-agent --model x --brief b"' \
+    'gh pr create --title t --body "codex exec ..."' \
+    $'cat <<EOF\ncodex exec "the brief"\nEOF' $'cat <<\'EOF\'\nvelo-openrouter-agent --model x\nEOF' \
+    'until pgrep -f codex; do sleep 1; done' 'velo-task status'
+  do allow $W "$c"; done
+  [ "$BAD" = 0 ]
+}
+t_raw_false_negatives() {  # the evasions this hook cannot see, pinned
+  local long
+  long=$(printf 'x%.0s' $(seq 1 1100))
+  miss $W "FOO=$long velo-openrouter-agent --model x" 'more than 1 KB of text in front of the command in one segment'
+  miss $W "FOO=$long codex exec \"the brief\"" 'more than 1 KB of text in front of the command in one segment'
+  miss $W 'bash -c "nohup velo-openrouter-agent --model x"' 'a string handed to bash -c'
+  miss $W "sh -c 'codex exec \"the brief\"'" 'a string handed to sh -c'
+  miss $W 'eval "nohup velo-openrouter-agent --model x"' 'a string handed to eval'
+  miss $W 'AGENT=velo-openrouter-agent; $AGENT --model x' 'a variable holds the program'
+  miss $W 'alias ca="codex exec"; ca "the brief"' 'an alias'
+  miss $W '"$(echo codex)" exec "the brief"' 'the output of a command substitution names the program'
+  miss $W 'echo codex | xargs -I{} {} exec "the brief"' 'xargs substitution'
+  miss $W 'bash launch-worker.sh' 'a script file that launches it'
+  miss $W './bin/launch-worker.sh --model x' 'a script file that launches it'
+  miss $W 'find . -name x -exec velo-openrouter-agent --model x \;' 'find -exec'
+  miss $W 'sudo -u neil velo-openrouter-agent --model x' 'a wrapper option that takes a word'
+  miss $W 'codex --some-new-flag v exec "the brief"' 'a codex option this hook does not know takes a word'
+  miss $W 'cp bin/velo-openrouter-agent /tmp/agent && /tmp/agent --model x' 'the runner copied under another name'
+  miss $W 'Velo-Openrouter-Agent --model x' 'a differently cased name on a case-insensitive volume'
+  miss $W 'Codex exec "the brief"' 'a differently cased name on a case-insensitive volume'
+  miss $W '>out velo-openrouter-agent --model x' 'a redirection in front of the command name'
+  miss $W '2>&1 codex exec "the brief"' 'a redirection in front of the command name'
+  miss $W 'python bin/velo-openrouter-agent-sdk.py --model x' 'the other raw entry points'
+  miss $W 'python3 bin/velo-openai-agents-runner.py --model x' 'the other raw entry points'
+  miss $W 'node /opt/codex/bin/codex.js exec "the brief"' 'the other raw entry points'
+  [ "$BAD" = 0 ]
+}
+
+# ---- the scanner the three share: what is text and what is a command ----
 t_scanner() {
   # heredoc bodies are text; what follows them is a command
   allow $V $'cat <<EOF\nvanth prune\nEOF'
@@ -337,14 +410,24 @@ t_messages() {
   [ -z "$out" ] || bad "a deny writes to stdout: $out"
   run_hook $V 'vanth status'
   [ "$RC" = 0 ] && [ -z "$ERR" ] || bad "an allow is not silent (exit $RC): $ERR"
+  run_hook $W 'nohup velo-openrouter-agent --model x --brief b'
+  [ "$RC" = 2 ] || bad "a raw worker launch exited $RC, want 2"
+  case $ERR in *'velo-dispatch <issue> <brief> --wait'*) ;; *) bad "the raw-launch message does not name velo-dispatch: $ERR" ;; esac
+  case $ERR in *'velo-gate-run <pr> <scope>'*) ;; *) bad "the raw-launch message does not name velo-gate-run: $ERR" ;; esac
+  case $ERR in *'velo-task status'*) ;; *) bad "the raw-launch message does not say what a raw launch dodges: $ERR" ;; esac
+  case $ERR in *'Matched: nohup velo-openrouter-agent --model x --brief b'*) ;; *) bad "the raw-launch message does not show the matched segment: $ERR" ;; esac
+  run_hook $W 'codex exec "the brief"'
+  [ "$RC" = 2 ] || bad "codex exec exited $RC, want 2"
+  case $ERR in *'Matched: codex exec'*) ;; *) bad "the codex-exec message does not show the matched segment: $ERR" ;; esac
   [ "$BAD" = 0 ]
 }
 t_failopen() {  # no jq, no lib, a lib that does not load, a payload with nothing to scan: exit 0, so a broken install never wedges Bash
   local hook body d out rc variant payload bin t
   d=$(/usr/bin/mktemp -d "$T/fo.XXXXXX") || exit 1
-  for hook in $V $P; do
+  for hook in $V $P $W; do
     case $hook in
       $V) payload=$(jq -cn '{tool_input:{command:"vanth prune"}}') ;;
+      $W) payload=$(jq -cn '{tool_input:{command:"nohup velo-openrouter-agent --model x"}}') ;;
       *)  payload=$(jq -cn '{tool_input:{command:"until pgrep -f x; do sleep 1; done"}}') ;;
     esac
     for body in '' '{}' 'not json' '{"tool_input":' '{"tool_input":{"command":null}}' '{"tool_input":{"command":""}}' \
@@ -390,10 +473,14 @@ t_scan_speed() {  # a hook runs before every Bash call: about 300 KB of command 
   # one word, unquoted (150 KB) and quoted (600 KB): quadratic without the caps in the scanner (66 s for 300 KB unquoted), linear with them
   /usr/bin/awk 'BEGIN { for (i = 0; i < 150000; i++) printf "a"; print "; vanth prune" }' | jq -Rs '{tool_input:{command:.}}' > "$d/one-word.json"
   /usr/bin/awk 'BEGIN { printf "echo \""; for (i = 0; i < 600000; i++) printf "a"; print "\"; vanth prune" }' | jq -Rs '{tool_input:{command:.}}' > "$d/one-quoted-word.json"
+  # the raw-launch hook has its own loop over the words of a segment (the codex options): the same two shapes, ending in a
+  # denied raw launch, so it is measured and not only the scanner it shares
+  /usr/bin/awk 'BEGIN { for (i = 0; i < 27000; i++) printf "echo \"a\" ; "; print "nohup velo-openrouter-agent --model x" }' | jq -Rs '{tool_input:{command:.}}' > "$d/many-segments-raw.json"
+  /usr/bin/awk 'BEGIN { printf "echo \""; for (i = 0; i < 600000; i++) printf "a"; print "\"; nohup velo-openrouter-agent --model x" }' | jq -Rs '{tool_input:{command:.}}' > "$d/one-quoted-word-raw.json"
   # CPU seconds, not elapsed ones: the slow mutants below burn 8 to 16 s of CPU where the real scanner needs 1.5 s, and a host
   # busy with other suites or with four parallel proof jobs stretches elapsed time past a fixed bound without the scanner changing.
-  for name in many-segments many-lines one-string heredoc vanth-segments loops one-word one-quoted-word; do
-    case $name in loops) hook=$P ;; *) hook=$V ;; esac
+  for name in many-segments many-lines one-string heredoc vanth-segments loops one-word one-quoted-word many-segments-raw one-quoted-word-raw; do
+    case $name in loops) hook=$P ;; *-raw) hook=$W ;; *) hook=$V ;; esac
     cpu_run "$d/clock" "$R/hooks/$hook" < "$d/$name.json"
     [ "$RC" = 2 ] || bad "$name: the hook exited $RC, want 2 (the command ends in the denied form)"
     below "$CPU" 5 || bad "$name: the hook used ${CPU}s of CPU on a $(wc -c < "$d/$name.json" | tr -d ' ') byte command (bound 5 s)"
@@ -420,11 +507,12 @@ t_readme_registration() {  # the registration line in README.md, run the way Cla
   stanza=$(/usr/bin/awk '/^```json$/ { inb = 1; buf = ""; next } /^```$/ { if (inb && index(buf, "deny-vanth-cleanup.sh")) { printf "%s", buf; exit } inb = 0; next } inb { buf = buf $0 "\n" }' "$R/README.md")
   [ -n "$stanza" ] || { bad "no json block in README.md registers deny-vanth-cleanup.sh"; return 1; }
   printf '%s' "$stanza" | jq -e . >/dev/null 2>&1 || { bad "the README registration stanza is not valid JSON"; return 1; }
-  for hook in deny-vanth-cleanup.sh deny-pgrep-wait-loop.sh; do
+  for hook in deny-vanth-cleanup.sh deny-pgrep-wait-loop.sh deny-raw-launch.sh; do
     cmd=$(printf '%s' "$stanza" | jq -r --arg h "$hook" '.hooks.PreToolUse[].hooks[].command | select(contains($h))')
     [ -n "$cmd" ] || { bad "the README stanza has no command for $hook"; continue; }
     case $hook in
       deny-vanth-cleanup.sh) payload=$(jq -cn '{tool_input:{command:"vanth prune"}}') ;;
+      deny-raw-launch.sh)    payload=$(jq -cn '{tool_input:{command:"codex exec \"the brief\""}}') ;;
       *)                     payload=$(jq -cn '{tool_input:{command:"until pgrep -f x; do sleep 1; done"}}') ;;
     esac
     for sh in /bin/sh /bin/bash; do
@@ -443,7 +531,7 @@ t_readme_registration() {  # the registration line in README.md, run the way Cla
 }
 t_hook_files() {  # the deny hooks and their lib are bash scripts that must parse and run on the bash 3.2 of a stock macOS
   local f name first
-  for name in deny-vanth-cleanup.sh deny-pgrep-wait-loop.sh guard-lib.sh; do
+  for name in deny-vanth-cleanup.sh deny-pgrep-wait-loop.sh deny-raw-launch.sh guard-lib.sh; do
     f="$R/hooks/$name"
     [ -f "$f" ] || { bad "hooks/$name is missing"; continue; }
     first=$(/usr/bin/head -n 1 "$f")
@@ -466,7 +554,7 @@ t_install_hooks() {  # install.sh puts the hooks where the registration looks, e
   inst() { env -i HOME="$d/home" PATH=/usr/bin:/bin VELO_AGENTS_HOME="$dest" VELO_CLAUDE_SKILLS="$d/skills" /bin/bash "$src/install.sh" "$@"; }
   out=$(inst 2>&1); rc=$?
   [ "$rc" = 0 ] || { echo "FAILED: install.sh exited $rc: $out"; return 1; }
-  for f in deny-vanth-cleanup.sh deny-pgrep-wait-loop.sh guard-lib.sh; do
+  for f in deny-vanth-cleanup.sh deny-pgrep-wait-loop.sh deny-raw-launch.sh guard-lib.sh; do
     [ -x "$dest/hooks/$f" ] || bad "install.sh left hooks/$f missing or not executable at the destination"
   done
   out=$(inst --check 2>&1); rc=$?
@@ -517,15 +605,17 @@ t_install_pycache() {  # a __pycache__ under hooks/ is not tooling: it is not sh
 }
 t_hook_docs() {  # every known false negative the tests pin is listed in the hook's header and in its README row, not only in the tests
   local hook phrase head row
-  local -a common vanth phrases
+  local -a common vanth raw phrases
   common=('a redirection in front of the command name' 'more than 1 KB of text in front of the command')
   vanth=('the output of a command substitution naming the program' 'xargs substitution' 'a quoted command path that contains a space')
-  for hook in $V $P; do
+  raw=('a string handed to bash -c' 'a variable or alias holding the program' 'a wrapper option that takes a word' 'a codex option this hook does not know takes a word' 'the other raw entry points')
+  for hook in $V $P $W; do
     head=$(/usr/bin/awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); printf "%s ", $0; next } NR > 1 { exit }' "$R/hooks/$hook")
     row=$(grep -F "| \`$hook\` |" "$R/README.md")
     [ -n "$row" ] || { bad "README.md has no table row for $hook"; continue; }
     phrases=("${common[@]}")
     [ "$hook" != "$V" ] || phrases=("${phrases[@]}" "${vanth[@]}")
+    [ "$hook" != "$W" ] || phrases=("${phrases[@]}" "${raw[@]}")
     for phrase in "${phrases[@]}"; do
       case $head in *"$phrase"*) ;; *) bad "the header of $hook does not list the known false negative: $phrase" ;; esac
       case $row in *"$phrase"*) ;; *) bad "the README row of $hook does not list the known false negative: $phrase" ;; esac
@@ -546,7 +636,11 @@ check "a pgrep inside a while/until loop is denied in every shape" t_pgrep_denie
 check "the loop stack: for/select/done decide whether a pgrep is inside a while" t_pgrep_nesting
 check "velo-task wait and everything that only looks like a wait loop pass" t_pgrep_allowed
 check "known false negatives and the accepted false positive are pinned" t_pgrep_false_negatives
-echo " the scanner both share"
+echo " deny-raw-launch.sh (#31 part C)"
+check "a raw velo-openrouter-agent or codex exec launch is denied in every shape" t_raw_denied
+check "velo-dispatch, velo-gate-run, --help/--version, other codex subcommands and the words in text pass" t_raw_allowed
+check "known false negatives are pinned" t_raw_false_negatives
+echo " the scanner the three share"
 check "heredocs, comments, quotes, substitutions: what is text and what is a command" t_scanner
 check "command text is never glob-expanded" t_noglob
 check "a multibyte character in quotes does not blind the scanner (UTF-8 locale)" t_utf8
@@ -563,7 +657,7 @@ check "a __pycache__ under hooks/ is not shipped and not read as a hook without 
 check "each known false negative the tests pin is listed in the hook's header and its README row" t_hook_docs
 
 echo "mutation proofs"
-LIB=hooks/guard-lib.sh; HV=hooks/deny-vanth-cleanup.sh; HP=hooks/deny-pgrep-wait-loop.sh
+LIB=hooks/guard-lib.sh; HV=hooks/deny-vanth-cleanup.sh; HP=hooks/deny-pgrep-wait-loop.sh; HW=hooks/deny-raw-launch.sh
 # B13 "allow all", and its mirror
 prove "allow all: the pgrep hook exits 0 before it scans (B13 mutant)" t_pgrep_denied $HP 'guard_scan_payload || exit 0' 'exit 0'
 prove "allow all: the vanth hook exits 0 before it scans" t_vanth_denied $HV 'guard_scan_payload || exit 0' 'exit 0'
@@ -691,6 +785,30 @@ prove "the README registration is not JSON" t_readme_registration README.md '"ma
 prove "the README registration of the pgrep hook has no guard" t_readme_registration README.md '[ -x \"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\" ] || exit 0; ' ''
 prove "the README registers no pgrep hook" t_readme_registration README.md $',\n          { "type": "command", "command": "[ -x \\"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\\" ] || exit 0; exec \\"$HOME/.agents/hooks/deny-pgrep-wait-loop.sh\\"" }' ''
 prove "the README registers no vanth hook" t_readme_registration README.md $'          { "type": "command", "command": "[ -x \\"$HOME/.agents/hooks/deny-vanth-cleanup.sh\\" ] || exit 0; exec \\"$HOME/.agents/hooks/deny-vanth-cleanup.sh\\"" },\n' ''
+# the raw-launch hook (#31 part C): H1 deny, H2 allow, H3 fail open, H4 documented
+prove "allow all: the raw-launch hook exits 0 before it scans (B13 mutant)" t_raw_denied $HW 'guard_scan_payload || exit 0' 'exit 0'
+prove "deny all: the raw-launch hook exits 2 before it scans" t_raw_allowed $HW 'guard_scan_payload || exit 0' 'exit 2'
+prove "allow codex: the codex branch is dropped (H1 mutant)" t_raw_denied $HW '    codex)' '    NOcodex)'
+prove "allow codex exec: the subcommand is not read (H1 mutant)" t_raw_denied $HW '[ "${GW[i]:-}" = exec ] || return 1' '[ "${GW[i]:-}" = NOexec ] || return 1'
+prove "allow the worker runner by name (H1 mutant)" t_raw_denied $HW '    velo-openrouter-agent) ;;' '    NOvelo-openrouter-agent) ;;'
+prove "allow the worker runner by path: the basename is not taken" t_raw_denied $HW 'base=${GW[0]##*/}' 'base=${GW[0]}'
+prove "-c is skipped without its word: codex -c a=b exec is not read" t_raw_denied $HW '-c|--config)       i=$((i + 2)) ;;' '-c|--config)       i=$((i + 1)) ;;'
+prove "-m and the other codex options are skipped without their word (H1 mutant)" t_raw_denied $HW '-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|-i|--image|-o|--enable|--disable|--output-last-message)' 'no-such-option)'
+prove "an option does not end the codex options: exec is never reached (H1 mutant)" t_raw_denied $HW '-*)                i=$((i + 1)) ;;' '-*)                break ;;'
+prove "no wrapper is looked through in front of the runner" t_raw_denied $LIB "$LIST) wrapped=1 ;;" "NOWRAPPER) wrapped=1 ;;"
+prove "a help flag no longer exempts (H2 mutant)" t_raw_allowed $HW '-h|--help|--version) return 1 ;;' '-h|NO--help|--version) return 1 ;;'
+prove "a version flag no longer exempts" t_raw_allowed $HW '-h|--help|--version) return 1 ;;' '-h|--help|NO--version) return 1 ;;'
+prove "a mention of the words in a heredoc is denied (the deny-on-mention mutant, H2)" t_raw_allowed $LIB 'if (hdk > 0) {' 'if (0) {'
+prove "--help after -- exempts although it is a prompt argument there" t_raw_denied $HW '--)                  return 0 ;;' ''
+prove "the raw-launch message does not name the entry point" t_messages $HW '  velo-dispatch <issue> <brief> --wait' '  the entry point'
+prove "the raw-launch hook fails closed when jq is missing (H3 mutant)" t_failopen $HW 'guard_scan_payload || exit 0' 'guard_scan_payload || exit 2'
+prove "the raw-launch hook fails closed when its lib is missing (H3 mutant)" t_failopen $HW '[ -r "$HOOK_DIR/guard-lib.sh" ] || exit 0' '[ -r "$HOOK_DIR/guard-lib.sh" ] || exit 2'
+prove "the raw-launch hook fails closed when its lib does not load (H3 mutant)" t_failopen $HW '. "$HOOK_DIR/guard-lib.sh" || exit 0' '. "$HOOK_DIR/guard-lib.sh" || exit 2'
+prove "the raw-launch header omits the other raw entry points (H4 mutant)" t_hook_docs $HW 'the other raw entry points' 'the other entry points'
+prove "the raw-launch README row omits the redirection miss (H4 mutant)" t_hook_docs README.md 'a redirection in front of the command name (`>out velo-openrouter-agent --model x`)' 'a redirection (`>out velo-openrouter-agent --model x`)'
+prove "the README registers no raw-launch hook" t_readme_registration README.md $',\n          { "type": "command", "command": "[ -x \\"$HOME/.agents/hooks/deny-raw-launch.sh\\" ] || exit 0; exec \\"$HOME/.agents/hooks/deny-raw-launch.sh\\"" }' ''
+prove "the raw-launch hook is not executable" t_hook_files %hooks/deny-raw-launch.sh 644 ''
+prove "the raw-launch hook starts with another interpreter" t_hook_files $HW $'#!/bin/bash\n# Claude Code PreToolUse hook for Bash: denies a raw launch' $'#!/usr/bin/env bash\n# Claude Code PreToolUse hook for Bash: denies a raw launch'
 prove "a hook is not executable" t_hook_files %hooks/deny-vanth-cleanup.sh 644 ''
 prove "a hook starts with another interpreter" t_hook_files $HP $'#!/bin/bash\n# Claude Code PreToolUse hook for Bash, beside' $'#!/usr/bin/env bash\n# Claude Code PreToolUse hook for Bash, beside'
 prove "the lib gains a bash-4 construct" t_hook_files $LIB 'export LC_ALL=C' $'export LC_ALL=C\ndeclare -A seeded'
