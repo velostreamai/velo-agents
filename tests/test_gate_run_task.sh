@@ -196,6 +196,7 @@ sc_g1_job_command_line() {
   [[ "$line" == "run gate-$TPR --issue $TPR --stage gate --rerun --timeout 7200 -- /usr/bin/env HOME="* ]]
                                                         sc_check job-asked-for-in-the-pinned-shape $?
   [[ "$line" == *" PATH="* ]];                          sc_check PATH-passed $?
+  [[ "$line" != *"VELO_REPO="* && "$line" != *"VELO_GATE_REPO="* ]]; sc_check no-repo-env-passed-for-the-default-repo $?
   [[ "$line" == *" OUT=$GATE_DIR/gate-run.run.out "* ]]; sc_check out-file-is-the-one-the-wrapper-reads $?
   [[ "$line" == *"/bin/bash -c "* ]];                   sc_check run-through-a-shell $?
   [[ "$line" == *" _ $FAKE_GATE $TPR $SCOPE --exec --wait" ]]
