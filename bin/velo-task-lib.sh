@@ -10,7 +10,8 @@
 #   daemon.provenance pid, start time, launch digest of the daemon velo-task launched     daemon.launch.log vanthd stdout/stderr
 #   session the owner token run tags jobs with when $CLAUDE_SESSION_ID is unset      stop-override, overrides.log the Stop guard's one-shot escape
 # VELO_TASK_PORT (default 48217) sets the daemon port. Tunables: VELO_TASK_START_WAIT, VELO_TASK_STOP_WAIT (seconds), VELO_TASK_POLL
-# (poll interval), VELO_TASK_RETRY_SLEEP (pause between re-tries of one transient `failed to reach daemon`). Exit codes: 0 ok, 1 error, 2 usage, 3 wait timeout, 4 cancel: already finished, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
+# (first poll interval of `wait`, backing off toward VELO_TASK_POLL_MAX), VELO_TASK_CONFIRM (seconds between daemon checks of a job a wait sees in flight),
+# VELO_TASK_RETRY_SLEEP (base pause between re-tries of one transient `failed to reach daemon`). Exit codes: 0 ok, 1 error, 2 usage, 3 wait timeout, 4 cancel: already finished, 5 idempotency conflict, 6 daemon refused/down/misconfigured.
 
 LIB_SRC="${BASH_SOURCE[0]}"
 LIB_SRC_DIR="${LIB_SRC%/*}"; [ "$LIB_SRC_DIR" != "$LIB_SRC" ] || LIB_SRC_DIR=.
@@ -59,6 +60,8 @@ done
 SECS_RE='^[0-9]+$|^[0-9]+\.[0-9]+$'   # a whole number of seconds, or digits, one dot, digits: /bin/sleep refuses 1.2.3, ., 1..2, .., .5 and 5.
 [[ "${VELO_TASK_POLL:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_POLL must be a number of seconds: $VELO_TASK_POLL"
 [[ "${VELO_TASK_RETRY_SLEEP:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_RETRY_SLEEP must be a number of seconds: $VELO_TASK_RETRY_SLEEP"
+[[ "${VELO_TASK_POLL_MAX:-0}" =~ $SECS_RE ]] || die 2 "VELO_TASK_POLL_MAX must be a number of seconds: $VELO_TASK_POLL_MAX"
+[[ "${VELO_TASK_CONFIRM:-0}" =~ $WHOLE_SECS_RE ]] || die 2 "VELO_TASK_CONFIRM must be a whole number of seconds: $VELO_TASK_CONFIRM"
 unset v p
 
 ps_lstart() {  # <pid> -> start time (LC_ALL=C TZ=UTC, whatever the caller's locale), empty when no such process
@@ -380,7 +383,8 @@ retry_transient_daemon() {  # <command...>: run it; when it exits non-zero and i
     [ "$rc" -ne 0 ] || break   # only a non-zero exit is diagnosed: a zero status is the answer
     case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac
     [ "$RETRY_ATTEMPTS" -lt 11 ] || break
-    /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"
+    # Grows with the attempt and is jittered, so concurrent callers that lost the same race do not reconnect in step.
+    /bin/sleep "$(/usr/bin/awk -v b="${VELO_TASK_RETRY_SLEEP:-0.2}" -v a="$RETRY_ATTEMPTS" 'BEGIN { srand(); printf "%.3f", b * a * (0.5 + rand()) }')"
   done
   return "$rc"
 }
@@ -420,7 +424,7 @@ cmd_status() {  # prints `<id> <verdict>`; exit 0 whenever it printed one, 2 unk
   printf '%s\n' "$VERDICT_LINE"
 }
 cmd_wait() {  # one call, one verdict per id: --all (default) waits for every id, --any returns the first; exit 0 iff every printed verdict is ok
-  local mode=all tmo=3600 ids=() jobs=() done_=() i n out deadline pending all_done=1 first=-1 worst=0
+  local mode=all tmo=3600 ids=() jobs=() done_=() asked=() i n out deadline pending all_done=1 first=-1 worst=0 pause cap rv
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --any) mode=any; shift ;;
@@ -434,10 +438,19 @@ cmd_wait() {  # one call, one verdict per id: --all (default) waits for every id
   for i in "${!ids[@]}"; do resolve "${ids[$i]}"; jobs[$i]="$JOB"; done  # every id is known before anything is polled
   need_daemon
   deadline=$((SECONDS + tmo))
+  pause="${VELO_TASK_POLL:-0.5}"; cap="${VELO_TASK_POLL_MAX:-3}"
+  # A poll is a read of Vanth's own database: no connection to the daemon, so a long wait leaves no TIME_WAIT behind. The daemon is asked
+  # (the verdict is always its answer) for a job's first poll, once its row stops saying in-flight, and every VELO_TASK_CONFIRM seconds
+  # (default 30) while it says in-flight, so a dead daemon or an unreadable row is still reported within that time.
   while :; do
     all_done=1; first=-1
     for i in "${!ids[@]}"; do
       if [ -z "${done_[$i]:-}" ]; then
+        if [ -n "${asked[$i]:-}" ] && [ $((SECONDS - asked[i])) -lt "${VELO_TASK_CONFIRM:-30}" ]; then
+          rv=$(st row-verdict "$VH/jobs.sqlite" "${jobs[$i]}" 2>/dev/null) || rv=""
+          [ "$rv" != in-flight ] || { all_done=0; continue; }
+        fi
+        asked[i]=$SECONDS
         read_verdict "${jobs[$i]}" "${ids[$i]}" --name "${ids[$i]}"
         [ "$VERDICT" != in-flight ] || { all_done=0; continue; }
         done_[$i]="$VERDICT_LINE"
@@ -457,7 +470,8 @@ cmd_wait() {  # one call, one verdict per id: --all (default) waits for every id
       pending=""; for i in "${!ids[@]}"; do [ -n "${done_[$i]:-}" ] || pending="$pending ${ids[$i]}"; done
       die 3 "wait timed out after ${tmo}s; still in flight:$pending"
     fi
-    /bin/sleep "${VELO_TASK_POLL:-0.5}"
+    /bin/sleep "$pause"
+    pause=$(/usr/bin/awk -v p="$pause" -v m="$cap" 'BEGIN { q = p * 1.5; if (q > m) q = (p > m ? p : m); printf "%.3f", q }')  # backs off toward the cap
   done
 }
 cmd_cancel() {  # `vanth stop` a job in flight, then print the verdict once it is killed; a job that already finished prints its real verdict on stderr, exit 4

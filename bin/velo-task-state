@@ -4,6 +4,7 @@
   json-get <file|-> <key>                    top-level JSON value as text (string raw, true/false, number); empty when absent
   jobs-ro [--cols a,b] <db> <sql> [param...] read-only SQLite on Vanth's jobs.sqlite: a JSON array, or with --cols one line a row (JSON-quoted if not one word)
   verdict-of [--db P] [--job J] [--name N] [--label L]   the verdict of the status object on stdin, `<label> <verdict>`; 2: not that job, 6: not an object
+  row-verdict <db> <job_id>                  the verdict of one jobs.sqlite row (the verdict_of rule, no daemon, no socket); 2: no such job
   launch <program> [name...]                 exec <program> with ONLY the named variables of this environment
   override-write <home> <reason>             the one-shot Stop override (temp + fsync + rename; a stale entry is replaced), logged in overrides.log
   override-take <home>                       consume a VALID override (private regular file of yours, `<time> uid=<n> reason=<text>`): 0, else 3
@@ -309,6 +310,17 @@ def cmd_session_read(args):
     return 0
 
 
+def cmd_row_verdict(args):
+    """row-verdict <db> <job_id>: the verdict of the job's own row, read-only, so a poll costs no connection to the daemon. Exit 2: no such job."""
+    if len(args) != 2:
+        usage("row-verdict: expected <db> <job_id>")
+    rows = query_ro(args[0], "SELECT * FROM jobs WHERE job_id = ?", (args[1],))
+    if not rows:
+        die(2, "row-verdict: no job %s in %s" % (args[1], args[0]))
+    print(verdict_of(rows[0]))
+    return 0
+
+
 def cmd_inflight(args):
     """inflight <db> <session> [--others]: this session's jobs whose verdict is in-flight, as `name job_id status` lines (--others: how many
     in-flight jobs do NOT carry the session's tag). The same verdict_of that status uses, so a failed job with a restart pending counts."""
@@ -326,7 +338,7 @@ def cmd_inflight(args):
     return 0
 
 
-COMMANDS = {"json-get": cmd_json_get, "jobs-ro": cmd_jobs_ro, "verdict-of": cmd_verdict_of, "launch": cmd_launch,
+COMMANDS = {"json-get": cmd_json_get, "jobs-ro": cmd_jobs_ro, "verdict-of": cmd_verdict_of, "row-verdict": cmd_row_verdict, "launch": cmd_launch,
             "override-write": cmd_override_write, "override-take": cmd_override_take, "inflight": cmd_inflight, "session-read": cmd_session_read}
 
 
