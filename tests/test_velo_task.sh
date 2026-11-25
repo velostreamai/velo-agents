@@ -530,6 +530,9 @@ t_jobs_ro() {
   need "rows come back as a compact JSON array" [ "$OUT" = '[{"job_id":"a","status":"running"},{"job_id":"b","status":"failed"}]' ]
   run ST jobs-ro --cols name,status "$d/jobs.sqlite" 'SELECT name, status FROM jobs WHERE name = ?' two
   need "--cols prints one line a row, and the parameter is bound" [ "$OUT" = "two failed" ]
+  run ST row-verdict "$d/jobs.sqlite" a; need "row-verdict of a running row is in-flight" [ "$OUT" = in-flight ]
+  run ST row-verdict "$d/jobs.sqlite" b; need "row-verdict of a failed row with no exit code is lost, never in-flight" [ "$OUT" = lost ]
+  run ST row-verdict "$d/jobs.sqlite" nobody; need "row-verdict of an unknown job is exit 2" [ "$RC" = 2 ]
   run ST jobs-ro --cols name "$d/jobs.sqlite" 'SELECT name FROM jobs WHERE name = ?' "two' OR '1'='1"
   need "a parameter is data: an injection matches nothing" [ -z "$OUT" ]
   "$PYBIN" -I -c 'import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute("INSERT INTO jobs (job_id, name, status) VALUES (?, ?, ?)", ("c", "x\ny z", "completed")); c.commit()' "$d/jobs.sqlite"
@@ -1487,6 +1490,14 @@ t_wait() {  # B4, B5, B15, B6
   run VT wait; need "no id: exit 2" [ "$RC" = 2 ]
   run VT wait --bogus w-ok; need "an unknown option: exit 2" [ "$RC" = 2 ]
   run VT wait --timeout 0 w-ok; need "a bad timeout: exit 2" [ "$RC" = 2 ]
+  # A poll reads Vanth's database; the daemon is asked on the first poll and then only every VELO_TASK_CONFIRM seconds, so a long wait
+  # opens one connection, not one per poll (the TIME_WAIT pile-up of a wait that polled the daemon 2-20 times a second).
+  n=$(grep -c '^vanth --json status job' "$E_CALLS")
+  run VT wait --timeout 2 w-run; need "a job that stays in flight for 2 s: exit 3" [ "$RC" = 3 ]
+  need "...the daemon was asked once, not on every poll" [ "$(( $(grep -c '^vanth --json status job' "$E_CALLS") - n ))" = 1 ]
+  n=$(grep -c '^vanth --json status job' "$E_CALLS")
+  VELO_TASK_CONFIRM=1 run VT wait --timeout 3 w-run; need "with a 1 s confirm interval: exit 3" [ "$RC" = 3 ]
+  need "...the daemon is asked again every confirm interval, so a dead daemon is still noticed" [ "$(( $(grep -c '^vanth --json status job' "$E_CALLS") - n ))" -ge 2 ]
   j=$(sql 'SELECT job_id FROM jobs WHERE name = ?' w-run)
   ( sleep 0.6; sql "UPDATE jobs SET status = 'completed', exit_code = 0 WHERE job_id = ?" "$j" >/dev/null ) &
   run VT wait --timeout 20 w-run; need "wait returns once the job finishes" [ "$RC" = 0 -a "$OUT" = "w-run ok" ]
@@ -1825,6 +1836,7 @@ prove "json-get fails on a missing file" t_json_get $S $'        except FileNotF
 prove "json-get writes in the caller's locale encoding" t_json_get $S '    sys.stdout.reconfigure(encoding="utf-8")' '    pass'
 prove "jobs-ro waits 0 ms" t_jobs_ro $S 'uri=True, timeout=2.0' 'uri=True, timeout=0.0'
 prove "jobs-ro skips the schema check" t_jobs_ro $S '        if missing:' '        if False:'
+prove "row-verdict: every row is in-flight" t_jobs_ro $S '    print(verdict_of(rows[0]))' '    print("in-flight")'
 prove "jobs-ro installs no authorizer" t_jobs_ro $S '        con.set_authorizer(read_only_authorizer)' '        pass'
 prove "a wait that is not a number is evaluated by bash arithmetic" t_hostile_env $L \
   '  [[ "${!v:-0}" =~ $WHOLE_SECS_RE ]] || die 2 "$v must be a whole number of seconds: ${!v}"' '  :'
@@ -1944,7 +1956,7 @@ prove "resolve: the oldest job" t_run_rerun $L 'ORDER BY created_at DESC, job_id
 prove "resolve: an unknown id goes on" t_resolve_exact $L '  [ -n "$found" ] || die 2 "unknown id' '  [ -n "$found" ] || JOB=job_nope; [ -n "$found" ] || die 0 "unknown id'
 prove "status: a daemon that cannot be reached is exit 1" t_status_daemon $L '*"failed to reach daemon"*) die 6 "daemon-down: $out; no verdict' '*"failed to reach daemon"*) die 1 "daemon-down: $out; no verdict'
 prove "B-RT1: no re-try at all" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 1 ] || break'
-prove "B-RT1: the default pause is nothing" t_status_transient_retry $L '/bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"' '/bin/sleep "${VELO_TASK_RETRY_SLEEP:-0}"'
+prove "B-RT1: the default pause is nothing" t_status_transient_retry $L '-v b="${VELO_TASK_RETRY_SLEEP:-0.2}"' '-v b="${VELO_TASK_RETRY_SLEEP:-0}"'
 prove "B-RT2: five calls instead of eleven" t_status_transient_retry $L '[ "$RETRY_ATTEMPTS" -lt 11 ] || break' '[ "$RETRY_ATTEMPTS" -lt 5 ] || break'
 prove "B-RT3: every error is re-tried, not just the daemon-down" t_status_transient_retry $L 'case "$RETRY_OUT" in *"failed to reach daemon"*) ;; *) break ;; esac' 'case "$RETRY_OUT" in *"vanth status"*) ;; *) break ;; esac'
 prove "B-RT4: a pause even when the first call answers" t_status_transient_retry $L 'RETRY_OUT=""; RETRY_ATTEMPTS=0' 'RETRY_OUT=""; RETRY_ATTEMPTS=0; /bin/sleep "${VELO_TASK_RETRY_SLEEP:-0.2}"'
@@ -1956,6 +1968,8 @@ prove "B-RT9: the old character-class check, which accepts 0, 010, 65536 and 999
 prove "wait: a failed winner of --any is exit 0" t_wait $L '[ "${done_[$first]#* }" = ok ]; return' 'true; return'
 prove "wait: --all with a failed job is exit 0" t_wait $L '[ "${done_[$i]#* }" = ok ] || worst=1;' 'true || worst=1;'
 prove "wait: a timeout is exit 1" t_wait $L 'die 3 "wait timed out' 'die 1 "wait timed out'
+prove "wait: every poll asks the daemon" t_wait $L 'if [ -n "${asked[$i]:-}" ] && [ $((SECONDS - asked[i])) -lt "${VELO_TASK_CONFIRM:-30}" ]; then' 'if false; then'
+prove "wait: the daemon is never asked again after the first poll" t_wait $L '-lt "${VELO_TASK_CONFIRM:-30}" ]; then' '-lt 100000 ]; then'
 prove "wait: --any waits for all" t_wait $L 'if [ "$mode" = any ] && [ "$first" -ge 0 ]; then' 'if false; then'
 prove "cancel: the job is not stopped" t_cancel $L 'out=$(vanth_env "$VANTH" --json stop "$JOB" --signal terminate --kill-after 5 2>&1) || rc=$?' 'out=""'
 # ---- hooks ----

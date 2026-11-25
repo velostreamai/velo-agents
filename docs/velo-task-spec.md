@@ -32,7 +32,13 @@ velo-task stop-override --reason <text>         let the session end once with jo
   The one answer that is not final is the daemon's own `failed to reach daemon` - its `/doctor` check losing a race with its `/health` check,
   which it does on ~1-2% of concurrent calls. That one call, and only that one, is re-run: at most 10 re-runs (11 calls in all),
   `VELO_TASK_RETRY_SLEEP` (default 0.2s) apart, and a success, an `unknown job` or any other error is returned at once. If the 11th call
-  loses the race too, the exit is 6 as before and the message says `after 11 attempts`.
+  loses the race too, the exit is 6 as before and the message says `after 11 attempts`. The pause grows with the attempt and is jittered
+  (0.5x to 1.5x of `VELO_TASK_RETRY_SLEEP` times the attempt number), so concurrent callers do not reconnect in step.
+  `wait` does not open a daemon connection per poll (each one left a TIME_WAIT socket; a long wait or several waiters exhausted the host's
+  ephemeral ports): a poll reads the job's own `jobs.sqlite` row (`velo-task-state row-verdict`, the same verdict rule), the poll interval
+  backs off from `VELO_TASK_POLL` (default 0.5s) by 1.5x toward `VELO_TASK_POLL_MAX` (default 3s), and the daemon is asked on a job's first
+  poll, once its row stops saying in-flight (the verdict is always the daemon's answer), and every `VELO_TASK_CONFIRM` seconds (default 30)
+  while it says in-flight, so a dead daemon is still reported within that time.
 - **R6** Stop guard (Claude Code Stop hook): reads `jobs.sqlite` read-only and BLOCKS while any `session:<me>` job is queued, launching,
   running, paused, retrying or stopping, printing `velo-task wait <id>` per job. Other sessions never block; a lost job is not a blocker.
   Fails closed (the query runs in a child and must end in a success marker) on a missing, unreadable, locked (>2 s) or wrong-schema database and on a missing or
